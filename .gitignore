@@ -1,0 +1,15 @@
+# Build output dirs
+/build/
+/build-gha/
+/builddir/
+/dist/
+/misrc_tools/build/
+
+# Vendored dependency build/install staging
+/.deps/
+
+# CI artifact output
+/.ci-artifacts/
+
+# Scratch
+/.tmp/
