@@ -1,6 +1,6 @@
 # MISRC GUI
 
-<img width="150" height="150" alt="image" src="https://github.com/user-attachments/assets/ecfc8e17-25ab-491a-9b8c-63c86b854b69" />
+<img width="150" height="150" alt="GUI_Icon" src="assets/Icons/MISRC_Icon.png" />
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
 
@@ -50,9 +50,14 @@ The record timer system is self fail proof, you cannot set a time lower than you
 
 ## Information Page 
 
-<img width="483" height="357" alt="image" src="https://github.com/user-attachments/assets/80a75446-7b4a-4071-9004-9f038d335c45" />
+<img width="473" height="388" alt="image" src="https://github.com/user-attachments/assets/83cfc78d-757c-467f-a74a-5755167ae5d5" />
 
-### Record
+- A/B  Swap for older V1.5a users
+- V4L2 Device discovery for Linux
+- Core Pinning (Linux Only)
+- Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
+
+## Record
 
 <img width="617" height="46" alt="image" src="https://github.com/user-attachments/assets/af6ad652-ca67-4f5d-bf35-7635d62dd187" />
 
@@ -236,4 +241,4 @@ Log Example:
 - February 2026 - First testing version released by Harry Munday
 - April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
-- Will add rest later this is the first draft!
+- August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
