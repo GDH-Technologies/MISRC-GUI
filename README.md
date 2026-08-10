@@ -73,6 +73,23 @@ The record button will turn orange and state finalizing when a file is still bei
 
 The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have no less then 16GB total. 
 
+
+## Settings Page
+
+<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="https://github.com/user-attachments/assets/db2d99a8-a712-4e24-9d6d-e2fdb2886428" />
+
+- Auto File Naming
+- Auto File Date Stamping
+- Stop on dropout mode
+- Base Name and Output
+- A/B RF Capture On/Off
+- FLAC/RAW PCM Encoding Control
+- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC is assumed 8-bit)
+- FLAC Level & Threads Control
+- Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
+- Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
+- Playback Input Files
+
 ## Scopes & Plugins
 
 There is a unified plugin system for deploying decoders.
