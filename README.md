@@ -35,7 +35,7 @@ The MISRC GUI, the layout is a simplified command and control system, designed f
 
 <img width="1427" height="752" alt="image" src="https://github.com/user-attachments/assets/7a715ce0-872b-4b38-ab31-e668505b8dc6" />
 
-The front GUU beginning from the top row
+The main GUI window from beginning from the top row
 
 - Information button
 - Metadata button
