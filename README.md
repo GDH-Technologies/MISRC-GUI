@@ -4,7 +4,7 @@
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
 
-A universal cross platform GUI tool for interfacing with and visualizing monitoring and control of FM RF archival focused, capture device workflows.
+A universal cross platform GUI tool for interfacing with and visualising monitoring and control of FM RF archival focused, capture device workflows.
 
 ### Current Supported Hardware
 
@@ -57,7 +57,9 @@ The record timer system is self fail proof, you cannot set a time lower than you
 - Core Pinning (Linux Only)
 - Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
 
-## Record
+The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+
+## Record & Audio Monitoring
 
 <img width="617" height="46" alt="image" src="https://github.com/user-attachments/assets/af6ad652-ca67-4f5d-bf35-7635d62dd187" />
 
@@ -65,14 +67,17 @@ Record button is clear when not in use.
 
 Record button is RED when capturing is in use.
 
-The record button will turn orange and state finalizing when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
+The record button will turn orange and state finalising when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
 
-## Timer and Level Stop
+Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
+
+## Timer and Level Auto Stop
 
 <img width="436" height="340" alt="image" src="https://github.com/user-attachments/assets/d5a7ea02-b2dc-41f6-a2db-d24783cde1c9" />
 
-The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have no less then 16GB total. 
+Timer mode allows for HH:MM:SS timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
 
+Level Autostop, this allows for you to set a overall % level alongside a timer to automatically stop captures when a tape is clearly reached its end and no active signal is being captured thus presenting a drastically lower level, users should be careful with this to prevent re-runs if tapes have spaced recordings.
 
 ## Settings Page
 
@@ -97,7 +102,7 @@ There is a unified plugin system for deploying decoders.
 Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
-- FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
+- FTT (visualises peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (Basic composite video decoder Luma B/W only currently)
 
 <img width="140" height="132" alt="image" src="https://github.com/user-attachments/assets/8a3d0632-5e9b-4c15-985e-73805c62f0e5" />
@@ -141,7 +146,7 @@ Persistence config, once you have configured your settings a global configuratio
 
 Understanding the waveform scale. 
 
-There are two visualization modes currently implemented. 
+There are two visualisation modes currently implemented. 
 
 - Level Bar (vertical colour indicator)
 - Waveform Line
@@ -259,3 +264,4 @@ Log Example:
 - April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
+- August 13th 20206 - Official release!
