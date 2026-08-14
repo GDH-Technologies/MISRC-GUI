@@ -28,6 +28,9 @@ typedef struct gui_app gui_app_t;
 #define DROPDOWN_RIGHT_VIEW     "RightView"
 #define DROPDOWN_CVBS_SYSTEM    "CvbsSystem"
 #define DROPDOWN_HISTOGRAM_BINS "HistogramBins"
+// Per-channel gear popover; index is the channel (0 = A, 1 = B). Registered
+// here so it shares the one-open-at-a-time slot with the view dropdowns.
+#define DROPDOWN_CHANNEL_GEAR   "ChannelGear"
 
 //-----------------------------------------------------------------------------
 // State Management

@@ -9,6 +9,7 @@
 #include "../visualization/gui_fft.h"
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
+#include "../visualization/gui_oscilloscope.h"
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
@@ -1620,6 +1621,9 @@ static CustomLayoutElement s_settings_icon_element;
 static CustomLayoutElement s_record_limit_icon_element;
 static CustomLayoutElement s_version_icon_element;
 static CustomLayoutElement s_metadata_icon_element;
+// Shared by both channels' gear buttons: the icon element carries no
+// per-instance data, so one static serves every gear on screen.
+static CustomLayoutElement s_channel_gear_icon_element;
 
 // Render settings panel (floating modal)
 static void render_settings_panel(gui_app_t *app) {
@@ -3827,6 +3831,116 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
 }
 
 // Render the channels panel - each channel has VU meter + waveform + stats grouped together
+// Per-channel gear button and its popover.
+//
+// The gear floats over the oscilloscope canvas rather than living inside it:
+// the canvas is a Clay custom element whose interior is drawn with raw raylib,
+// so anything placed in there would need its own cached hit rect. Floating
+// keeps the button a real Clay element, which Clay_PointerOver can test and
+// which the text-edit machinery can anchor to.
+//
+// The offset clears the "CH A" label drawn at (x+8, y+4) at FONT_SIZE_OSC_LABEL
+// and sits above the "100us/div" line at y+26. The Mode and Trig buttons are
+// top-right, so there is no collision there.
+static void render_channel_gear(gui_app_t *app, int channel) {
+    if (!app) return;
+
+    bool open = gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)channel);
+    Clay_ElementId canvas_id = (channel == 0) ? CLAY_ID("OscilloscopeCanvasA")
+                                              : CLAY_ID("OscilloscopeCanvasB");
+
+    CLAY(CLAY_IDI("ChannelGearBtn", channel), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(20), CLAY_SIZING_FIXED(20) },
+            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .floating = {
+            .offset = { 58.0f, 5.0f },
+            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP,
+                              .parent  = CLAY_ATTACH_POINT_LEFT_TOP },
+            .parentId = canvas_id.id,
+            .zIndex = 5,
+            .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID
+        },
+        .backgroundColor = to_clay_color(open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+        .cornerRadius = CLAY_CORNER_RADIUS(4)
+    }) {
+        CLAY(CLAY_IDI("ChannelGearIcon", channel), {
+            .layout = { .sizing = { CLAY_SIZING_FIXED(14), CLAY_SIZING_FIXED(14) } },
+            .custom = { .customData = &s_channel_gear_icon_element }
+        }) {}
+    }
+
+    if (!open) return;
+
+    bool cxadc_has_b = false;
+    bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_has_b);
+    bool channel_b_missing = (channel == 1) && cxadc_mode && !cxadc_has_b;
+
+    static char gear_title[32];
+    snprintf(gear_title, sizeof(gear_title), "Channel %s", channel == 0 ? "A" : "B");
+    static char gear_source[32];
+    if (cxadc_mode) {
+        snprintf(gear_source, sizeof(gear_source), "cxadc%d", channel);
+    } else {
+        gear_source[0] = '\0';
+    }
+
+    // zIndex 20 clears the panel and every view dropdown (all implicit 0) but
+    // stays under the modal popup at 1000. Clay stops its pointer scan at a
+    // capture-mode floating root, so this also shields the Clay elements
+    // underneath for free -- the raylib panel interior still needs the click
+    // to be consumed explicitly, which the handler does.
+    CLAY(CLAY_IDI("ChannelGearPopover", channel), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(320), CLAY_SIZING_FIT(0) },
+            .padding = { 12, 12, 10, 10 },
+            .childGap = 6,
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        },
+        .floating = {
+            .offset = { 0.0f, 4.0f },
+            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP,
+                              .parent  = CLAY_ATTACH_POINT_LEFT_BOTTOM },
+            .parentId = CLAY_IDI("ChannelGearBtn", channel).id,
+            .zIndex = 20,
+            .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID
+        },
+        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+        .cornerRadius = CLAY_CORNER_RADIUS(6),
+        .border = { .width = { 1, 1, 1, 1 }, .color = to_clay_color(COLOR_BUTTON_ACTIVE) }
+    }) {
+        // Header: channel name, and the backing card when this is a CXADC.
+        CLAY(CLAY_IDI("ChannelGearHeader", channel), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 8,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            }
+        }) {
+            CLAY_TEXT(make_string(gear_title), CLAY_TEXT_CONFIG({
+                .fontSize = FONT_SIZE_NORMAL,
+                .textColor = to_clay_color(channel == 0 ? COLOR_CHANNEL_A : COLOR_CHANNEL_B)
+            }));
+            if (gear_source[0]) {
+                CLAY_TEXT(make_string(gear_source), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(COLOR_TEXT_DIM)
+                }));
+            }
+        }
+
+        if (channel_b_missing) {
+            CLAY_TEXT(CLAY_STRING("Single-card CXADC has no RF channel B source"),
+                CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(COLOR_TEXT_DIM)
+                }));
+        }
+    }
+}
+
 static void render_channels_panel(gui_app_t *app) {
 #ifdef ENABLE_DDD
     // DdD is single-channel: hide the Channel B row entirely so channel A
@@ -3863,6 +3977,7 @@ static void render_channels_panel(gui_app_t *app) {
     s_osc_b_element.customData.channel_panel.channel = 1;
 
     s_settings_icon_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON;
+    s_channel_gear_icon_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON;
 
     CLAY(CLAY_ID("ChannelsPanel"), {
         .layout = {
@@ -3918,6 +4033,7 @@ static void render_channels_panel(gui_app_t *app) {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
                 .custom = { .customData = &s_osc_a_element }
             }) {}
+            render_channel_gear(app, 0);
 
             // Stats panel A
             render_channel_stats(app, 0);
@@ -3949,6 +4065,7 @@ static void render_channels_panel(gui_app_t *app) {
                     .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
                     .custom = { .customData = &s_osc_b_element }
                 }) {}
+                render_channel_gear(app, 1);
 
                 // Stats panel B
                 render_channel_stats(app, 1);
@@ -4302,6 +4419,68 @@ void gui_render_layout(gui_app_t *app) {
 }
 
 // Handle UI interactions
+// Close the panel's own Mode/Trig overlay dropdowns for a channel. They live in
+// the private waveform panel state, not the gui_dropdown registry, so opening
+// the gear does not close them and they would paint through the popover.
+static void gui_ui_close_channel_panel_overlays(gui_app_t *app, int channel) {
+    if (!app) return;
+    channel_panel_config_t *config = (channel == 0) ? &app->panel_config_a
+                                                    : &app->panel_config_b;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+    if (config->left_view == PANEL_VIEW_WAVEFORM) {
+        gui_waveform_close_overlays(config->left_state);
+    }
+    if (config->split && config->right_view == PANEL_VIEW_WAVEFORM) {
+        gui_waveform_close_overlays(config->right_state);
+    }
+    atomic_flag_clear(&app->panel_config_lock);
+}
+
+// Returns true when the click was consumed.
+//
+// Ordering matters here and is not cosmetic. waveform_panel_handle_click treats
+// *any* press inside the panel bounds as a trigger-level grab, and it is reached
+// from gui_dropdown_handle_click -> panel_handle_all_clicks, which runs at the
+// very end of gui_handle_interactions. So this must run first and consume, or
+// clicking the gear would silently yank the user's trigger level.
+//
+// Dismissal is explicit rather than relying on gui_dropdown_close_all(): that
+// call sits *after* panel_handle_all_clicks in gui_dropdown_handle_click, and
+// since the popover floats over a waveform panel, an outside click is usually
+// claimed by the panel first and never reaches it. Closing here while
+// deliberately NOT consuming gives the expected dismiss-and-act behaviour.
+static bool gui_ui_handle_channel_gear_click(gui_app_t *app) {
+    for (int ch = 0; ch < 2; ch++) {
+        if (Clay_PointerOver(CLAY_IDI("ChannelGearBtn", ch))) {
+            bool was_open = gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)ch);
+            gui_dropdown_toggle(DROPDOWN_CHANNEL_GEAR, (uint32_t)ch);
+            if (!was_open) {
+                gui_ui_close_channel_panel_overlays(app, ch);
+            }
+            if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
+                gui_ui_clear_text_edit();
+            }
+            return true;
+        }
+    }
+
+    for (int ch = 0; ch < 2; ch++) {
+        if (!gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)ch)) continue;
+
+        if (Clay_PointerOver(CLAY_IDI("ChannelGearPopover", ch))) {
+            // Consume unconditionally, including clicks on dead space inside
+            // the popover, so nothing leaks through to the panel beneath.
+            return true;
+        }
+
+        gui_dropdown_close_all();
+        if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
+            gui_ui_clear_text_edit();
+        }
+    }
+    return false;
+}
+
 void gui_handle_interactions(gui_app_t *app) {
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
@@ -4333,6 +4512,14 @@ void gui_handle_interactions(gui_app_t *app) {
     }
     if (s_metadata_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_metadata_window_open = false;
+    }
+    // ESC closes the gear popover, but only once any active field edit inside
+    // it has been dismissed -- otherwise a single ESC would both cancel the
+    // edit and close the popover out from under it.
+    if (IsKeyPressed(KEY_ESCAPE) && s_active_text_field == UI_TEXT_FIELD_NONE &&
+        (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
+         gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1))) {
+        gui_dropdown_close_all();
     }
 
 
@@ -4432,8 +4619,24 @@ void gui_handle_interactions(gui_app_t *app) {
         return;  // Popup consumed the interaction
     }
 
+    // The gear popover floats at zIndex 20, above the settings panel and the
+    // other modals (which sit at the implicit 0), so it would paint over them.
+    // Close it whenever one of them opens rather than trying to interleave.
+    if (app->settings_panel_open || s_record_limit_window_open ||
+        s_version_info_window_open || s_metadata_window_open || gui_popup_is_open()) {
+        if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
+            gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)) {
+            gui_dropdown_close_all();
+        }
+    }
+
     // Handle clicks
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        // Runs before every panel hit test -- see the note on the handler.
+        if (gui_ui_handle_channel_gear_click(app)) {
+            gui_ui_set_click_consumed();
+            return;
+        }
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoCorePinningToggle"))) {

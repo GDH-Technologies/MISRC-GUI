@@ -33,6 +33,12 @@ void gui_waveform_panel_register(void);
 
 void gui_oscilloscope_cleanup(void);
 
+// Close the panel's own Mode/Trig overlay dropdowns. Those live in the private
+// waveform panel state rather than the gui_dropdown registry, so opening a
+// registry dropdown does not close them and they would paint through anything
+// floating above the panel. Safe to call with NULL.
+void gui_waveform_close_overlays(void *state);
+
 //-----------------------------------------------------------------------------
 // Grid Drawing
 //-----------------------------------------------------------------------------
