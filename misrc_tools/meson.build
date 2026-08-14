@@ -365,6 +365,7 @@ if raylib_dep.found()
     'misrc_gui/input/gui_cxadc_params.c',
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
+    'misrc_gui/input/gui_preview_v4l2.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',

@@ -20,6 +20,7 @@
 #include "../ui/gui_ui.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
+#include "../input/gui_preview_v4l2.h"
 #include "../processing/gui_extract.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
@@ -335,6 +336,17 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--smoke-test") == 0) {
             return 0;
+        }
+        /* Headless preview diagnostics. These run without a window so the
+         * reader can be exercised -- and its unplug, teardown and scheduling
+         * behaviour verified -- without anyone watching a GUI. */
+        if (strcmp(argv[i], "--preview-probe") == 0) {
+            return gui_preview_probe_main();
+        }
+        if (strcmp(argv[i], "--preview-probe-stream") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
+            return gui_preview_probe_stream_main(dev, secs);
         }
     }
 #if defined(__APPLE__)
