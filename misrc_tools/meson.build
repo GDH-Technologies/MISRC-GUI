@@ -362,6 +362,7 @@ if raylib_dep.found()
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
+    'misrc_gui/input/gui_cxadc_params.c',
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
     # Processing
