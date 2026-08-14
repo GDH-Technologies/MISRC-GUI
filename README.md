@@ -27,6 +27,47 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
 
 
+## Building from source on Fedora
+
+The build system is **Meson**. The `CMakeLists.txt` at the repository root is stale and
+truncated — it never defines `add_executable`, so it cannot build anything. Do not use it.
+
+Install the dependencies:
+
+```sh
+sudo dnf install -y gcc meson ninja-build cmake pkgconf-pkg-config git nasm \
+  flac-devel libusb1-devel raylib-devel fftw-devel soxr-devel alsa-lib-devel \
+  libX11-devel mesa-libGL-devel libuvc-devel
+```
+
+Then build:
+
+```sh
+./scripts/build-fedora.sh
+```
+
+Binaries land in `build-fedora/`. The script builds the vendored `third_party/hsdaoh` into
+`.deps/install` first (no distro packages it, and the API used here is the MISRC fork rather
+than upstream), then configures Meson against system libraries.
+
+Notes on the Fedora-specific pieces:
+
+- **System FLAC is used directly.** Fedora ships `flac-devel` 1.5.0, which satisfies the
+  `>= 1.5.0` requirement for multithreaded encode, so none of the bundled-FLAC machinery the
+  CI needs for Ubuntu 22.04 applies here.
+- **`fftw-devel`**, not `fftw3f-devel` — Fedora's single package ships all precisions.
+- **`libX11-devel` and `mesa-libGL-devel`** are required because the GUI link line appends a
+  literal `-lX11 -lGL`, independent of what `raylib.pc` declares.
+- **`libuvc-devel`** is only needed to build vendored hsdaoh; Meson never looks for it.
+- `scripts/build-appimage-local.sh` is **not** usable natively on Fedora — it asserts a glibc
+  2.35 ceiling for AppImage portability and Fedora 44 is glibc 2.43. Use its container mode
+  if you need an AppImage.
+
+By default a missing optional dependency silently drops a feature. Pass
+`-Dmisrc_gui=enabled`, `-Dfx3=enabled` or `-Dddd=enabled` to turn that into a configure
+error instead; `build-fedora.sh` already sets the first of these.
+
+
 ## Visual Overview & Use
 
 

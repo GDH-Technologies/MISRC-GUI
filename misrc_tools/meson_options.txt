@@ -1,0 +1,29 @@
+# Build options for MISRC.
+#
+# Named meson_options.txt rather than meson.options: the latter is only read by
+# meson >= 1.1, and this project still declares a much lower floor.
+#
+# Every dependency in meson.build is `required: false`, which means a missing
+# package silently drops a feature instead of failing configure. That is fine
+# for CI (which controls its own image) but hostile locally: a missing raylib
+# leaves the misrc_gui target undefined, so `meson compile misrc_gui` fails
+# with an unhelpful "unknown target" long after the configure output scrolled
+# past. These options let a local build demand the features it expects.
+
+option('misrc_gui',
+       type: 'feature',
+       value: 'auto',
+       description: 'Build the misrc_gui GUI application (needs raylib + fftw3f). ' +
+                    'enabled = fail configure if the dependencies are missing.')
+
+option('fx3',
+       type: 'feature',
+       value: 'auto',
+       description: 'Cypress FX3 capture support (needs libusb-1.0). ' +
+                    'enabled = fail configure if libusb-1.0 is missing.')
+
+option('ddd',
+       type: 'feature',
+       value: 'auto',
+       description: 'DomesdayDuplicator capture support (needs libusb-1.0). ' +
+                    'enabled = fail configure if libusb-1.0 is missing.')
