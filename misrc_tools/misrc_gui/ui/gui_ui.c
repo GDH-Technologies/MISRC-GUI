@@ -1056,6 +1056,26 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_INGEST_NOTES) {
         return s_metadata_window_open;
     }
+    // The RF tag fields have a second home in the per-channel gear popover, so
+    // they must be editable there without the settings panel being open. Same
+    // rules otherwise: auto-naming supplies the filename these tags go into,
+    // and the tag is baked in at record start.
+    if (field == UI_TEXT_FIELD_RF_TAG_A || field == UI_TEXT_FIELD_RF_TAG_B) {
+        int gear_ch = (field == UI_TEXT_FIELD_RF_TAG_A) ? 0 : 1;
+        if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)gear_ch)) {
+            if (gui_ui_settings_locked(app) || !app->settings.auto_names_enabled) {
+                return false;
+            }
+            if (gear_ch == 1) {
+                bool gear_cxadc_has_b = false;
+                bool gear_cxadc = gui_ui_selected_device_is_cxadc(app, &gear_cxadc_has_b);
+                if ((gear_cxadc && !gear_cxadc_has_b) || !app->settings.capture_b) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
@@ -3938,6 +3958,137 @@ static void render_channel_gear(gui_app_t *app, int channel) {
                     .textColor = to_clay_color(COLOR_TEXT_DIM)
                 }));
         }
+
+        // These three mirror settings the panel already owns. All are baked
+        // into filenames or FLAC headers at record start, so all lock while
+        // recording -- unlike the CX values below, which stay live.
+        bool locked = gui_ui_settings_locked(app);
+        bool capture_on = (channel == 0) ? app->settings.capture_a : app->settings.capture_b;
+        bool resample_on = (channel == 0) ? app->settings.enable_resample_a
+                                          : app->settings.enable_resample_b;
+        bool row_disabled = locked || channel_b_missing;
+        bool tag_disabled = row_disabled || !app->settings.auto_names_enabled ||
+                            (channel == 1 && !app->settings.capture_b);
+        bool resample_disabled = row_disabled ||
+                                 (channel == 1 && !app->settings.capture_b);
+
+        // Record enable
+        CLAY(CLAY_IDI("ChannelGearRecordRow", channel), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 8,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            }
+        }) {
+            CLAY(CLAY_IDI("ChannelGearRecordLabel", channel), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Record:"), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(row_disabled ? ui_disabled_color(COLOR_TEXT_DIM)
+                                                            : COLOR_TEXT_DIM)
+                }));
+            }
+            Color rec_bg = capture_on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            CLAY(CLAY_IDI("ChannelGearRecordToggle", channel), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(26) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(row_disabled ? ui_disabled_color(rec_bg) : rec_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(capture_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                    CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_STATS,
+                        .textColor = to_clay_color(row_disabled ? ui_disabled_color(COLOR_TEXT)
+                                                                : COLOR_TEXT)
+                    }));
+            }
+        }
+
+        // Tag
+        CLAY(CLAY_IDI("ChannelGearTagRow", channel), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 8,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            }
+        }) {
+            CLAY(CLAY_IDI("ChannelGearTagLabel", channel), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Tag:"), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(tag_disabled ? ui_disabled_color(COLOR_TEXT_DIM)
+                                                            : COLOR_TEXT_DIM)
+                }));
+            }
+            const char *tag_value = app->settings.rf_channel_tags[channel];
+            ui_text_field_t tag_field = (channel == 0) ? UI_TEXT_FIELD_RF_TAG_A
+                                                       : UI_TEXT_FIELD_RF_TAG_B;
+            Color tag_bg = tag_disabled ? ui_disabled_color((Color){ 25, 25, 30, 255 })
+                                        : (Color){ 25, 25, 30, 255 };
+            Color tag_fg = tag_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+            CLAY(CLAY_IDI("ChannelGearTagField", channel), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(160), CLAY_SIZING_FIXED(26) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                    .padding = { 6, 6, 0, 0 }
+                },
+                .backgroundColor = to_clay_color(tag_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                if (gui_ui_is_text_field_active(tag_field) && !tag_disabled) {
+                    gui_ui_render_active_text(tag_field, tag_value, FONT_SIZE_STATS, 1, tag_fg);
+                } else {
+                    CLAY_TEXT(make_string(tag_value[0] ? tag_value : "(none)"),
+                        CLAY_TEXT_CONFIG({
+                            .fontSize = FONT_SIZE_STATS,
+                            .textColor = to_clay_color(tag_value[0] ? tag_fg
+                                                                    : ui_disabled_color(tag_fg))
+                        }));
+                }
+            }
+        }
+
+        // Resample
+        CLAY(CLAY_IDI("ChannelGearResampleRow", channel), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 8,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            }
+        }) {
+            CLAY(CLAY_IDI("ChannelGearResampleLabel", channel), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Resample:"), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(resample_disabled ? ui_disabled_color(COLOR_TEXT_DIM)
+                                                                 : COLOR_TEXT_DIM)
+                }));
+            }
+            Color rs_bg = resample_on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            CLAY(CLAY_IDI("ChannelGearResampleToggle", channel), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(26) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(resample_disabled ? ui_disabled_color(rs_bg) : rs_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(resample_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                    CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_STATS,
+                        .textColor = to_clay_color(resample_disabled ? ui_disabled_color(COLOR_TEXT)
+                                                                     : COLOR_TEXT)
+                    }));
+            }
+        }
     }
 }
 
@@ -4436,6 +4587,96 @@ static void gui_ui_close_channel_panel_overlays(gui_app_t *app, int channel) {
     atomic_flag_clear(&app->panel_config_lock);
 }
 
+// Controls inside an open gear popover. Every guard is re-derived here rather
+// than trusted from the render pass, matching the rest of the file.
+static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
+    bool cxadc_has_b = false;
+    bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_has_b);
+#ifdef ENABLE_DDD
+    bool ddd_mode = gui_ui_selected_device_is_ddd(app);
+#else
+    bool ddd_mode = false;
+#endif
+    bool b_missing = (channel == 1) && (ddd_mode || (cxadc_mode && !cxadc_has_b));
+    bool locked = gui_ui_settings_locked(app);
+
+    if (Clay_PointerOver(CLAY_IDI("ChannelGearRecordToggle", channel))) {
+        if (locked) {
+            gui_app_set_status(app, "Settings are locked while recording is active");
+            return;
+        }
+        if (b_missing) {
+            gui_app_set_status(app, ddd_mode
+                ? "DdD is single-channel; channel B has no signal source"
+                : "Single-card CXADC has no RF channel B source");
+            return;
+        }
+        if (channel == 0) {
+            app->settings.capture_a = !app->settings.capture_a;
+        } else {
+            app->settings.capture_b = !app->settings.capture_b;
+            // Mirrors the settings panel: disabling B also drops its resample,
+            // otherwise a disabled channel keeps a rate that goes nowhere.
+            if (!app->settings.capture_b) {
+                app->settings.enable_resample_b = false;
+                app->settings.resample_rate_b = 40000.0f;
+            }
+        }
+        gui_settings_save(&app->settings);
+        if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
+            gui_ui_clear_text_edit();
+        }
+        return;
+    }
+
+    if (Clay_PointerOver(CLAY_IDI("ChannelGearResampleToggle", channel))) {
+        if (locked) {
+            gui_app_set_status(app, "Settings are locked while recording is active");
+            return;
+        }
+        if (b_missing) {
+            gui_app_set_status(app, ddd_mode
+                ? "DdD is single-channel; channel B resample not applicable"
+                : "Single-card CXADC has no RF channel B source");
+            return;
+        }
+        if (channel == 1 && !app->settings.capture_b) {
+            gui_app_set_status(app, "Enable RF channel B to edit CH B resample settings");
+            return;
+        }
+        if (channel == 0) {
+            bool enable = !app->settings.enable_resample_a;
+            app->settings.enable_resample_a = enable;
+            if (!enable) app->settings.resample_rate_a = 40000.0f;
+        } else {
+            bool enable = !app->settings.enable_resample_b;
+            app->settings.enable_resample_b = enable;
+            if (!enable) app->settings.resample_rate_b = 40000.0f;
+        }
+        gui_settings_save(&app->settings);
+        return;
+    }
+
+    if (Clay_PointerOver(CLAY_IDI("ChannelGearTagField", channel))) {
+        ui_text_field_t field = (channel == 0) ? UI_TEXT_FIELD_RF_TAG_A
+                                               : UI_TEXT_FIELD_RF_TAG_B;
+        if (!gui_ui_text_field_can_edit(app, field)) {
+            if (locked) {
+                gui_app_set_status(app, "Settings are locked while recording is active");
+            } else if (b_missing) {
+                gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
+            } else if (!app->settings.auto_names_enabled) {
+                gui_app_set_status(app, "Enable auto naming to edit channel tags");
+            } else if (channel == 1 && !app->settings.capture_b) {
+                gui_app_set_status(app, "Enable RF channel B to edit CH B tag");
+            }
+            return;
+        }
+        gui_ui_begin_text_edit(app, field, CLAY_IDI("ChannelGearTagField", channel), 6.0f, 6.0f);
+        return;
+    }
+}
+
 // Returns true when the click was consumed.
 //
 // Ordering matters here and is not cosmetic. waveform_panel_handle_click treats
@@ -4468,6 +4709,7 @@ static bool gui_ui_handle_channel_gear_click(gui_app_t *app) {
         if (!gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)ch)) continue;
 
         if (Clay_PointerOver(CLAY_IDI("ChannelGearPopover", ch))) {
+            gui_ui_handle_channel_gear_controls(app, ch);
             // Consume unconditionally, including clicks on dead space inside
             // the popover, so nothing leaks through to the panel beneath.
             return true;
@@ -4537,10 +4779,22 @@ void gui_handle_interactions(gui_app_t *app) {
          s_active_text_field == UI_TEXT_FIELD_INGEST_OPERATOR ||
          s_active_text_field == UI_TEXT_FIELD_INGEST_LOCATION ||
          s_active_text_field == UI_TEXT_FIELD_INGEST_NOTES);
+    // The RF tag fields are also reachable from the gear popover, which is not
+    // the settings panel -- without this arm the catch-all below would clear
+    // the edit every frame and typing there would be impossible.
+    bool gear_text_field_active =
+        ((s_active_text_field == UI_TEXT_FIELD_RF_TAG_A &&
+          gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0)) ||
+         (s_active_text_field == UI_TEXT_FIELD_RF_TAG_B &&
+          gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)));
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if (metadata_text_field_active && s_metadata_window_open &&
                !s_record_limit_window_open && !s_version_info_window_open) {
+        gui_ui_handle_active_text_edit(app);
+    } else if (gear_text_field_active && !app->settings_panel_open &&
+               !s_record_limit_window_open && !s_version_info_window_open &&
+               !s_metadata_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if ((!app->settings_panel_open && !s_metadata_window_open) ||
                s_record_limit_window_open || s_version_info_window_open) {
