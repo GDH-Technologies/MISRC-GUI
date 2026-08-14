@@ -171,7 +171,12 @@ int misrc_device_enumerate(misrc_device_list_t *list, bool include_hsdaoh, bool 
         for (size_t i = 0; i < sc_count; i++) {
             /* Check if device supports 1920x1080 YUYV at >=40fps */
             bool supports_1080p60 = false;
-            sc_formatlist_t *sc_fmt;
+            /* Must be initialised: sc_get_formats() returns 0 without writing
+             * *fmt_list when the node cannot be opened -- which happens if the
+             * device is unplugged between sc_get_devices() and here. Leaving it
+             * indeterminate would hand sc_free_format_list() a wild pointer,
+             * and its !fmts guard cannot catch a garbage stack value. */
+            sc_formatlist_t *sc_fmt = NULL;
             size_t f_count = sc_get_formats(sc_devs[i].device_id, &sc_fmt);
 
             for (size_t j = 0; j < f_count && !supports_1080p60; j++) {
