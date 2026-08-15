@@ -381,8 +381,9 @@ int main(int argc, char **argv) {
     // Keep defaults usable while fitting common laptop screens.
     const int default_window_width = 1425;
     const int default_window_height = 720;
-    const int min_window_width = 1040;
-    const int min_window_height = 650;
+    // Allow quarter-screen tiling and compact desktop snapping on common displays.
+    const int min_window_width = 640;
+    const int min_window_height = 360;
     char window_title[128];
     snprintf(window_title, sizeof(window_title), "MISRC Capture %s", MIRSC_TOOLS_VERSION);
     InitWindow(default_window_width, default_window_height, window_title);
