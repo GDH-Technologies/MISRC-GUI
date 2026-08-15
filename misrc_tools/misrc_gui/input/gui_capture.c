@@ -1130,7 +1130,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         }
 #ifdef ENABLE_FX3
         else if (src->type == MISRC_DEVICE_TYPE_FX3) {
-            snprintf(dst->name, sizeof(dst->name), "[FX3] %s", src->name);
+            snprintf(dst->name, sizeof(dst->name), "[FX3ADC] %s", src->name);
             dst->type = DEVICE_TYPE_FX3;
             dst->index = src->index;
             snprintf(dst->serial, sizeof(dst->serial), "%s", src->device_id);
@@ -1562,7 +1562,7 @@ int gui_app_start_capture(gui_app_t *app) {
         // Open FX3 device first
         int r = gui_fx3_open(app, dev->index);
         if (r < 0) {
-            gui_app_set_status(app, "Failed to open FX3 device");
+            gui_app_set_status(app, "Failed to open FX3ADC device");
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }

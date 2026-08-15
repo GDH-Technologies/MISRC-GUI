@@ -1334,7 +1334,7 @@ int gui_fx3_start(gui_app_t *app) {
     if (fx3_start_before_thread) {
         if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
             fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
+            gui_app_set_status(app, "FX3ADC: Failed to start acquisition");
             gui_extract_stop();
             if (app->display_thread) {
                 gui_display_thread_stop(app->display_thread);
@@ -1382,7 +1382,7 @@ int gui_fx3_start(gui_app_t *app) {
         fprintf(stderr, "[FX3] Waited additional 100ms for bulk transfer to be pending\n");
         if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
             fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
+            gui_app_set_status(app, "FX3ADC: Failed to start acquisition");
             atomic_store(&app->fx3_running, false);
             thrd_join(thread, NULL);
             app->fx3_thread = NULL;
@@ -1395,7 +1395,7 @@ int gui_fx3_start(gui_app_t *app) {
         }
     }
 
-    gui_app_set_status(app, "FX3 capture running");
+    gui_app_set_status(app, "FX3ADC capture running");
     return 0;
 }
 
@@ -1432,7 +1432,7 @@ void gui_fx3_stop(gui_app_t *app) {
 
     atomic_store(&app->stream_synced, false);
 
-    gui_app_set_status(app, "FX3 capture stopped");
+    gui_app_set_status(app, "FX3ADC capture stopped");
 }
 
 bool gui_fx3_is_running(gui_app_t *app) {

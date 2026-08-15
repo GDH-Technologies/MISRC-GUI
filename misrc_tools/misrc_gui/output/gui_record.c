@@ -345,7 +345,7 @@ static const char *gui_record_device_type_name(const gui_app_t *app) {
             return "playback";
 #ifdef ENABLE_FX3
         case DEVICE_TYPE_FX3:
-            return "fx3";
+            return "fx3adc";
 #endif
 #ifdef ENABLE_DDD
         case DEVICE_TYPE_DDD:

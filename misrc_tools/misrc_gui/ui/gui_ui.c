@@ -2499,7 +2499,7 @@ static const char *gui_ui_device_type_name(device_type_t type) {
         case DEVICE_TYPE_SIMULATED:      return "Simulated";
         case DEVICE_TYPE_PLAYBACK:       return "Playback";
 #ifdef ENABLE_FX3
-        case DEVICE_TYPE_FX3:            return "FX3";
+        case DEVICE_TYPE_FX3:            return "FX3ADC";
 #endif
 #ifdef ENABLE_DDD
         case DEVICE_TYPE_DDD:            return "DdD";
@@ -3207,7 +3207,7 @@ static void render_toolbar(gui_app_t *app) {
     if (cxadc_mode) {
         mode_label = cxadc_clockgen_mode ? "Mode: CXADC Clockgen" : "Mode: CXADC";
     } else if (fx3_mode) {
-        mode_label = "Mode: FX3";
+        mode_label = "Mode: FX3ADC";
     } else if (ddd_mode) {
         mode_label = "Mode: DdD";
     } else {
@@ -3217,7 +3217,7 @@ static void render_toolbar(gui_app_t *app) {
         if (cxadc_mode) {
             mode_label = cxadc_clockgen_mode ? "CxC" : "CXA";
         } else if (fx3_mode) {
-            mode_label = "FX3";
+            mode_label = "FX3ADC";
         } else if (ddd_mode) {
             mode_label = "DdD";
         } else {
@@ -3227,7 +3227,7 @@ static void render_toolbar(gui_app_t *app) {
         if (cxadc_mode) {
             mode_label = cxadc_clockgen_mode ? "CxClk" : "CXADC";
         } else if (fx3_mode) {
-            mode_label = "FX3";
+            mode_label = "FX3ADC";
         } else if (ddd_mode) {
             mode_label = "DdD";
         } else {
@@ -4424,10 +4424,33 @@ void gui_render_layout(gui_app_t *app) {
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
-        int device_dropdown_overlay_width = 200;
+        int overlay_screen_width = GetScreenWidth();
+        bool overlay_toolbar_tiny = overlay_screen_width < 760;
+        bool overlay_toolbar_ultra_narrow = overlay_screen_width < 900;
+        bool overlay_toolbar_very_narrow = overlay_screen_width < 1020;
+        int overlay_text_size = overlay_toolbar_very_narrow ? FONT_SIZE_DROPDOWN : FONT_SIZE_NORMAL;
+        int overlay_padding = overlay_toolbar_very_narrow ? 6 : 10;
+        int overlay_row_height = overlay_toolbar_tiny ? 24 : 28;
+        int overlay_min_width = overlay_toolbar_tiny ? 100 : (overlay_toolbar_ultra_narrow ? 120 : (overlay_toolbar_very_narrow ? 138 : 160));
+        int overlay_max_width = overlay_toolbar_tiny ? 190 : (overlay_toolbar_ultra_narrow ? 220 : (overlay_toolbar_very_narrow ? 250 : 320));
+        int device_dropdown_overlay_width = overlay_min_width;
         Clay_ElementData device_dropdown_data = Clay_GetElementData(CLAY_ID("DeviceDropdown"));
         if (device_dropdown_data.found) {
-            device_dropdown_overlay_width = gui_ui_clamp_int((int)roundf(device_dropdown_data.boundingBox.width), 96, 320);
+            device_dropdown_overlay_width = gui_ui_clamp_int((int)roundf(device_dropdown_data.boundingBox.width),
+                                                             overlay_min_width,
+                                                             overlay_max_width);
+        }
+        for (int i = 0; i < app->device_count; i++) {
+            int option_width = gui_ui_measure_button_width(app,
+                                                           app->devices[i].name,
+                                                           overlay_text_size,
+                                                           overlay_padding,
+                                                           16,
+                                                           overlay_min_width,
+                                                           overlay_max_width);
+            if (option_width > device_dropdown_overlay_width) {
+                device_dropdown_overlay_width = option_width;
+            }
         }
         CLAY(CLAY_ID("DeviceDropdownOverlay"), {
             .layout = {
@@ -4448,15 +4471,15 @@ void gui_render_layout(gui_app_t *app) {
 
                 CLAY(CLAY_IDI("DeviceOption", i), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(overlay_row_height) },
                         .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                        .padding = { 10, 10, 0, 0 }
+                        .padding = { overlay_padding, overlay_padding, 0, 0 }
                     },
                     .backgroundColor = to_clay_color(item_color)
                 }) {
                     // Use device name directly - it's already in persistent storage
                     CLAY_TEXT(make_string(app->devices[i].name),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN, .textColor = to_clay_color(COLOR_TEXT) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = overlay_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
             }
         }
@@ -4984,7 +5007,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     ? "CXADC Clockgen mode is fixed by detected card count"
                     : "CXADC mode is fixed by detected card count");
             } else if (mode_toggle_is_fx3) {
-                gui_app_set_status(app, "FX3 backend selected; MISRC/HSDAOH mode not applicable");
+                gui_app_set_status(app, "FX3ADC backend selected; MISRC/HSDAOH mode not applicable");
             } else if (mode_toggle_is_ddd) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
             } else if (app->is_recording) {
@@ -5129,7 +5152,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B has no signal source");
                     } else if (settings_fx3_mode) {
-                        gui_app_set_status(app, "FX3 is single-channel; channel B has no signal source");
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B has no signal source");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     }
@@ -5207,7 +5230,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
                     } else if (settings_fx3_mode) {
-                        gui_app_set_status(app, "FX3 is single-channel; channel B resample not applicable");
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B resample not applicable");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     } else if (!app->settings.capture_b) {
@@ -5227,7 +5250,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
                     } else if (settings_fx3_mode) {
-                        gui_app_set_status(app, "FX3 is single-channel; channel B resample not applicable");
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B resample not applicable");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     } else if (!app->settings.capture_b) {
@@ -5305,7 +5328,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B bit depth not applicable");
                     } else if (settings_fx3_mode) {
-                        gui_app_set_status(app, "FX3 is single-channel; channel B bit depth not applicable");
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B bit depth not applicable");
                     } else if (!app->settings.capture_b) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B bit depth");
                     }
