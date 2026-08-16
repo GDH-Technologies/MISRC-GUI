@@ -675,14 +675,18 @@ static void strip_timestamp_prefix_inplace(char *s) {
 }
 
 // Output-folder picker. Returns true if output_path changed.
+// NOTE: On Android this is no longer called — the settings click handler in
+// gui_ui.c launches the async SAF picker (android_pick_output_folder_async)
+// and applies the result via the per-frame poll, so the render thread never
+// blocks across the picker Activity transition. This sync path remains for
+// desktop platforms.
 bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     if (!settings) return false;
     char picked[512] = {0};
 #if defined(__ANDROID__)
-    extern int android_pick_output_folder(char *out_path, size_t out_path_len, int timeout_seconds);
-    if (!android_pick_output_folder(picked, sizeof(picked), 90)) {
-        return false;
-    }
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
 #elif defined(__APPLE__)
     // Use AppleScript choose folder dialog and return POSIX path.
     const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
@@ -745,11 +749,9 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
 
     char picked[512] = {0};
 #if defined(__ANDROID__)
-    extern int android_pick_playback_file(int channel, char *out_path, size_t out_path_len, int timeout_seconds);
-    if (!android_pick_playback_file(channel, picked, sizeof(picked), 120)) {
-        return false;
-    }
-    trim_newlines(picked);
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
 #elif defined(__APPLE__)
     // choose file, return POSIX path
     const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";

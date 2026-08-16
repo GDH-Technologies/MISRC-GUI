@@ -41,6 +41,7 @@ extern void hsdaoh_set_android_usb_fd(int fd) __attribute__((weak));
 
 /* ---- state ---- */
 static atomic_int  s_usb_fd = -1;          /* granted fd, -1 = none */
+static atomic_int  s_usb_device_present = 0; /* Java-reported physical attach state */
 static JavaVM     *s_jvm = NULL;            /* cached in JNI_OnLoad */
 static jobject     s_activity_ref = NULL;  /* global ref to MainActivity */
 
@@ -50,23 +51,31 @@ static jobject     s_activity_ref = NULL;  /* global ref to MainActivity */
  * Empty until nativeSetStoragePath() is called from MainActivity.onCreate. */
 static char s_storage_path[512] = "";
 
-/* Permission request result signaling (native waits, Java signals). */
-static pthread_mutex_t  s_perm_mtx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t   s_perm_cv  = PTHREAD_COND_INITIALIZER;
-static atomic_int       s_perm_result = -1; /* -1=pending, 0=denied, 1=granted */
+/* Async USB permission result (render thread polls; Java sets).
+ * The previous design blocked the raylib render thread on a cond var while
+ * the system USB-permission dialog was shown. That dialog is a separate
+ * Activity, so Android destroys our NativeActivity's EGL surface while the
+ * render thread is stuck -> on resume the render loop is dead (app hangs).
+ * Async launch + per-frame poll keeps the render thread alive across the
+ * activity transition. */
+static atomic_int s_async_perm_active = 0;   /* 1 = request launched */
+static atomic_int s_async_perm_result = -1;  /* -1 pending, 0 denied, 1 granted */
 
-/* Android settings picker (folder/file) request signaling. */
+/* Async settings picker (folder/file) result (render thread polls; Java sets).
+ * Same rationale: ACTION_OPEN_DOCUMENT_TREE / ACTION_OPEN_DOCUMENT launch a
+ * separate system Activity; blocking the render thread across that transition
+ * kills EGL on resume. */
 enum {
     ANDROID_PICKER_KIND_OUTPUT_DIR = 1,
     ANDROID_PICKER_KIND_PLAYBACK_A = 2,
     ANDROID_PICKER_KIND_PLAYBACK_B = 3,
 };
-static pthread_mutex_t s_picker_mtx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_picker_cv  = PTHREAD_COND_INITIALIZER;
-static int             s_picker_wait_kind = 0;
-static int             s_picker_done = 0;
-static int             s_picker_ok = 0;
-static char            s_picker_path[1024] = "";
+static pthread_mutex_t s_async_picker_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int  s_async_picker_active = 0;        /* 1 = picker launched */
+static int  s_async_picker_result_pending = 0;
+static int  s_async_picker_result_kind = 0;
+static int  s_async_picker_result_ok = 0;
+static char s_async_picker_result_path[1024] = "";
 /* Java-keyboard text forwarded from MainActivity into native UI text fields. */
 static pthread_mutex_t s_text_input_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char            s_text_input_buf[2048] = "";
@@ -138,16 +147,15 @@ Java_dev_misrc_gui_MainActivity_nativeSetStoragePath(JNIEnv *env, jobject thiz, 
     }
 }
 
-/* MainActivity.nativeUsbPermissionResult(boolean granted) — Java signals the
- * waiting native thread that the permission dialog completed. */
+/* MainActivity.nativeUsbPermissionResult(boolean granted) — Java reports the
+ * USB permission dialog result. Stored in async state; the render thread
+ * polls android_poll_usb_permission_result() each frame (no cond var). */
 JNIEXPORT void JNICALL
 Java_dev_misrc_gui_MainActivity_nativeUsbPermissionResult(JNIEnv *env, jobject thiz, jboolean granted)
 {
     (void)env; (void)thiz;
-    atomic_store(&s_perm_result, granted ? 1 : 0);
-    pthread_mutex_lock(&s_perm_mtx);
-    pthread_cond_signal(&s_perm_cv);
-    pthread_mutex_unlock(&s_perm_mtx);
+    atomic_store(&s_async_perm_result, granted ? 1 : 0);
+    /* s_async_perm_active stays 1 until the render thread consumes the result. */
     LOGI("nativeUsbPermissionResult: granted=%d", granted ? 1 : 0);
 }
 
@@ -158,27 +166,42 @@ Java_dev_misrc_gui_MainActivity_nativePickerResult(JNIEnv *env, jobject thiz, ji
     (void)thiz;
     const char *cpath = path ? (*env)->GetStringUTFChars(env, path, NULL) : NULL;
 
-    pthread_mutex_lock(&s_picker_mtx);
-    if (s_picker_wait_kind != 0 && kind == s_picker_wait_kind) {
-        s_picker_ok = accepted ? 1 : 0;
-        s_picker_done = 1;
-        if (cpath) {
-            snprintf(s_picker_path, sizeof(s_picker_path), "%s", cpath);
-        } else {
-            s_picker_path[0] = '\0';
-        }
-        pthread_cond_signal(&s_picker_cv);
-        LOGI("nativePickerResult: kind=%d accepted=%d path=%s",
-             (int)kind, accepted ? 1 : 0, cpath ? cpath : "(null)");
+    pthread_mutex_lock(&s_async_picker_mtx);
+    s_async_picker_result_kind = (int)kind;
+    s_async_picker_result_ok = accepted ? 1 : 0;
+    if (cpath) {
+        snprintf(s_async_picker_result_path, sizeof(s_async_picker_result_path), "%s", cpath);
     } else {
-        LOGI("nativePickerResult: dropping unexpected callback kind=%d wait_kind=%d",
-             (int)kind, s_picker_wait_kind);
+        s_async_picker_result_path[0] = '\0';
     }
-    pthread_mutex_unlock(&s_picker_mtx);
+    s_async_picker_result_pending = 1;
+    s_async_picker_active = 0;
+    pthread_mutex_unlock(&s_async_picker_mtx);
+
+    LOGI("nativePickerResult: kind=%d accepted=%d path=%s",
+         (int)kind, accepted ? 1 : 0, cpath ? cpath : "(null)");
 
     if (cpath) {
         (*env)->ReleaseStringUTFChars(env, path, cpath);
     }
+}
+
+/* MainActivity.nativeSetUsbDevicePresent(boolean present) — Java reports
+ * whether a known/UVC capture device is physically attached. Native device
+ * enumeration uses this to only list the MS2130 entry when real hardware is
+ * present (the patched hsdaoh_get_device_count() unconditionally returns 1
+ * on Android because rootless libusb cannot enumerate /dev/bus/usb). */
+JNIEXPORT void JNICALL
+Java_dev_misrc_gui_MainActivity_nativeSetUsbDevicePresent(JNIEnv *env, jobject thiz, jboolean present)
+{
+    (void)env; (void)thiz;
+    atomic_store(&s_usb_device_present, present ? 1 : 0);
+    LOGI("nativeSetUsbDevicePresent: %d", present ? 1 : 0);
+}
+
+int android_usb_device_present(void)
+{
+    return atomic_load(&s_usb_device_present);
 }
 
 /* MainActivity.nativePushTextInput(String text) */
@@ -326,180 +349,182 @@ void android_set_keyboard_visible(int visible)
     (*s_jvm)->DetachCurrentThread(s_jvm);
 }
 
-static int android_request_picker_internal(int picker_kind,
-                                           int playback_channel,
-                                           char *out_path,
-                                           size_t out_path_len,
-                                           int timeout_seconds)
+/* ---- Async picker API (non-blocking; render thread polls) ----
+ *
+ * The render thread calls android_pick_*_async() to launch the system picker
+ * (via JNI into MainActivity, which runs startActivityForResult on the UI
+ * thread) and returns immediately. The render thread keeps rendering frames.
+ * When the user selects a folder/file, MainActivity.onActivityResult calls
+ * nativePickerResult(), which stores the result in s_async_picker_* state.
+ * The render thread polls android_poll_picker_result() each frame and applies
+ * the result to settings. This avoids blocking the render thread across the
+ * picker Activity lifecycle (which destroys/recreates our EGL surface). */
+static int android_launch_picker_async(int picker_kind, int playback_channel)
 {
-    if (out_path && out_path_len > 0) out_path[0] = '\0';
-    if (!s_jvm) return 0;
+    if (!s_jvm) { LOGE("android_launch_picker_async: no JavaVM"); return 0; }
 
     JNIEnv *env = NULL;
     jint rc = (*s_jvm)->AttachCurrentThread(s_jvm, &env, NULL);
     if (rc != JNI_OK || !env) {
-        LOGE("android_request_picker_internal: AttachCurrentThread failed: %d", rc);
+        LOGE("android_launch_picker_async: AttachCurrentThread failed: %d", rc);
         return 0;
     }
 
     jobject activity = find_current_activity(env);
     if (!activity) {
-        LOGE("android_request_picker_internal: no Activity available");
+        LOGE("android_launch_picker_async: no Activity available");
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
 
     jclass cls = (*env)->GetObjectClass(env, activity);
     if (!cls) {
-        clear_pending_jni_exception(env, "GetObjectClass(activity) for picker");
+        clear_pending_jni_exception(env, "GetObjectClass(activity) for picker async");
         (*env)->DeleteLocalRef(env, activity);
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
     jmethodID mid = NULL;
     if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
-        mid = cls ? (*env)->GetMethodID(env, cls, "requestOutputFolderFromNative", "()V") : NULL;
+        mid = (*env)->GetMethodID(env, cls, "requestOutputFolderFromNative", "()V");
     } else {
-        mid = cls ? (*env)->GetMethodID(env, cls, "requestPlaybackFileFromNative", "(I)V") : NULL;
+        mid = (*env)->GetMethodID(env, cls, "requestPlaybackFileFromNative", "(I)V");
     }
     if (!mid) {
-        clear_pending_jni_exception(env, "GetMethodID(picker request)");
-        LOGE("android_request_picker_internal: picker method not found (kind=%d)", picker_kind);
-        if (cls) (*env)->DeleteLocalRef(env, cls);
+        clear_pending_jni_exception(env, "GetMethodID(picker async)");
+        LOGE("android_launch_picker_async: picker method not found (kind=%d)", picker_kind);
+        (*env)->DeleteLocalRef(env, cls);
         (*env)->DeleteLocalRef(env, activity);
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
 
-    pthread_mutex_lock(&s_picker_mtx);
-    s_picker_wait_kind = picker_kind;
-    s_picker_done = 0;
-    s_picker_ok = 0;
-    s_picker_path[0] = '\0';
-    pthread_mutex_unlock(&s_picker_mtx);
+    pthread_mutex_lock(&s_async_picker_mtx);
+    s_async_picker_active = 1;
+    s_async_picker_result_pending = 0;
+    s_async_picker_result_kind = picker_kind;
+    pthread_mutex_unlock(&s_async_picker_mtx);
 
     if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
         (*env)->CallVoidMethod(env, activity, mid);
-        clear_pending_jni_exception(env, "CallVoidMethod(requestOutputFolderFromNative)");
+        clear_pending_jni_exception(env, "CallVoidMethod(requestOutputFolderFromNative async)");
     } else {
         (*env)->CallVoidMethod(env, activity, mid, (jint)playback_channel);
-        clear_pending_jni_exception(env, "CallVoidMethod(requestPlaybackFileFromNative)");
+        clear_pending_jni_exception(env, "CallVoidMethod(requestPlaybackFileFromNative async)");
     }
 
-    if (cls) (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);
-
-    int ok = 0;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += (timeout_seconds > 0 ? timeout_seconds : 60);
-
-    pthread_mutex_lock(&s_picker_mtx);
-    while (!s_picker_done) {
-        if (pthread_cond_timedwait(&s_picker_cv, &s_picker_mtx, &ts) != 0) {
-            break;
-        }
-    }
-    if (s_picker_done && s_picker_ok && s_picker_path[0]) {
-        ok = 1;
-        if (out_path && out_path_len > 0) {
-            snprintf(out_path, out_path_len, "%s", s_picker_path);
-        }
-    }
-    s_picker_wait_kind = 0;
-    s_picker_done = 0;
-    s_picker_ok = 0;
-    s_picker_path[0] = '\0';
-    pthread_mutex_unlock(&s_picker_mtx);
-    return ok;
+    return 1;
 }
 
-/* Blocking Android output-folder picker for gui_settings_choose_output_folder(). */
-int android_pick_output_folder(char *out_path, size_t out_path_len, int timeout_seconds)
+int android_pick_output_folder_async(void)
 {
-    return android_request_picker_internal(ANDROID_PICKER_KIND_OUTPUT_DIR,
-                                           0, out_path, out_path_len, timeout_seconds);
+    return android_launch_picker_async(ANDROID_PICKER_KIND_OUTPUT_DIR, 0);
 }
 
-/* Blocking Android playback-file picker for gui_settings_choose_playback_file(). */
-int android_pick_playback_file(int channel, char *out_path, size_t out_path_len, int timeout_seconds)
+int android_pick_playback_file_async(int channel)
 {
     int kind = (channel == 1) ? ANDROID_PICKER_KIND_PLAYBACK_B : ANDROID_PICKER_KIND_PLAYBACK_A;
-    return android_request_picker_internal(kind, channel, out_path, out_path_len, timeout_seconds);
+    return android_launch_picker_async(kind, channel);
 }
 
-/* Ask Java (MainActivity) to show the USB permission dialog for the known
- * hsdaoh device, then block up to timeout_seconds for the result.
- * Returns 1 if permission granted (and fd now set), 0 otherwise.
- * If an fd is already granted, returns 1 immediately without re-prompting. */
-int android_request_usb_permission(int timeout_seconds)
+int android_picker_active(void)
 {
-    if (android_usb_has_fd()) return 1;
-    if (!s_jvm) {
-        LOGE("android_request_usb_permission: no JavaVM (JNI_OnLoad not called)");
+    int v;
+    pthread_mutex_lock(&s_async_picker_mtx);
+    v = s_async_picker_active;
+    pthread_mutex_unlock(&s_async_picker_mtx);
+    return v;
+}
+
+/* Returns 1 if a picker result was consumed (out_* filled), 0 if none pending. */
+int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len)
+{
+    pthread_mutex_lock(&s_async_picker_mtx);
+    if (!s_async_picker_result_pending) {
+        pthread_mutex_unlock(&s_async_picker_mtx);
         return 0;
     }
+    s_async_picker_result_pending = 0;
+    s_async_picker_active = 0;
+    if (out_kind) *out_kind = s_async_picker_result_kind;
+    if (out_ok)   *out_ok   = s_async_picker_result_ok;
+    if (out_path && out_path_len > 0) {
+        snprintf(out_path, out_path_len, "%s", s_async_picker_result_path);
+    }
+    pthread_mutex_unlock(&s_async_picker_mtx);
+    return 1;
+}
+
+/* ---- Async USB permission API (non-blocking; render thread polls) ----
+ *
+ * android_request_usb_permission_async() asks MainActivity to show the system
+ * USB permission dialog and returns immediately. The render thread keeps
+ * rendering. When the user grants/denies, MainActivity's broadcast receiver
+ * calls nativeUsbPermissionResult(), storing the result. The render thread
+ * polls android_poll_usb_permission_result() each frame; on grant (and fd set
+ * by Java via nativeSetUsbFd) it proceeds to hsdaoh_open + start_stream. */
+int android_request_usb_permission_async(void)
+{
+    if (android_usb_has_fd()) return 1;
+    if (!s_jvm) { LOGE("android_request_usb_permission_async: no JavaVM"); return 0; }
 
     JNIEnv *env = NULL;
     jint rc = (*s_jvm)->AttachCurrentThread(s_jvm, &env, NULL);
     if (rc != JNI_OK || !env) {
-        LOGE("android_request_usb_permission: AttachCurrentThread failed: %d", rc);
+        LOGE("android_request_usb_permission_async: AttachCurrentThread failed: %d", rc);
         return 0;
     }
 
     jobject activity = find_current_activity(env);
     if (!activity) {
-        LOGE("android_request_usb_permission: no Activity available");
+        LOGE("android_request_usb_permission_async: no Activity available");
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
 
-    /* Reset result to pending before requesting. */
-    atomic_store(&s_perm_result, -1);
+    atomic_store(&s_async_perm_result, -1);
+    atomic_store(&s_async_perm_active, 1);
 
     jclass cls = (*env)->GetObjectClass(env, activity);
     if (!cls) {
-        clear_pending_jni_exception(env, "GetObjectClass(activity) for USB permission");
+        clear_pending_jni_exception(env, "GetObjectClass(activity) for USB permission async");
         (*env)->DeleteLocalRef(env, activity);
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
-    jmethodID mid = cls ? (*env)->GetMethodID(env, cls, "requestPermissionFromNative", "()V") : NULL;
+    jmethodID mid = (*env)->GetMethodID(env, cls, "requestPermissionFromNative", "()V");
     if (!mid) {
-        clear_pending_jni_exception(env, "GetMethodID(requestPermissionFromNative)");
-        LOGE("android_request_usb_permission: requestPermissionFromNative not found on %s",
-             cls ? "Activity" : "(no class)");
-        if (cls) (*env)->DeleteLocalRef(env, cls);
+        clear_pending_jni_exception(env, "GetMethodID(requestPermissionFromNative async)");
+        LOGE("android_request_usb_permission_async: method not found");
+        (*env)->DeleteLocalRef(env, cls);
         (*env)->DeleteLocalRef(env, activity);
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
     (*env)->CallVoidMethod(env, activity, mid);
-    clear_pending_jni_exception(env, "CallVoidMethod(requestPermissionFromNative)");
+    clear_pending_jni_exception(env, "CallVoidMethod(requestPermissionFromNative async)");
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);
+    return 1;
+}
 
-    /* Block for the result. */
-    int granted = 0;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += (timeout_seconds > 0 ? timeout_seconds : 30);
+int android_permission_pending(void)
+{
+    return atomic_load(&s_async_perm_active);
+}
 
-    pthread_mutex_lock(&s_perm_mtx);
-    while (atomic_load(&s_perm_result) == -1) {
-        if (pthread_cond_timedwait(&s_perm_cv, &s_perm_mtx, &ts) != 0) {
-            break;  /* timeout or error */
-        }
-    }
-    granted = (atomic_load(&s_perm_result) == 1);
-    pthread_mutex_unlock(&s_perm_mtx);
-
-    if (granted) {
-        LOGI("android_request_usb_permission: granted, fd=%d", android_usb_get_fd());
-    } else {
-        LOGE("android_request_usb_permission: denied or timed out");
-    }
-    return granted;
+/* Returns 1 if a permission result was consumed (out_granted filled), 0 if still pending. */
+int android_poll_usb_permission_result(int *out_granted)
+{
+    if (!atomic_load(&s_async_perm_active)) return 0;
+    int r = atomic_load(&s_async_perm_result);
+    if (r == -1) return 0;  /* dialog still open */
+    atomic_store(&s_async_perm_active, 0);
+    if (out_granted) *out_granted = r;
+    atomic_store(&s_async_perm_result, -1);
+    return 1;
 }

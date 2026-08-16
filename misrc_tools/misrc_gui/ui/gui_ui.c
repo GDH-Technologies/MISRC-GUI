@@ -27,6 +27,9 @@
 #if defined(__ANDROID__)
 extern void android_set_keyboard_visible(int visible);
 extern size_t android_drain_text_input(char *out, size_t out_len);
+extern const char *android_get_storage_path(void);
+#include <pthread.h>
+#include <stdatomic.h>
 #endif
 
 #ifndef MIRSC_TOOLS_VERSION
@@ -4609,10 +4612,114 @@ void gui_render_layout(gui_app_t *app) {
     gui_popup_render();
 }
 
+#if defined(__ANDROID__)
+/* Per-frame poll for async Android results (USB permission + file/folder
+ * pickers). These run async so the render thread never blocks across a
+ * system Activity transition (permission dialog / SAF picker), which would
+ * destroy our EGL surface and hang the app on resume. */
+static void gui_ui_poll_android_results(gui_app_t *app)
+{
+    extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
+    extern int android_poll_usb_permission_result(int *out_granted);
+    extern int android_permission_pending(void);
+    extern int android_usb_has_fd(void);
+    extern int android_usb_device_present(void);
+
+    /* Re-enumerate the device list whenever the Java-reported physical USB
+     * presence changes, so the MS2130 entry appears when plugged in and
+     * disappears when unplugged (instead of being a permanent phantom that
+     * shifted selection and broke the Test Signal device). Skip while
+     * capturing or while a start/stop worker is in flight. */
+    static int s_last_usb_present = -1;
+    int usb_present_now = android_usb_device_present();
+    if (usb_present_now != s_last_usb_present) {
+        if (!app->is_capturing && !gui_app_capture_busy()) {
+            int prev_selected_type = -1;
+            if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+                prev_selected_type = (int)app->devices[app->selected_device].type;
+            }
+            gui_app_enumerate_devices(app);
+            /* Keep the user's selection on the same device type if possible
+             * (e.g. stay on Test Signal when the MS2130 appears). */
+            if (prev_selected_type >= 0) {
+                for (int i = 0; i < app->device_count; i++) {
+                    if ((int)app->devices[i].type == prev_selected_type) {
+                        app->selected_device = i;
+                        break;
+                    }
+                }
+            }
+            s_last_usb_present = usb_present_now;
+        }
+        /* else: retry on a later frame once capture/start/stop settles */
+    }
+
+    /* Picker results -> apply to settings. */
+    int pkind = 0, pok = 0;
+    char ppath[512];
+    if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
+        fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
+                pkind, pok, ppath);
+        if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
+            if (pok && ppath[0]) {
+                snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", ppath);
+                gui_settings_save(&app->settings);
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Output folder set: %s", ppath);
+                gui_app_set_status(app, msg);
+            } else if (pok) {
+                /* ok but empty path: use the scoped-storage-exempt app dir. */
+                const char *def = android_get_storage_path();
+                if (def && def[0]) {
+                    snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", def);
+                    gui_settings_save(&app->settings);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Output folder set (app dir): %s", def);
+                    gui_app_set_status(app, msg);
+                } else {
+                    gui_app_set_status(app, "No folder selected");
+                }
+            } else {
+                gui_app_set_status(app, "No folder selected");
+            }
+        } else if (pkind == 2 || pkind == 3) { /* PLAYBACK_A / PLAYBACK_B */
+            if (pok && ppath[0]) {
+                char *dst = (pkind == 3) ? app->settings.playback_file_b : app->settings.playback_file_a;
+                snprintf(dst, sizeof(app->settings.playback_file_a), "%s", ppath);
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, (pkind == 3) ? "Channel B playback file set" : "Channel A playback file set");
+            } else {
+                gui_app_set_status(app, "No file selected");
+            }
+        }
+    }
+
+    /* USB permission result -> complete the connect that the Connect button
+     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
+     * capture startup on a worker thread so the render loop stays alive. */
+    if (android_permission_pending()) {
+        int granted = 0;
+        if (android_poll_usb_permission_result(&granted)) {
+            if (granted && android_usb_has_fd()) {
+                gui_app_set_status(app, "USB permission granted, starting capture...");
+                gui_app_start_capture_async(app);
+            } else {
+                gui_app_set_status(app, "USB permission denied or no USB capture device found");
+                app->reconnect_pending = false;
+                app->reconnect_attempts = 0;
+            }
+        }
+    }
+}
+#endif
+
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
+#if defined(__ANDROID__)
+    gui_ui_poll_android_results(app);
+#endif
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
@@ -5134,14 +5241,47 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (app->is_capturing) {
+#if defined(__ANDROID__)
+                /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
+                 * hang joining libusb/libuvc threads; never block the render
+                 * thread on it. */
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
             } else {
+#if defined(__ANDROID__)
+                /* Async USB permission: never block the render thread on the
+                 * system permission dialog (a separate Activity that destroys
+                 * our EGL surface mid-block). If the fd is already granted,
+                 * start capture now; otherwise launch the async permission
+                 * request and let the per-frame poll complete the connect. */
+                extern int android_usb_has_fd(void);
+                extern int android_request_usb_permission_async(void);
+                extern int android_permission_pending(void);
+                extern void android_usb_clear_fd(void);
+                if (android_usb_has_fd()) {
+                    /* fd already granted: start capture on a worker thread so
+                     * the render loop stays responsive during hsdaoh_open. */
+                    gui_app_start_capture_async(app);
+                    app->reconnect_pending = false;
+                    app->reconnect_attempts = 0;
+                } else if (!android_permission_pending()) {
+                    android_usb_clear_fd();
+                    if (android_request_usb_permission_async()) {
+                        gui_app_set_status(app, "Requesting USB permission...");
+                    } else {
+                        gui_app_set_status(app, "USB permission request failed to start");
+                    }
+                }
+#else
                 if (gui_app_start_capture(app) == 0) {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
                 }
+#endif
             }
         }
         if (mode_toggle_hit) {
@@ -5534,30 +5674,72 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 
             if (Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+#if defined(__ANDROID__)
+                /* Async SAF picker: launch and return; the per-frame poll in
+                 * gui_handle_interactions applies the result. Never block the
+                 * render thread across the picker Activity transition. */
+                extern int android_pick_output_folder_async(void);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_output_folder_async()) {
+                        gui_app_set_status(app, "Waiting for folder selection...");
+                    } else {
+                        gui_app_set_status(app, "Folder picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 // Best-effort folder picker (platform-specific).
                 if (gui_settings_choose_output_folder(&app->settings)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No folder selected (or folder picker unavailable)");
                 }
+#endif
             }
 
         // Playback file selection buttons
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseA"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(0)) {
+                        gui_app_set_status(app, "Waiting for CH A playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 0)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseB"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(1)) {
+                        gui_app_set_status(app, "Waiting for CH B playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 1)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileClearA"))) {
                 app->settings.playback_file_a[0] = '\0';

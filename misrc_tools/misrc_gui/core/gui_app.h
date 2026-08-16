@@ -477,6 +477,14 @@ void gui_app_cleanup(gui_app_t *app);
 // Device management
 void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
+/* Android-only: run gui_app_start_capture() on a worker thread so the render
+ * loop stays responsive during hsdaoh_open + stream start. On non-Android
+ * builds this is not declared/defined. */
+#if defined(__ANDROID__)
+void gui_app_start_capture_async(gui_app_t *app);
+void gui_app_stop_capture_async(gui_app_t *app);
+int gui_app_capture_busy(void);
+#endif
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
 void gui_app_stop_recording(gui_app_t *app);

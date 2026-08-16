@@ -15,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.util.Log;
@@ -26,6 +27,7 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
+import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -124,6 +126,11 @@ public class MainActivity extends NativeActivity {
     private native void nativePickerResult(int kind, boolean accepted, String path);
     /** Native bridge: forward Java text input into native UI text fields. */
     private native void nativePushTextInput(String text);
+    /** Native bridge: report whether a known/UVC USB capture device is
+     * physically attached, so native device enumeration only lists the
+     * MS2130 entry when it is really present (the hsdaoh Android patch
+     * cannot enumerate /dev/bus/usb without root, so Java owns presence). */
+    private native void nativeSetUsbDevicePresent(boolean present);
 
     @Override
     public void onCreate(android.os.Bundle savedInstanceState) {
@@ -162,6 +169,7 @@ public class MainActivity extends NativeActivity {
             Log.e(TAG, "nativeRegisterActivity unavailable: " + e.getMessage());
         }
         ensureNativeTextInputView();
+        updateUsbDevicePresence();
         // Request runtime permissions only after Activity/native startup is
         // complete so callback paths (nativeSetUsbFd/nativeUsbPermissionResult)
         // are live when the USB dialog result arrives.
@@ -257,6 +265,7 @@ public class MainActivity extends NativeActivity {
         // Re-request CAMERA (if previously denied) then USB permission, and
         // hand fd for any device already permitted. Covers the case where the
         // user granted CAMERA in settings while the app was backgrounded.
+        updateUsbDevicePresence();
         requestCameraPermissionThenUsb();
         handFdForAlreadyPermittedDevices();
     }
@@ -314,6 +323,29 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    /** Scan the USB device list and tell native whether a capture candidate
+     * (known VID/PID or UVC-class) is physically attached right now. */
+    private void updateUsbDevicePresence() {
+        boolean present = false;
+        if (mUsbManager != null) {
+            HashMap<String, UsbDevice> deviceList = mUsbManager.getDeviceList();
+            if (deviceList != null) {
+                for (Map.Entry<String, UsbDevice> entry : deviceList.entrySet()) {
+                    if (isPermissionCandidate(entry.getValue())) {
+                        present = true;
+                        break;
+                    }
+                }
+            }
+        }
+        try {
+            nativeSetUsbDevicePresent(present);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativeSetUsbDevicePresent unavailable: " + e.getMessage());
+        }
+        Log.i(TAG, "USB capture device present: " + present);
+    }
+
     private void closeUsbConnectionForDeviceName(String deviceName) {
         if (deviceName == null || deviceName.isEmpty()) return;
         UsbDeviceConnection conn = mOpenConnections.remove(deviceName);
@@ -340,12 +372,16 @@ public class MainActivity extends NativeActivity {
                     if (granted && device != null) {
                         fdReady = openUsbDeviceAndHandFd(device);
                     }
+                    Toast.makeText(MainActivity.this,
+                            "USB permission: granted=" + granted + " fdReady=" + fdReady,
+                            Toast.LENGTH_LONG).show();
                     // Signal the native thread that may be blocked in
                     // android_request_usb_permission() waiting on the result.
                     signalNativeUsbPermissionResult(fdReady);
                 } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                     UsbDevice device = (UsbDevice)
                             intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    updateUsbDevicePresence();
                     if (device != null && isPermissionCandidate(device)) {
                         Log.i(TAG, "USB device attached: " + device.getDeviceName());
                         requestPermissionForKnownDevices();
@@ -353,6 +389,7 @@ public class MainActivity extends NativeActivity {
                 } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                     UsbDevice device = (UsbDevice)
                             intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    updateUsbDevicePresence();
                     if (device != null && isPermissionCandidate(device)) {
                         Log.i(TAG, "USB device detached: " + device.getDeviceName());
                         closeUsbConnectionForDeviceName(device.getDeviceName());
@@ -669,6 +706,8 @@ public class MainActivity extends NativeActivity {
                 requestCount++;
                 Log.i(TAG, "Requested USB permission for " + device.getDeviceName()
                         + " VID=" + device.getVendorId() + " PID=" + device.getProductId());
+                Toast.makeText(this, "USB permission requested for " + device.getDeviceName(),
+                        Toast.LENGTH_LONG).show();
             }
         }
         if (openedFdCount > 0) {
@@ -718,6 +757,7 @@ public class MainActivity extends NativeActivity {
         mOpenConnections.put(key, connection);
 
         Log.i(TAG, "USB granted for " + device.getDeviceName() + ", fd=" + fd);
+        Toast.makeText(this, "USB fd handed to native: " + fd, Toast.LENGTH_LONG).show();
         try {
             nativeSetUsbFd(fd);
             return true;
@@ -787,8 +827,35 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    private boolean hasAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            return Environment.isExternalStorageManager();
+        }
+        return true;
+    }
+
+    /** Open the system "All files access" toggle for this app. Required on
+     * Android 11+ for native fopen() to write into user-picked folders under
+     * /storage/emulated/0 — the regular "Files and media" permission does NOT
+     * grant direct filesystem writes under scoped storage. */
+    private void requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < 30) return;
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            } catch (Exception e2) {
+                Log.e(TAG, "Cannot open All files access settings: " + e2.getMessage());
+            }
+        }
+    }
+
     private void handleOutputDirPickerResult(int resultCode, Intent data) {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            Toast.makeText(this, "Folder picker: no result (resultCode=" + resultCode + ")", Toast.LENGTH_LONG).show();
             signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
             return;
         }
@@ -796,12 +863,26 @@ public class MainActivity extends NativeActivity {
         persistGrantedUriPermissions(data, uri);
 
         String path = resolveWritablePathFromTreeUri(uri);
+        if (path == null && !hasAllFilesAccess()) {
+            /* The picked folder exists but native fopen() can't write there
+             * without "All files access" (scoped storage). Send the user to
+             * the Settings toggle, then they re-pick the folder. */
+            Toast.makeText(this,
+                    "Folder needs 'All files access' — enable it for MISRC, then pick the folder again",
+                    Toast.LENGTH_LONG).show();
+            requestAllFilesAccess();
+            signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
+            return;
+        }
         if (path == null) {
             File ext = getExternalFilesDir(null);
             if (ext != null) {
                 path = ext.getAbsolutePath();
                 Log.w(TAG, "Selected folder is not directly writable by native fopen(); using app folder: " + path);
+                Toast.makeText(this, "Folder not writable; using app folder: " + path, Toast.LENGTH_LONG).show();
             }
+        } else {
+            Toast.makeText(this, "Folder picked: " + path, Toast.LENGTH_LONG).show();
         }
         signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, path != null && !path.isEmpty(), path);
     }
@@ -809,12 +890,14 @@ public class MainActivity extends NativeActivity {
     private void handlePlaybackPickerResult(int channel, int resultCode, Intent data) {
         int kind = pickerKindForPlaybackChannel(channel);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            Toast.makeText(this, "File picker: no result (ch=" + channel + ")", Toast.LENGTH_LONG).show();
             signalNativePickerResult(kind, false, null);
             return;
         }
         Uri uri = data.getData();
         persistGrantedUriPermissions(data, uri);
         String copiedPath = copyDocumentToAppPlaybackFile(uri, channel);
+        Toast.makeText(this, "File imported: " + (copiedPath != null ? copiedPath : "(failed)"), Toast.LENGTH_LONG).show();
         signalNativePickerResult(kind, copiedPath != null && !copiedPath.isEmpty(), copiedPath);
     }
 
