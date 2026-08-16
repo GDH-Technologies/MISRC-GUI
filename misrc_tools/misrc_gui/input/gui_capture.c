@@ -976,7 +976,7 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->trigger_b.display_width, DISPLAY_BUFFER_SIZE);  // Will be updated by renderer
     app->trigger_b.scope_mode = SCOPE_MODE_PHOSPHOR;  // Phosphor mode by default
     app->trigger_b.trigger_mode = TRIGGER_MODE_RISING;  // Rising edge by default
-    app->trigger_b.trigger_source = TRIGGER_SOURCE_CH1;
+    app->trigger_b.trigger_source = TRIGGER_SOURCE_CH2;
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
@@ -1518,11 +1518,13 @@ int gui_app_start_capture(gui_app_t *app) {
         int cxadc_cards = dev->index;
         if (cxadc_cards < 1) cxadc_cards = 1;
         if (cxadc_cards > 2) cxadc_cards = 2;
+        // gui_cxadc_start() launches extraction internally; set runtime
+        // capability flags first so extraction selects the correct A/B path.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = (cxadc_cards > 1);
         gui_capture_apply_cxadc_profile(app, cxadc_cards);
         int cxadc_rc = gui_cxadc_start(app, cxadc_cards);
         if (cxadc_rc == 0) {
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = (cxadc_cards > 1);
             bool prev_runtime_mode = app->capture_mode_runtime_misrc;
             app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
             TraceLog(LOG_INFO,
@@ -1559,6 +1561,10 @@ int gui_app_start_capture(gui_app_t *app) {
     if (dev->type == DEVICE_TYPE_FX3) {
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+        // gui_fx3_start() launches extraction internally; declare A-only mode
+        // before startup so channel mapping is correct from first frame.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = false;
         // Open FX3 device first
         int r = gui_fx3_open(app, dev->index);
         if (r < 0) {
@@ -1577,8 +1583,6 @@ int gui_app_start_capture(gui_app_t *app) {
             app->capture_start_time = GetTime();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // fx3usbadc is single-channel (ADC A only)
             {
                 time_t t = time(NULL);
                 struct tm tmv;
@@ -1604,6 +1608,10 @@ int gui_app_start_capture(gui_app_t *app) {
     if (dev->type == DEVICE_TYPE_DDD) {
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+        // gui_ddd_start() launches extraction internally; declare A-only mode
+        // before startup so channel mapping is correct from first frame.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = false;
         // Open DdD device first
         int r = gui_ddd_open(app, dev->index);
         if (r < 0) {
@@ -1619,8 +1627,6 @@ int gui_app_start_capture(gui_app_t *app) {
             app->capture_start_time = GetTime();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // DdD is single-channel (ADC A only)
             {
                 time_t t = time(NULL);
                 struct tm tmv;

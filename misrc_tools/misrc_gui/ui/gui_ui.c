@@ -53,6 +53,7 @@ static bool s_capture_mode_render_last_settings = true;
 static bool s_capture_mode_render_last_recording = false;
 static bool s_capture_mode_render_last_capturing = false;
 static bool s_capture_mode_render_last_source_runtime = false;
+static bool s_capture_b_forced_off_by_single_channel = false;
 
 static const char *gui_ui_capture_mode_name(bool misrc_mode) {
     return misrc_mode ? "MISRC" : "HSDAOH";
@@ -519,7 +520,7 @@ static double s_status_output_rate_bps = 0.0;
 #define STATUS_FREE_SPACE_LOW_BYTES ((uint64_t)10 * 1000 * 1000 * 1000)
 #define STATUS_FREE_SPACE_WARN_BYTES ((uint64_t)25 * 1000 * 1000 * 1000)
 
-static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
+void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     if (!app) return;
     if (!s_capture_mode_state_initialized) {
         s_capture_mode_state_misrc = app->settings.misrc_mode;
@@ -537,6 +538,11 @@ static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     bool fx3_mode = false;
 #endif
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+    bool cxadc_has_channel_b = false;
+    if (cxadc_mode && app->selected_device >= 0 && app->selected_device < app->device_count) {
+        cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
+    }
+    bool single_channel_device = ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_channel_b);
     bool expected_mode = s_capture_mode_state_misrc;
     if (cxadc_mode) {
         expected_mode = false;
@@ -562,14 +568,11 @@ static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     }
     if (cxadc_mode) {
         bool cxadc_settings_changed = false;
-        bool cxadc_has_channel_b = false;
-        if (app->selected_device >= 0 && app->selected_device < app->device_count) {
-            cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
-        }
         // Single-card CXADC has no RF-B source.
         if (!cxadc_has_channel_b && app->settings.capture_b) {
             app->settings.capture_b = false;
             cxadc_settings_changed = true;
+            s_capture_b_forced_off_by_single_channel = true;
         }
         if (app->settings.rf_bits_a != 8) {
             app->settings.rf_bits_a = 8;
@@ -596,12 +599,24 @@ static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
         if (app->settings.capture_b) {
             app->settings.capture_b = false;
             single_channel_settings_changed = true;
+            s_capture_b_forced_off_by_single_channel = true;
         }
         if (single_channel_settings_changed) {
             gui_settings_save(&app->settings);
         }
     }
 #endif
+    if (!single_channel_device) {
+        bool restore_capture_b = false;
+        if (s_capture_b_forced_off_by_single_channel && !app->settings.capture_b) {
+            app->settings.capture_b = true;
+            restore_capture_b = true;
+        }
+        s_capture_b_forced_off_by_single_channel = false;
+        if (restore_capture_b) {
+            gui_settings_save(&app->settings);
+        }
+    }
     gui_ui_trace_capture_mode_state(app, "gui_ui_sync_capture_mode_state", false);
 }
 

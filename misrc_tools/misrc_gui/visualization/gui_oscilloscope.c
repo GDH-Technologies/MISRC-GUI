@@ -104,6 +104,7 @@ typedef struct {
 
     // Initialization flag
     bool initialized;
+    bool trigger_source_defaulted_by_channel;
 } waveform_panel_state_t;
 
 // Forward declarations for static helper functions
@@ -143,6 +144,18 @@ void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
     s_trigger_src_ch1 = samples_ch1;
     s_trigger_src_ch2 = samples_ch2;
     s_trigger_src_count = count;
+}
+
+static inline trigger_source_t waveform_default_trigger_source_for_channel(int channel)
+{
+    return (channel == 1) ? TRIGGER_SOURCE_CH2 : TRIGGER_SOURCE_CH1;
+}
+
+static void waveform_apply_channel_trigger_source_default(waveform_panel_state_t *state, int channel)
+{
+    if (!state || state->trigger_source_defaulted_by_channel) return;
+    state->trigger_source = waveform_default_trigger_source_for_channel(channel);
+    state->trigger_source_defaulted_by_channel = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -878,6 +891,7 @@ static void *waveform_create(void) {
     state->dragging = false;
 
     state->initialized = true;
+    state->trigger_source_defaulted_by_channel = false;
     return state;
 }
 
@@ -1100,10 +1114,10 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
 static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, int channel,
                                          Vector2 click, Rectangle bounds) {
-    (void)channel;  // Unused since we now use per-panel state
 
     if (!state_ptr || !app) return false;
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    waveform_apply_channel_trigger_source_default(state, channel);
 
     //-------------------------------------------------------------------------
     // Render Mode Dropdown
@@ -1152,7 +1166,11 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
             Rectangle opt_rect = state->trigger_mode_opts_rect[i + 1];
             if (CheckCollisionPointRec(click, opt_rect)) {
+                bool was_enabled = state->trigger_enabled;
                 state->trigger_enabled = true;
+                if (!was_enabled) {
+                    state->trigger_source = waveform_default_trigger_source_for_channel(channel);
+                }
                 state->trigger_mode = (trigger_mode_t)i;
                 state->trigger_dropdown_open = false;
                 return true;
@@ -1181,6 +1199,11 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return false;
     }
 
+    // Trigger level drag adjusts an already-enabled trigger only.
+    if (!state->trigger_enabled) {
+        return false;
+    }
+
     // Don't allow trigger level drag in CVBS/Sync modes (auto trigger)
     // or CH3 headswitch mode (phase predictor ignores manual level).
     if (state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC ||
@@ -1192,9 +1215,6 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     // Start dragging on mouse press
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
         state->dragging = true;
-
-        // Enable trigger when starting to drag
-        state->trigger_enabled = true;
 
         // Calculate trigger level from click position
         float center_y = bounds.y + bounds.height / 2.0f;
@@ -1275,6 +1295,7 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
 
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     if (!state->initialized) return;
+    waveform_apply_channel_trigger_source_default(state, channel);
 
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
