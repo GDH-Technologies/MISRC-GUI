@@ -1130,7 +1130,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         }
 #ifdef ENABLE_FX3
         else if (src->type == MISRC_DEVICE_TYPE_FX3) {
-            snprintf(dst->name, sizeof(dst->name), "[FX3ADC] %s", src->name);
+            snprintf(dst->name, sizeof(dst->name), "[FX3] %s", src->name);
             dst->type = DEVICE_TYPE_FX3;
             dst->index = src->index;
             snprintf(dst->serial, sizeof(dst->serial), "%s", src->device_id);
