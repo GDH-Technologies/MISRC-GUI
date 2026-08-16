@@ -26,6 +26,7 @@
 #include <time.h>
 #if defined(__ANDROID__)
 extern void android_set_keyboard_visible(int visible);
+extern size_t android_drain_text_input(char *out, size_t out_len);
 #endif
 
 #ifndef MIRSC_TOOLS_VERSION
@@ -524,6 +525,7 @@ static char status_errors_display[16];
 static char status_rf_buf_display[16];
 static char status_aud_buf_display[16];
 static char status_free_space_display[120];
+static char status_message_display[192];
 static char record_limit_state_display[96];
 static char record_limit_timecode_display[20];
 static bool s_status_free_space_valid = false;
@@ -1610,6 +1612,41 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
             }
         }
     }
+#if defined(__ANDROID__)
+    {
+        char android_text[512];
+        size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+        bool finish_edit_requested = false;
+        if (android_len > 0) {
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach == '\r' || ach == '\n') {
+                    finish_edit_requested = true;
+                    continue;
+                }
+                if (ach == '\b' || ach == 127) {
+                    if (!gui_ui_text_delete_selection(dst)) {
+                        if (gui_ui_text_backspace(dst, &s_active_text_cursor)) changed = true;
+                    } else {
+                        changed = true;
+                    }
+                    continue;
+                }
+                if (primary_mod_down) continue;
+                if (!gui_ui_text_field_char_allowed(s_active_text_field, (int)ach)) continue;
+                if (gui_ui_text_delete_selection(dst)) changed = true;
+                if (gui_ui_text_insert_char(dst, cap, (int)ach)) changed = true;
+            }
+        }
+        if (finish_edit_requested) {
+            gui_ui_text_clamp_state(dst);
+            gui_settings_save(&app->settings);
+            gui_ui_clear_text_edit();
+            return;
+        }
+    }
+#endif
     int ch = GetCharPressed();
     while (ch > 0) {
         if (!primary_mod_down && gui_ui_text_field_char_allowed(s_active_text_field, ch)) {
@@ -4151,6 +4188,8 @@ static void render_status_bar(gui_app_t *app) {
     bool show_frame_count = !status_narrow;
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
+    bool show_status_message = !status_tiny && !status_quarter_scale;
+    bool show_free_space = !show_status_message || !status_narrow;
     int sample_rate_value_width = status_narrow ? 68 : 80;
     int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
     int frames_value_width = 50;
@@ -4158,6 +4197,8 @@ static void render_status_bar(gui_app_t *app) {
     int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
     int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
     int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
+    int status_left_gap = status_tiny ? 6 : 10;
+    int status_message_value_width = status_narrow ? 220 : (status_compact ? 300 : 430);
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
     const char *samples_label = status_tiny ? "S:" : (status_narrow ? "Samp:" : "Samples:");
@@ -4177,48 +4218,96 @@ static void render_status_bar(gui_app_t *app) {
             .layout = {
                 .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = status_left_gap
             }
         }) {
-
-            Color free_space_color = COLOR_TEXT_DIM;
-            if (s_status_free_space_valid) {
-                format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
-                                               s_status_free_space_cached_bytes);
-                if (app->is_recording && s_status_output_rate_bps > 0.0) {
-                    char free_only[48];
-                    char runway_hms[24];
-                    double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
-                    format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
-                    format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
-                    if (status_tiny) {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "Rwy %s", runway_hms);
-                    } else if (status_narrow) {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "%s | Rwy %s", free_only, runway_hms);
-                    } else {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "%s | Runway %s",
-                                 free_only, runway_hms);
+            if (show_status_message) {
+                const char *raw_status = (app->status_message[0] != '\0')
+                    ? app->status_message
+                    : (app->is_capturing ? "Capturing..." : "Ready");
+                size_t max_chars = status_narrow ? 32 : (status_compact ? 44 : 72);
+                size_t raw_len = strlen(raw_status);
+                if (raw_len > max_chars && max_chars > 3) {
+                    snprintf(status_message_display, sizeof(status_message_display), "%.*s...",
+                             (int)(max_chars - 3), raw_status);
+                } else {
+                    snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+                }
+                Color status_color = COLOR_TEXT;
+                if (strstr(raw_status, "denied") != NULL ||
+                    strstr(raw_status, "Denied") != NULL ||
+                    strstr(raw_status, "error") != NULL ||
+                    strstr(raw_status, "Error") != NULL ||
+                    strstr(raw_status, "failed") != NULL ||
+                    strstr(raw_status, "Failed") != NULL ||
+                    strstr(raw_status, "not granted") != NULL ||
+                    strstr(raw_status, "timed out") != NULL) {
+                    status_color = COLOR_CLIP_RED;
+                } else if (strstr(raw_status, "Requesting") != NULL ||
+                           strstr(raw_status, "Reconnecting") != NULL ||
+                           strstr(raw_status, "Waiting") != NULL ||
+                           strstr(raw_status, "Initializing") != NULL) {
+                    status_color = COLOR_METER_YELLOW;
+                }
+                CLAY(CLAY_ID("ConnectionStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Status:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY(CLAY_ID("ConnectionStatusValue"), {
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(status_message_value_width), CLAY_SIZING_FIT(0) } }
+                    }) {
+                        CLAY_TEXT(make_string(status_message_display),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(status_color) }));
                     }
                 }
-                if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
-                    free_space_color = COLOR_CLIP_RED;
-                } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
-                    free_space_color = COLOR_METER_YELLOW;
-                }
-            } else {
-                snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
             }
 
-            CLAY(CLAY_ID("FreeSpaceStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+            if (show_free_space) {
+                Color free_space_color = COLOR_TEXT_DIM;
+                if (s_status_free_space_valid) {
+                    format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
+                                                   s_status_free_space_cached_bytes);
+                    if (app->is_recording && s_status_output_rate_bps > 0.0) {
+                        char free_only[48];
+                        char runway_hms[24];
+                        double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
+                        format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
+                        format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                        if (status_tiny) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "Rwy %s", runway_hms);
+                        } else if (status_narrow) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Rwy %s", free_only, runway_hms);
+                        } else {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Runway %s",
+                                     free_only, runway_hms);
+                        }
+                    }
+                    if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
+                        free_space_color = COLOR_CLIP_RED;
+                    } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
+                        free_space_color = COLOR_METER_YELLOW;
+                    }
+                } else {
+                    snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
                 }
-            }) {
-                CLAY_TEXT(make_string(status_free_space_display),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+
+                CLAY(CLAY_ID("FreeSpaceStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+                    }
+                }) {
+                    CLAY_TEXT(make_string(status_free_space_display),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+                }
             }
         }
 
@@ -4584,6 +4673,29 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && s_record_limit_timecode_edit) {
         gui_ui_clear_text_edit();
         s_record_limit_cursor_char = record_limit_nearest_digit_cursor_char(s_record_limit_cursor_char);
+#if defined(__ANDROID__)
+        {
+            char android_text[128];
+            size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach >= '0' && ach <= '9') {
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = (char)ach;
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, +1);
+                } else if (ach == ':' || ach == '/') {
+                    if (s_record_limit_cursor_char <= 1) {
+                        s_record_limit_cursor_char = 3;
+                    } else if (s_record_limit_cursor_char <= 4) {
+                        s_record_limit_cursor_char = 6;
+                    }
+                } else if (ach == '\b' || ach == 127) {
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, -1);
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = '0';
+                }
+            }
+        }
+#endif
 
         int ch = GetCharPressed();
         while (ch > 0) {

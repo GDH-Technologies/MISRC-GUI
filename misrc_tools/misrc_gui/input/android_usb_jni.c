@@ -67,6 +67,18 @@ static int             s_picker_wait_kind = 0;
 static int             s_picker_done = 0;
 static int             s_picker_ok = 0;
 static char            s_picker_path[1024] = "";
+/* Java-keyboard text forwarded from MainActivity into native UI text fields. */
+static pthread_mutex_t s_text_input_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char            s_text_input_buf[2048] = "";
+
+static void clear_pending_jni_exception(JNIEnv *env, const char *ctx)
+{
+    if (!env) return;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        LOGE("Cleared pending JNI exception (%s)", ctx ? ctx : "unknown");
+    }
+}
 
 /* ---- JNI_OnLoad: cache the JavaVM so native threads can attach ---- */
 JNIEXPORT jint JNICALL
@@ -169,6 +181,31 @@ Java_dev_misrc_gui_MainActivity_nativePickerResult(JNIEnv *env, jobject thiz, ji
     }
 }
 
+/* MainActivity.nativePushTextInput(String text) */
+JNIEXPORT void JNICALL
+Java_dev_misrc_gui_MainActivity_nativePushTextInput(JNIEnv *env, jobject thiz, jstring text)
+{
+    (void)thiz;
+    if (!text) return;
+    const char *ctext = (*env)->GetStringUTFChars(env, text, NULL);
+    if (!ctext) return;
+
+    pthread_mutex_lock(&s_text_input_mtx);
+    size_t cur_len = strlen(s_text_input_buf);
+    size_t add_len = strlen(ctext);
+    size_t room = (sizeof(s_text_input_buf) - 1 > cur_len)
+        ? (sizeof(s_text_input_buf) - 1 - cur_len)
+        : 0;
+    if (room > 0) {
+        if (add_len > room) add_len = room;
+        memcpy(s_text_input_buf + cur_len, ctext, add_len);
+        s_text_input_buf[cur_len + add_len] = '\0';
+    }
+    pthread_mutex_unlock(&s_text_input_mtx);
+
+    (*env)->ReleaseStringUTFChars(env, text, ctext);
+}
+
 /* ---- C API used by the native capture path (gui_capture.c / hsdaoh) ---- */
 
 int android_usb_get_fd(void) { return atomic_load(&s_usb_fd); }
@@ -185,6 +222,21 @@ void android_usb_clear_fd(void)
  * writable, no permission). Empty string if nativeSetStoragePath() hasn't
  * run yet — callers should fall back to a default in that case. */
 const char *android_get_storage_path(void) { return s_storage_path; }
+size_t android_drain_text_input(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return 0;
+    out[0] = '\0';
+    pthread_mutex_lock(&s_text_input_mtx);
+    size_t n = strlen(s_text_input_buf);
+    if (n >= out_len) n = out_len - 1;
+    if (n > 0) {
+        memcpy(out, s_text_input_buf, n);
+        out[n] = '\0';
+    }
+    s_text_input_buf[0] = '\0';
+    pthread_mutex_unlock(&s_text_input_mtx);
+    return n;
+}
 
 /* If nativeRegisterActivity() never ran (e.g. its JNI binding failed in
  * onCreate), fall back to finding the current Activity via ActivityThread so
@@ -203,16 +255,36 @@ static jobject find_current_activity(JNIEnv *env)
              android.app.ActivityThread.currentActivity()
          which returns the current Activity instance. */
     jclass atCls = (*env)->FindClass(env, "android/app/ActivityThread");
-    if (!atCls) return NULL;
+    if (!atCls) {
+        clear_pending_jni_exception(env, "FindClass(ActivityThread)");
+        return NULL;
+    }
     jmethodID currentAT = (*env)->GetStaticMethodID(env, atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!currentAT) { (*env)->DeleteLocalRef(env, atCls); return NULL; }
+    if (!currentAT) {
+        clear_pending_jni_exception(env, "GetStaticMethodID(currentActivityThread)");
+        (*env)->DeleteLocalRef(env, atCls);
+        return NULL;
+    }
     jobject at = (*env)->CallStaticObjectMethod(env, atCls, currentAT);
+    clear_pending_jni_exception(env, "CallStaticObjectMethod(currentActivityThread)");
     (*env)->DeleteLocalRef(env, atCls);
     if (!at) return NULL;
     jclass atObjCls = (*env)->GetObjectClass(env, at);
+    if (!atObjCls) {
+        clear_pending_jni_exception(env, "GetObjectClass(ActivityThread)");
+        (*env)->DeleteLocalRef(env, at);
+        return NULL;
+    }
     jmethodID getAct = (*env)->GetMethodID(env, atObjCls, "getCurrentActivity", "()Landroid/app/Activity;");
+    if (!getAct) {
+        clear_pending_jni_exception(env, "GetMethodID(getCurrentActivity)");
+        (*env)->DeleteLocalRef(env, atObjCls);
+        (*env)->DeleteLocalRef(env, at);
+        return NULL;
+    }
     (*env)->DeleteLocalRef(env, atObjCls);
     jobject act = getAct ? (*env)->CallObjectMethod(env, at, getAct) : NULL;
+    clear_pending_jni_exception(env, "CallObjectMethod(getCurrentActivity)");
     (*env)->DeleteLocalRef(env, at);
     if (act) LOGI("android_request_usb_permission: found Activity via ActivityThread fallback");
     return act;
@@ -234,10 +306,18 @@ void android_set_keyboard_visible(int visible)
     }
 
     jclass cls = (*env)->GetObjectClass(env, activity);
+    if (!cls) {
+        clear_pending_jni_exception(env, "GetObjectClass(activity) for keyboard");
+        (*env)->DeleteLocalRef(env, activity);
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return;
+    }
     jmethodID mid = cls ? (*env)->GetMethodID(env, cls, "setKeyboardVisibleFromNative", "(Z)V") : NULL;
     if (mid) {
         (*env)->CallVoidMethod(env, activity, mid, visible ? JNI_TRUE : JNI_FALSE);
+        clear_pending_jni_exception(env, "CallVoidMethod(setKeyboardVisibleFromNative)");
     } else {
+        clear_pending_jni_exception(env, "GetMethodID(setKeyboardVisibleFromNative)");
         LOGE("android_set_keyboard_visible: method not found");
     }
 
@@ -270,6 +350,12 @@ static int android_request_picker_internal(int picker_kind,
     }
 
     jclass cls = (*env)->GetObjectClass(env, activity);
+    if (!cls) {
+        clear_pending_jni_exception(env, "GetObjectClass(activity) for picker");
+        (*env)->DeleteLocalRef(env, activity);
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return 0;
+    }
     jmethodID mid = NULL;
     if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
         mid = cls ? (*env)->GetMethodID(env, cls, "requestOutputFolderFromNative", "()V") : NULL;
@@ -277,6 +363,7 @@ static int android_request_picker_internal(int picker_kind,
         mid = cls ? (*env)->GetMethodID(env, cls, "requestPlaybackFileFromNative", "(I)V") : NULL;
     }
     if (!mid) {
+        clear_pending_jni_exception(env, "GetMethodID(picker request)");
         LOGE("android_request_picker_internal: picker method not found (kind=%d)", picker_kind);
         if (cls) (*env)->DeleteLocalRef(env, cls);
         (*env)->DeleteLocalRef(env, activity);
@@ -293,8 +380,10 @@ static int android_request_picker_internal(int picker_kind,
 
     if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
         (*env)->CallVoidMethod(env, activity, mid);
+        clear_pending_jni_exception(env, "CallVoidMethod(requestOutputFolderFromNative)");
     } else {
         (*env)->CallVoidMethod(env, activity, mid, (jint)playback_channel);
+        clear_pending_jni_exception(env, "CallVoidMethod(requestPlaybackFileFromNative)");
     }
 
     if (cls) (*env)->DeleteLocalRef(env, cls);
@@ -370,8 +459,15 @@ int android_request_usb_permission(int timeout_seconds)
     atomic_store(&s_perm_result, -1);
 
     jclass cls = (*env)->GetObjectClass(env, activity);
+    if (!cls) {
+        clear_pending_jni_exception(env, "GetObjectClass(activity) for USB permission");
+        (*env)->DeleteLocalRef(env, activity);
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return 0;
+    }
     jmethodID mid = cls ? (*env)->GetMethodID(env, cls, "requestPermissionFromNative", "()V") : NULL;
     if (!mid) {
+        clear_pending_jni_exception(env, "GetMethodID(requestPermissionFromNative)");
         LOGE("android_request_usb_permission: requestPermissionFromNative not found on %s",
              cls ? "Activity" : "(no class)");
         if (cls) (*env)->DeleteLocalRef(env, cls);
@@ -380,6 +476,7 @@ int android_request_usb_permission(int timeout_seconds)
         return 0;
     }
     (*env)->CallVoidMethod(env, activity, mid);
+    clear_pending_jni_exception(env, "CallVoidMethod(requestPermissionFromNative)");
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);

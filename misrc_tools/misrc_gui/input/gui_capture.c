@@ -1739,11 +1739,16 @@ int gui_app_start_capture(gui_app_t *app) {
          * branch then wraps the granted fd with uvc_wrap(). */
         extern int android_request_usb_permission(int timeout_seconds);
         extern int android_usb_has_fd(void);
+        extern void android_usb_clear_fd(void);
+        /* Always force a fresh fd handoff for each connect attempt.
+         * hsdaoh/libusb may close wrapped fds on prior sessions, so stale
+         * descriptors must not short-circuit permission + open flow. */
+        android_usb_clear_fd();
         if (!android_usb_has_fd()) {
             gui_app_set_status(app, "Requesting USB permission...");
             if (!android_request_usb_permission(30)) {
                 fprintf(stderr, "[GUI] USB permission denied or timed out\n");
-                gui_app_set_status(app, "USB permission denied");
+                gui_app_set_status(app, "USB permission denied or no USB capture device found");
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 return -3;
             }
@@ -1752,6 +1757,9 @@ int gui_app_start_capture(gui_app_t *app) {
         r = hsdaoh_open(&app->hs_dev, dev->index);
         if (r < 0 || !app->hs_dev) {
             fprintf(stderr, "[GUI] hsdaoh_open failed: %d\n", r);
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             if (r == -3) {
 #if defined(__ANDROID__)
                 gui_app_set_status(app, "USB permission denied or device not granted");
@@ -1761,7 +1769,13 @@ int gui_app_start_capture(gui_app_t *app) {
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 return -3;
             } else {
+#if defined(__ANDROID__)
+                char usb_open_msg[96];
+                snprintf(usb_open_msg, sizeof(usb_open_msg), "USB open failed (code %d)", r);
+                gui_app_set_status(app, usb_open_msg);
+#else
                 gui_app_set_status(app, "Failed to open device");
+#endif
             }
             app->hs_dev = NULL;
             proc_set_priority(PROC_PRIORITY_NORMAL);
@@ -1785,6 +1799,9 @@ int gui_app_start_capture(gui_app_t *app) {
             gui_app_set_status(app, "Failed to start stream");
             hsdaoh_close(app->hs_dev);
             app->hs_dev = NULL;
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
@@ -1958,6 +1975,12 @@ void gui_app_stop_capture(gui_app_t *app) {
         hsdaoh_stop_stream(app->hs_dev);
         hsdaoh_close(app->hs_dev);
         app->hs_dev = NULL;
+#if defined(__ANDROID__)
+        {
+            extern void android_usb_clear_fd(void);
+            android_usb_clear_fd();
+        }
+#endif
     }
     if (app->sc_dev) {
         sc_stop_capture(app->sc_dev);

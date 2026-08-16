@@ -106,7 +106,10 @@ static int gui_layout_height(void) {
 }
 static bool gui_status_is_permission_denied(const gui_app_t *app) {
     if (!app) return false;
-    return strstr(app->status_message, "Permission denied") != NULL;
+    return strstr(app->status_message, "Permission denied") != NULL ||
+           strstr(app->status_message, "permission denied") != NULL ||
+           strstr(app->status_message, "device not granted") != NULL ||
+           strstr(app->status_message, "USB open failed") != NULL;
 }
 static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
     switch (reason) {

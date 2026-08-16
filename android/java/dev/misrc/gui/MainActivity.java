@@ -15,9 +15,17 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.text.Editable;
+import android.text.InputType;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -49,6 +57,30 @@ import java.util.Map;
  */
 public class MainActivity extends NativeActivity {
     private static final String TAG = "MISRC";
+
+    /* CRITICAL: NativeActivity loads libmisrc_gui.so internally with dlopen
+     * (loadNativeCode) for ANativeActivity_onCreate, but that path does NOT
+     * call JNI_OnLoad and does NOT register the library with this class's
+     * classloader. Without an explicit System.loadLibrary() here:
+     *   - every `native` method on this class throws UnsatisfiedLinkError
+     *     (nativeSetUsbFd / nativeRegisterActivity / nativeUsbPermissionResult /
+     *     nativePickerResult / nativePushTextInput / nativeSetStoragePath), and
+     *   - JNI_OnLoad never runs, so the native side has no JavaVM and the
+     *     keyboard / picker / USB-permission bridges are completely dead.
+     * Load order: libhsdaoh.so first (libmisrc_gui.so links against it). */
+    static {
+        try {
+            System.loadLibrary("hsdaoh");
+        } catch (Throwable t) {
+            Log.e("MISRC", "System.loadLibrary(hsdaoh) failed: " + t.getMessage());
+        }
+        try {
+            System.loadLibrary("misrc_gui");
+            Log.i("MISRC", "System.loadLibrary(misrc_gui) OK (JNI bridge bound)");
+        } catch (Throwable t) {
+            Log.e("MISRC", "System.loadLibrary(misrc_gui) failed: " + t.getMessage());
+        }
+    }
     private static final String ACTION_USB_PERMISSION = "dev.misrc.gui.USB_PERMISSION";
     private static final int REQ_CAMERA = 0x5143;  // 'CA' -> CAMERA runtime request code
     private static final int REQ_MEDIA = 0x4d45;   // 'ME' -> media runtime request code
@@ -74,6 +106,7 @@ public class MainActivity extends NativeActivity {
     private boolean mReceiverRegistered = false;
     private final HashMap<String, UsbDeviceConnection> mOpenConnections = new HashMap<>();
     private int mPendingPlaybackChannel = -1;
+    private NativeTextInputEditText mNativeTextInputView;
 
     /** Native bridge: store the granted USB device file descriptor. */
     private native void nativeSetUsbFd(int fd);
@@ -89,6 +122,8 @@ public class MainActivity extends NativeActivity {
     private native void nativeSetStoragePath(String path);
     /** Native bridge: resolve async Android picker responses in native code. */
     private native void nativePickerResult(int kind, boolean accepted, String path);
+    /** Native bridge: forward Java text input into native UI text fields. */
+    private native void nativePushTextInput(String text);
 
     @Override
     public void onCreate(android.os.Bundle savedInstanceState) {
@@ -126,6 +161,7 @@ public class MainActivity extends NativeActivity {
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "nativeRegisterActivity unavailable: " + e.getMessage());
         }
+        ensureNativeTextInputView();
         // Request runtime permissions only after Activity/native startup is
         // complete so callback paths (nativeSetUsbFd/nativeUsbPermissionResult)
         // are live when the USB dialog result arrives.
@@ -213,6 +249,11 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        try {
+            nativeRegisterActivity(this);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativeRegisterActivity unavailable on resume: " + e.getMessage());
+        }
         // Re-request CAMERA (if previously denied) then USB permission, and
         // hand fd for any device already permitted. Covers the case where the
         // user granted CAMERA in settings while the app was backgrounded.
@@ -242,6 +283,10 @@ public class MainActivity extends NativeActivity {
     }
 
     private boolean isPermissionCandidate(UsbDevice device) {
+        // Keep UVC fallback for MS2130/MS2131 variants that present with
+        // non-listed VID/PID tuples. requestPermissionForKnownDevices()
+        // prefers known devices first, then falls back to UVC only when
+        // no known device is currently attached.
         return isKnownDevice(device) || isUvcClassDevice(device);
     }
 
@@ -260,6 +305,23 @@ public class MainActivity extends NativeActivity {
             Log.e(TAG, "nativePickerResult unavailable: " + e.getMessage());
         }
     }
+
+    private void clearNativeUsbFd() {
+        try {
+            nativeSetUsbFd(-1);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativeSetUsbFd(-1) unavailable: " + e.getMessage());
+        }
+    }
+
+    private void closeUsbConnectionForDeviceName(String deviceName) {
+        if (deviceName == null || deviceName.isEmpty()) return;
+        UsbDeviceConnection conn = mOpenConnections.remove(deviceName);
+        if (conn != null) {
+            try { conn.close(); } catch (Exception ignored) {}
+        }
+    }
+
 
     private void registerUsbReceiver() {
         if (mReceiverRegistered) return;
@@ -281,10 +343,28 @@ public class MainActivity extends NativeActivity {
                     // Signal the native thread that may be blocked in
                     // android_request_usb_permission() waiting on the result.
                     signalNativeUsbPermissionResult(fdReady);
+                } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+                    UsbDevice device = (UsbDevice)
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    if (device != null && isPermissionCandidate(device)) {
+                        Log.i(TAG, "USB device attached: " + device.getDeviceName());
+                        requestPermissionForKnownDevices();
+                    }
+                } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+                    UsbDevice device = (UsbDevice)
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    if (device != null && isPermissionCandidate(device)) {
+                        Log.i(TAG, "USB device detached: " + device.getDeviceName());
+                        closeUsbConnectionForDeviceName(device.getDeviceName());
+                        clearNativeUsbFd();
+                        signalNativeUsbPermissionResult(false);
+                    }
                 }
             }
         };
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         // CRITICAL: use RECEIVER_EXPORTED, not NOT_EXPORTED. The permission-
         // result broadcast is sent by the SYSTEM UsbService (a different
         // UID/process), not by our own app. On API 33+ (we target 34),
@@ -338,24 +418,201 @@ public class MainActivity extends NativeActivity {
             }
         });
     }
+    private void pushNativeTextToInput(String text) {
+        if (text == null || text.isEmpty()) return;
+        try {
+            nativePushTextInput(text);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativePushTextInput unavailable: " + e.getMessage());
+        }
+    }
+
+    private void pushNativeBackspaces(int count) {
+        if (count <= 0) return;
+        StringBuilder sb = new StringBuilder(count);
+        for (int i = 0; i < count; i++) {
+            sb.append('\b');
+        }
+        pushNativeTextToInput(sb.toString());
+    }
+
+    private void ensureNativeTextInputView() {
+        if (mNativeTextInputView != null) return;
+        if (getWindow() == null) return;
+        View decor = getWindow().getDecorView();
+        if (!(decor instanceof ViewGroup)) return;
+
+        NativeTextInputEditText input = new NativeTextInputEditText(this);
+        input.setLayoutParams(new ViewGroup.LayoutParams(1, 1));
+        input.setAlpha(0.0f);
+        input.setCursorVisible(false);
+        input.setBackground(null);
+        input.setLongClickable(false);
+        input.setTextIsSelectable(false);
+        input.setSingleLine(true);
+        input.setFocusable(true);
+        input.setFocusableInTouchMode(true);
+        input.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        ((ViewGroup) decor).addView(input);
+        mNativeTextInputView = input;
+    }
+
+    private final class NativeTextInputConnection extends BaseInputConnection {
+        private String mComposingText = "";
+
+        NativeTextInputConnection(View targetView) {
+            super(targetView, true);
+        }
+
+        void resetState() {
+            mComposingText = "";
+        }
+
+        private void pushDiff(String previous, String next) {
+            String oldText = previous != null ? previous : "";
+            String newText = next != null ? next : "";
+            int max = Math.min(oldText.length(), newText.length());
+            int common = 0;
+            while (common < max && oldText.charAt(common) == newText.charAt(common)) {
+                common++;
+            }
+            int removeCount = oldText.length() - common;
+            if (removeCount > 0) {
+                pushNativeBackspaces(removeCount);
+            }
+            if (newText.length() > common) {
+                pushNativeTextToInput(newText.substring(common));
+            }
+        }
+
+        @Override
+        public Editable getEditable() {
+            return mNativeTextInputView != null ? mNativeTextInputView.getEditableText() : null;
+        }
+
+        @Override
+        public boolean commitText(CharSequence text, int newCursorPosition) {
+            String committed = text != null ? text.toString() : "";
+            pushDiff(mComposingText, committed);
+            mComposingText = "";
+            Editable editable = getEditable();
+            if (editable != null) editable.clear();
+            return true;
+        }
+
+        @Override
+        public boolean setComposingText(CharSequence text, int newCursorPosition) {
+            String next = text != null ? text.toString() : "";
+            pushDiff(mComposingText, next);
+            mComposingText = next;
+            return true;
+        }
+
+        @Override
+        public boolean finishComposingText() {
+            mComposingText = "";
+            return true;
+        }
+
+        @Override
+        public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+            if (beforeLength > 0) {
+                pushNativeBackspaces(beforeLength);
+                if (!mComposingText.isEmpty()) {
+                    int keep = Math.max(0, mComposingText.length() - beforeLength);
+                    mComposingText = mComposingText.substring(0, keep);
+                }
+            }
+            return true;
+        }
+
+        @Override
+        public boolean sendKeyEvent(KeyEvent event) {
+            if (event != null && event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
+                    pushNativeBackspaces(1);
+                    if (!mComposingText.isEmpty()) {
+                        mComposingText = mComposingText.substring(0, mComposingText.length() - 1);
+                    }
+                    return true;
+                }
+                if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
+                    pushNativeTextToInput("\n");
+                    mComposingText = "";
+                    return true;
+                }
+                int unicode = event.getUnicodeChar();
+                if (unicode > 0 && !Character.isISOControl(unicode)) {
+                    pushNativeTextToInput(new String(Character.toChars(unicode)));
+                    return true;
+                }
+            }
+            return super.sendKeyEvent(event);
+        }
+    }
+
+    private final class NativeTextInputEditText extends EditText {
+        private NativeTextInputConnection mBridgeConnection;
+
+        NativeTextInputEditText(Context context) {
+            super(context);
+        }
+
+        void resetBridgeState() {
+            Editable editable = getText();
+            if (editable != null) editable.clear();
+            if (mBridgeConnection != null) mBridgeConnection.resetState();
+        }
+
+        @Override
+        public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+            outAttrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+            outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+            mBridgeConnection = new NativeTextInputConnection(this);
+            return mBridgeConnection;
+        }
+    }
 
     /** Called by native text input handlers to show/hide soft keyboard. */
     public void setKeyboardVisibleFromNative(final boolean visible) {
         runOnUiThread(new Runnable() {
             @Override public void run() {
-                View view = getWindow() != null ? getWindow().getDecorView() : null;
-                if (view == null) return;
                 InputMethodManager imm =
                         (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
                 if (imm == null) return;
+
+                ensureNativeTextInputView();
+                View target = mNativeTextInputView;
+                if (target == null) {
+                    target = getCurrentFocus();
+                    if (target == null && getWindow() != null) {
+                        target = getWindow().getDecorView();
+                    }
+                    if (target == null) return;
+                }
+
                 if (visible) {
-                    view.requestFocus();
-                    boolean shown = imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT);
+                    if (mNativeTextInputView != null) {
+                        mNativeTextInputView.resetBridgeState();
+                        mNativeTextInputView.requestFocus();
+                        target = mNativeTextInputView;
+                    } else {
+                        target.setFocusable(true);
+                        target.setFocusableInTouchMode(true);
+                        target.requestFocus();
+                    }
+                    imm.restartInput(target);
+                    boolean shown = imm.showSoftInput(target, InputMethodManager.SHOW_FORCED);
                     if (!shown) {
                         imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
                     }
                 } else {
-                    imm.hideSoftInputFromWindow(view.getWindowToken(), 0);
+                    imm.hideSoftInputFromWindow(target.getWindowToken(), 0);
+                    if (mNativeTextInputView != null) {
+                        mNativeTextInputView.resetBridgeState();
+                        mNativeTextInputView.clearFocus();
+                    }
                 }
             }
         });
@@ -367,6 +624,16 @@ public class MainActivity extends NativeActivity {
         HashMap<String, UsbDevice> deviceList = mUsbManager.getDeviceList();
         if (deviceList == null) { Log.e(TAG, "requestPermission: deviceList null"); return; }
         Log.i(TAG, "requestPermission: " + deviceList.size() + " USB device(s) attached");
+        boolean hasKnownAttached = false;
+        for (Map.Entry<String, UsbDevice> entry : deviceList.entrySet()) {
+            if (isKnownDevice(entry.getValue())) {
+                hasKnownAttached = true;
+                break;
+            }
+        }
+        if (!hasKnownAttached) {
+            Log.w(TAG, "No known VID/PID device detected; falling back to UVC candidate matching");
+        }
         int candidateCount = 0;
         int requestCount = 0;
         int openedFdCount = 0;
@@ -374,7 +641,7 @@ public class MainActivity extends NativeActivity {
             UsbDevice device = entry.getValue();
             boolean known = isKnownDevice(device);
             boolean uvc = isUvcClassDevice(device);
-            boolean candidate = isPermissionCandidate(device);
+            boolean candidate = hasKnownAttached ? known : (known || uvc);
             Log.i(TAG, "  USB dev: " + device.getDeviceName()
                     + " VID=0x" + Integer.toHexString(device.getVendorId())
                     + " PID=0x" + Integer.toHexString(device.getProductId())
@@ -407,7 +674,9 @@ public class MainActivity extends NativeActivity {
         if (openedFdCount > 0) {
             signalNativeUsbPermissionResult(true);
         } else if (candidateCount == 0) {
-            Log.w(TAG, "No known/UVC USB capture candidates found; cannot show USB permission dialog");
+            Log.w(TAG, hasKnownAttached
+                    ? "Known USB capture candidate missing from permission/open flow"
+                    : "No known/UVC USB capture candidates found; cannot show USB permission dialog");
             signalNativeUsbPermissionResult(false);
         } else if (requestCount == 0) {
             Log.w(TAG, "Candidate USB devices found, but no permission request/open path was taken");
@@ -431,37 +700,29 @@ public class MainActivity extends NativeActivity {
     private boolean openUsbDeviceAndHandFd(UsbDevice device) {
         if (device == null || mUsbManager == null) return false;
         String key = device.getDeviceName();
-        UsbDeviceConnection connection = mOpenConnections.get(key);
-        if (connection == null) {
-            connection = mUsbManager.openDevice(device);
-        }
+        // Always reopen on handoff to avoid stale/reused descriptors after
+        // previous native sessions close wrapped libusb handles.
+        closeUsbConnectionForDeviceName(key);
+        UsbDeviceConnection connection = mUsbManager.openDevice(device);
         if (connection == null) {
             Log.e(TAG, "openDevice() returned null for " + device.getDeviceName());
             return false;
         }
-        mOpenConnections.put(key, connection);
 
         int fd = connection.getFileDescriptor();
         if (fd < 0) {
             try { connection.close(); } catch (Exception ignored) {}
-            mOpenConnections.remove(key);
-            connection = mUsbManager.openDevice(device);
-            if (connection == null) {
-                Log.e(TAG, "openDevice() retry failed for " + device.getDeviceName());
-                return false;
-            }
-            mOpenConnections.put(key, connection);
-            fd = connection.getFileDescriptor();
+            Log.e(TAG, "openDevice() returned invalid fd for " + device.getDeviceName());
+            return false;
         }
+        mOpenConnections.put(key, connection);
 
         Log.i(TAG, "USB granted for " + device.getDeviceName() + ", fd=" + fd);
-        if (fd >= 0) {
-            try {
-                nativeSetUsbFd(fd);
-                return true;
-            } catch (UnsatisfiedLinkError e) {
-                Log.e(TAG, "nativeSetUsbFd unavailable: " + e.getMessage());
-            }
+        try {
+            nativeSetUsbFd(fd);
+            return true;
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativeSetUsbFd unavailable: " + e.getMessage());
         }
         return false;
         // Keep the connection alive: native code (libusb) now owns the fd, but
@@ -502,7 +763,12 @@ public class MainActivity extends NativeActivity {
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        startActivityForResult(intent, REQ_PICK_OUTPUT_DIR);
+        try {
+            startActivityForResult(intent, REQ_PICK_OUTPUT_DIR);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to launch output folder picker: " + e.getMessage());
+            signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
+        }
     }
 
     private void launchPlaybackFilePicker(int channel) {
@@ -512,7 +778,13 @@ public class MainActivity extends NativeActivity {
         intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"audio/flac", "audio/x-flac"});
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        startActivityForResult(intent, channel == 1 ? REQ_PICK_PLAYBACK_B : REQ_PICK_PLAYBACK_A);
+        int requestCode = channel == 1 ? REQ_PICK_PLAYBACK_B : REQ_PICK_PLAYBACK_A;
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to launch playback file picker: " + e.getMessage());
+            signalNativePickerResult(pickerKindForPlaybackChannel(channel), false, null);
+        }
     }
 
     private void handleOutputDirPickerResult(int resultCode, Intent data) {
@@ -640,6 +912,7 @@ public class MainActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        clearNativeUsbFd();
         for (Map.Entry<String, UsbDeviceConnection> entry : mOpenConnections.entrySet()) {
             UsbDeviceConnection conn = entry.getValue();
             if (conn != null) {
@@ -650,6 +923,15 @@ public class MainActivity extends NativeActivity {
         if (mReceiverRegistered) {
             try { unregisterReceiver(mUsbReceiver); } catch (Exception ignored) {}
             mReceiverRegistered = false;
+        }
+        if (mNativeTextInputView != null) {
+            try {
+                ViewGroup parent = (ViewGroup) mNativeTextInputView.getParent();
+                if (parent != null) {
+                    parent.removeView(mNativeTextInputView);
+                }
+            } catch (Exception ignored) {}
+            mNativeTextInputView = null;
         }
         super.onDestroy();
     }
