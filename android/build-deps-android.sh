@@ -284,17 +284,23 @@ extern uvc_error_t uvc_wrap(int sys_dev, uvc_context_t *context, uvc_device_hand
 static uvc_error_t _hsdaoh_open_android_fd(hsdaoh_dev_t *dev)
 {
     uvc_error_t r;
-    libusb_context *usb_ctx = NULL;
     int fd = hsdaoh_get_android_usb_fd();
     if (fd < 0)
         return UVC_ERROR_ACCESS;  /* permission not granted yet */
-    if (libusb_init(&usb_ctx) != 0)
-        return UVC_ERROR_IO;
-    libusb_set_option(usb_ctx, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
-    r = uvc_init(&dev->uvc_ctx, usb_ctx);
-    if (r < 0) { libusb_exit(usb_ctx); return r; }
+    /* CRITICAL: pass NULL so libuvc creates and OWNS its libusb context.
+     * libuvc only spawns its libusb event-handler thread when own_usb_ctx=1
+     * (uvc_init with NULL); with a caller-provided context no
+     * libusb_handle_events loop runs, so stream transfer callbacks never
+     * fire -> connect "succeeds" but ZERO data arrives (the Android
+     * no-feed bug). LIBUSB_OPTION_NO_DEVICE_DISCOVERY set on the NULL
+     * (default) context is inherited by contexts created afterwards
+     * (libusb >= 1.0.26), so uvc_init's internal libusb_init still skips
+     * the root-only /dev/bus/usb enumeration. */
+    libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+    r = uvc_init(&dev->uvc_ctx, NULL);
+    if (r < 0) return r;
     r = uvc_wrap(fd, dev->uvc_ctx, &dev->uvc_devh);
-    if (r < 0) { uvc_exit(dev->uvc_ctx); libusb_exit(usb_ctx); dev->uvc_ctx = NULL; }
+    if (r < 0) { uvc_exit(dev->uvc_ctx); dev->uvc_ctx = NULL; }
     return r;
 }
 #endif
