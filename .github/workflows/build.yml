@@ -1347,22 +1347,23 @@ jobs:
           if [[ "$(tail -1 "$BODY_FILE")" == '## Highlights' ]]; then
             printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
-          printf '\n%s\n' '' '## Contributions' '' >> "$BODY_FILE"
-          printf '%s\n' '### Contributors' '' >> "$BODY_FILE"
-          CONTRIBUTOR_LINES="$(git shortlog -sne --no-merges "$LOG_RANGE" 2>/dev/null || true)"
+          # Contributors summary (commit count per author). Use shortlog -sn
+          # WITHOUT -e so author emails are NOT published in the release notes.
+          # The per-commit list is already covered by Highlights above and by
+          # GitHub's auto-generated What's Changed (generate_release_notes), so
+          # a duplicate "Commit attribution" section is omitted to avoid listing
+          # every commit two or three times.
+          printf '\n%s\n' '' '## Contributors' '' >> "$BODY_FILE"
+          # shortlog -sn prints "<count>\t<author name>"; cut -f2 drops the
+          # count and keeps just the name (no emails).
+          CONTRIBUTOR_LINES="$(git shortlog -sn --no-merges "$LOG_RANGE" 2>/dev/null | cut -f2 || true)"
           if [[ -n "$CONTRIBUTOR_LINES" ]]; then
             while IFS= read -r line; do
+              [[ -n "$line" ]] || continue
               printf -- '- %s\n' "$line" >> "$BODY_FILE"
             done <<< "$CONTRIBUTOR_LINES"
           else
             printf '%s\n' "- (no contributors found in range ${LOG_RANGE})" >> "$BODY_FILE"
-          fi
-          printf '\n%s\n' '### Commit attribution' '' >> "$BODY_FILE"
-          COMMIT_ATTR_LINES="$(git log --pretty=format:'- %s (%h) by %an' --no-merges "$LOG_RANGE" 2>/dev/null || true)"
-          if [[ -n "$COMMIT_ATTR_LINES" ]]; then
-            printf '%s\n' "$COMMIT_ATTR_LINES" >> "$BODY_FILE"
-          else
-            printf '%s\n' "- (no commit attribution found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
           printf '\n%s\n' '' '## Downloads' '' >> "$BODY_FILE"
           printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
