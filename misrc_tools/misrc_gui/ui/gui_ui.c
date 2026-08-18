@@ -3548,9 +3548,21 @@ static void render_toolbar(gui_app_t *app) {
             }
             // Audio channel select (CH1/2 vs CH3/4)
             Color ch_bg = app->settings.audio_monitor_ch34 ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-            const char *audio_ch_toggle_label = app->settings.audio_monitor_ch34
-                ? (toolbar_ultra_narrow ? "3/4" : "CH3/4")
-                : (toolbar_ultra_narrow ? "1/2" : "CH1/2");
+#if defined(_WIN32)
+            bool cxadc_win_audio_map = cxadc_mode;
+#else
+            bool cxadc_win_audio_map = false;
+#endif
+            const char *audio_ch_toggle_label = NULL;
+            if (cxadc_win_audio_map) {
+                audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                    ? (toolbar_ultra_narrow ? "HSW" : "HSW CH3")
+                    : (toolbar_ultra_narrow ? "A1/2" : "AUD 1/2");
+            } else {
+                audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                    ? (toolbar_ultra_narrow ? "3/4" : "CH3/4")
+                    : (toolbar_ultra_narrow ? "1/2" : "CH1/2");
+            }
             CLAY(CLAY_ID("AudioChannelToggle"), {
                 .layout = { .sizing = { CLAY_SIZING_FIXED(audio_ch_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
                 .backgroundColor = to_clay_color(ch_bg),
@@ -5493,13 +5505,40 @@ void gui_handle_interactions(gui_app_t *app) {
 
         // Audio playback monitoring toggle
         if (Clay_PointerOver(CLAY_ID("AudioPlaybackToggle"))) {
-            gui_audio_set_playback_enabled(app, !app->settings.audio_monitor_playback);
+            bool enable = !app->settings.audio_monitor_playback;
+            gui_audio_set_playback_enabled(app, enable);
+            bool mon_cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+            if (mon_cxadc_mode) {
+                gui_app_set_status(app, enable
+                    ? "CXADC audio monitoring enabled"
+                    : "CXADC audio monitoring disabled");
+            } else {
+                gui_app_set_status(app, enable
+                    ? "Audio monitoring enabled"
+                    : "Audio monitoring disabled");
+            }
         }
         
-        // Audio channel select toggle (CH1/2 vs CH3/4)
+        // Audio channel select toggle
         if (Clay_PointerOver(CLAY_ID("AudioChannelToggle"))) {
             app->settings.audio_monitor_ch34 = !app->settings.audio_monitor_ch34;
             gui_settings_save(&app->settings);
+#if defined(_WIN32)
+            bool mon_cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+            if (mon_cxadc_mode) {
+                gui_app_set_status(app, app->settings.audio_monitor_ch34
+                    ? "CXADC monitor source: headswitch (CH3)"
+                    : "CXADC monitor source: audio pair (CH1/2)");
+            } else {
+                gui_app_set_status(app, app->settings.audio_monitor_ch34
+                    ? "Audio monitor source: CH3/4"
+                    : "Audio monitor source: CH1/2");
+            }
+#else
+            gui_app_set_status(app, app->settings.audio_monitor_ch34
+                ? "Audio monitor source: CH3/4"
+                : "Audio monitor source: CH1/2");
+#endif
         }
 
         // Check record button - UI indicates record-write to disk finialization

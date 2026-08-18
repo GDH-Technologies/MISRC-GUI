@@ -20,6 +20,190 @@
 #ifndef LIBASOUND_ENABLED
 #define LIBASOUND_ENABLED 0
 #endif
+#if defined(_WIN32)
+static int cxadc_win_card_path(int card_idx, char *path_out, size_t path_out_len)
+{
+    if (!path_out || path_out_len == 0) return -1;
+    if (card_idx < 0 || card_idx >= 2) return -1;
+    int n = snprintf(path_out, path_out_len, "\\\\.\\cxadc%d", card_idx);
+    if (n <= 0 || (size_t)n >= path_out_len) return -1;
+    return 0;
+}
+
+static void cxadc_win_trim(char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+}
+
+static int cxadc_win_run_ps_readline(const char *script, char *line_out, size_t line_out_len)
+{
+    if (!script || !line_out || line_out_len == 0) return -1;
+    line_out[0] = '\0';
+
+    char command[2048];
+    int n = snprintf(command,
+                     sizeof(command),
+                     "powershell -NoProfile -ExecutionPolicy Bypass -Command \"%s\"",
+                     script);
+    if (n <= 0 || (size_t)n >= sizeof(command)) return -1;
+
+    FILE *pipe = _popen(command, "r");
+    if (!pipe) return -1;
+
+    bool got_line = false;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        cxadc_win_trim(buf);
+        if (buf[0] == '\0') continue;
+        snprintf(line_out, line_out_len, "%s", buf);
+        got_line = true;
+        break;
+    }
+
+    int rc = _pclose(pipe);
+    if (rc != 0 || !got_line) return -1;
+    return 0;
+}
+static bool cxadc_win_ieq(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+static int cxadc_win_parse_bool(const char *value, bool *out_bool)
+{
+    if (!value || !out_bool) return -1;
+    if (cxadc_win_ieq(value, "true") || strcmp(value, "1") == 0) {
+        *out_bool = true;
+        return 0;
+    }
+    if (cxadc_win_ieq(value, "false") || strcmp(value, "0") == 0) {
+        *out_bool = false;
+        return 0;
+    }
+    return -1;
+}
+
+static int cxadc_win_get_center_offset(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1024];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
+                     card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(line, &endptr, 10);
+    if (errno != 0 || endptr == line) return -1;
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) return -1;
+    *value_out = (int)parsed;
+    return 0;
+}
+
+static int cxadc_win_set_center_offset(int card_idx, int value)
+{
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1400];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "Set-CxadcWinConfig -Path '%s' -CenterOffset %d | Out-Null; "
+                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
+                     card_path, value, card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(line, &endptr, 10);
+    if (errno != 0 || endptr == line) return -1;
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return -1;
+    if ((int)parsed != value) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_get_tenbit(int card_idx, bool *enabled_out)
+{
+    if (!enabled_out) return -1;
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1024];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
+                     card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+    return cxadc_win_parse_bool(line, enabled_out);
+}
+
+static int cxadc_win_set_tenbit(int card_idx, bool enabled)
+{
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+    const char *enabled_ps = enabled ? "$true" : "$false";
+
+    char script[1400];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "Set-CxadcWinConfig -Path '%s' -EnableTenbit %s | Out-Null; "
+                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
+                     card_path, enabled_ps, card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+    bool readback = false;
+    if (cxadc_win_parse_bool(line, &readback) != 0) return -1;
+    if (readback != enabled) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -207,8 +391,7 @@ int gui_cxadc_get_center_offset(int card_idx, int *value_out)
 {
     if (!value_out) return -1;
 #if defined(_WIN32)
-    (void)card_idx;
-    return -1;
+    return cxadc_win_get_center_offset(card_idx, value_out);
 #else
     return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
 #endif
@@ -217,9 +400,9 @@ int gui_cxadc_get_center_offset(int card_idx, int *value_out)
 int gui_cxadc_set_center_offset(int card_idx, int value)
 {
 #if defined(_WIN32)
-    (void)card_idx;
-    (void)value;
-    return -1;
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    return cxadc_win_set_center_offset(card_idx, value);
 #else
     if (value < CXADC_SYSFS_CENTER_OFFSET_MIN) value = CXADC_SYSFS_CENTER_OFFSET_MIN;
     if (value > CXADC_SYSFS_CENTER_OFFSET_MAX) value = CXADC_SYSFS_CENTER_OFFSET_MAX;
@@ -229,19 +412,13 @@ int gui_cxadc_set_center_offset(int card_idx, int value)
 
 int gui_cxadc_adjust_center_offset(int card_idx, int delta, int *new_value_out)
 {
-#if defined(_WIN32)
-    (void)card_idx;
-    (void)delta;
-    if (new_value_out) *new_value_out = 0;
-    return -1;
-#else
     int current = 0;
     if (gui_cxadc_get_center_offset(card_idx, &current) != 0) {
         return -1;
     }
     int next = current + delta;
-    if (next < CXADC_SYSFS_CENTER_OFFSET_MIN) next = CXADC_SYSFS_CENTER_OFFSET_MIN;
-    if (next > CXADC_SYSFS_CENTER_OFFSET_MAX) next = CXADC_SYSFS_CENTER_OFFSET_MAX;
+    if (next < 0) next = 0;
+    if (next > 255) next = 255;
     if (gui_cxadc_set_center_offset(card_idx, next) != 0) {
         return -1;
     }
@@ -249,15 +426,16 @@ int gui_cxadc_adjust_center_offset(int card_idx, int delta, int *new_value_out)
         *new_value_out = next;
     }
     return 0;
-#endif
 }
 
 int gui_cxadc_get_tenbit(int card_idx, int *value_out)
 {
     if (!value_out) return -1;
 #if defined(_WIN32)
-    (void)card_idx;
-    return -1;
+    bool enabled = false;
+    if (cxadc_win_get_tenbit(card_idx, &enabled) != 0) return -1;
+    *value_out = enabled ? 1 : 0;
+    return 0;
 #else
     int raw = 0;
     if (cxadc_sysfs_read_int_param(card_idx, "tenbit", &raw) != 0) {
@@ -271,9 +449,7 @@ int gui_cxadc_get_tenbit(int card_idx, int *value_out)
 int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 {
 #if defined(_WIN32)
-    (void)card_idx;
-    (void)enabled;
-    return -1;
+    return cxadc_win_set_tenbit(card_idx, enabled);
 #else
     return cxadc_sysfs_write_int_param(card_idx, "tenbit", enabled ? 1 : 0);
 #endif
@@ -281,11 +457,6 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 
 static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
 {
-#if defined(_WIN32)
-    (void)card_count;
-    (void)enabled;
-    return 0;
-#else
     if (card_count < 1) card_count = 1;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     for (int i = 0; i < card_count; i++) {
@@ -303,7 +474,6 @@ static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX
         }
     }
     return 0;
-#endif
 }
 static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_b)
 {
@@ -1115,9 +1285,37 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                                 dst[0] = dst[1] = dst[2] = 0;
                             }
                         }
-                        dst_frame[9] = 0;
-                        dst_frame[10] = 0;
-                        dst_frame[11] = 0;
+                        uint8_t *dst_ch4 = dst_frame + 9;
+                        if (dev_channels >= 4) {
+                            const uint8_t *src = src_frame + ((size_t)3 * ctx->audio_sample_bytes);
+                            if (ctx->audio_format == CXADC_AUDIO_FMT_S24_3LE) {
+                                dst_ch4[0] = src[0]; dst_ch4[1] = src[1]; dst_ch4[2] = src[2];
+                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_S32_LE) {
+                                int32_t s32 = (int32_t)((uint32_t)src[0] |
+                                                        ((uint32_t)src[1] << 8) |
+                                                        ((uint32_t)src[2] << 16) |
+                                                        ((uint32_t)src[3] << 24));
+                                cxadc_store_s24le(dst_ch4, s32 >> 8);
+                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_S16_LE) {
+                                int16_t s16 = (int16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
+                                cxadc_store_s24le(dst_ch4, ((int32_t)s16) << 8);
+                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_FLOAT32) {
+                                float f;
+                                memcpy(&f, src, 4);
+                                int32_t s32 = (int32_t)(f * 8388607.0f);
+                                cxadc_store_s24le(dst_ch4, s32);
+                            } else {
+                                dst_ch4[0] = dst_ch4[1] = dst_ch4[2] = 0;
+                            }
+                        } else if (dev_channels >= 3) {
+                            // Mirror headswitch (CH3) into CH4 for control paths
+                            // that operate on CH3/4 pairs.
+                            dst_ch4[0] = dst_frame[6];
+                            dst_ch4[1] = dst_frame[7];
+                            dst_ch4[2] = dst_frame[8];
+                        } else {
+                            dst_ch4[0] = dst_ch4[1] = dst_ch4[2] = 0;
+                        }
                     }
                     gui_headswitch_lock_ingest_s24le_interleaved(out, output_bytes, ctx->audio_sample_rate_hz);
                     bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
@@ -1375,16 +1573,18 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     s_cxadc.audio_device_name[0] = '\0';
 
     gui_headswitch_lock_reset();
-#if !defined(_WIN32)
     if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+#if !defined(_WIN32)
         if (errno == EACCES || errno == EPERM) {
             gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
         } else {
             gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
         }
+#else
+        gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+#endif
         return -1;
     }
-#endif
 
     if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
         gui_app_set_status(app, "CXADC: failed to open card device(s)");

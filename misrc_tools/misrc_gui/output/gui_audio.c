@@ -131,6 +131,16 @@ static inline int16_t pcm24_to_i16(int32_t s24) {
     return (int16_t)(s24 >> 8);
 }
 
+static inline int32_t audio_read_s24le_channel(const uint8_t *frame, int channel_index)
+{
+    if (!frame || channel_index < 0 || channel_index > 3) return 0;
+    size_t base = (size_t)channel_index * 3;
+    uint32_t raw = (uint32_t)frame[base] |
+                   ((uint32_t)frame[base + 1] << 8) |
+                   ((uint32_t)frame[base + 2] << 16);
+    return signext24(raw);
+}
+
 static bool gui_audio_selected_device_is_cxadc(const gui_app_t *app)
 {
     if (!app) return false;
@@ -272,18 +282,27 @@ static int audio_thread_main(void *ctx)
             }
             
             // Downmix 4ch 24-bit to stereo 16-bit at source sample rate.
-            // Select CH1/2 or CH3/4 based on user setting
+            // Select CH1/2 or CH3/4 based on user setting.
+            // For CXADC sources, CH3 is headswitch and CH4 may be silence/
+            // mirror depending on backend mapping; use CH3 dual-mono in the
+            // CH3/4 monitor mode so the control always produces valid output.
             const bool use_ch34 = a->app->settings.audio_monitor_ch34;
-            const size_t ch_offset = use_ch34 ? 6 : 0; // CH3/4 starts at byte 6, CH1/2 at byte 0
+            const bool cxadc_mode = gui_audio_selected_device_is_cxadc(a->app);
             
             for (size_t i = 0; i < frames_in; i++) {
-                size_t base = i * 12 + ch_offset;
-                uint32_t r1 = (uint32_t)b[base] | ((uint32_t)b[base + 1] << 8) | ((uint32_t)b[base + 2] << 16);
-                uint32_t r2 = (uint32_t)b[base + 3] | ((uint32_t)b[base + 4] << 8) | ((uint32_t)b[base + 5] << 16);
-                int32_t s1 = signext24(r1);
-                int32_t s2 = signext24(r2);
-                int32_t mix = (s1 / 2) + (s2 / 2);
-                int16_t s16 = pcm24_to_i16(mix);
+                const uint8_t *frame = b + (i * 12);
+                int16_t s16 = 0;
+                if (use_ch34 && cxadc_mode) {
+                    int32_t hs = audio_read_s24le_channel(frame, 2); // CH3 headswitch
+                    s16 = pcm24_to_i16(hs);
+                } else {
+                    int ch_a = use_ch34 ? 2 : 0;
+                    int ch_b = use_ch34 ? 3 : 1;
+                    int32_t s1 = audio_read_s24le_channel(frame, ch_a);
+                    int32_t s2 = audio_read_s24le_channel(frame, ch_b);
+                    int32_t mix = (s1 / 2) + (s2 / 2);
+                    s16 = pcm24_to_i16(mix);
+                }
                 tmp_in[i * 2 + 0] = s16;
                 tmp_in[i * 2 + 1] = s16;
             }
