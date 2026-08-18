@@ -6,6 +6,7 @@
  */
 
 #include "gui_cvbs.h"
+#include "../visualization/gui_panel.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
 #include "../visualization/gui_text.h"
@@ -1716,23 +1717,10 @@ void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
     // Upload to GPU
     UpdateTexture(decoder->frame_texture, decoder->frame_image.data);
 
-    // Calculate aspect-correct rectangle (4:3 aspect ratio for CVBS)
-    float aspect = 4.0f / 3.0f;
-    float display_aspect = width / height;
-
-    float draw_w, draw_h;
-    if (display_aspect > aspect) {
-        // Height limited
-        draw_h = height;
-        draw_w = height * aspect;
-    } else {
-        // Width limited
-        draw_w = width;
-        draw_h = width / aspect;
-    }
-
-    float draw_x = x + (width - draw_w) / 2;
-    float draw_y = y + (height - draw_h) / 2;
+    // Aspect-correct rectangle (4:3 for CVBS), shared with the VHS FM and
+    // Preview panels so the letterboxing math lives in one place.
+    Rectangle fit = gui_panel_aspect_fit((Rectangle){ x, y, width, height }, 4.0f / 3.0f);
+    float draw_x = fit.x, draw_y = fit.y, draw_w = fit.width, draw_h = fit.height;
 
     // Active mode crops to the picture area only.
     // Full mode draws everything with the contrast offset baked in above.

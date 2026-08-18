@@ -23,6 +23,8 @@
 #include "gui_simulated.h"
 #include "gui_playback.h"
 #include "gui_cxadc.h"
+#include "../visualization/gui_preview_panel.h"
+#include "gui_preview_v4l2.h"
 #ifdef ENABLE_FX3
 #include "gui_fx3.h"
 #endif
@@ -308,6 +310,9 @@ static uint32_t s_capture_last_drop_count = 0;
 static uint32_t s_capture_last_logged_drop_total = 0;
 static uint32_t s_capture_missed_streak = 0;
 static bool s_capture_missed_burst_reported = false;
+/* Latches the first malformed-frame report so a device that delivers the wrong
+ * geometry logs once instead of 25-60 times a second. Cleared on capture start. */
+static bool s_capture_short_frame_reported = false;
 static uint64_t s_capture_prev_callback_time_ms = 0;
 static uint64_t s_diag_last_emit_ms = 0;
 static uint32_t s_diag_last_frame_count = 0;
@@ -737,6 +742,43 @@ void gui_capture_callback(void *data_info_ptr) {
         return;
     }
 
+    // hsdaoh_extract_metadata() reads the last word of the first
+    // sizeof(metadata_t)*2 lines, i.e. it indexes up to
+    // (sizeof(metadata_t)*2 * width*2 - 1) bytes into the frame. Both bounds
+    // below are unstated invariants of that helper; without them a device that
+    // delivers a smaller frame than we asked for reads past the end of the
+    // buffer. That is not hypothetical -- it is what any non-1080p capture
+    // device does, and the 1920x1080 enumeration filter was the only thing
+    // keeping such a device away from this code path.
+    const unsigned int meta_lines_required = (unsigned int)(sizeof(metadata_t) * 2);
+    if (data_info->height < meta_lines_required) {
+        if (!s_capture_short_frame_reported) {
+            s_capture_short_frame_reported = true;
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "Device provides %ux%u; MISRC transport needs at least %u lines",
+                     data_info->width, data_info->height, meta_lines_required);
+            gui_app_set_status(app, msg);
+            gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
+        }
+        return;
+    }
+
+    size_t frame_bytes_required = (size_t)data_info->width * data_info->height * 2u;
+    if (data_info->len != 0 && data_info->len < frame_bytes_required) {
+        if (!s_capture_short_frame_reported) {
+            s_capture_short_frame_reported = true;
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "Short frame: got %zu bytes, expected %zu for %ux%u",
+                     data_info->len, frame_bytes_required,
+                     data_info->width, data_info->height);
+            gui_app_set_status(app, msg);
+            gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
+        }
+        return;
+    }
+
     // Extract metadata from frame
     metadata_t meta;
     hsdaoh_extract_metadata(data_info->buf, &meta, data_info->width);
@@ -889,6 +931,7 @@ void gui_app_init(gui_app_t *app) {
     gui_fft_panel_register();
     gui_cvbs_panel_register();
     gui_histogram_panel_register();
+    gui_preview_panel_register();
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
@@ -1119,10 +1162,14 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         misrc_device_info_t *src = &devices.devices[i];
         device_info_t *dst = &app->devices[app->device_count];
 
-        // Format name with type prefix for simple_capture devices
+        // Format name with type prefix for simple_capture devices. A device
+        // listed only because MISRC_SC_ALLOW_ANY relaxed the format filter is
+        // marked, so it is obvious in the dropdown that it cannot carry RF.
         if (src->type == MISRC_DEVICE_TYPE_SIMPLE_CAPTURE) {
-            snprintf(dst->name, sizeof(dst->name), "[%s] %s",
-                     device_get_simple_capture_short_name(), src->name);
+            snprintf(dst->name, sizeof(dst->name), "[%s]%s %s",
+                     device_get_simple_capture_short_name(),
+                     src->supports_1080p60 ? "" : " (unsupported format)",
+                     src->name);
             dst->type = DEVICE_TYPE_SIMPLE_CAPTURE;
             dst->index = -1;
             // Store device_id in serial field for simple_capture
@@ -1685,6 +1732,7 @@ int gui_app_start_capture(gui_app_t *app) {
     s_capture_last_logged_drop_total = 0;
     s_capture_missed_streak = 0;
     s_capture_missed_burst_reported = false;
+    s_capture_short_frame_reported = false;
     s_capture_prev_callback_time_ms = 0;
     // Reset upstream dual-ADC pairing state for a fresh capture session.
     s_upstream_chb_ready = false;
@@ -1943,6 +1991,7 @@ void gui_app_stop_capture(gui_app_t *app) {
     app->low_signal_armed = false;
     s_capture_missed_streak = 0;
     s_capture_missed_burst_reported = false;
+    s_capture_short_frame_reported = false;
     s_capture_prev_callback_time_ms = 0;
     s_capture_last_logged_drop_total = 0;
     // Reset upstream dual-ADC pairing state so reconnects start clean.

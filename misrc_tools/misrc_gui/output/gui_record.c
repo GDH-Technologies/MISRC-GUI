@@ -8,6 +8,8 @@
  */
 
 #include "gui_record.h"
+#include "gui_video_record.h"
+#include "../input/gui_preview_v4l2.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../ui/gui_popup.h"
@@ -384,6 +386,12 @@ static thrd_t s_writer_thread_b;
 static thrd_t s_finalize_thread;
 static atomic_bool s_finalize_thread_running = ATOMIC_VAR_INIT(false);
 static bool s_writer_threads_running = false;
+/* Latched at start. Finalize keys off THIS, never off live settings -- the RF
+ * join below reads app->settings.capture_a/b at stop time, which is wrong if a
+ * setting changed mid-session. */
+static bool s_video_started = false;
+static char s_record_path_video[600];
+static char s_video_start_msg[480];
 static atomic_bool s_record_stop_finalizing = ATOMIC_VAR_INIT(false);
 static atomic_bool s_record_stop_finalize_done = ATOMIC_VAR_INIT(false);
 static FILE *s_file_a = NULL;
@@ -723,14 +731,19 @@ static uint64_t gui_record_get_encoded_total_bytes(const gui_app_t *app) {
     return atomic_load(&app->recording_compressed_a) + atomic_load(&app->recording_compressed_b);
 }
 
+/* NOTE: the reference video is included here; the audio WAVs still are not,
+ * which is a pre-existing under-estimate this narrows without closing. The
+ * video can be the largest single output under FFV1, so leaving it out would
+ * make the runway estimate badly optimistic. */
 static uint64_t gui_record_get_effective_output_total_bytes(const gui_app_t *app,
                                                             uint64_t raw_total,
                                                             uint64_t encoded_total) {
     if (!app) return 0;
     if (app->settings.use_flac) {
-        return (encoded_total > 0) ? encoded_total : raw_total;
+        return ((encoded_total > 0) ? encoded_total : raw_total)
+             + gui_video_record_output_bytes();
     }
-    return raw_total;
+    return raw_total + gui_video_record_output_bytes();
 }
 
 static uint64_t gui_record_estimate_output_bytes_from_raw_backlog(const gui_app_t *app,
@@ -2107,6 +2120,20 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
              app->settings.enable_audio_2ch_34 ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
 
+    /* Built from settings alone. This function runs before the video spawn in
+     * the FLAC path and after it in the RAW path, so it must not read live
+     * video-module state or the two logs would disagree. */
+    snprintf(msg, sizeof(msg), "Reference video: enabled=%s codec=%s",
+             app->settings.video_record_enabled ? "on" : "off",
+             app->settings.video_record_codec == 1 ? "FFV1" : "H.264");
+    gui_record_log_write_line_locked("INFO", msg);
+
+    if (app->settings.video_record_enabled && app->settings.video_filename[0]) {
+        snprintf(msg, sizeof(msg), "VIDEO_FILE_PATH: %s/%s",
+                 app->settings.output_path, app->settings.video_filename);
+        gui_record_log_write_line_locked("INFO", msg);
+    }
+
     if (app->settings.enable_audio_4ch && app->settings.audio_4ch_filename[0]) {
         snprintf(msg, sizeof(msg), "AUDIO_4CH_FILE_PATH: %s/%s",
                  app->settings.output_path, app->settings.audio_4ch_filename);
@@ -2228,6 +2255,18 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
     } else {
         snprintf(app->settings.audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
     }
+
+    /* Reference video -- must stay in lockstep with the same block in
+     * gui_settings_refresh_auto_names(). The only intended difference between
+     * the two functions is that base already carries the record-start
+     * timestamp here. */
+    char video_tag[40] = {0};
+    sanitize_tag(video_tag, sizeof(video_tag), app->settings.video_output_tag);
+    if (video_tag[0]) {
+        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_%s_video.mkv", base, video_tag);
+    } else {
+        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
+    }
     if (audio_tag_12[0]) {
         snprintf(app->settings.audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
@@ -2251,6 +2290,284 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
 }
 
 // Start recording - checks for file existence first
+/* Prints what both auto-name functions produce from one settings blob. They
+ * are separate implementations that must agree, and the only sanctioned
+ * difference is the record-start timestamp -- so with timestamping off they
+ * must match exactly, and with it on they must differ only by that segment. */
+/* Round-trips the reference-video settings through the on-disk file. Point
+ * XDG_CONFIG_HOME at a scratch directory before running, or this rewrites the
+ * real settings file. */
+int gui_record_video_settings_test_main(void)
+{
+    gui_settings_t a;
+    memset(&a, 0, sizeof(a));
+    gui_settings_load(&a);
+
+    /* Values chosen to be different from every default, so a field that is
+     * silently not persisted shows up as a mismatch rather than a coincidence. */
+    a.video_record_enabled = true;
+    a.video_record_codec = 1;                       /* FFV1 */
+    snprintf(a.video_output_tag, sizeof(a.video_output_tag), "refcam");
+    snprintf(a.ffmpeg_path, sizeof(a.ffmpeg_path), "/opt/custom/ffmpeg");
+    gui_settings_save(&a);
+
+    gui_settings_t b;
+    memset(&b, 0, sizeof(b));
+    gui_settings_load(&b);
+
+    int rc = 0;
+    printf("round-trip:\n");
+    printf("  video_record_enabled : %d -> %d\n", a.video_record_enabled, b.video_record_enabled);
+    printf("  video_record_codec   : %d -> %d\n", a.video_record_codec, b.video_record_codec);
+    printf("  video_output_tag     : %s -> %s\n", a.video_output_tag, b.video_output_tag);
+    printf("  ffmpeg_path          : %s -> %s\n", a.ffmpeg_path, b.ffmpeg_path);
+    printf("  video_filename       : %s\n", b.video_filename);
+
+    if (a.video_record_enabled != b.video_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
+    if (a.video_record_codec != b.video_record_codec)     { printf("FAIL: codec\n"); rc = 1; }
+    if (strcmp(a.video_output_tag, b.video_output_tag))   { printf("FAIL: tag\n"); rc = 1; }
+    if (strcmp(a.ffmpeg_path, b.ffmpeg_path))             { printf("FAIL: ffmpeg_path\n"); rc = 1; }
+    /* The load path re-runs the namer, so the tag must have reached the name. */
+    if (b.video_filename[0] && !strstr(b.video_filename, "refcam")) {
+        printf("FAIL: tag did not reach the generated filename\n"); rc = 1;
+    }
+
+    /* A hand-edited file must not be able to select a codec that does not
+     * exist -- the loader clamps rather than trusting the number. */
+    gui_settings_t c = b;
+    c.video_record_codec = 99;
+    gui_settings_save(&c);
+    gui_settings_t d;
+    memset(&d, 0, sizeof(d));
+    gui_settings_load(&d);
+    printf("  out-of-range codec 99 -> %d (must be 0 or 1)\n", d.video_record_codec);
+    if (d.video_record_codec != 0 && d.video_record_codec != 1) {
+        printf("FAIL: codec not clamped\n"); rc = 1;
+    }
+
+    printf("%s\n", rc ? "SETTINGS TEST FAILED" : "settings test passed");
+    return rc;
+}
+
+/* Spawn the reference-video encoder. Called from both the FLAC and RAW start
+ * paths at the same relative position: after the RF writer threads are latched
+ * and before the producer is enabled.
+ *
+ * That placement is what keeps the unwind cost at one site -- every existing
+ * failure path in gui_record_start_confirmed sits above it, so none can be
+ * reached with the video already started. Moving this earlier would mean
+ * adding video teardown to eight other unwind edits. */
+static void gui_record_start_video_if_enabled(gui_app_t *app)
+{
+    if (!app->settings.video_record_enabled) return;
+
+    preview_status_t pv = gui_preview_get_status();
+    uint32_t pitch = gui_preview_negotiated_pitch();
+    if (pitch == 0) pitch = pv.width * 2;
+
+    snprintf(s_record_path_video, sizeof(s_record_path_video), "%s/%s",
+             app->settings.output_path, app->settings.video_filename);
+
+    /* Hold the stream for the whole recording, so closing the preview panel
+     * stops the picture without stopping the file. */
+    gui_preview_hold_acquire();
+
+    char err[256] = {0};
+    if (gui_video_record_start(s_record_path_video,
+                               app->settings.video_record_codec == 1 ? VIDEO_CODEC_FFV1
+                                                                     : VIDEO_CODEC_H264,
+                               pv.width, pv.height, pitch,
+                               pv.fps_num, pv.fps_den, err, sizeof(err)) != 0) {
+        gui_preview_hold_release();
+        /* Deliberately not fatal here. The RF writers are already running and
+         * the producer is about to be enabled; losing the reference video is
+         * not a reason to lose the capture. Preflight is where a missing
+         * encoder refuses -- by this point everything it checked has passed. */
+        char msg[320];
+        snprintf(msg, sizeof(msg), "Reference video failed to start: %s", err);
+        gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
+        gui_app_set_status(app, msg);
+        s_record_path_video[0] = '\0';
+        return;
+    }
+
+    s_video_started = true;
+    /* Stashed rather than logged here. The FLAC path opens the session log
+     * before this runs and the RAW path opens it after, so logging directly
+     * would silently drop the line in the RAW branch. */
+    gui_app_set_status(app, "Reference video recording started");
+    snprintf(s_video_start_msg, sizeof(s_video_start_msg),
+             "Reference video started: %s (%s, %ux%u @ %.2f fps)",
+             s_record_path_video,
+             app->settings.video_record_codec == 1 ? "FFV1" : "H.264",
+             pv.width, pv.height,
+             pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0);
+}
+
+/* Emit whatever the video spawn stashed. Called from a point in each branch
+ * where the session log is known to be open. */
+static void gui_record_flush_video_start_log(gui_app_t *app)
+{
+    if (!s_video_start_msg[0]) return;
+    /* Only consume the message once there is a file to write it to.
+     * gui_record_log_capture_event silently drops the line when the session log
+     * is not open yet, which is exactly the RAW path's situation at the spawn
+     * site -- clearing it there lost the line entirely. */
+    if (!s_capture_log_file) return;
+    gui_record_log_capture_event(app, "INFO", s_video_start_msg, GUI_ERROR_CLASS_NONE, 0);
+    s_video_start_msg[0] = '\0';
+}
+
+/* Headless record: captures from the simulated device straight to files, with
+ * no window and no clicking. Exists for one comparison in particular -- the RF
+ * outputs from a run with the reference video ON must be byte-identical to a
+ * run with it OFF. That is the proof that the video path cannot perturb the
+ * capture it sits beside. */
+int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
+                                bool use_flac)
+{
+    static gui_app_t app;
+    memset(&app, 0, sizeof(app));
+    gui_settings_init_defaults(&app.settings);
+
+    snprintf(app.settings.output_path, sizeof(app.settings.output_path), "%s", out_dir);
+    snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "auto");
+    app.settings.auto_names_enabled = true;
+    /* Deterministic filenames, so the two runs are directly comparable. */
+    app.settings.append_timestamp_on_capture_start = false;
+    app.settings.use_flac = use_flac;
+    app.settings.capture_a = true;
+    app.settings.capture_b = true;
+    app.settings.video_record_enabled = with_video;
+    app.settings.enable_audio_4ch = false;
+    app.settings.enable_audio_2ch_12 = false;
+    app.settings.enable_audio_2ch_34 = false;
+    gui_settings_refresh_auto_names(&app.settings);
+
+    gui_app_init(&app);
+    /* main() does this for the real app; without it the preview singleton is
+     * all zeros and reports UNSUPPORTED. */
+    gui_preview_init(NULL);
+    if (with_video) gui_preview_refresh_devices();
+    gui_app_enumerate_devices(&app);
+
+    int sim = -1;
+    for (int i = 0; i < app.device_count; i++) {
+        if (app.devices[i].type == DEVICE_TYPE_SIMULATED) { sim = i; break; }
+    }
+    if (sim < 0) { fprintf(stderr, "no simulated device\n"); return 2; }
+    app.selected_device = sim;
+
+    /* Returns 0 on success, not a bool. */
+    int cap_rc = gui_app_start_capture(&app);
+    if (cap_rc != 0) {
+        fprintf(stderr, "start_capture failed (%d): %s\n", cap_rc, app.status_message);
+        return 2;
+    }
+    struct timespec settle = { 1, 0 };
+    nanosleep(&settle, NULL);
+
+    int rs = gui_record_start(&app);
+    if (rs != RECORD_OK) {
+        fprintf(stderr, "record_start returned %d: %s\n", rs, app.status_message);
+        gui_app_stop_capture(&app);
+        return 2;
+    }
+    printf("recording %ds (video=%s, %s) -> %s\n", seconds, with_video ? "on" : "off",
+           use_flac ? "flac" : "raw", out_dir);
+
+    for (int i = 0; i < seconds; i++) {
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
+    }
+
+    gui_app_stop_recording(&app);
+    /* Finalize runs on its own thread; wait it out rather than racing it. */
+    for (int i = 0; i < 300 && gui_record_is_finalizing(); i++) {
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    gui_app_stop_capture(&app);
+
+    if (with_video) {
+        gui_video_record_status_t vs = gui_video_record_get_status();
+        printf("video: submitted=%llu written=%llu dropped=%llu bytes=%llu%s%s\n",
+               (unsigned long long)vs.frames_submitted,
+               (unsigned long long)vs.frames_written,
+               (unsigned long long)vs.frames_dropped,
+               (unsigned long long)vs.output_bytes,
+               vs.error ? " err=" : "", vs.error ? vs.err_text : "");
+    }
+    printf("rfA=%s rfB=%s\n", app.settings.output_filename_a, app.settings.output_filename_b);
+    return 0;
+}
+
+int gui_record_name_test_main(void)
+{
+    static gui_app_t app;
+    memset(&app, 0, sizeof(app));
+    gui_settings_init_defaults(&app.settings);
+
+    snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "tapetest");
+    snprintf(app.settings.video_output_tag, sizeof(app.settings.video_output_tag), "ref cam");
+    snprintf(app.settings.rf_channel_tags[0], sizeof(app.settings.rf_channel_tags[0]), "luma");
+    snprintf(app.settings.audio_output_tags[0], sizeof(app.settings.audio_output_tags[0]), "quad");
+    app.settings.auto_names_enabled = true;
+    app.settings.use_flac = true;
+    app.settings.video_record_enabled = true;
+
+    int rc = 0;
+
+    /* Pass 1: timestamping off, so the two must be character-identical. */
+    app.settings.append_timestamp_on_capture_start = false;
+    gui_settings_refresh_auto_names(&app.settings);
+    char s_video[MAX_FILENAME_LEN], s_a[MAX_FILENAME_LEN], s_4ch[MAX_FILENAME_LEN];
+    snprintf(s_video, sizeof(s_video), "%s", app.settings.video_filename);
+    snprintf(s_a, sizeof(s_a), "%s", app.settings.output_filename_a);
+    snprintf(s_4ch, sizeof(s_4ch), "%s", app.settings.audio_4ch_filename);
+
+    gui_record_apply_auto_names(&app);
+    printf("no timestamp:\n");
+    printf("  settings namer video : %s\n", s_video);
+    printf("  record   namer video : %s\n", app.settings.video_filename);
+    printf("  settings namer rfA   : %s\n", s_a);
+    printf("  record   namer rfA   : %s\n", app.settings.output_filename_a);
+    printf("  settings namer 4ch   : %s\n", s_4ch);
+    printf("  record   namer 4ch   : %s\n", app.settings.audio_4ch_filename);
+
+    if (strcmp(s_video, app.settings.video_filename) != 0) {
+        printf("FAIL: video names diverge with timestamping off\n"); rc = 1;
+    }
+    if (strcmp(s_a, app.settings.output_filename_a) != 0) {
+        printf("FAIL: rfA names diverge with timestamping off\n"); rc = 1;
+    }
+    if (strcmp(s_4ch, app.settings.audio_4ch_filename) != 0) {
+        printf("FAIL: 4ch names diverge with timestamping off\n"); rc = 1;
+    }
+
+    /* Pass 2: timestamping on -- the record namer must differ, and only by
+     * inserting the timestamp after the base name. */
+    app.settings.append_timestamp_on_capture_start = true;
+    gui_record_apply_auto_names(&app);
+    printf("with timestamp:\n  record namer video : %s\n", app.settings.video_filename);
+
+    if (strcmp(s_video, app.settings.video_filename) == 0) {
+        printf("FAIL: timestamping had no effect on the video name\n"); rc = 1;
+    } else if (strncmp(app.settings.video_filename, "tapetest_", 9) != 0 ||
+               strstr(app.settings.video_filename, "_ref-cam_video.mkv") == NULL) {
+        printf("FAIL: timestamped video name is not base + timestamp + tag + suffix\n"); rc = 1;
+    }
+
+    /* The tag contained a space; sanitize_tag must map it to '-' rather than
+     * leave whitespace in a filename. */
+    if (strstr(s_video, "ref-cam") == NULL) {
+        printf("FAIL: tag was not sanitised (%s)\n", s_video); rc = 1;
+    }
+
+    printf("%s\n", rc ? "NAME TEST FAILED" : "name test passed");
+    return rc;
+}
+
 int gui_record_start(gui_app_t *app) {
 
     (void)gui_record_collect_finalize_if_done();
@@ -2284,11 +2601,17 @@ int gui_record_start(gui_app_t *app) {
     snprintf(path_b, sizeof(path_b), "%s/%s", app->settings.output_path, app->settings.output_filename_b);
 
     // Check if output files already exist
-    struct stat stat_a, stat_b;
+    struct stat stat_a, stat_b, stat_v;
     bool file_a_exists = app->settings.capture_a && (stat(path_a, &stat_a) == 0);
     bool file_b_exists = app->settings.capture_b && (stat(path_b, &stat_b) == 0);
+    /* Without this the RF files prompt while the reference video is silently
+     * clobbered. */
+    char path_video[600];
+    snprintf(path_video, sizeof(path_video), "%s/%s",
+             app->settings.output_path, app->settings.video_filename);
+    bool file_v_exists = app->settings.video_record_enabled && (stat(path_video, &stat_v) == 0);
 
-    if (file_a_exists || file_b_exists) {
+    if (file_a_exists || file_b_exists || file_v_exists) {
         // Build detailed message with file info
         char message[512];
         char size_buf[32];
@@ -2421,6 +2744,65 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         }
     }
 #endif
+
+    /* Reference video preflight. Deliberately here: before any output file is
+     * opened and before s_recording_app is set, so a refusal leaves nothing to
+     * unwind. */
+    s_video_started = false;
+    s_record_path_video[0] = '\0';
+    s_video_start_msg[0] = '\0';
+    if (app->settings.video_record_enabled) {
+        gui_video_record_set_ffmpeg_path(app->settings.ffmpeg_path);
+        if (!gui_video_record_probe()) {
+            gui_app_set_status(app, "Reference video is on but ffmpeg was not found. "
+                                    "Set ffmpeg_path in Settings, or turn Reference video off.");
+            return RECORD_ERROR;
+        }
+
+        preview_status_t pv = gui_preview_get_status();
+        if (pv.state == PREVIEW_STATE_UNSUPPORTED) {
+            gui_app_set_status(app, "Reference video requires Linux/V4L2 and is not available "
+                                    "in this build. Turn Reference video off to record.");
+            return RECORD_ERROR;
+        }
+        if (pv.state == PREVIEW_STATE_DISCONNECTED || pv.state == PREVIEW_STATE_NO_DEVICE) {
+            /* Connect on demand. The stream is normally owned by a panel, and
+             * requiring one to be open would block an RF capture for a reason
+             * that has nothing to do with the RF. */
+            if (gui_preview_connect() != 0) {
+                pv = gui_preview_get_status();
+                char msg[320];
+                snprintf(msg, sizeof(msg),
+                         "Reference video is on but the preview device could not be opened: %s. "
+                         "Turn Reference video off to record without it.",
+                         pv.err_text[0] ? pv.err_text : "no device");
+                gui_app_set_status(app, msg);
+                return RECORD_ERROR;
+            }
+            pv = gui_preview_get_status();
+        }
+
+        if (pv.state == PREVIEW_STATE_POPPED_OUT) {
+            char msg[320];
+            snprintf(msg, sizeof(msg),
+                     "Reference video is on but the preview is in a separate window (pid %d). "
+                     "Bring it back, or turn Reference video off.", pv.child_pid);
+            gui_app_set_status(app, msg);
+            return RECORD_ERROR;
+        }
+        /* STALLED is accepted: it only means no frame for a few seconds, which
+         * is a paused tape as often as a fault. */
+        if (pv.state != PREVIEW_STATE_STREAMING && pv.state != PREVIEW_STATE_STALLED &&
+            pv.state != PREVIEW_STATE_CONNECTING) {
+            char msg[320];
+            snprintf(msg, sizeof(msg),
+                     "Reference video is on but the preview is not running: %s. "
+                     "Turn Reference video off to record without it.",
+                     pv.err_text[0] ? pv.err_text : "not connected");
+            gui_app_set_status(app, msg);
+            return RECORD_ERROR;
+        }
+    }
 
     s_recording_app = app;
     atomic_store(&app->recording_bytes, 0);
@@ -2606,6 +2988,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                 gui_record_log_capture_event(app, "ERROR", "Failed to start FLAC writer A",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
                 app->is_recording = false;
+                /* Removes the tap and asks the writer to drain. Does not join --
+                 * this is the render thread; the join happens in finalize. */
+                if (s_video_started) gui_video_record_request_stop();
+
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (s_flac_writer_a) { flac_writer_abort(s_flac_writer_a); s_flac_writer_a = NULL; }
                 if (s_flac_writer_b) { flac_writer_abort(s_flac_writer_b); s_flac_writer_b = NULL; }
@@ -2641,6 +3027,9 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             started_b = true;
         }
         s_writer_threads_running = started_a || started_b;
+
+        gui_record_start_video_if_enabled(app);
+        gui_record_flush_video_start_log(app);
 #if defined(__APPLE__)
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
@@ -2757,6 +3146,9 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             started_b = true;
         }
         s_writer_threads_running = started_a || started_b;
+
+        gui_record_start_video_if_enabled(app);
+        gui_record_flush_video_start_log(app);
 #if defined(__APPLE__)
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
@@ -2772,6 +3164,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // Start audio output/monitoring (if enabled)
         gui_audio_start(app, &app->buffers);
         gui_record_open_session_log(app, path_a, path_b);
+        gui_record_flush_video_start_log(app);   /* RAW: log opens last */
 
         gui_app_set_status(app, "Recording (RAW)...");
     }
@@ -2785,6 +3178,34 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     if (s_writer_threads_running) {
         if (app->settings.capture_a) thrd_join(s_writer_thread_a, NULL);
         if (app->settings.capture_b) thrd_join(s_writer_thread_b, NULL);
+    }
+    /* After the RF joins: the master reaches a consistent state first, and the
+     * video finish can block for seconds flushing an FFV1 GOP. Keyed off the
+     * latched flag, never off live settings. */
+    if (s_video_started) {
+        gui_video_record_finish();
+        gui_video_record_status_t vs = gui_video_record_get_status();
+        gui_preview_hold_release();
+        s_video_started = false;
+
+        char msg[420];
+        snprintf(msg, sizeof(msg),
+                 "Reference video: frames=%llu written=%llu dropped=%llu duped=%llu bytes=%llu",
+                 (unsigned long long)vs.frames_submitted,
+                 (unsigned long long)vs.frames_written,
+                 (unsigned long long)vs.frames_dropped,
+                 (unsigned long long)vs.frames_duped,
+                 (unsigned long long)vs.output_bytes);
+        gui_record_log_capture_event(app, vs.error ? "ERROR" : "INFO", msg,
+                                     vs.error ? GUI_ERROR_CLASS_SYSTEM : GUI_ERROR_CLASS_NONE,
+                                     vs.error ? 1 : 0);
+        if (vs.error && vs.err_text[0]) {
+            char emsg[256];
+            snprintf(emsg, sizeof(emsg), "Reference video error: %s", vs.err_text);
+            gui_record_log_capture_event(app, "ERROR", emsg, GUI_ERROR_CLASS_SYSTEM, 1);
+        }
+    }
+    {
         s_writer_threads_running = false;
     }
     gui_record_spill_reset_all();

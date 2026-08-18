@@ -20,6 +20,8 @@
 #include "../ui/gui_ui.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
+#include "../input/gui_preview_v4l2.h"
+#include "../output/gui_video_record.h"
 #include "../processing/gui_extract.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
@@ -76,10 +78,16 @@ static void print_usage(const char *program_name) {
             "MISRC GUI %s\n"
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view]\n"
+            "  %s --preview-only <device> [--preview-format YUYV:WxH@fps]\n"
+            "  %s --preview-probe | --preview-probe-stream <device> [seconds]\n"
+            "  %s --preview-selftest\n"
             "\n"
             "No arguments launch the GUI.\n"
             "Use --debug-view to enable verbose runtime logs.\n",
             MIRSC_TOOLS_VERSION,
+            program_name ? program_name : "misrc_gui",
+            program_name ? program_name : "misrc_gui",
+            program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
 }
 static int gui_layout_width(void) {
@@ -336,6 +344,66 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--smoke-test") == 0) {
             return 0;
         }
+        /* Headless preview diagnostics. These run without a window so the
+         * reader can be exercised -- and its unplug, teardown and scheduling
+         * behaviour verified -- without anyone watching a GUI. */
+        if (strcmp(argv[i], "--preview-probe") == 0) {
+            return gui_preview_probe_main();
+        }
+        if (strcmp(argv[i], "--preview-selftest") == 0) {
+            return gui_preview_selftest_main();
+        }
+        if (strcmp(argv[i], "--auto-record") == 0) {
+            const char *dir = (i + 1 < argc) ? argv[i + 1] : ".";
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 5;
+            bool wv  = (i + 3 < argc) && strcmp(argv[i + 3], "video") == 0;
+            bool flac = !((i + 4 < argc) && strcmp(argv[i + 4], "raw") == 0);
+            return gui_record_auto_record_main(dir, secs, wv, flac);
+        }
+        if (strcmp(argv[i], "--video-settings-test") == 0) {
+            return gui_record_video_settings_test_main();
+        }
+        if (strcmp(argv[i], "--video-name-test") == 0) {
+            return gui_record_name_test_main();
+        }
+        if (strcmp(argv[i], "--video-probe") == 0) {
+            return gui_video_record_probe_main();
+        }
+        if (strcmp(argv[i], "--video-record-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
+            const char *codec = (i + 4 < argc) ? argv[i + 4] : NULL;
+            return gui_video_record_test_main(dev, out, secs, codec);
+        }
+        if (strcmp(argv[i], "--video-tap-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
+            return gui_preview_tap_test_main(dev, secs);
+        }
+        if (strcmp(argv[i], "--preview-dump-frame") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
+            return gui_preview_dump_frame_main(dev, out);
+        }
+        /* The popout window. Returns before InitWindow, the fonts, Clay,
+         * gui_app_init and device enumeration -- the child shares none of it,
+         * and must not touch the settings file the parent is also using. */
+        if (strcmp(argv[i], "--preview-only") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *fmt = NULL;
+            int ppid = 0;
+            for (int j = i + 1; j + 1 < argc; j++) {
+                if (strcmp(argv[j], "--preview-format") == 0) fmt = argv[j + 1];
+                else if (strcmp(argv[j], "--preview-parent-pid") == 0) ppid = atoi(argv[j + 1]);
+            }
+            return gui_preview_child_main(dev, fmt, ppid);
+        }
+        if (strcmp(argv[i], "--preview-probe-stream") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
+            return gui_preview_probe_stream_main(dev, secs);
+        }
     }
 #if defined(__APPLE__)
     int elevate_rc = gui_macos_relaunch_as_admin_if_needed(argc, argv);
@@ -434,6 +502,7 @@ int main(int argc, char **argv) {
     Clay_SetMeasureTextFunction(Raylib_MeasureText, fonts);
 
     // Initialize application
+    gui_preview_init(argc > 0 ? argv[0] : NULL);
     gui_app_init(&app);
 
     // Set app for text rendering font access
@@ -538,6 +607,7 @@ int main(int argc, char **argv) {
 
         // Check for pending popup result (for async confirmations like file overwrite)
         gui_record_check_popup(&app);
+        gui_preview_tick();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
@@ -768,6 +838,8 @@ int main(int argc, char **argv) {
     // Save settings before cleanup
     gui_settings_save(&app.settings);
     
+    gui_video_record_shutdown();
+    gui_preview_shutdown();
     gui_app_cleanup(&app);
     free(clay_memory);
 

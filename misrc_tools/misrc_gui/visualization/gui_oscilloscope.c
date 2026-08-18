@@ -132,6 +132,13 @@ void gui_oscilloscope_cleanup(void) {
     // No static resources - per-panel cleanup handled by vtable destroy()
 }
 
+void gui_waveform_close_overlays(void *state) {
+    waveform_panel_state_t *ws = (waveform_panel_state_t *)state;
+    if (!ws) return;
+    ws->render_mode_dropdown_open = false;
+    ws->trigger_dropdown_open = false;
+}
+
 static const int16_t *s_trigger_src_ch1 = NULL;
 static const int16_t *s_trigger_src_ch2 = NULL;
 static size_t s_trigger_src_count = 0;

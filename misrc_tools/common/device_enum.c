@@ -34,6 +34,52 @@
 
 
 /*-----------------------------------------------------------------------------
+ * simple_capture allocation cleanup
+ *
+ * sc_get_devices() and sc_get_formats() hand back heap allocations that nothing
+ * in the tree ever freed. misrc_device_enumerate() is called on every reconnect
+ * attempt, so during a reconnect storm that leaked steadily.
+ *
+ * These live here rather than in the sc backends because each platform has its
+ * own simple_capture_*.c and only the Linux one can be built and tested here;
+ * the allocation shape is public in simple_capture.h, so freeing from the
+ * caller is well-defined. Promote them into the sc API if a second consumer
+ * appears.
+ *---------------------------------------------------------------------------*/
+
+static void sc_free_device_list(sc_capture_dev_t *devs, size_t count)
+{
+    if (!devs) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(devs[i].device_id);
+        free(devs[i].name);
+    }
+    free(devs);
+}
+
+static void sc_free_format_list(sc_formatlist_t *fmts, size_t count)
+{
+    if (!fmts) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!fmts[i].sizes) {
+            continue;
+        }
+        /* fps is only allocated for discrete frame sizes, and n_sizes counts
+         * exactly those, so bound by n_sizes rather than the 64-entry
+         * allocation. The remainder is calloc'd to NULL either way. */
+        for (size_t j = 0; j < fmts[i].n_sizes; j++) {
+            free(fmts[i].sizes[j].fps);
+        }
+        free(fmts[i].sizes);
+    }
+    free(fmts);
+}
+
+/*-----------------------------------------------------------------------------
  * Device List Management
  *-----------------------------------------------------------------------------*/
 
@@ -110,13 +156,27 @@ int misrc_device_enumerate(misrc_device_list_t *list, bool include_hsdaoh, bool 
 
     /* Enumerate simple_capture devices */
     if (include_simple_capture) {
+        /* MISRC_SC_ALLOW_ANY=1 lists every capture-capable OS video device
+         * regardless of format, instead of only those that can carry the
+         * 1920x1080 YUYV60 hsdaoh transport. This exists to observe how the
+         * app behaves with an arbitrary dongle selected; such a device cannot
+         * carry RF (the frame parser will never find HSDAOH_MAGIC) and will
+         * never sync. Unset -- the default -- the behaviour is unchanged. */
+        const char *allow_any_env = getenv("MISRC_SC_ALLOW_ANY");
+        bool allow_any = (allow_any_env && allow_any_env[0] == '1');
+
         sc_capture_dev_t *sc_devs;
         size_t sc_count = sc_get_devices(&sc_devs);
 
         for (size_t i = 0; i < sc_count; i++) {
             /* Check if device supports 1920x1080 YUYV at >=40fps */
             bool supports_1080p60 = false;
-            sc_formatlist_t *sc_fmt;
+            /* Must be initialised: sc_get_formats() returns 0 without writing
+             * *fmt_list when the node cannot be opened -- which happens if the
+             * device is unplugged between sc_get_devices() and here. Leaving it
+             * indeterminate would hand sc_free_format_list() a wild pointer,
+             * and its !fmts guard cannot catch a garbage stack value. */
+            sc_formatlist_t *sc_fmt = NULL;
             size_t f_count = sc_get_formats(sc_devs[i].device_id, &sc_fmt);
 
             for (size_t j = 0; j < f_count && !supports_1080p60; j++) {
@@ -143,19 +203,24 @@ int misrc_device_enumerate(misrc_device_list_t *list, bool include_hsdaoh, bool 
                 }
             }
 
+            sc_free_format_list(sc_fmt, f_count);
+
             /* Only add devices that support the required format */
-            if (supports_1080p60) {
+            if (supports_1080p60 || allow_any) {
                 misrc_device_info_t *dev = device_list_add(list);
                 if (!dev) {
+                    sc_free_device_list(sc_devs, sc_count);
                     return -1;
                 }
                 dev->type = MISRC_DEVICE_TYPE_SIMPLE_CAPTURE;
                 dev->index = -1;  /* Not used for simple_capture */
                 snprintf(dev->name, sizeof(dev->name), "%s", sc_devs[i].name);
                 snprintf(dev->device_id, sizeof(dev->device_id), "%s", sc_devs[i].device_id);
-                dev->supports_1080p60 = true;
+                dev->supports_1080p60 = supports_1080p60;
             }
         }
+
+        sc_free_device_list(sc_devs, sc_count);
     }
 
     return (int)list->count;

@@ -7,6 +7,7 @@
  */
 
 #include "gui_panel.h"
+#include "../input/gui_preview_v4l2.h"
 #include "panel_interface.h"
 #include "../core/gui_app.h"
 #include "gui_oscilloscope.h"
@@ -23,7 +24,25 @@ static const char* s_view_names[] = {
     [PANEL_VIEW_FFT] = "FFT",
     [PANEL_VIEW_CVBS] = "Video",
     [PANEL_VIEW_HISTOGRAM] = "Histogram",
+    [PANEL_VIEW_PREVIEW] = "Preview",
 };
+
+Rectangle gui_panel_aspect_fit(Rectangle bounds, float aspect) {
+    float display_aspect = bounds.width / bounds.height;
+    float draw_w, draw_h;
+    if (display_aspect > aspect) {
+        // Height limited
+        draw_h = bounds.height;
+        draw_w = bounds.height * aspect;
+    } else {
+        // Width limited
+        draw_w = bounds.width;
+        draw_h = bounds.width / aspect;
+    }
+    return (Rectangle){ bounds.x + (bounds.width - draw_w) * 0.5f,
+                        bounds.y + (bounds.height - draw_h) * 0.5f,
+                        draw_w, draw_h };
+}
 
 const char* panel_view_type_name(panel_view_type_t type) {
     if (type < PANEL_VIEW_COUNT) return s_view_names[type];
@@ -38,6 +57,8 @@ bool panel_view_type_available(panel_view_type_t type) {
             return true;
         case PANEL_VIEW_FFT:
             return gui_fft_available();
+        case PANEL_VIEW_PREVIEW:
+            return gui_preview_supported();
         default:
             return false;
     }

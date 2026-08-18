@@ -441,6 +441,33 @@ static void hsdaoh_callback(hsdaoh_data_info_t *data_info)
 
 	capture_handler_ctx_t *handler = &ctx->handler;
 
+	/* hsdaoh_extract_metadata() reads the last word of the first
+	 * sizeof(metadata_t)*2 lines, so it needs at least that many lines and a
+	 * buffer that really is width*height*2 bytes. Both are unstated invariants
+	 * of the transport that no caller checked; a device delivering a smaller
+	 * frame than requested reads past the end of the mmap. The 1920x1080
+	 * enumeration filter was the only thing keeping such a device away from
+	 * here. Mirrors the same guards in the GUI callback. */
+	{
+		static bool short_frame_reported = false;
+		const unsigned int meta_lines_required = (unsigned int)(sizeof(metadata_t) * 2);
+		size_t frame_bytes_required = (size_t)data_info->width * data_info->height * 2u;
+
+		if (data_info->width == 0 || data_info->height == 0 ||
+		    data_info->height < meta_lines_required ||
+		    (data_info->len != 0 && data_info->len < frame_bytes_required)) {
+			if (!short_frame_reported) {
+				short_frame_reported = true;
+				print_capture_message(NULL, HSDAOH_ERROR,
+					"Device provides %ux%u (%zu bytes); MISRC transport needs at least "
+					"%u lines and %zu bytes per frame\n",
+					data_info->width, data_info->height, data_info->len,
+					meta_lines_required, frame_bytes_required);
+			}
+			return;
+		}
+	}
+
 	metadata_t meta;
 	hsdaoh_extract_metadata(data_info->buf, &meta, data_info->width);
 
@@ -521,6 +548,34 @@ static void hsdaoh_callback(hsdaoh_data_info_t *data_info)
 		rb_write_finished(&ctx->rb, result.stream0_bytes);
 	if (capture_audio_this_frame && buf_out_audio)
 		rb_write_finished(&ctx->rb_audio, result.stream1_bytes);
+}
+
+/* simple_capture delivers an sc_data_info_t, which is NOT layout-compatible
+ * with the hsdaoh_data_info_t that hsdaoh_callback expects, so the two cannot
+ * be bridged by casting the function pointer:
+ *
+ *   sc_data_info_t     32 bytes, len is uint32_t at offset 24, codec at 28
+ *   hsdaoh_data_info_t 48 bytes, len is size_t   at offset 24
+ *
+ * Reading len through the hsdaoh view therefore returns (codec << 32) | len --
+ * observed as 6222098200930330624 for a 829440-byte YUYV frame -- and every
+ * field past it (stream_id, srate, device_error at offset 44) lies beyond the
+ * end of the smaller struct. Convert explicitly instead, as the GUI already
+ * does in gui_simple_capture_callback. */
+static void cli_simple_capture_callback(sc_data_info_t *sc_info)
+{
+	if (!sc_info)
+		return;
+
+	hsdaoh_data_info_t info;
+	memset(&info, 0, sizeof(info));
+	info.ctx = sc_info->ctx;
+	info.buf = (unsigned char *)sc_info->data;
+	info.width = sc_info->width;
+	info.height = sc_info->height;
+	info.len = sc_info->len;
+
+	hsdaoh_callback(&info);
 }
 
 int audio_file_writer(void *ctx)
@@ -1256,7 +1311,7 @@ int main(int argc, char **argv)
 
 	if (sc_dev_name) {
 		proc_set_priority(PROC_PRIORITY_ABOVE);
-		r = sc_start_capture(sc_dev_name, 1920, 1080, SC_CODEC_YUYV, 60, 1, (sc_frame_callback_t)hsdaoh_callback, &cap_ctx, &sc_dev);
+		r = sc_start_capture(sc_dev_name, 1920, 1080, SC_CODEC_YUYV, 60, 1, cli_simple_capture_callback, &cap_ctx, &sc_dev);
 		if (r < 0) {
 			fprintf(stderr, "Failed to open %s device %s.\n", sc_get_impl_name(), sc_dev_name);
 			proc_set_priority(PROC_PRIORITY_NORMAL);

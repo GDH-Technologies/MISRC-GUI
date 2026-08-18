@@ -7,6 +7,7 @@
  */
 
 #include "gui_vhs_fm.h"
+#include "../visualization/gui_panel.h"
 #include "../visualization/gui_text.h"
 #include "../../common/threading.h"
 
@@ -979,18 +980,8 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float 
     }
     UpdateTexture(decoder->frame_texture, decoder->frame_image.data);
 
-    float aspect = 4.0f / 3.0f;
-    float display_aspect = width / height;
-    float draw_w, draw_h;
-    if (display_aspect > aspect) {
-        draw_h = height;
-        draw_w = height * aspect;
-    } else {
-        draw_w = width;
-        draw_h = width / aspect;
-    }
-    float draw_x = x + (width - draw_w) * 0.5f;
-    float draw_y = y + (height - draw_h) * 0.5f;
+    Rectangle fit = gui_panel_aspect_fit((Rectangle){ x, y, width, height }, 4.0f / 3.0f);
+    float draw_x = fit.x, draw_y = fit.y, draw_w = fit.width, draw_h = fit.height;
 
     Rectangle src = {0, 0, (float)VHS_PREVIEW_WIDTH, (float)frame_h};
     Rectangle dst = {draw_x, draw_y, draw_w, draw_h};

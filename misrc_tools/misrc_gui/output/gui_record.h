@@ -83,4 +83,11 @@ bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,
 // Returns false when output_path is unset or the filesystem query fails.
 bool gui_record_get_output_free_space_bytes(const gui_app_t *app, uint64_t *free_bytes_out);
 
+/* Headless check that the two auto-name functions have not drifted. */
+int gui_record_name_test_main(void);
+
+int gui_record_video_settings_test_main(void);
+
+int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video, bool use_flac);
+
 #endif // GUI_RECORD_H

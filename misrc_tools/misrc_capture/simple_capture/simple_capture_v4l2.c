@@ -188,6 +188,25 @@ int sc_start_capture(const char* device_id, uint32_t width, uint32_t height, sc_
 	fmt.fmt.pix.field = V4L2_FIELD_ANY;
 	if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) { close(fd); return -1; }
 
+	/* VIDIOC_S_FMT is _IOWR: the driver clamps to the nearest format it can do
+	 * and writes the result back. Adopt the geometry it actually negotiated --
+	 * storing the *requested* size instead (as this did previously) hands the
+	 * frame callback a buffer labelled larger than it is, and the metadata
+	 * extractor then reads far past the end of the mmap. The MediaFoundation
+	 * backend already does this readback; V4L2 was the odd one out.
+	 *
+	 * The pixel format is a different matter: every consumer of sc_data_info_t
+	 * assumes the codec it asked for, so a silent substitution would feed
+	 * garbage downstream with no explanation. Fail the open instead. */
+	if (fmt.fmt.pix.pixelformat != (uint32_t)codec) { close(fd); return -1; }
+	if (fmt.fmt.pix.width != width || fmt.fmt.pix.height != height) {
+		fprintf(stderr, "[v4l2] %s: requested %ux%u, driver negotiated %ux%u\n",
+		        device_id, width, height, fmt.fmt.pix.width, fmt.fmt.pix.height);
+	}
+	width  = fmt.fmt.pix.width;
+	height = fmt.fmt.pix.height;
+	if (width == 0 || height == 0) { close(fd); return -1; }
+
 	struct v4l2_streamparm parm;
 	memset(&parm, 0, sizeof(parm));
 	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;

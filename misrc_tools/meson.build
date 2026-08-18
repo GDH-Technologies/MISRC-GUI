@@ -1,6 +1,8 @@
 project('MISRC', 'c',
         default_options: ['c_std=c11', 'buildtype=release', 'b_lto=true'],
-        meson_version: '>=0.54')
+        # 0.57 is the real floor, not 0.54: the vendored-hsdaoh probe below
+        # calls run_command(..., env: {...}), which 0.54 does not support.
+        meson_version: '>=0.57')
 
 
 version_target = vcs_tag(command: ['git-version.sh'], fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
@@ -129,15 +131,37 @@ endif
 # from an old `make install`). Fall back to pkg-config only if the vendored
 # install is absent, and warn loudly there so the gap is visible.
 fs = import('fs')
-hsdaoh_vendored_pc = meson.current_source_dir() / '..' / '.deps' / 'install' / 'lib' / 'pkgconfig' / 'hsdaoh.pc'
-if fs.exists(hsdaoh_vendored_pc)
-  vendored_pc_dir = meson.current_source_dir() / '..' / '.deps' / 'install' / 'lib' / 'pkgconfig'
-  hs_cflags = run_command('pkg-config', '--cflags', 'hsdaoh',
+hsdaoh_deps_root = meson.current_source_dir() / '..' / '.deps' / 'install'
+
+# The vendored install lands in 'lib' on Debian/CI but 'lib64' on Fedora and
+# other GNUInstallDirs-multilib distros, and CMake names the file libhsdaoh.pc
+# while pkg-config is asked for 'hsdaoh'. Probe every combination rather than
+# assuming CI's, so a native distro build takes the vendored branch too.
+vendored_pc_dir = ''
+hsdaoh_pc_name = ''
+foreach _libdir : ['lib', 'lib64']
+  foreach _pc : ['hsdaoh', 'libhsdaoh']
+    if vendored_pc_dir == '' and fs.exists(hsdaoh_deps_root / _libdir / 'pkgconfig' / (_pc + '.pc'))
+      vendored_pc_dir = hsdaoh_deps_root / _libdir / 'pkgconfig'
+      hsdaoh_pc_name = _pc
+    endif
+  endforeach
+endforeach
+
+if vendored_pc_dir != ''
+  hs_cflags = run_command('pkg-config', '--cflags', hsdaoh_pc_name,
                           env: {'PKG_CONFIG_PATH': vendored_pc_dir}, check: true).stdout().strip().split()
-  hs_libs = run_command('pkg-config', '--libs', 'hsdaoh',
+  hs_libs = run_command('pkg-config', '--libs', hsdaoh_pc_name,
                         env: {'PKG_CONFIG_PATH': vendored_pc_dir}, check: true).stdout().strip().split()
-  hsdaoh_libdir = run_command('pkg-config', '--variable=libdir', 'hsdaoh',
+  hsdaoh_libdir = run_command('pkg-config', '--variable=libdir', hsdaoh_pc_name,
                               env: {'PKG_CONFIG_PATH': vendored_pc_dir}, check: true).stdout().strip()
+  # hsdaoh's CMakeLists hardcodes libdir=${exec_prefix}/lib in the generated .pc
+  # regardless of CMAKE_INSTALL_LIBDIR, so on a lib64 install that path does not
+  # exist. Fall back to the directory that actually holds the .pc file.
+  if not fs.exists(hsdaoh_libdir)
+    hsdaoh_libdir = vendored_pc_dir / '..'
+    message('hsdaoh .pc declares a libdir that does not exist; using ' + hsdaoh_libdir)
+  endif
   hsdaoh_dep = declare_dependency(
     compile_args: hs_cflags,
     link_args: hs_libs + ['-Wl,-rpath,' + hsdaoh_libdir],
@@ -250,8 +274,10 @@ if libusb_common_dep.found()
   cflags += ['-DENABLE_FX3=1']
   fx3_enabled = true
   message('Vendored cyusb shim + libusb-1.0 found, building with FX3 support')
+elif get_option('fx3').enabled()
+  error('FX3 support was requested (-Dfx3=enabled) but libusb-1.0 was not found. Install libusb-1.0 development headers (Fedora: libusb1-devel) and reconfigure.')
 else
-  message('libusb-1.0 not found, building without FX3 support')
+  message('libusb-1.0 not found, building without FX3 support. Use -Dfx3=enabled to make this a hard error.')
 endif
 
 # DdD (DomesdayDuplicator) support (optional, uses libusb on all platforms)
@@ -264,8 +290,10 @@ if libusb_common_dep.found()
   cflags += ['-DENABLE_DDD=1']
   ddd_enabled = true
   message('libusb-1.0 found, building with DdD support')
+elif get_option('ddd').enabled()
+  error('DdD support was requested (-Dddd=enabled) but libusb-1.0 was not found. Install libusb-1.0 development headers (Fedora: libusb1-devel) and reconfigure.')
 else
-  message('libusb-1.0 not found, building without DdD support')
+  message('libusb-1.0 not found, building without DdD support. Use -Dddd=enabled to make this a hard error.')
 endif
 
 
@@ -318,7 +346,10 @@ executable('misrc_capture',
               install: true)
 
 # GUI application (requires raylib)
-raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
+# `required:` takes the feature object directly, so -Dmisrc_gui=enabled turns a
+# missing raylib into a configure error instead of a silently undefined target
+# that only surfaces as "unknown target misrc_gui" at compile time.
+raylib_dep = dependency('raylib', required: get_option('misrc_gui'), static: windows_static_deps)
 
 if raylib_dep.found()
   if not fftw3f_dep.found()
@@ -331,8 +362,10 @@ if raylib_dep.found()
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
+    'misrc_gui/input/gui_cxadc_params.c',
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
+    'misrc_gui/input/gui_preview_v4l2.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
@@ -351,6 +384,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_text.c',
     'misrc_gui/visualization/gui_vu_meter.c',
     'misrc_gui/visualization/panel_registry.c',
+    'misrc_gui/visualization/gui_preview_panel.c',
     # UI
     'misrc_gui/ui/gui_ui.c',
     'misrc_gui/ui/gui_dropdown.c',
@@ -358,6 +392,7 @@ if raylib_dep.found()
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Output
     'misrc_gui/output/gui_record.c',
+    'misrc_gui/output/gui_video_record.c',
     'misrc_gui/output/gui_audio.c',
     'common/extract.c',
     'common/ringbuffer.c',
@@ -435,5 +470,6 @@ if raylib_dep.found()
 
   message('raylib found, building GUI application')
 else
-  message('raylib not found, skipping GUI application')
+  message('raylib not found, skipping GUI application. ' +
+          'Reconfigure with -Dmisrc_gui=enabled to make this a hard error instead.')
 endif
