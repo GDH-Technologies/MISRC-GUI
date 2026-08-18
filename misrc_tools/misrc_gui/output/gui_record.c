@@ -427,6 +427,19 @@ struct writer_ctx {
     gui_record_session_t *ses;      // Owning recording session
 };
 
+#define GUI_RECORD_SPILL_CHANNELS 2
+
+typedef struct {
+    FILE *fp;
+    char path[512];
+    atomic_uint_fast64_t write_offset;
+    atomic_uint_fast64_t read_offset;
+    atomic_uint_fast64_t last_backlog_log_mark;
+    atomic_bool forced_mode;
+    atomic_bool opened;
+    atomic_flag io_lock;
+} gui_record_spill_channel_t;
+
 /* All state one recording needs through finalize. Heap-allocated at record
  * start, handed to the finalize thread at stop, freed once finalize is
  * reaped -- so a new recording can start while the previous one finalizes. */
@@ -456,14 +469,44 @@ struct gui_record_session {
     FILE *log_file;
     char log_path[512];
 
+    /* Spill temp-file state and per-channel output write-error flags. */
+    gui_record_spill_channel_t spill[GUI_RECORD_SPILL_CHANNELS];
+    atomic_bool write_error[GUI_RECORD_SPILL_CHANNELS];
+
+    /* Byte totals accumulated by this session's writer threads (survive a new
+     * recording resetting the app-level display atomics). */
+    atomic_uint_fast64_t acc_raw[GUI_RECORD_SPILL_CHANNELS];
+    atomic_uint_fast64_t acc_comp[GUI_RECORD_SPILL_CHANNELS];
+
     double recording_start_time;
     double stop_request_time;
     uint32_t start_rec_a_waits, start_rec_a_drops;
     uint32_t start_rec_b_waits, start_rec_b_drops;
+    uint32_t end_rec_a_waits, end_rec_a_drops;
+    uint32_t end_rec_b_waits, end_rec_b_drops;
 };
 
 static gui_record_session_t *s_active = NULL;      /* recording in progress */
 static gui_record_session_t *s_finalizing = NULL;  /* handed to finalize thread */
+
+/* Explicitly initialize a freshly calloc'd session's atomics (atomic_flag has
+ * no portable zero-initialized state). */
+static void gui_record_session_init_sync(gui_record_session_t *ses) {
+    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
+        atomic_flag_clear(&ses->spill[i].io_lock);
+        atomic_store(&ses->spill[i].opened, false);
+        atomic_store(&ses->spill[i].forced_mode, false);
+        atomic_store(&ses->spill[i].write_offset, 0);
+        atomic_store(&ses->spill[i].read_offset, 0);
+        atomic_store(&ses->spill[i].last_backlog_log_mark, 0);
+        ses->spill[i].fp = NULL;
+        ses->spill[i].path[0] = '\0';
+        atomic_store(&ses->write_error[i], false);
+        atomic_store(&ses->acc_raw[i], 0);
+        atomic_store(&ses->acc_comp[i], 0);
+    }
+    atomic_store(&ses->recording, false);
+}
 
 static void gui_record_log_lock(void) {
     while (atomic_flag_test_and_set(&s_capture_log_lock)) {
@@ -570,7 +613,6 @@ static bool gui_record_collect_finalize_if_done(void) {
     return true;
 }
 
-#define GUI_RECORD_SPILL_CHANNELS 2
 #define GUI_RECORD_SPILL_LOG_STEP_BYTES ((uint64_t)256 * 1024 * 1024)
 #define GUI_RECORD_DISK_GUARD_CHECK_INTERVAL_MS 1000ULL
 #define GUI_RECORD_DISK_GUARD_MIN_HEADROOM_BYTES ((uint64_t)2 * 1000 * 1000 * 1000)
@@ -582,27 +624,6 @@ static atomic_uint_fast64_t s_disk_guard_last_free_bytes = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_last_output_bytes = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_output_rate_bps = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_last_required_bytes = ATOMIC_VAR_INIT(0);
-
-typedef struct {
-    FILE *fp;
-    char path[512];
-    atomic_uint_fast64_t write_offset;
-    atomic_uint_fast64_t read_offset;
-    atomic_uint_fast64_t last_backlog_log_mark;
-    atomic_bool forced_mode;
-    atomic_bool opened;
-    atomic_flag io_lock;
-} gui_record_spill_channel_t;
-
-static gui_record_spill_channel_t s_record_spill[GUI_RECORD_SPILL_CHANNELS];
-
-// Per-channel output-file write error flags. Set by the writer threads when
-// the FLAC encoder or RAW fwrite fails (e.g. file locked by another app for
-// viewing). When set, the writer spills raw data to the temp file to protect
-// the capture, and the UI flashes the finalizing icon at capture stop.
-static atomic_bool s_record_write_error[GUI_RECORD_SPILL_CHANNELS] = {
-    ATOMIC_VAR_INIT(false), ATOMIC_VAR_INIT(false)
-};
 
 static const char *gui_record_spill_channel_name(int channel) {
     return (channel == 0) ? "A" : "B";
@@ -692,12 +713,12 @@ static bool gui_record_spill_open_channel_in_dir(const char *base_dir,
 }
 #endif
 
-static bool gui_record_spill_open_channel(gui_app_t *app, int channel, char *error_msg, size_t error_msg_size) {
+static bool gui_record_spill_open_channel(gui_record_session_t *ses, gui_app_t *app, int channel, char *error_msg, size_t error_msg_size) {
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (atomic_load(&spill->opened)) {
         return true;
     }
@@ -756,12 +777,12 @@ static bool gui_record_spill_open_channel(gui_app_t *app, int channel, char *err
     return true;
 }
 
-static void gui_record_spill_close_channel(int channel) {
+static void gui_record_spill_close_channel(gui_record_session_t *ses, int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     FILE *fp = spill->fp;
     spill->fp = NULL;
     if (fp) {
@@ -780,24 +801,27 @@ static void gui_record_spill_close_channel(int channel) {
     atomic_store(&spill->opened, false);
 }
 
-static void gui_record_spill_reset_all(void) {
+static void gui_record_spill_reset_all(gui_record_session_t *ses) {
+    if (!ses) return;
     for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        atomic_flag_clear(&s_record_spill[i].io_lock);
-        gui_record_spill_close_channel(i);
+        atomic_flag_clear(&ses->spill[i].io_lock);
+        gui_record_spill_close_channel(ses, i);
     }
 }
 
-static uint64_t gui_record_spill_backlog_bytes_locked(int channel) {
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+static uint64_t gui_record_spill_backlog_bytes_locked(gui_record_session_t *ses, int channel) {
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     uint64_t write_off = atomic_load(&spill->write_offset);
     uint64_t read_off = atomic_load(&spill->read_offset);
     return (write_off >= read_off) ? (write_off - read_off) : 0;
 }
 
 static uint64_t gui_record_spill_backlog_total_bytes(void) {
+    gui_record_session_t *ses = s_active;
+    if (!ses) return 0;
     uint64_t total = 0;
     for (int channel = 0; channel < GUI_RECORD_SPILL_CHANNELS; channel++) {
-        total += gui_record_spill_backlog_bytes_locked(channel);
+        total += gui_record_spill_backlog_bytes_locked(ses, channel);
     }
     return total;
 }
@@ -847,12 +871,12 @@ static uint64_t gui_record_estimate_output_bytes_from_raw_backlog(const gui_app_
     }
     return (uint64_t)estimate;
 }
-static void gui_record_spill_recycle_if_drained(int channel) {
+static void gui_record_spill_recycle_if_drained(gui_record_session_t *ses, int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (!atomic_load(&spill->opened) || !spill->fp) {
         return;
     }
@@ -896,12 +920,12 @@ static void gui_record_spill_recycle_if_drained(int channel) {
     gui_record_spill_unlock(spill);
 }
 
-static bool gui_record_spill_read_block(int channel, int16_t *dst, size_t bytes) {
+static bool gui_record_spill_read_block(gui_record_session_t *ses, int channel, int16_t *dst, size_t bytes) {
     if (!gui_record_spill_valid_channel(channel) || !dst || bytes == 0) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (!atomic_load(&spill->opened) || !spill->fp) {
         return false;
     }
@@ -926,7 +950,7 @@ static bool gui_record_spill_read_block(int channel, int16_t *dst, size_t bytes)
 
     if (ok) {
         atomic_store(&spill->read_offset, read_off + bytes);
-        gui_record_spill_recycle_if_drained(channel);
+        gui_record_spill_recycle_if_drained(ses, channel);
     }
 
     return ok;
@@ -936,7 +960,9 @@ bool gui_record_spill_is_forced(int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
     }
-    return atomic_load(&s_record_spill[channel].forced_mode);
+    gui_record_session_t *ses = s_active;
+    if (!ses) return false;
+    return atomic_load(&ses->spill[channel].forced_mode);
 }
 
 void gui_record_spill_clear_forced(int channel) {
@@ -947,7 +973,10 @@ void gui_record_spill_clear_forced(int channel) {
     // ringbuffer writes. The spill temp file itself is recycled by the
     // existing gui_record_spill_recycle_if_drained() path once the
     // writer thread drains it.
-    atomic_store(&s_record_spill[channel].forced_mode, false);
+    gui_record_session_t *ses = s_active;
+    if (ses) {
+        atomic_store(&ses->spill[channel].forced_mode, false);
+    }
 }
 
 bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *samples, size_t bytes,
@@ -959,11 +988,18 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
         return false;
     }
 
-    if (!gui_record_spill_open_channel(app, channel, error_msg, error_msg_size)) {
+    gui_record_session_t *ses = s_active;
+    if (!ses) {
+        if (error_msg && error_msg_size > 0) {
+            snprintf(error_msg, error_msg_size, "No active recording session for spill");
+        }
+        return false;
+    }
+    if (!gui_record_spill_open_channel(ses, app, channel, error_msg, error_msg_size)) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     bool first_force = !atomic_exchange(&spill->forced_mode, true);
     if (first_force && app) {
         char msg[640];
@@ -996,7 +1032,7 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
     }
 
     atomic_store(&spill->write_offset, write_off + bytes);
-    uint64_t backlog = gui_record_spill_backlog_bytes_locked(channel);
+    uint64_t backlog = gui_record_spill_backlog_bytes_locked(ses, channel);
     uint64_t mark = backlog / GUI_RECORD_SPILL_LOG_STEP_BYTES;
     uint64_t last_mark = atomic_load(&spill->last_backlog_log_mark);
     if (mark > last_mark) {
@@ -1083,11 +1119,18 @@ static void gui_flac_error_callback(void *user_data, flac_writer_error_t error, 
     fprintf(stderr, "FLAC ERROR: %s\n", message);
 }
 
-// Bytes written callback for compression ratio tracking
+// Bytes written callback for compression ratio tracking. Accumulates into the
+// session (survives a new recording resetting the app atomics) and mirrors the
+// app-level atomic that feeds the live ratio display.
 static void gui_flac_bytes_callback(void *user_data, size_t bytes_written) {
     writer_ctx_t *wctx = (writer_ctx_t *)user_data;
     if (wctx && wctx->compressed_bytes) {
         atomic_fetch_add(wctx->compressed_bytes, bytes_written);
+    }
+    if (wctx && wctx->app) {
+        atomic_fetch_add((wctx->channel == 0) ? &wctx->app->recording_compressed_a
+                                              : &wctx->app->recording_compressed_b,
+                         bytes_written);
     }
 }
 static inline int8_t gui_record_sample_12bit_to_i8(int16_t sample) {
@@ -1141,7 +1184,7 @@ static bool gui_record_get_next_block(writer_ctx_t *wctx, size_t block_bytes, in
         return true;
     }
 
-    if (gui_record_spill_read_block(wctx->channel, spill_block, block_bytes)) {
+    if (gui_record_spill_read_block(wctx->ses, wctx->channel, spill_block, block_bytes)) {
         *out_samples = spill_block;
         *from_ringbuffer = false;
         return true;
@@ -1282,7 +1325,7 @@ static int flac_writer_thread(void *ctx) {
         // next flac_writer_process call's write callback will succeed and
         // encoding resumes (recovery detected below).
         if (encode_failed) {
-            atomic_store(&s_record_write_error[wctx->channel], true);
+            atomic_store(&wctx->ses->write_error[wctx->channel], true);
             if (from_ringbuffer && wctx->app) {
                 // Spill the raw block before marking it consumed (the
                 // ringbuffer memory is still valid here). Blocks that came
@@ -1305,8 +1348,8 @@ static int flac_writer_thread(void *ctx) {
 
         // Encode succeeded. If we were previously in a write-error state,
         // clear the flag and log recovery so the UI stops flashing.
-        if (atomic_load(&s_record_write_error[wctx->channel])) {
-            atomic_store(&s_record_write_error[wctx->channel], false);
+        if (atomic_load(&wctx->ses->write_error[wctx->channel])) {
+            atomic_store(&wctx->ses->write_error[wctx->channel], false);
             flac_encoder_error_logged = false;
             fprintf(stderr, "[FLAC] Channel %c write recovered\n",
                     wctx->channel == 0 ? 'A' : 'B');
@@ -1326,8 +1369,10 @@ static int flac_writer_thread(void *ctx) {
             atomic_fetch_add(&wctx->app->recording_bytes, len);
             if (wctx->channel == 0) {
                 atomic_fetch_add(&wctx->app->recording_raw_a, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->ses->acc_raw[0], raw_bytes_per_block);
             } else {
                 atomic_fetch_add(&wctx->app->recording_raw_b, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->ses->acc_raw[1], raw_bytes_per_block);
             }
         }
     }
@@ -1443,7 +1488,7 @@ static int raw_writer_thread(void *ctx) {
                 if (written == retry_bytes && !ferror(wctx->file)) {
                     // Write recovered — resume normal operation.
                     write_error = false;
-                    atomic_store(&s_record_write_error[wctx->channel], false);
+                    atomic_store(&wctx->ses->write_error[wctx->channel], false);
                     fprintf(stderr, "[RAW] Channel %c write recovered\n",
                             wctx->channel == 0 ? 'A' : 'B');
                     if (wctx->app) {
@@ -1456,8 +1501,10 @@ static int raw_writer_thread(void *ctx) {
                         atomic_fetch_add(&wctx->app->recording_bytes, in_len);
                         if (wctx->channel == 0) {
                             atomic_fetch_add(&wctx->app->recording_raw_a, in_len);
+                            atomic_fetch_add(&wctx->ses->acc_raw[0], in_len);
                         } else {
                             atomic_fetch_add(&wctx->app->recording_raw_b, in_len);
+                            atomic_fetch_add(&wctx->ses->acc_raw[1], in_len);
                         }
                     }
                     continue;
@@ -1527,7 +1574,7 @@ static int raw_writer_thread(void *ctx) {
             // viewing). Enter write-error state, spill the block to the
             // temp file to preserve the data, and keep the capture running.
             write_error = true;
-            atomic_store(&s_record_write_error[wctx->channel], true);
+            atomic_store(&wctx->ses->write_error[wctx->channel], true);
             clearerr(wctx->file);
             raw_write_err_count++;
             if (raw_write_err_count <= 5 || (raw_write_err_count % 1000) == 0) {
@@ -1555,8 +1602,10 @@ static int raw_writer_thread(void *ctx) {
             atomic_fetch_add(&wctx->app->recording_bytes, in_len);
             if (wctx->channel == 0) {
                 atomic_fetch_add(&wctx->app->recording_raw_a, in_len);
+                atomic_fetch_add(&wctx->ses->acc_raw[0], in_len);
             } else {
                 atomic_fetch_add(&wctx->app->recording_raw_b, in_len);
+                atomic_fetch_add(&wctx->ses->acc_raw[1], in_len);
             }
         }
     }
@@ -1581,7 +1630,6 @@ void gui_record_init(void) {
     atomic_store(&s_record_stop_finalizing, false);
     atomic_store(&s_record_stop_finalize_done, false);
     gui_record_reset_disk_guard_state();
-    gui_record_spill_reset_all();
 }
 
 // Cleanup recording subsystem
@@ -1598,7 +1646,6 @@ void gui_record_cleanup(void) {
         s_finalizing = NULL;
     }
     gui_record_reset_disk_guard_state();
-    gui_record_spill_reset_all();
     gui_record_close_session_log();
 }
 
@@ -1609,9 +1656,13 @@ bool gui_record_is_active(void) {
 
 // Check if any recording channel has a persistent output-file write error.
 bool gui_record_has_write_error(void) {
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        if (atomic_load(&s_record_write_error[i])) {
-            return true;
+    gui_record_session_t *sessions[2] = { s_active, s_finalizing };
+    for (int s = 0; s < 2; s++) {
+        if (!sessions[s]) continue;
+        for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
+            if (atomic_load(&sessions[s]->write_error[i])) {
+                return true;
+            }
         }
     }
     return false;
@@ -2752,11 +2803,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     atomic_store(&app->recording_compressed_a, 0);
     atomic_store(&app->recording_compressed_b, 0);
     app->last_recording_duration_s = 0.0;
-    gui_record_spill_reset_all();
-    // Clear per-channel write-error flags for the new recording session.
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        atomic_store(&s_record_write_error[i], false);
-    }
+    gui_record_session_init_sync(ses);
 
     // Reset record buffers before starting
     gui_extract_reset_record_rbs(app);
@@ -2790,7 +2837,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_a.buf_id = BUF_RECORD_A;
         ses->ctx_a.file = ses->file_a;
         ses->ctx_a.channel = 0;
-        ses->ctx_a.compressed_bytes = &app->recording_compressed_a;
+        ses->ctx_a.compressed_bytes = &ses->acc_comp[0];
         ses->ctx_a.flac_bits_per_sample = bits_a;
         ses->ctx_a.rf_bits = bits_a;
         ses->ctx_a.raw_bytes_per_sample = 2;  // input blocks are int16
@@ -2809,7 +2856,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_b.buf_id = BUF_RECORD_B;
         ses->ctx_b.file = ses->file_b;
         ses->ctx_b.channel = 1;
-        ses->ctx_b.compressed_bytes = &app->recording_compressed_b;
+        ses->ctx_b.compressed_bytes = &ses->acc_comp[1];
         ses->ctx_b.flac_bits_per_sample = bits_b;
         ses->ctx_b.rf_bits = bits_b;
         ses->ctx_b.raw_bytes_per_sample = 2;  // input blocks are int16
@@ -3171,7 +3218,7 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     {
         ses->writer_threads_running = false;
     }
-    gui_record_spill_reset_all();
+    gui_record_spill_reset_all(ses);
 
     // Alert the user if a persistent output-file write error was active
     // during recording (e.g. file locked by another app for viewing). The
@@ -3241,21 +3288,17 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     if (processing_duration < 0.0) processing_duration = 0.0;
     if (total_duration < 0.0) total_duration = 0.0;
     app->last_recording_duration_s = capture_duration;
-    uint64_t raw_a = atomic_load(&app->recording_raw_a);
-    uint64_t raw_b = atomic_load(&app->recording_raw_b);
-    uint64_t comp_a = atomic_load(&app->recording_compressed_a);
-    uint64_t comp_b = atomic_load(&app->recording_compressed_b);
+    uint64_t raw_a = atomic_load(&ses->acc_raw[0]);
+    uint64_t raw_b = atomic_load(&ses->acc_raw[1]);
+    uint64_t comp_a = atomic_load(&ses->acc_comp[0]);
+    uint64_t comp_b = atomic_load(&ses->acc_comp[1]);
     uint64_t raw_total = raw_a + raw_b;
     uint64_t comp_total = comp_a + comp_b;
     double ratio_total = (comp_total > 0) ? ((double)raw_total / (double)comp_total) : 0.0;
-    uint32_t end_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
-    uint32_t end_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
-    uint32_t end_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
-    uint32_t end_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
-    uint32_t rec_a_waits = end_rec_a_waits - ses->start_rec_a_waits;
-    uint32_t rec_a_drops = end_rec_a_drops - ses->start_rec_a_drops;
-    uint32_t rec_b_waits = end_rec_b_waits - ses->start_rec_b_waits;
-    uint32_t rec_b_drops = end_rec_b_drops - ses->start_rec_b_drops;
+    uint32_t rec_a_waits = ses->end_rec_a_waits - ses->start_rec_a_waits;
+    uint32_t rec_a_drops = ses->end_rec_a_drops - ses->start_rec_a_drops;
+    uint32_t rec_b_waits = ses->end_rec_b_waits - ses->start_rec_b_waits;
+    uint32_t rec_b_drops = ses->end_rec_b_drops - ses->start_rec_b_drops;
     uint32_t rec_waits = rec_a_waits + rec_b_waits;
     uint32_t rec_drops = rec_a_drops + rec_b_drops;
 
@@ -3328,6 +3371,13 @@ void gui_record_stop(gui_app_t *app) {
     }
     gui_record_reset_disk_guard_state();
     ses->stop_request_time = GetTime();
+
+    // Snapshot buffer-stat counters NOW: a new recording keeps incrementing
+    // the shared buffer-manager counters while this session finalizes.
+    ses->end_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+    ses->end_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+    ses->end_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+    ses->end_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
 
     // Disable recording in extraction thread first.
     gui_extract_set_recording(false, false, 16, 16);
