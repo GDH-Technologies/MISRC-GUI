@@ -64,7 +64,12 @@ static struct {
 
     char ffmpeg_log[600];
     preview_tap_t tap;
+    atomic_bool drain_abandoned;   /* the child stopped reading; do not wait on it */
+    double      stop_at;           /* when a stop was asked for; published before run=false */
 } vr;
+
+static vr_inject_t s_inject = VR_INJECT_NONE;
+void gui_video_record_set_inject(vr_inject_t what) { s_inject = what; }
 
 /* ffmpeg probe cache */
 static struct {
@@ -274,6 +279,23 @@ static bool vr_send_all(const uint8_t *buf, size_t len)
         ssize_t n = send(vr.sock, buf + sent, len - sent, MSG_NOSIGNAL);
         if (n > 0) { sent += (size_t)n; continue; }
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* SO_SNDTIMEO fired: the encoder is not draining. While the
+             * recording is live that is ordinary backpressure, so keep trying.
+             *
+             * The stop state has to be read HERE, live, on every timeout. A
+             * deadline captured before the send began is useless: a send that
+             * was already blocked when the stop arrived would never learn one
+             * exists, and the writer would loop on 200ms timeouts forever
+             * while finalize waited on its join. */
+            if (!atomic_load_explicit(&vr.run, memory_order_acquire) &&
+                vr_now() > vr.stop_at + VR_DRAIN_LIMIT_S) {
+                atomic_store(&vr.drain_abandoned, true);
+                vr_set_error("reference video encoder stopped reading; gave up draining", 0);
+                return false;
+            }
+            continue;
+        }
         vr_set_error("reference video encoder stopped reading", errno);
         return false;
     }
@@ -301,11 +323,12 @@ static void *vr_writer_thread(void *arg)
             continue;
         }
 
-        if (!running) {
-            /* Bound the drain so a stalled encoder cannot hold finalize open. */
-            if (drain_started == 0.0) drain_started = vr_now();
-            else if (vr_now() - drain_started > VR_DRAIN_LIMIT_S) break;
-        }
+        /* Bound the drain so a stalled encoder cannot hold finalize open. The
+         * same deadline is re-checked inside vr_send_all on every send
+         * timeout, which is what covers a send that was already blocked when
+         * the stop arrived. */
+        if (!running && vr_now() > vr.stop_at + VR_DRAIN_LIMIT_S) break;
+        (void)drain_started;
 
         double now = vr_now();
         if (now - last_stat >= VR_STAT_INTERVAL_S) {
@@ -391,6 +414,10 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
         argv[n++] = (char *)"-g";       argv[n++] = (char *)"1";
         argv[n++] = (char *)"-slices";  argv[n++] = (char *)"4";
         argv[n++] = (char *)"-slicecrc";argv[n++] = (char *)"1";
+    } else if (s_inject == VR_INJECT_BAD_ARGS) {
+        /* A codec ffmpeg does not have: it must fail fast, with the reason in
+         * its own log, rather than hanging or half-writing a file. */
+        argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"no_such_codec_xyz";
     } else {
         argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"libx264";
         argv[n++] = (char *)"-preset";  argv[n++] = (char *)"veryfast";
@@ -447,6 +474,8 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
     vr.child_pid = 0;
     atomic_store(&vr.head, 0);
     atomic_store(&vr.tail, 0);
+    atomic_store(&vr.drain_abandoned, false);
+    vr.stop_at = 0.0;
     atomic_store(&vr.pending_dupes, 0);
     snprintf(vr.status.path, sizeof(vr.status.path), "%s", out_path);
     snprintf(vr.ffmpeg_log, sizeof(vr.ffmpeg_log), "%s.ffmpeg.log", out_path);
@@ -468,6 +497,12 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
      * round-trips to ffmpeg's read loop. */
     int want = VR_SNDBUF_BYTES;
     setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
+    /* Without a send timeout a stopped or wedged ffmpeg blocks the writer
+     * inside send() forever, where it can never observe the stop flag -- the
+     * drain deadline is checked at the top of the loop, which such a thread
+     * never reaches again. This is what makes the deadline reachable. */
+    struct timeval sndto = { 0, 200 * 1000 };
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
 
     vr.wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (vr.wake_fd < 0) {
@@ -538,7 +573,8 @@ void gui_video_record_request_stop(void)
 {
     if (!vr.thread_running) return;
     gui_preview_tap_remove();          /* returns once no tap call is in flight */
-    atomic_store(&vr.run, false);
+    vr.stop_at = vr_now();             /* published before the flag the writer reads */
+    atomic_store_explicit(&vr.run, false, memory_order_release);
     uint64_t one = 1;
     ssize_t w = write(vr.wake_fd, &one, sizeof(one));
     (void)w;
@@ -547,7 +583,10 @@ void gui_video_record_request_stop(void)
 static void vr_reap_child(void)
 {
     if (vr.child_pid <= 0) return;
-    double deadline = vr_now() + VR_REAP_LIMIT_S;
+    /* If the writer gave up draining, the child demonstrably is not reading, so
+     * there is nothing to wait politely for. */
+    double deadline = vr_now() +
+        (atomic_load(&vr.drain_abandoned) ? 0.0 : VR_REAP_LIMIT_S);
     int wstatus = 0;
 
     while (vr_now() < deadline) {
@@ -556,6 +595,9 @@ static void vr_reap_child(void)
         struct timespec ts = { 0, 10 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
+    /* SIGCONT first: a SIGSTOPped child queues SIGTERM and never acts on it,
+     * so without this the escalation would always fall through to SIGKILL. */
+    kill(vr.child_pid, SIGCONT);
     kill(vr.child_pid, SIGTERM);
     deadline = vr_now() + 2.0;
     while (vr_now() < deadline) {
@@ -588,7 +630,8 @@ void gui_video_record_finish(void)
     if (!vr.thread_running) return;
 
     gui_preview_tap_remove();
-    atomic_store(&vr.run, false);
+    if (vr.stop_at == 0.0) vr.stop_at = vr_now();
+    atomic_store_explicit(&vr.run, false, memory_order_release);
     uint64_t one = 1;
     ssize_t w = write(vr.wake_fd, &one, sizeof(one));
     (void)w;
@@ -634,11 +677,26 @@ int gui_video_record_probe_main(void)
     return ok ? 0 : 1;
 }
 
+static int s_inject_at = 0;
+
 int gui_video_record_test_main(const char *device, const char *out_path,
                               int seconds, const char *codec_name)
 {
     if (!out_path) { fprintf(stderr, "usage: --video-record-test <dev> <out.mkv> <secs> [x264|ffv1]\n"); return 2; }
-    video_codec_t codec = (codec_name && strcmp(codec_name, "ffv1") == 0)
+    char codec_buf[64] = {0};
+    if (codec_name) snprintf(codec_buf, sizeof(codec_buf), "%s", codec_name);
+    /* "x264", "ffv1", or "<codec>:kill@5" / ":hang@5" / ":bad-args" */
+    char *spec = strchr(codec_buf, ':');
+    if (spec) {
+        *spec++ = '\0';
+        char *at = strchr(spec, '@');
+        if (at) { *at++ = '\0'; s_inject_at = atoi(at); }
+        if      (strcmp(spec, "kill") == 0)     s_inject = VR_INJECT_KILL;
+        else if (strcmp(spec, "hang") == 0)     s_inject = VR_INJECT_HANG;
+        else if (strcmp(spec, "bad-args") == 0) s_inject = VR_INJECT_BAD_ARGS;
+        if (s_inject_at <= 0) s_inject_at = 5;
+    }
+    video_codec_t codec = (codec_buf[0] && strcmp(codec_buf, "ffv1") == 0)
                         ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264;
 
     gui_preview_init(NULL);
@@ -680,20 +738,34 @@ int gui_video_record_test_main(const char *device, const char *out_path,
            gui_video_record_get_status().child_pid);
 
     if (seconds <= 0) seconds = 10;
+    int child = gui_video_record_get_status().child_pid;
     /* Deliberately not a whole number of seconds: the frame period is 40ms and
      * sampling at an exact multiple aliases against it. */
     for (int i = 0; i < seconds; i++) {
         struct timespec ts = { 1, 7 * 1000 * 1000 };
         nanosleep(&ts, NULL);
+        if (s_inject_at > 0 && i + 1 == s_inject_at && child > 0) {
+            if (s_inject == VR_INJECT_KILL) {
+                printf("  >> SIGKILL ffmpeg (pid %d)\n", child);
+                kill(child, SIGKILL);
+            } else if (s_inject == VR_INJECT_HANG) {
+                printf("  >> SIGSTOP ffmpeg (pid %d) - stops reading from here on\n", child);
+                kill(child, SIGSTOP);
+            }
+        }
         gui_video_record_status_t vs = gui_video_record_get_status();
-        printf("  t=%2ds submitted=%llu written=%llu dropped=%llu duped=%llu bytes=%llu%s%s\n",
-               i + 1,
+        preview_status_t live = gui_preview_get_status();
+        /* The preview counter is the point of this line under injection: with
+         * ffmpeg hung it must keep climbing at 25fps while the video counters
+         * stall, which is what proves the capture thread is not blocked. */
+        printf("  t=%2ds preview=%llu @%.1ffps | submitted=%llu written=%llu dropped=%llu duped=%llu bytes=%llu%s%s\n",
+               i + 1, (unsigned long long)live.frames, live.fps_measured,
                (unsigned long long)vs.frames_submitted, (unsigned long long)vs.frames_written,
                (unsigned long long)vs.frames_dropped, (unsigned long long)vs.frames_duped,
                (unsigned long long)vs.output_bytes,
                vs.error ? "  err=" : "", vs.error ? vs.err_text : "");
         fflush(stdout);
-        if (vs.error) break;
+        if (vs.error && s_inject == VR_INJECT_NONE) break;
     }
 
     double t0 = vr_now();
@@ -702,6 +774,9 @@ int gui_video_record_test_main(const char *device, const char *out_path,
     double stop_s = vr_now() - t0;
 
     gui_video_record_status_t vs = gui_video_record_get_status();
+    /* Sample the preview BEFORE tearing it down: the whole point under
+     * injection is whether the capture thread survived the encoder dying. */
+    preview_status_t final_preview = gui_preview_get_status();
     gui_preview_disconnect();
     gui_preview_shutdown();
 
@@ -711,6 +786,32 @@ int gui_video_record_test_main(const char *device, const char *out_path,
            (unsigned long long)vs.frames_dropped, (unsigned long long)vs.frames_duped,
            (unsigned long long)vs.output_bytes);
     if (vs.error) printf("error: %s\n", vs.err_text);
+
+    if (s_inject != VR_INJECT_NONE) {
+        /* Under injection the interesting question is not "did it succeed" but
+         * "did it notice, did the capture thread survive, and is what landed on
+         * disk still usable". The normal assertions below would all fire by
+         * design, so they are skipped rather than reported as failures. */
+        const char *name = s_inject == VR_INJECT_KILL ? "kill"
+                         : s_inject == VR_INJECT_HANG ? "hang" : "bad-args";
+        printf("inject=%s detected=%s preview_state=%d preview_frames=%llu fps=%.1f\n",
+               name, vs.error ? "yes" : "no",
+               (int)final_preview.state,
+               (unsigned long long)final_preview.frames,
+               final_preview.fps_measured);
+        bool preview_survived = (final_preview.state == PREVIEW_STATE_STREAMING ||
+                                 final_preview.state == PREVIEW_STATE_STALLED);
+        if (!preview_survived) {
+            printf("FAIL: the capture thread did not survive the encoder fault\n");
+            return 1;
+        }
+        if (!vs.error) {
+            printf("FAIL: the fault went undetected\n");
+            return 1;
+        }
+        printf("injection test passed\n");
+        return 0;
+    }
 
     /* Assertions, so the harness can actually fail. Without these it reports
      * success for a run that wrote nothing at all. */
@@ -734,6 +835,7 @@ int gui_video_record_test_main(const char *device, const char *out_path,
         rc = 1;
     }
     if (vs.error) rc = 1;
+
     printf("%s\n", rc ? "VIDEO RECORD TEST FAILED" : "video record test passed");
     return rc;
 }

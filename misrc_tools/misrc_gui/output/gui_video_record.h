@@ -72,6 +72,16 @@ gui_video_record_status_t gui_video_record_get_status(void);
 uint64_t gui_video_record_output_bytes(void);
 bool     gui_video_record_is_running(void);
 
+/* Fault injection, test builds only: exercises the paths that matter most and
+ * are hardest to reach by hand. */
+typedef enum {
+    VR_INJECT_NONE = 0,
+    VR_INJECT_KILL,      /* SIGKILL ffmpeg mid-stream */
+    VR_INJECT_HANG,      /* SIGSTOP ffmpeg so it stops reading, forever */
+    VR_INJECT_BAD_ARGS   /* spawn ffmpeg with a codec it cannot honour */
+} vr_inject_t;
+void gui_video_record_set_inject(vr_inject_t what);
+
 /* Headless harness. */
 int gui_video_record_test_main(const char *device, const char *out_path,
                                int seconds, const char *codec_name);
