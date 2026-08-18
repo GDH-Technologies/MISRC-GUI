@@ -286,6 +286,12 @@ typedef struct {
     // after fixed RF/Audio/Display allocations; record buffers stay lazy.
     uint32_t memory_budget_gb;
 
+    // Update check metadata (GitHub releases). last_check_unix_s is persisted
+    // so the automatic checker runs at most once every 7 days.
+    uint64_t update_last_check_unix_s;
+    char update_last_release_tag[64];
+    bool update_available_cached;
+
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
     char playback_file_b[MAX_FILENAME_LEN];   // FLAC file for channel B playback

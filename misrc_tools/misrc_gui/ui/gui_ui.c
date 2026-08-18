@@ -18,6 +18,7 @@
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/threading.h"
 #include <clay.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -316,6 +317,306 @@ static double s_record_limit_deadline_s = 0.0;
 #if defined(__ANDROID__)
 static bool s_android_keyboard_visible = false;
 #endif
+// Update checker (GitHub release tag lookup).
+#define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
+#define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
+
+typedef struct {
+    bool manual;
+} gui_ui_update_check_task_t;
+
+static thrd_t s_update_check_thread;
+static bool s_update_check_thread_started = false;
+static atomic_bool s_update_check_running = false;
+static atomic_bool s_update_check_result_pending = false;
+static bool s_update_check_result_manual = false;
+static bool s_update_check_result_success = false;
+static char s_update_check_result_tag[64] = {0};
+static char s_update_check_result_error[160] = {0};
+
+static void gui_ui_trim_ascii_whitespace_inplace(char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+}
+
+static bool gui_ui_ci_starts_with(const char *value, const char *prefix)
+{
+    if (!value || !prefix) return false;
+    while (*prefix) {
+        if (!*value) return false;
+        if (tolower((unsigned char)*value) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+        value++;
+        prefix++;
+    }
+    return true;
+}
+
+static bool gui_ui_extract_release_tag_from_url(const char *url, char *tag_out, size_t tag_out_len)
+{
+    if (!url || !tag_out || tag_out_len == 0) return false;
+    tag_out[0] = '\0';
+    const char *marker = "/releases/tag/";
+    const char *start = strstr(url, marker);
+    if (!start) return false;
+    start += strlen(marker);
+    if (*start == '\0') return false;
+
+    size_t i = 0;
+    while (start[i] &&
+           !isspace((unsigned char)start[i]) &&
+           start[i] != '?' &&
+           start[i] != '#' &&
+           start[i] != '/') {
+        if (i + 1 >= tag_out_len) break;
+        tag_out[i] = start[i];
+        i++;
+    }
+    tag_out[i] = '\0';
+    return (i > 0);
+}
+
+static bool gui_ui_parse_semver_triplet(const char *version, int *major_out, int *minor_out, int *patch_out)
+{
+    if (!version || !major_out || !minor_out || !patch_out) return false;
+    const char *p = version;
+    if (*p == 'v' || *p == 'V') p++;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    char *end = NULL;
+    long major = strtol(p, &end, 10);
+    if (!end || end == p || *end != '.') return false;
+    p = end + 1;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    long minor = strtol(p, &end, 10);
+    if (!end || end == p || *end != '.') return false;
+    p = end + 1;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    long patch = strtol(p, &end, 10);
+    if (!end || end == p) return false;
+
+    *major_out = (int)major;
+    *minor_out = (int)minor;
+    *patch_out = (int)patch;
+    return true;
+}
+
+static int gui_ui_compare_versions(const char *current_version, const char *latest_version)
+{
+    int cmaj = 0, cmin = 0, cpat = 0;
+    int lmaj = 0, lmin = 0, lpat = 0;
+    bool current_ok = gui_ui_parse_semver_triplet(current_version, &cmaj, &cmin, &cpat);
+    bool latest_ok = gui_ui_parse_semver_triplet(latest_version, &lmaj, &lmin, &lpat);
+    if (current_ok && latest_ok) {
+        if (cmaj != lmaj) return (cmaj < lmaj) ? -1 : 1;
+        if (cmin != lmin) return (cmin < lmin) ? -1 : 1;
+        if (cpat != lpat) return (cpat < lpat) ? -1 : 1;
+        return 0;
+    }
+    int text_cmp = strcmp(current_version ? current_version : "",
+                          latest_version ? latest_version : "");
+    if (text_cmp < 0) return -1;
+    if (text_cmp > 0) return 1;
+    return 0;
+}
+
+static bool gui_ui_fetch_latest_release_tag(char *tag_out, size_t tag_out_len, char *error_out, size_t error_out_len)
+{
+    if (!tag_out || tag_out_len == 0 || !error_out || error_out_len == 0) return false;
+    tag_out[0] = '\0';
+    error_out[0] = '\0';
+
+#if defined(_WIN32)
+    const char *cmd = "curl.exe -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
+    FILE *fp = _popen(cmd, "r");
+#else
+    const char *cmd = "curl -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
+    FILE *fp = popen(cmd, "r");
+#endif
+    if (!fp) {
+        snprintf(error_out, error_out_len, "unable to launch curl");
+        return false;
+    }
+
+    char line[512];
+    char location[512] = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        gui_ui_trim_ascii_whitespace_inplace(line);
+        if (line[0] == '\0') continue;
+        if (gui_ui_ci_starts_with(line, "location:")) {
+            const char *value = line + 9;
+            while (*value && isspace((unsigned char)*value)) value++;
+            snprintf(location, sizeof(location), "%s", value);
+        }
+    }
+
+#if defined(_WIN32)
+    int rc = _pclose(fp);
+#else
+    int rc = pclose(fp);
+#endif
+
+    if (location[0] == '\0') {
+        if (rc != 0) {
+            snprintf(error_out, error_out_len, "curl request failed");
+        } else {
+            snprintf(error_out, error_out_len, "latest release redirect header missing");
+        }
+        return false;
+    }
+
+    if (!gui_ui_extract_release_tag_from_url(location, tag_out, tag_out_len)) {
+        snprintf(error_out, error_out_len, "unable to parse release tag");
+        return false;
+    }
+    return true;
+}
+
+static int gui_ui_update_check_thread_main(void *arg_ptr)
+{
+    gui_ui_update_check_task_t task = {0};
+    if (arg_ptr) {
+        task = *((gui_ui_update_check_task_t *)arg_ptr);
+        free(arg_ptr);
+    }
+
+    char latest_tag[64] = {0};
+    char error_text[160] = {0};
+    bool ok = gui_ui_fetch_latest_release_tag(latest_tag, sizeof(latest_tag), error_text, sizeof(error_text));
+
+    s_update_check_result_manual = task.manual;
+    s_update_check_result_success = ok;
+    if (ok) {
+        snprintf(s_update_check_result_tag, sizeof(s_update_check_result_tag), "%s", latest_tag);
+        s_update_check_result_error[0] = '\0';
+    } else {
+        s_update_check_result_tag[0] = '\0';
+        snprintf(s_update_check_result_error, sizeof(s_update_check_result_error), "%s",
+                 error_text[0] ? error_text : "unknown error");
+    }
+
+    atomic_store_explicit(&s_update_check_result_pending, true, memory_order_release);
+    atomic_store_explicit(&s_update_check_running, false, memory_order_release);
+    return 0;
+}
+
+static bool gui_ui_start_update_check(bool manual)
+{
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+        return false;
+    }
+    if (atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) {
+        return false;
+    }
+    gui_ui_update_check_task_t *task = (gui_ui_update_check_task_t *)malloc(sizeof(gui_ui_update_check_task_t));
+    if (!task) {
+        return false;
+    }
+    task->manual = manual;
+
+    atomic_store_explicit(&s_update_check_running, true, memory_order_release);
+    if (thrd_create_with_priority(&s_update_check_thread,
+                                  gui_ui_update_check_thread_main,
+                                  task,
+                                  THRD_PRIORITY_NORMAL) != thrd_success) {
+        atomic_store_explicit(&s_update_check_running, false, memory_order_release);
+        free(task);
+        return false;
+    }
+    s_update_check_thread_started = true;
+    return true;
+}
+
+static void gui_ui_join_update_check_thread_if_needed(void)
+{
+    if (!s_update_check_thread_started) return;
+    (void)thrd_join(s_update_check_thread, NULL);
+    s_update_check_thread_started = false;
+}
+
+static void gui_ui_process_update_check_result(gui_app_t *app)
+{
+    if (!app) return;
+    if (!atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) return;
+    atomic_store_explicit(&s_update_check_result_pending, false, memory_order_release);
+    gui_ui_join_update_check_thread_if_needed();
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    app->settings.update_last_check_unix_s = now_s;
+
+    if (s_update_check_result_success) {
+        snprintf(app->settings.update_last_release_tag,
+                 sizeof(app->settings.update_last_release_tag),
+                 "%s",
+                 s_update_check_result_tag);
+        int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        app->settings.update_available_cached = (cmp < 0);
+        gui_settings_save(&app->settings);
+
+        if (s_update_check_result_manual) {
+            char msg[196];
+            if (cmp < 0) {
+                snprintf(msg, sizeof(msg), "Update available: %s (current %s)",
+                         app->settings.update_last_release_tag, MIRSC_TOOLS_VERSION);
+            } else if (cmp == 0) {
+                snprintf(msg, sizeof(msg), "No update available (latest %s)",
+                         app->settings.update_last_release_tag);
+            } else {
+                snprintf(msg, sizeof(msg), "Running newer build than release %s",
+                         app->settings.update_last_release_tag);
+            }
+            gui_app_set_status(app, msg);
+        } else if (app->settings.update_available_cached) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Update available: %s", app->settings.update_last_release_tag);
+            gui_app_set_status(app, msg);
+        }
+    } else {
+        gui_settings_save(&app->settings);
+        if (s_update_check_result_manual) {
+            char msg[220];
+            snprintf(msg, sizeof(msg), "Update check failed: %s",
+                     s_update_check_result_error[0] ? s_update_check_result_error : "unknown error");
+            gui_app_set_status(app, msg);
+        }
+    }
+}
+
+static bool gui_ui_update_check_due(const gui_settings_t *settings, uint64_t now_s)
+{
+    if (!settings) return false;
+    if (settings->update_last_check_unix_s == 0) return true;
+    if (now_s < settings->update_last_check_unix_s) return true;
+    uint64_t elapsed = now_s - settings->update_last_check_unix_s;
+    return elapsed >= GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS;
+}
+
+static void gui_ui_update_check_tick(gui_app_t *app)
+{
+    if (!app) return;
+    gui_ui_process_update_check_result(app);
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) return;
+    if (atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) return;
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    if (gui_ui_update_check_due(&app->settings, now_s)) {
+        (void)gui_ui_start_update_check(false);
+    }
+}
 
 void gui_ui_sync_android_keyboard_state(void) {
 #if defined(__ANDROID__)
@@ -2698,6 +2999,7 @@ static void render_version_info_window(gui_app_t *app)
     static char vi_state[24];
     static char vi_device[96];
     static char vi_rate[32];
+    static char vi_update_status[160];
 
     snprintf(vi_version, sizeof(vi_version), "%s", MIRSC_TOOLS_VERSION);
 
@@ -2724,6 +3026,24 @@ static void render_version_info_window(gui_app_t *app)
         snprintf(vi_rate, sizeof(vi_rate), "%.3f kSPS", (double)sr / 1000.0);
     } else {
         snprintf(vi_rate, sizeof(vi_rate), "%u Hz", sr);
+    }
+
+    Color update_status_color = COLOR_TEXT_DIM;
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+        snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
+    } else if (app->settings.update_last_release_tag[0]) {
+        int update_cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        if (update_cmp < 0) {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Available: %s", app->settings.update_last_release_tag);
+            update_status_color = COLOR_METER_YELLOW;
+        } else if (update_cmp == 0) {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Up to date (%s)", app->settings.update_last_release_tag);
+            update_status_color = COLOR_SYNC_GREEN;
+        } else {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Running newer build (latest %s)", app->settings.update_last_release_tag);
+        }
+    } else {
+        snprintf(vi_update_status, sizeof(vi_update_status), "Not checked yet");
     }
     bool ab_swap_cxadc = gui_ui_selected_device_is_cxadc(app, NULL);
 #ifdef ENABLE_FX3
@@ -2793,7 +3113,7 @@ static void render_version_info_window(gui_app_t *app)
 
         // Version row
         CLAY(CLAY_ID("VersionInfoVersionRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
         }) {
             CLAY(CLAY_ID("VersionInfoVersionLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
                 CLAY_TEXT(CLAY_STRING("Version:"),
@@ -2801,6 +3121,37 @@ static void render_version_info_window(gui_app_t *app)
             }
             CLAY_TEXT(make_string(vi_version),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+            Color update_btn_bg = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? ui_disabled_color(COLOR_BUTTON)
+                : COLOR_BUTTON;
+            Color update_btn_fg = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? ui_disabled_color(COLOR_TEXT)
+                : COLOR_TEXT;
+            const char *update_btn_label = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? "Checking..."
+                : "Check for Update";
+            CLAY(CLAY_ID("VersionInfoCheckUpdateButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(132), CLAY_SIZING_FIXED(24) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(update_btn_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(make_string(update_btn_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_btn_fg) }));
+            }
+        }
+
+        CLAY(CLAY_ID("VersionInfoUpdateRow"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+        }) {
+            CLAY(CLAY_ID("VersionInfoUpdateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                CLAY_TEXT(CLAY_STRING("Update:"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+            CLAY_TEXT(make_string(vi_update_status),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
         }
 
         // Capture state row
@@ -4883,6 +5234,7 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
+    gui_ui_update_check_tick(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
     if (playback_mode) {
         s_record_limit_window_open = false;
@@ -5035,6 +5387,18 @@ void gui_handle_interactions(gui_app_t *app) {
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
+            if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
+                gui_ui_process_update_check_result(app);
+                if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+                    gui_app_set_status(app, "Update check already running");
+                } else if (gui_ui_start_update_check(true)) {
+                    gui_app_set_status(app, "Checking for updates...");
+                } else {
+                    gui_app_set_status(app, "Unable to start update check");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCorePinningToggle"))) {
                 app->settings.show_core_pinning_in_settings = !app->settings.show_core_pinning_in_settings;
                 if (!app->settings.show_core_pinning_in_settings && s_active_text_field == UI_TEXT_FIELD_FLAC_AFFINITY) {

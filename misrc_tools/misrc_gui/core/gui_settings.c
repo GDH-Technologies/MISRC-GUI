@@ -473,6 +473,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
     // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
     settings->memory_budget_gb = 4;
+    settings->update_last_check_unix_s = 0;
+    settings->update_last_release_tag[0] = '\0';
+    settings->update_available_cached = false;
 
     // Keep derived filenames coherent with default auto-naming state.
     gui_settings_refresh_auto_names(settings);
@@ -591,6 +594,9 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
     fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
+    fprintf(f, "  \"update_last_check_unix_s\": %llu,\n", (unsigned long long)settings->update_last_check_unix_s);
+    fprintf(f, "  \"update_last_release_tag\": \"%s\",\n", settings->update_last_release_tag);
+    fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -1014,6 +1020,16 @@ void gui_settings_load(gui_settings_t *settings) {
         if (gb < 1) gb = 4;
         if (gb > 16) gb = 16;
         settings->memory_budget_gb = (uint32_t)gb;
+    }
+    if ((value = find_value(content, "update_last_check_unix_s")) != NULL) {
+        settings->update_last_check_unix_s = (uint64_t)strtoull(value, NULL, 10);
+    }
+    if ((value = find_value(content, "update_last_release_tag")) != NULL) {
+        strncpy(settings->update_last_release_tag, value, sizeof(settings->update_last_release_tag) - 1);
+        settings->update_last_release_tag[sizeof(settings->update_last_release_tag) - 1] = '\0';
+    }
+    if ((value = find_value(content, "update_available_cached")) != NULL) {
+        settings->update_available_cached = (strcmp(value, "true") == 0);
     }
 
     if ((value = find_value(content, "reduce_8bit_a")) != NULL) {
