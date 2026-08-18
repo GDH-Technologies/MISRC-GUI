@@ -1347,21 +1347,42 @@ jobs:
           if [[ "$(tail -1 "$BODY_FILE")" == '## Highlights' ]]; then
             printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
-          # Contributors summary (commit count per author). Use shortlog -sn
-          # WITHOUT -e so author emails are NOT published in the release notes.
-          # The per-commit list is already covered by Highlights above and by
-          # GitHub's auto-generated What's Changed (generate_release_notes), so
-          # a duplicate "Commit attribution" section is omitted to avoid listing
-          # every commit two or three times.
+          # Contributors as GitHub @handles (de-duplicated). Handles are
+          # derived from commit author emails: noreply github emails resolve
+          # automatically (<handle>@users.noreply.github.com or
+          # <id>+<handle>@users.noreply.github.com), and an explicit
+          # email=handle map covers non-noreply emails. Commits whose email
+          # can't be resolved are skipped (their work is still credited via
+          # Highlights + GitHub's auto-generated What's Changed). No author
+          # emails or raw names are published.
+          CONTRIBUTOR_HANDLE_MAP="
+            harry@opcomedia.com=harrypm
+          "
+          github_handle_for_email() {
+            local email="$1"
+            while IFS='=' read -r map_email map_handle; do
+              map_email="${map_email// /}"; map_handle="${map_handle// /}"
+              [[ -z "$map_email" ]] && continue
+              if [[ "${email,,}" == "${map_email,,}" ]]; then
+                printf '%s' "$map_handle"
+                return 0
+              fi
+            done <<< "$CONTRIBUTOR_HANDLE_MAP"
+            case "$email" in
+              *"+*"@users.noreply.github.com) printf '%s' "${email%%+*}"; return 0 ;;
+              *@users.noreply.github.com)     printf '%s' "${email%@users.noreply.github.com}"; return 0 ;;
+            esac
+            return 1
+          }
           printf '\n%s\n' '' '## Contributors' '' >> "$BODY_FILE"
-          # shortlog -sn prints "<count>\t<author name>"; cut -f2 drops the
-          # count and keeps just the name (no emails).
-          CONTRIBUTOR_LINES="$(git shortlog -sn --no-merges "$LOG_RANGE" 2>/dev/null | cut -f2 || true)"
-          if [[ -n "$CONTRIBUTOR_LINES" ]]; then
-            while IFS= read -r line; do
-              [[ -n "$line" ]] || continue
-              printf -- '- %s\n' "$line" >> "$BODY_FILE"
-            done <<< "$CONTRIBUTOR_LINES"
+          CONTRIB_HANDLES="$(git log --pretty=format:'%ae' --no-merges "$LOG_RANGE" 2>/dev/null | sort -u | while IFS= read -r email; do
+            handle="$(github_handle_for_email "$email")" && printf '%s\n' "@$handle"
+          done | sort -u)"
+          if [[ -n "$CONTRIB_HANDLES" ]]; then
+            while IFS= read -r h; do
+              [[ -n "$h" ]] || continue
+              printf -- '- %s\n' "$h" >> "$BODY_FILE"
+            done <<< "$CONTRIB_HANDLES"
           else
             printf '%s\n' "- (no contributors found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
