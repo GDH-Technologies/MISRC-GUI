@@ -146,6 +146,22 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer);
 // Returns true on success or when no rewrite was needed.
 bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written);
 
+// One vorbis comment for flac_writer_embed_tags().
+typedef struct {
+    const char *key;
+    const char *value;
+} flac_writer_tag_t;
+
+// Appends key=value comments to the file's VORBIS_COMMENT block (creating one
+// after STREAMINFO if absent). With the trailing PADDING block reserved at
+// encode time this is an in-place metadata write (milliseconds); on legacy
+// files without padding libFLAC falls back to rewriting the whole file through
+// a ".metadata_edit" temp. *rewrote (optional) reports which path was taken so
+// callers can warn about slow legacy rewrites. File mtime is preserved.
+// Returns true on success.
+bool flac_writer_embed_tags(const char *path, const flac_writer_tag_t *tags,
+                            size_t n_tags, bool *rewrote);
+
 // Abort without finalizing (useful for error paths)
 // Does not write final frames or fix seektable
 void flac_writer_abort(flac_writer_t *writer);

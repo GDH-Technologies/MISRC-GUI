@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <FLAC/metadata.h>
+
 #include "flac_writer.h"
 
 #define TEST_SAMPLE_COUNT 123457ULL /* deliberately non-round */
@@ -183,8 +185,86 @@ int main(int argc, char **argv) {
         }
         if (expect_total(path, 0, "overflow count rewrites total_samples to 0 (unknown)") != 0) break;
 
+        /* In-place tag embed: padded file must not need a tempfile rewrite. */
+        flac_writer_tag_t tags[2] = {
+            { "RF_TOTAL_SAMPLES", "123457" },
+            { "DURATION_SECONDS", "3.086425" },
+        };
+        bool rewrote = true;
+        if (!flac_writer_embed_tags(path, tags, 2, &rewrote)) {
+            fprintf(stderr, "FAIL: embed_tags failed on padded file\n");
+            break;
+        }
+        if (rewrote) {
+            fprintf(stderr, "FAIL: embed_tags rewrote a padded file (should be in place)\n");
+            break;
+        }
+        printf("PASS: embed_tags is in-place on a padded file\n");
+
+        /* Round-trip: read the tags back via the chain API. */
+        {
+            FLAC__Metadata_Chain *rchain = FLAC__metadata_chain_new();
+            FLAC__Metadata_Iterator *riter = FLAC__metadata_iterator_new();
+            int tag_ok = 0;
+            if (rchain && riter && FLAC__metadata_chain_read(rchain, path)) {
+                FLAC__metadata_iterator_init(riter, rchain);
+                do {
+                    FLAC__StreamMetadata *b = FLAC__metadata_iterator_get_block(riter);
+                    if (b && b->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+                        int f1 = FLAC__metadata_object_vorbiscomment_find_entry_from(b, 0, "RF_TOTAL_SAMPLES");
+                        int f2 = FLAC__metadata_object_vorbiscomment_find_entry_from(b, 0, "DURATION_SECONDS");
+                        tag_ok = (f1 >= 0 && f2 >= 0);
+                        break;
+                    }
+                } while (FLAC__metadata_iterator_next(riter));
+            }
+            if (riter) FLAC__metadata_iterator_delete(riter);
+            if (rchain) FLAC__metadata_chain_delete(rchain);
+            if (!tag_ok) {
+                fprintf(stderr, "FAIL: embedded tags did not round-trip\n");
+                break;
+            }
+            printf("PASS: embedded tags round-trip\n");
+        }
+
         rc = 0;
     } while (0);
+
+    if (rc == 0) {
+        rc = 1;
+        char legacy_path[1024];
+        snprintf(legacy_path, sizeof(legacy_path), "%s.legacy", path);
+        FILE *lf = fopen(legacy_path, "wb");
+        flac_writer_config_t lcfg = flac_writer_default_config();
+        lcfg.compression_level = 0;
+        lcfg.num_threads = 1;
+        lcfg.padding_bytes = 0; /* legacy layout: no padding */
+        flac_writer_t *lw = lf ? flac_writer_create_file(lf, &lcfg) : NULL;
+        if (lw) {
+            int32_t z[4096] = {0};
+            if (flac_writer_process(lw, z, 4096) == 4096 &&
+                flac_writer_finish(lw) == FLAC_WRITER_OK) {
+                flac_writer_tag_t ltags[1] = { { "RF_SAMPLE_RATE", "40000000" } };
+                bool lrewrote = false;
+                if (find_metadata_block(legacy_path, 1, NULL) == 0) {
+                    fprintf(stderr, "FAIL: padding_bytes=0 still produced a PADDING block\n");
+                } else if (!flac_writer_embed_tags(legacy_path, ltags, 1, &lrewrote)) {
+                    fprintf(stderr, "FAIL: embed_tags failed on legacy file\n");
+                } else if (!lrewrote) {
+                    fprintf(stderr, "FAIL: embed_tags claims in-place on an unpadded file\n");
+                } else {
+                    printf("PASS: legacy (unpadded) file falls back to rewrite and reports it\n");
+                    rc = 0;
+                }
+            } else {
+                fprintf(stderr, "FAIL: legacy encode failed\n");
+            }
+        } else {
+            fprintf(stderr, "FAIL: cannot create legacy test file\n");
+            if (lf) fclose(lf);
+        }
+        remove(legacy_path);
+    }
 
     remove(path);
     return rc;

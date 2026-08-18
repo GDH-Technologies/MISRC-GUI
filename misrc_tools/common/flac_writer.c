@@ -718,6 +718,76 @@ bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written)
 }
 
 /* ============================================================================
+ * Post-close vorbis tag embedding (in-place via reserved padding)
+ * ============================================================================ */
+bool flac_writer_embed_tags(const char *path, const flac_writer_tag_t *tags,
+                            size_t n_tags, bool *rewrote) {
+    if (rewrote) *rewrote = false;
+    if (!path || !path[0] || !tags || n_tags == 0) return false;
+
+    FLAC__Metadata_Chain *chain = FLAC__metadata_chain_new();
+    if (!chain) return false;
+
+    bool success = false;
+    if (FLAC__metadata_chain_read(chain, path)) {
+        FLAC__Metadata_Iterator *iter = FLAC__metadata_iterator_new();
+        if (iter) {
+            FLAC__metadata_iterator_init(iter, chain);
+            FLAC__StreamMetadata *vc = NULL;
+            do {
+                FLAC__StreamMetadata *b = FLAC__metadata_iterator_get_block(iter);
+                if (b && b->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+                    vc = b;
+                    break;
+                }
+            } while (FLAC__metadata_iterator_next(iter));
+
+            bool created_vc = false;
+            if (!vc) {
+                vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+                created_vc = (vc != NULL);
+            }
+
+            bool ok = (vc != NULL);
+            for (size_t i = 0; ok && i < n_tags; i++) {
+                FLAC__StreamMetadata_VorbisComment_Entry entry;
+                if (!FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(
+                        &entry, tags[i].key, tags[i].value)) {
+                    ok = false;
+                    break;
+                }
+                /* copy=false transfers entry ownership to the block on success */
+                if (!FLAC__metadata_object_vorbiscomment_append_comment(vc, entry, false)) {
+                    free(entry.entry);
+                    ok = false;
+                }
+            }
+
+            if (ok && created_vc) {
+                /* Insert the new block directly after STREAMINFO. */
+                FLAC__metadata_iterator_init(iter, chain);
+                ok = FLAC__metadata_iterator_insert_block_after(iter, vc);
+            }
+            if (!ok && created_vc && vc) {
+                FLAC__metadata_object_delete(vc);
+            }
+
+            if (ok) {
+                if (rewrote) {
+                    *rewrote = FLAC__metadata_chain_check_if_tempfile_needed(
+                        chain, /*use_padding=*/true);
+                }
+                success = FLAC__metadata_chain_write(chain, /*use_padding=*/true,
+                                                     /*preserve_file_stats=*/true);
+            }
+            FLAC__metadata_iterator_delete(iter);
+        }
+    }
+    FLAC__metadata_chain_delete(chain);
+    return success;
+}
+
+/* ============================================================================
  * Abort (cleanup without finalizing)
  * ============================================================================ */
 void flac_writer_abort(flac_writer_t *writer) {
@@ -799,6 +869,13 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *w) {
 
 bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written) {
     (void)path; (void)samples_written;
+    return false;
+}
+
+bool flac_writer_embed_tags(const char *path, const flac_writer_tag_t *tags,
+                            size_t n_tags, bool *rewrote) {
+    (void)path; (void)tags; (void)n_tags;
+    if (rewrote) *rewrote = false;
     return false;
 }
 
