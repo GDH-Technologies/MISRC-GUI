@@ -15,6 +15,24 @@ A universal cross platform GUI tool for interfacing with and visualising monitor
 - DdD (DomesDay Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
+### Linux setup note (CXADC DC controls)
+
+For CXADC `DC` up/down controls to work without root, the sysfs parameter files must be writable by the `video` group.
+
+One-time fix for the current boot:
+
+```bash
+sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*
+```
+
+Verify:
+
+```bash
+ls -l /sys/class/cxadc/cxadc*/device/parameters/center_offset
+```
+
+Expected group is `video` (e.g. `root video`).
+
 
 ## Downloads
 
