@@ -213,7 +213,7 @@ static void sanitize_tag(char *dst, size_t dst_len, const char *src) {
 
 // Keep derived filenames in sync with current auto-naming settings.
 // This refresh does NOT append capture-start timestamp (that is applied when recording starts).
-static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
+void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     if (!settings) return;
     if (!settings->auto_names_enabled) return;
 
@@ -293,6 +293,18 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     } else {
         snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
     }
+
+    /* Reference video. Deliberately no codec in the name: it is discoverable
+     * from the file, and putting it here would make the two auto-name
+     * functions diverge if the codec changed between a settings refresh and a
+     * record start. Container is always .mkv. */
+    char video_tag[40] = {0};
+    sanitize_tag(video_tag, sizeof(video_tag), settings->video_output_tag);
+    if (video_tag[0]) {
+        snprintf(settings->video_filename, MAX_FILENAME_LEN, "%s_%s_video.mkv", base, video_tag);
+    } else {
+        snprintf(settings->video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
+    }
     if (audio_tag_12[0]) {
         snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
@@ -346,6 +358,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     strcpy(settings->aux_filename, "aux_data.bin");
     strcpy(settings->raw_filename, "raw_data.bin");
     strcpy(settings->audio_4ch_filename, "quad_4ch.wav");
+    strcpy(settings->video_filename, "video.mkv");
     strcpy(settings->audio_2ch_12_filename, "stereo_ch1_ch2.wav");
     strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
 
@@ -414,6 +427,10 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     
     // Audio output defaults
     settings->enable_audio_4ch = false;
+    settings->video_record_enabled = false;
+    settings->video_record_codec = 0;        /* H.264 */
+    settings->video_output_tag[0] = '\0';
+    settings->ffmpeg_path[0] = '\0';
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -486,6 +503,9 @@ void gui_settings_save(const gui_settings_t *settings) {
 
     // Audio filenames + enables (mirror CLI options)
     fprintf(f, "  \"audio_4ch_filename\": \"%s\",\n", settings->audio_4ch_filename);
+    fprintf(f, "  \"video_filename\": \"%s\",\n", settings->video_filename);
+    fprintf(f, "  \"video_output_tag\": \"%s\",\n", settings->video_output_tag);
+    fprintf(f, "  \"ffmpeg_path\": \"%s\",\n", settings->ffmpeg_path);
     fprintf(f, "  \"audio_2ch_12_filename\": \"%s\",\n", settings->audio_2ch_12_filename);
     fprintf(f, "  \"audio_2ch_34_filename\": \"%s\",\n", settings->audio_2ch_34_filename);
     fprintf(f, "  \"audio_1ch_1_filename\": \"%s\",\n", settings->audio_1ch_filenames[0]);
@@ -501,6 +521,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"audio_tag_2ch_34\": \"%s\",\n", settings->audio_output_tags[2]);
 
     fprintf(f, "  \"enable_audio_4ch\": %s,\n", settings->enable_audio_4ch ? "true" : "false");
+    fprintf(f, "  \"video_record_enabled\": %s,\n", settings->video_record_enabled ? "true" : "false");
+    fprintf(f, "  \"video_record_codec\": %d,\n", settings->video_record_codec);
     fprintf(f, "  \"enable_audio_2ch_12\": %s,\n", settings->enable_audio_2ch_12 ? "true" : "false");
     fprintf(f, "  \"enable_audio_2ch_34\": %s,\n", settings->enable_audio_2ch_34 ? "true" : "false");
     fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
@@ -970,6 +992,26 @@ void gui_settings_load(gui_settings_t *settings) {
     }
 
     // Audio filenames + enables
+    if ((value = find_value(content, "video_filename")) != NULL) {
+        strncpy(settings->video_filename, value, MAX_FILENAME_LEN - 1);
+        settings->video_filename[MAX_FILENAME_LEN - 1] = '\0';
+    }
+    if ((value = find_value(content, "video_output_tag")) != NULL) {
+        strncpy(settings->video_output_tag, value, sizeof(settings->video_output_tag) - 1);
+        settings->video_output_tag[sizeof(settings->video_output_tag) - 1] = '\0';
+    }
+    if ((value = find_value(content, "ffmpeg_path")) != NULL) {
+        strncpy(settings->ffmpeg_path, value, sizeof(settings->ffmpeg_path) - 1);
+        settings->ffmpeg_path[sizeof(settings->ffmpeg_path) - 1] = '\0';
+    }
+    if ((value = find_value(content, "video_record_enabled")) != NULL) {
+        settings->video_record_enabled = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "video_record_codec")) != NULL) {
+        int c = atoi(value);
+        /* Clamp: a hand-edited file must not select a codec that does not exist. */
+        settings->video_record_codec = (c == 1) ? 1 : 0;
+    }
     if ((value = find_value(content, "audio_4ch_filename")) != NULL) {
         strncpy(settings->audio_4ch_filename, value, MAX_FILENAME_LEN - 1);
         settings->audio_4ch_filename[MAX_FILENAME_LEN - 1] = '\0';

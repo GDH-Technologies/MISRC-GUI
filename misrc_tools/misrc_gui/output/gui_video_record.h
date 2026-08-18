@@ -43,6 +43,9 @@ typedef struct {
 
 /* Resolve the ffmpeg binary and ask it what it can encode. Cached; safe to
  * call from UI code. Returns false if no usable ffmpeg was found. */
+/* Explicit ffmpeg path from settings; "" restores automatic resolution.
+ * Invalidates the probe cache. */
+void gui_video_record_set_ffmpeg_path(const char *path);
 bool gui_video_record_probe(void);
 const char *gui_video_record_ffmpeg_path(void);     /* "" when not found */
 const char *gui_video_record_ffmpeg_version(void);
@@ -86,5 +89,8 @@ void gui_video_record_set_inject(vr_inject_t what);
 int gui_video_record_test_main(const char *device, const char *out_path,
                                int seconds, const char *codec_name);
 int gui_video_record_probe_main(void);
+/* Prints what both auto-name functions produce for the same settings, so the
+ * pair cannot silently drift. */
+int gui_video_record_name_test_main(void);
 
 #endif /* GUI_VIDEO_RECORD_H */

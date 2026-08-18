@@ -15,6 +15,7 @@
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
+#include "../output/gui_video_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
@@ -182,6 +183,7 @@ typedef enum {
     UI_TEXT_FIELD_RF_TAG_A,
     UI_TEXT_FIELD_RF_TAG_B,
     UI_TEXT_FIELD_AUDIO_TAG_4CH,
+    UI_TEXT_FIELD_VIDEO_TAG,
     UI_TEXT_FIELD_AUDIO_TAG_12,
     UI_TEXT_FIELD_AUDIO_TAG_34,
     UI_TEXT_FIELD_AUDIO_LABEL_1,
@@ -1002,6 +1004,10 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.rf_channel_tags[1];
             *cap = sizeof(app->settings.rf_channel_tags[1]);
             return true;
+        case UI_TEXT_FIELD_VIDEO_TAG:
+            *dst = app->settings.video_output_tag;
+            *cap = sizeof(app->settings.video_output_tag);
+            return true;
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
             *dst = app->settings.audio_output_tags[0];
             *cap = sizeof(app->settings.audio_output_tags[0]);
@@ -1146,6 +1152,7 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
                    gui_ui_flac_affinity_supported();
         case UI_TEXT_FIELD_RF_TAG_A:
         case UI_TEXT_FIELD_RF_TAG_B:
+        case UI_TEXT_FIELD_VIDEO_TAG:
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
         case UI_TEXT_FIELD_AUDIO_TAG_12:
         case UI_TEXT_FIELD_AUDIO_TAG_34:
@@ -2136,6 +2143,45 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                                 CLAY_TEXT(make_string(tag4), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(audio_tag_4ch_fg) }));
                             }
                         }
+                    }
+
+                    // Reference video: the USB preview dongle's picture, encoded
+                    // by ffmpeg alongside the RF. Greyed out when no usable
+                    // ffmpeg was found, so it cannot be armed into a state that
+                    // would later refuse to start a recording.
+                    bool ff_ok = gui_video_record_probe();
+                    CLAY(CLAY_ID("ToggleRowVideoRef"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                        Color vr_bg = app->settings.video_record_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        if (!ff_ok) vr_bg = ui_disabled_color(vr_bg);
+                        CLAY(CLAY_ID("ToggleVideoRecord"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(vr_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT((app->settings.video_record_enabled && ff_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        }
+                        CLAY_TEXT(CLAY_STRING("Reference video"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        CLAY(CLAY_ID("VideoCodecBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ff_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(app->settings.video_record_codec == 1 ? CLAY_STRING("FFV1") : CLAY_STRING("H.264"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        }
+                        Color vtag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
+                        Color vtag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                        CLAY(CLAY_ID("VideoTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(vtag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            const char *vtag = app->settings.video_output_tag[0] ? app->settings.video_output_tag : "(tag)";
+                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_VIDEO_TAG) && app->settings.auto_names_enabled) {
+                                gui_ui_render_active_text(UI_TEXT_FIELD_VIDEO_TAG, vtag, FONT_SIZE_STATS, 1, vtag_fg);
+                            } else {
+                                CLAY_TEXT(make_string(vtag), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(vtag_fg) }));
+                            }
+                        }
+                    }
+                    // Says which ffmpeg was found, or why the toggle is dead.
+                    CLAY(CLAY_ID("VideoRefHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+                        static char vr_hint[220];
+                        if (ff_ok) {
+                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s%s", gui_video_record_ffmpeg_path(),
+                                     app->settings.video_record_codec == 1
+                                       ? "   FFV1 is lossless, roughly 5-16 MB/s" : "   H.264 CRF 18, under 3 MB/s");
+                        } else {
+                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");
+                        }
+                        CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
                     }
 
                     CLAY(CLAY_ID("ToggleRowAudio2ch12"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -6100,6 +6146,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
             }
 
+            if (Clay_PointerOver(CLAY_ID("VideoTagField")) && app->settings.auto_names_enabled) {
+
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_VIDEO_TAG, CLAY_ID("VideoTagField"), 6.0f, 6.0f);
+
+            }
+
+
             if (Clay_PointerOver(CLAY_ID("AudioTag4chField")) && app->settings.auto_names_enabled) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_AUDIO_TAG_4CH, CLAY_ID("AudioTag4chField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
@@ -6120,6 +6173,20 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("ToggleAudio2ch12"))) {
                 app->settings.enable_audio_2ch_12 = !app->settings.enable_audio_2ch_12;
                 gui_settings_save(&app->settings);
+            }
+            if (Clay_PointerOver(CLAY_ID("ToggleVideoRecord"))) {
+                if (!gui_video_record_probe()) {
+                    gui_app_set_status(app, "ffmpeg was not found; reference video cannot be enabled");
+                } else {
+                    app->settings.video_record_enabled = !app->settings.video_record_enabled;
+                    gui_settings_save(&app->settings);
+                }
+            }
+            if (Clay_PointerOver(CLAY_ID("VideoCodecBox"))) {
+                if (gui_video_record_probe()) {
+                    app->settings.video_record_codec = (app->settings.video_record_codec == 1) ? 0 : 1;
+                    gui_settings_save(&app->settings);
+                }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleAudio4ch"))) {
                 app->settings.enable_audio_4ch = !app->settings.enable_audio_4ch;

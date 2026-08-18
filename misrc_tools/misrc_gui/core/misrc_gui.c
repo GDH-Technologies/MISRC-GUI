@@ -353,6 +353,12 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--preview-selftest") == 0) {
             return gui_preview_selftest_main();
         }
+        if (strcmp(argv[i], "--video-settings-test") == 0) {
+            return gui_record_video_settings_test_main();
+        }
+        if (strcmp(argv[i], "--video-name-test") == 0) {
+            return gui_record_name_test_main();
+        }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
         }

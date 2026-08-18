@@ -152,8 +152,24 @@ static bool vr_find_in_path(char *out, size_t cap)
     return false;
 }
 
+/* Set from the settings file before probing, so the user's explicit choice
+ * wins over anything found on PATH. Kept as a copy rather than a pointer into
+ * gui_settings_t, because this module deliberately knows nothing about it. */
+static char s_ffmpeg_override[512];
+
+void gui_video_record_set_ffmpeg_path(const char *path)
+{
+    if (path && path[0]) snprintf(s_ffmpeg_override, sizeof(s_ffmpeg_override), "%s", path);
+    else                 s_ffmpeg_override[0] = '\0';
+    ff.probed = false;   /* a new path deserves a fresh probe */
+}
+
 static bool vr_resolve_ffmpeg(char *out, size_t cap)
 {
+    if (vr_is_executable(s_ffmpeg_override)) {
+        snprintf(out, cap, "%s", s_ffmpeg_override);
+        return true;
+    }
     const char *env = getenv("MISRC_FFMPEG");
     if (vr_is_executable(env)) { snprintf(out, cap, "%s", env); return true; }
     if (vr_find_in_path(out, cap)) return true;
@@ -860,5 +876,7 @@ bool gui_video_record_is_running(void) { return false; }
 int gui_video_record_test_main(const char *d, const char *o, int s, const char *c)
 { (void)d;(void)o;(void)s;(void)c; fprintf(stderr, "requires Linux\n"); return 2; }
 int gui_video_record_probe_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }
+void gui_video_record_set_ffmpeg_path(const char *p) { (void)p; }
+int gui_video_record_name_test_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }
 
 #endif /* __linux__ */

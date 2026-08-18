@@ -2228,6 +2228,18 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
     } else {
         snprintf(app->settings.audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
     }
+
+    /* Reference video -- must stay in lockstep with the same block in
+     * gui_settings_refresh_auto_names(). The only intended difference between
+     * the two functions is that base already carries the record-start
+     * timestamp here. */
+    char video_tag[40] = {0};
+    sanitize_tag(video_tag, sizeof(video_tag), app->settings.video_output_tag);
+    if (video_tag[0]) {
+        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_%s_video.mkv", base, video_tag);
+    } else {
+        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
+    }
     if (audio_tag_12[0]) {
         snprintf(app->settings.audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
@@ -2251,6 +2263,131 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
 }
 
 // Start recording - checks for file existence first
+/* Prints what both auto-name functions produce from one settings blob. They
+ * are separate implementations that must agree, and the only sanctioned
+ * difference is the record-start timestamp -- so with timestamping off they
+ * must match exactly, and with it on they must differ only by that segment. */
+/* Round-trips the reference-video settings through the on-disk file. Point
+ * XDG_CONFIG_HOME at a scratch directory before running, or this rewrites the
+ * real settings file. */
+int gui_record_video_settings_test_main(void)
+{
+    gui_settings_t a;
+    memset(&a, 0, sizeof(a));
+    gui_settings_load(&a);
+
+    /* Values chosen to be different from every default, so a field that is
+     * silently not persisted shows up as a mismatch rather than a coincidence. */
+    a.video_record_enabled = true;
+    a.video_record_codec = 1;                       /* FFV1 */
+    snprintf(a.video_output_tag, sizeof(a.video_output_tag), "refcam");
+    snprintf(a.ffmpeg_path, sizeof(a.ffmpeg_path), "/opt/custom/ffmpeg");
+    gui_settings_save(&a);
+
+    gui_settings_t b;
+    memset(&b, 0, sizeof(b));
+    gui_settings_load(&b);
+
+    int rc = 0;
+    printf("round-trip:\n");
+    printf("  video_record_enabled : %d -> %d\n", a.video_record_enabled, b.video_record_enabled);
+    printf("  video_record_codec   : %d -> %d\n", a.video_record_codec, b.video_record_codec);
+    printf("  video_output_tag     : %s -> %s\n", a.video_output_tag, b.video_output_tag);
+    printf("  ffmpeg_path          : %s -> %s\n", a.ffmpeg_path, b.ffmpeg_path);
+    printf("  video_filename       : %s\n", b.video_filename);
+
+    if (a.video_record_enabled != b.video_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
+    if (a.video_record_codec != b.video_record_codec)     { printf("FAIL: codec\n"); rc = 1; }
+    if (strcmp(a.video_output_tag, b.video_output_tag))   { printf("FAIL: tag\n"); rc = 1; }
+    if (strcmp(a.ffmpeg_path, b.ffmpeg_path))             { printf("FAIL: ffmpeg_path\n"); rc = 1; }
+    /* The load path re-runs the namer, so the tag must have reached the name. */
+    if (b.video_filename[0] && !strstr(b.video_filename, "refcam")) {
+        printf("FAIL: tag did not reach the generated filename\n"); rc = 1;
+    }
+
+    /* A hand-edited file must not be able to select a codec that does not
+     * exist -- the loader clamps rather than trusting the number. */
+    gui_settings_t c = b;
+    c.video_record_codec = 99;
+    gui_settings_save(&c);
+    gui_settings_t d;
+    memset(&d, 0, sizeof(d));
+    gui_settings_load(&d);
+    printf("  out-of-range codec 99 -> %d (must be 0 or 1)\n", d.video_record_codec);
+    if (d.video_record_codec != 0 && d.video_record_codec != 1) {
+        printf("FAIL: codec not clamped\n"); rc = 1;
+    }
+
+    printf("%s\n", rc ? "SETTINGS TEST FAILED" : "settings test passed");
+    return rc;
+}
+
+int gui_record_name_test_main(void)
+{
+    static gui_app_t app;
+    memset(&app, 0, sizeof(app));
+    gui_settings_init_defaults(&app.settings);
+
+    snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "tapetest");
+    snprintf(app.settings.video_output_tag, sizeof(app.settings.video_output_tag), "ref cam");
+    snprintf(app.settings.rf_channel_tags[0], sizeof(app.settings.rf_channel_tags[0]), "luma");
+    snprintf(app.settings.audio_output_tags[0], sizeof(app.settings.audio_output_tags[0]), "quad");
+    app.settings.auto_names_enabled = true;
+    app.settings.use_flac = true;
+    app.settings.video_record_enabled = true;
+
+    int rc = 0;
+
+    /* Pass 1: timestamping off, so the two must be character-identical. */
+    app.settings.append_timestamp_on_capture_start = false;
+    gui_settings_refresh_auto_names(&app.settings);
+    char s_video[MAX_FILENAME_LEN], s_a[MAX_FILENAME_LEN], s_4ch[MAX_FILENAME_LEN];
+    snprintf(s_video, sizeof(s_video), "%s", app.settings.video_filename);
+    snprintf(s_a, sizeof(s_a), "%s", app.settings.output_filename_a);
+    snprintf(s_4ch, sizeof(s_4ch), "%s", app.settings.audio_4ch_filename);
+
+    gui_record_apply_auto_names(&app);
+    printf("no timestamp:\n");
+    printf("  settings namer video : %s\n", s_video);
+    printf("  record   namer video : %s\n", app.settings.video_filename);
+    printf("  settings namer rfA   : %s\n", s_a);
+    printf("  record   namer rfA   : %s\n", app.settings.output_filename_a);
+    printf("  settings namer 4ch   : %s\n", s_4ch);
+    printf("  record   namer 4ch   : %s\n", app.settings.audio_4ch_filename);
+
+    if (strcmp(s_video, app.settings.video_filename) != 0) {
+        printf("FAIL: video names diverge with timestamping off\n"); rc = 1;
+    }
+    if (strcmp(s_a, app.settings.output_filename_a) != 0) {
+        printf("FAIL: rfA names diverge with timestamping off\n"); rc = 1;
+    }
+    if (strcmp(s_4ch, app.settings.audio_4ch_filename) != 0) {
+        printf("FAIL: 4ch names diverge with timestamping off\n"); rc = 1;
+    }
+
+    /* Pass 2: timestamping on -- the record namer must differ, and only by
+     * inserting the timestamp after the base name. */
+    app.settings.append_timestamp_on_capture_start = true;
+    gui_record_apply_auto_names(&app);
+    printf("with timestamp:\n  record namer video : %s\n", app.settings.video_filename);
+
+    if (strcmp(s_video, app.settings.video_filename) == 0) {
+        printf("FAIL: timestamping had no effect on the video name\n"); rc = 1;
+    } else if (strncmp(app.settings.video_filename, "tapetest_", 9) != 0 ||
+               strstr(app.settings.video_filename, "_ref-cam_video.mkv") == NULL) {
+        printf("FAIL: timestamped video name is not base + timestamp + tag + suffix\n"); rc = 1;
+    }
+
+    /* The tag contained a space; sanitize_tag must map it to '-' rather than
+     * leave whitespace in a filename. */
+    if (strstr(s_video, "ref-cam") == NULL) {
+        printf("FAIL: tag was not sanitised (%s)\n", s_video); rc = 1;
+    }
+
+    printf("%s\n", rc ? "NAME TEST FAILED" : "name test passed");
+    return rc;
+}
+
 int gui_record_start(gui_app_t *app) {
 
     (void)gui_record_collect_finalize_if_done();

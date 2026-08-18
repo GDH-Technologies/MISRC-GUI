@@ -196,6 +196,7 @@ typedef struct {
     char aux_filename[MAX_FILENAME_LEN];
     char raw_filename[MAX_FILENAME_LEN];
     char audio_4ch_filename[MAX_FILENAME_LEN];
+    char video_filename[MAX_FILENAME_LEN];   // reference video (MKV)
     char audio_2ch_12_filename[MAX_FILENAME_LEN];
     char audio_2ch_34_filename[MAX_FILENAME_LEN];
     char audio_1ch_filenames[4][MAX_FILENAME_LEN]; // Individual channel files
@@ -231,6 +232,10 @@ typedef struct {
 
     // Audio output options
     bool enable_audio_4ch;
+    // Reference video: the USB preview dongle's picture, encoded by ffmpeg
+    // alongside the RF. The RF stays the archival master; this is for QC.
+    bool video_record_enabled;
+    int  video_record_codec;                 // 0 = H.264 (default), 1 = FFV1
     bool enable_audio_2ch_12;
     bool enable_audio_2ch_34;
     bool enable_audio_1ch[4];                  // Individual channel enables
@@ -253,6 +258,8 @@ typedef struct {
     char audio_1ch_labels[4][32];
     // Optional tags for non-mono audio outputs: [0]=4ch, [1]=stereo ch1/2, [2]=stereo ch3/4
     char audio_output_tags[3][32];
+    char video_output_tag[32];
+    char ffmpeg_path[512];                   // empty = resolve automatically
     // Ingest metadata (saved to settings and written to capture log at record start)
     char ingest_project[128];
     char ingest_tape_id[128];
@@ -496,6 +503,13 @@ void gui_app_set_status(gui_app_t *app, const char *message);
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
+
+/* Regenerate every auto-derived output filename from the current base name and
+ * tags. Deliberately does NOT append the record-start timestamp -- that is the
+ * one intended difference from gui_record_apply_auto_names(), which does. The
+ * two are separate implementations that must otherwise stay in lockstep;
+ * --video-name-test checks they have not drifted. */
+void gui_settings_refresh_auto_names(gui_settings_t *settings);
 const char* gui_settings_get_desktop_path(void);
 
 // Best-effort folder picker for output_path. Returns true if changed.
