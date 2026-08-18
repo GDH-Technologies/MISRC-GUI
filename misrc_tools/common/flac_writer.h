@@ -71,6 +71,11 @@ typedef struct {
     bool enable_seektable;           // Generate seektable metadata (default: true)
     uint32_t seektable_spacing;      // Samples between seek points (0 = default: 1<<18)
 
+    // Trailing PADDING block reserved at encode time so post-capture metadata
+    // (vorbis tags) can be embedded in place instead of rewriting the whole
+    // file. 0 disables. Default: 4096 bytes.
+    uint32_t padding_bytes;
+
     // Callbacks (all optional - NULL disables)
     flac_error_callback_t error_cb;
     flac_bytes_written_callback_t bytes_cb;
@@ -87,7 +92,8 @@ typedef struct flac_writer flac_writer_t;
  * ============================================================================ */
 
 // Create default configuration with sensible defaults
-// Returns config: 40kHz, 16-bit, level 1, no verify, auto threads, seektable enabled
+// Returns config: 40kHz, 16-bit, level 1, no verify, auto threads, seektable
+// enabled, 4096B trailing padding
 flac_writer_config_t flac_writer_default_config(void);
 
 // Create writer and initialize encoder for FILE* output
@@ -139,6 +145,22 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer);
 // left untouched. Call after flac_writer_finish() and fclose() of the output.
 // Returns true on success or when no rewrite was needed.
 bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written);
+
+// One vorbis comment for flac_writer_embed_tags().
+typedef struct {
+    const char *key;
+    const char *value;
+} flac_writer_tag_t;
+
+// Appends key=value comments to the file's VORBIS_COMMENT block (creating one
+// after STREAMINFO if absent). With the trailing PADDING block reserved at
+// encode time this is an in-place metadata write (milliseconds); on legacy
+// files without padding libFLAC falls back to rewriting the whole file through
+// a ".metadata_edit" temp. *rewrote (optional) reports which path was taken so
+// callers can warn about slow legacy rewrites. File mtime is preserved.
+// Returns true on success.
+bool flac_writer_embed_tags(const char *path, const flac_writer_tag_t *tags,
+                            size_t n_tags, bool *rewrote);
 
 // Abort without finalizing (useful for error paths)
 // Does not write final frames or fix seektable

@@ -380,31 +380,141 @@ static void gui_record_build_log_timestamp(char *dst, size_t dst_len) {
 
 // do_exit is declared in gui_capture.h (defined in misrc_gui.c)
 
-// Writer threads
-static thrd_t s_writer_thread_a;
-static thrd_t s_writer_thread_b;
+// Finalize thread (one finalize in flight at most)
 static thrd_t s_finalize_thread;
 static atomic_bool s_finalize_thread_running = ATOMIC_VAR_INIT(false);
-static bool s_writer_threads_running = false;
-/* Latched at start. Finalize keys off THIS, never off live settings -- the RF
- * join below reads app->settings.capture_a/b at stop time, which is wrong if a
- * setting changed mid-session. */
-static bool s_video_started = false;
 static char s_record_path_video[600];
 static char s_video_start_msg[480];
 static atomic_bool s_record_stop_finalizing = ATOMIC_VAR_INIT(false);
 static atomic_bool s_record_stop_finalize_done = ATOMIC_VAR_INIT(false);
-static FILE *s_file_a = NULL;
-static FILE *s_file_b = NULL;
-static char s_record_path_a[512];
-static char s_record_path_b[512];
-#if LIBFLAC_ENABLED == 1
-static uint32_t s_record_sample_rate_a = 0;
-static uint32_t s_record_sample_rate_b = 0;
-#endif
-static FILE *s_capture_log_file = NULL;
-static char s_capture_log_path[512];
 static atomic_flag s_capture_log_lock = ATOMIC_FLAG_INIT;
+
+// File writer context
+typedef struct writer_ctx writer_ctx_t;
+typedef struct gui_record_session gui_record_session_t;
+
+struct writer_ctx {
+    buffer_manager_t *bufmgr;  // Buffer manager pointer
+    buffer_id_t buf_id;        // BUF_RECORD_A or BUF_RECORD_B
+    FILE *file;
+    int channel;  // 0 = A, 1 = B
+
+    // RF bit depth requested for output
+    // - FLAC: 8/12/16
+    // - RAW:  8/16
+    uint8_t rf_bits;
+
+    // For RAW writer: bytes per sample (1=8-bit, 2=16-bit)
+    size_t raw_bytes_per_sample;
+
+    // RF resampling (rate in kHz; 0 or disabled = passthrough)
+    bool enable_resample;
+    float resample_rate_khz;
+    int resample_quality;      // 0-4
+    float resample_gain_db;
+
+#if LIBSOXR_ENABLED
+    void *soxr;                // soxr_t (NULL if not initialized)
+    float soxr_rate_khz;       // configured output rate (kHz)
+#endif
+
+#if LIBFLAC_ENABLED == 1
+    flac_writer_t *writer;
+    atomic_uint_fast64_t *compressed_bytes;
+    uint8_t flac_bits_per_sample;
+#endif
+    gui_app_t *app;                 // For error reporting
+    gui_record_session_t *ses;      // Owning recording session
+};
+
+#define GUI_RECORD_SPILL_CHANNELS 2
+
+typedef struct {
+    FILE *fp;
+    char path[512];
+    atomic_uint_fast64_t write_offset;
+    atomic_uint_fast64_t read_offset;
+    atomic_uint_fast64_t last_backlog_log_mark;
+    atomic_bool forced_mode;
+    atomic_bool opened;
+    atomic_flag io_lock;
+} gui_record_spill_channel_t;
+
+/* All state one recording needs through finalize. Heap-allocated at record
+ * start, handed to the finalize thread at stop, freed once finalize is
+ * reaped -- so a new recording can start while the previous one finalizes. */
+struct gui_record_session {
+    gui_app_t *app;
+
+    /* True while this session is actively recording; cleared at stop so the
+     * session's writer threads switch to drain mode. */
+    atomic_bool recording;
+
+    /* Set by finalize once the writer threads have exited and the output
+     * files are closed. The shared record ring buffers and the single video
+     * encoder are free again -- a new recording may start; only this
+     * session's private metadata/summary work remains. */
+    atomic_bool drained;
+
+    /* Latched at start -- finalize must never read live settings. */
+    bool use_flac;
+    bool capture_a, capture_b;
+    bool video_started;
+    char path_video[600];
+
+    FILE *file_a, *file_b;
+    char path_a[512], path_b[512];
+#if LIBFLAC_ENABLED == 1
+    flac_writer_t *flac_a, *flac_b;
+    uint32_t sample_rate_a, sample_rate_b;
+#endif
+
+    thrd_t writer_thread_a, writer_thread_b;
+    bool writer_threads_running;
+    writer_ctx_t ctx_a, ctx_b;
+
+    FILE *log_file;
+    char log_path[512];
+
+    /* Spill temp-file state and per-channel output write-error flags. */
+    gui_record_spill_channel_t spill[GUI_RECORD_SPILL_CHANNELS];
+    atomic_bool write_error[GUI_RECORD_SPILL_CHANNELS];
+
+    /* Byte totals accumulated by this session's writer threads (survive a new
+     * recording resetting the app-level display atomics). */
+    atomic_uint_fast64_t acc_raw[GUI_RECORD_SPILL_CHANNELS];
+    atomic_uint_fast64_t acc_comp[GUI_RECORD_SPILL_CHANNELS];
+
+    double recording_start_time;
+    double stop_request_time;
+    uint32_t start_rec_a_waits, start_rec_a_drops;
+    uint32_t start_rec_b_waits, start_rec_b_drops;
+    uint32_t end_rec_a_waits, end_rec_a_drops;
+    uint32_t end_rec_b_waits, end_rec_b_drops;
+};
+
+static gui_record_session_t *s_active = NULL;      /* recording in progress */
+static gui_record_session_t *s_finalizing = NULL;  /* handed to finalize thread */
+
+/* Explicitly initialize a freshly calloc'd session's atomics (atomic_flag has
+ * no portable zero-initialized state). */
+static void gui_record_session_init_sync(gui_record_session_t *ses) {
+    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
+        atomic_flag_clear(&ses->spill[i].io_lock);
+        atomic_store(&ses->spill[i].opened, false);
+        atomic_store(&ses->spill[i].forced_mode, false);
+        atomic_store(&ses->spill[i].write_offset, 0);
+        atomic_store(&ses->spill[i].read_offset, 0);
+        atomic_store(&ses->spill[i].last_backlog_log_mark, 0);
+        ses->spill[i].fp = NULL;
+        ses->spill[i].path[0] = '\0';
+        atomic_store(&ses->write_error[i], false);
+        atomic_store(&ses->acc_raw[i], 0);
+        atomic_store(&ses->acc_comp[i], 0);
+    }
+    atomic_store(&ses->recording, false);
+    atomic_store(&ses->drained, false);
+}
 
 static void gui_record_log_lock(void) {
     while (atomic_flag_test_and_set(&s_capture_log_lock)) {
@@ -416,14 +526,19 @@ static void gui_record_log_unlock(void) {
     atomic_flag_clear(&s_capture_log_lock);
 }
 
-static void gui_record_close_session_log(void) {
+static void gui_record_close_session_log_ses(gui_record_session_t *ses) {
+    if (!ses) return;
     gui_record_log_lock();
-    if (s_capture_log_file) {
-        fclose(s_capture_log_file);
-        s_capture_log_file = NULL;
+    if (ses->log_file) {
+        fclose(ses->log_file);
+        ses->log_file = NULL;
     }
-    s_capture_log_path[0] = '\0';
+    ses->log_path[0] = '\0';
     gui_record_log_unlock();
+}
+
+static void gui_record_close_session_log(void) {
+    gui_record_close_session_log_ses(s_active);
 }
 
 static void gui_record_trim_trailing_newline(char *s) {
@@ -434,18 +549,45 @@ static void gui_record_trim_trailing_newline(char *s) {
     }
 }
 
+/* Caller holds the log lock. Writes to the active session's log (only used
+ * while opening that log, so s_active is set). */
 static void gui_record_log_write_line_locked(const char *level, const char *message) {
-    if (!s_capture_log_file || !message || !message[0]) return;
+    if (!s_active || !s_active->log_file || !message || !message[0]) return;
     char ts[32];
     gui_record_build_log_timestamp(ts, sizeof(ts));
-    fprintf(s_capture_log_file, "[%s] [%s] %s\n", ts, (level && level[0]) ? level : "INFO", message);
-    fflush(s_capture_log_file);
+    fprintf(s_active->log_file, "[%s] [%s] %s\n", ts, (level && level[0]) ? level : "INFO", message);
+    fflush(s_active->log_file);
+}
+
+static void gui_record_log_write_line_ses(gui_record_session_t *ses,
+                                          const char *level, const char *message) {
+    if (!ses || !message || !message[0]) return;
+    gui_record_log_lock();
+    if (ses->log_file) {
+        char ts[32];
+        gui_record_build_log_timestamp(ts, sizeof(ts));
+        fprintf(ses->log_file, "[%s] [%s] %s\n", ts,
+                (level && level[0]) ? level : "INFO", message);
+        fflush(ses->log_file);
+    }
+    gui_record_log_unlock();
 }
 
 static void gui_record_log_write_line(const char *level, const char *message) {
-    gui_record_log_lock();
-    gui_record_log_write_line_locked(level, message);
-    gui_record_log_unlock();
+    gui_record_log_write_line_ses(s_active, level, message);
+}
+
+static void gui_record_log_writef_ses(gui_record_session_t *ses,
+                                      const char *level, const char *format, ...) {
+    if (!ses || !format || !format[0]) return;
+    char message[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    gui_record_trim_trailing_newline(message);
+    if (!message[0]) return;
+    gui_record_log_write_line_ses(ses, level, message);
 }
 
 static void gui_record_log_writef(const char *level, const char *format, ...) {
@@ -460,17 +602,9 @@ static void gui_record_log_writef(const char *level, const char *format, ...) {
     gui_record_log_write_line(level, message);
 }
 
-// Global app pointer for threads
-static gui_app_t *s_recording_app = NULL;
-
 // Overwrite confirmation pending state
 static bool s_overwrite_pending = false;
 static gui_app_t *s_pending_app = NULL;
-
-typedef struct {
-    gui_app_t *app;
-    double stop_request_time;
-} gui_record_finalize_ctx_t;
 
 static bool gui_record_collect_finalize_if_done(void) {
     if (!atomic_exchange(&s_record_stop_finalize_done, false)) {
@@ -480,16 +614,13 @@ static bool gui_record_collect_finalize_if_done(void) {
         thrd_join(s_finalize_thread, NULL);
         atomic_store(&s_finalize_thread_running, false);
     }
+    if (s_finalizing) {
+        free(s_finalizing);
+        s_finalizing = NULL;
+    }
     return true;
 }
 
-// Record-buffer backpressure stats at recording start (to compute per-session deltas)
-static uint32_t s_start_rec_a_wait_count = 0;
-static uint32_t s_start_rec_a_drop_count = 0;
-static uint32_t s_start_rec_b_wait_count = 0;
-static uint32_t s_start_rec_b_drop_count = 0;
-
-#define GUI_RECORD_SPILL_CHANNELS 2
 #define GUI_RECORD_SPILL_LOG_STEP_BYTES ((uint64_t)256 * 1024 * 1024)
 #define GUI_RECORD_DISK_GUARD_CHECK_INTERVAL_MS 1000ULL
 #define GUI_RECORD_DISK_GUARD_MIN_HEADROOM_BYTES ((uint64_t)2 * 1000 * 1000 * 1000)
@@ -501,27 +632,6 @@ static atomic_uint_fast64_t s_disk_guard_last_free_bytes = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_last_output_bytes = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_output_rate_bps = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t s_disk_guard_last_required_bytes = ATOMIC_VAR_INIT(0);
-
-typedef struct {
-    FILE *fp;
-    char path[512];
-    atomic_uint_fast64_t write_offset;
-    atomic_uint_fast64_t read_offset;
-    atomic_uint_fast64_t last_backlog_log_mark;
-    atomic_bool forced_mode;
-    atomic_bool opened;
-    atomic_flag io_lock;
-} gui_record_spill_channel_t;
-
-static gui_record_spill_channel_t s_record_spill[GUI_RECORD_SPILL_CHANNELS];
-
-// Per-channel output-file write error flags. Set by the writer threads when
-// the FLAC encoder or RAW fwrite fails (e.g. file locked by another app for
-// viewing). When set, the writer spills raw data to the temp file to protect
-// the capture, and the UI flashes the finalizing icon at capture stop.
-static atomic_bool s_record_write_error[GUI_RECORD_SPILL_CHANNELS] = {
-    ATOMIC_VAR_INIT(false), ATOMIC_VAR_INIT(false)
-};
 
 static const char *gui_record_spill_channel_name(int channel) {
     return (channel == 0) ? "A" : "B";
@@ -611,12 +721,12 @@ static bool gui_record_spill_open_channel_in_dir(const char *base_dir,
 }
 #endif
 
-static bool gui_record_spill_open_channel(gui_app_t *app, int channel, char *error_msg, size_t error_msg_size) {
+static bool gui_record_spill_open_channel(gui_record_session_t *ses, gui_app_t *app, int channel, char *error_msg, size_t error_msg_size) {
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (atomic_load(&spill->opened)) {
         return true;
     }
@@ -675,12 +785,12 @@ static bool gui_record_spill_open_channel(gui_app_t *app, int channel, char *err
     return true;
 }
 
-static void gui_record_spill_close_channel(int channel) {
+static void gui_record_spill_close_channel(gui_record_session_t *ses, int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     FILE *fp = spill->fp;
     spill->fp = NULL;
     if (fp) {
@@ -699,24 +809,27 @@ static void gui_record_spill_close_channel(int channel) {
     atomic_store(&spill->opened, false);
 }
 
-static void gui_record_spill_reset_all(void) {
+static void gui_record_spill_reset_all(gui_record_session_t *ses) {
+    if (!ses) return;
     for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        atomic_flag_clear(&s_record_spill[i].io_lock);
-        gui_record_spill_close_channel(i);
+        atomic_flag_clear(&ses->spill[i].io_lock);
+        gui_record_spill_close_channel(ses, i);
     }
 }
 
-static uint64_t gui_record_spill_backlog_bytes_locked(int channel) {
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+static uint64_t gui_record_spill_backlog_bytes_locked(gui_record_session_t *ses, int channel) {
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     uint64_t write_off = atomic_load(&spill->write_offset);
     uint64_t read_off = atomic_load(&spill->read_offset);
     return (write_off >= read_off) ? (write_off - read_off) : 0;
 }
 
 static uint64_t gui_record_spill_backlog_total_bytes(void) {
+    gui_record_session_t *ses = s_active;
+    if (!ses) return 0;
     uint64_t total = 0;
     for (int channel = 0; channel < GUI_RECORD_SPILL_CHANNELS; channel++) {
-        total += gui_record_spill_backlog_bytes_locked(channel);
+        total += gui_record_spill_backlog_bytes_locked(ses, channel);
     }
     return total;
 }
@@ -766,12 +879,12 @@ static uint64_t gui_record_estimate_output_bytes_from_raw_backlog(const gui_app_
     }
     return (uint64_t)estimate;
 }
-static void gui_record_spill_recycle_if_drained(int channel) {
+static void gui_record_spill_recycle_if_drained(gui_record_session_t *ses, int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (!atomic_load(&spill->opened) || !spill->fp) {
         return;
     }
@@ -815,12 +928,12 @@ static void gui_record_spill_recycle_if_drained(int channel) {
     gui_record_spill_unlock(spill);
 }
 
-static bool gui_record_spill_read_block(int channel, int16_t *dst, size_t bytes) {
+static bool gui_record_spill_read_block(gui_record_session_t *ses, int channel, int16_t *dst, size_t bytes) {
     if (!gui_record_spill_valid_channel(channel) || !dst || bytes == 0) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     if (!atomic_load(&spill->opened) || !spill->fp) {
         return false;
     }
@@ -845,7 +958,7 @@ static bool gui_record_spill_read_block(int channel, int16_t *dst, size_t bytes)
 
     if (ok) {
         atomic_store(&spill->read_offset, read_off + bytes);
-        gui_record_spill_recycle_if_drained(channel);
+        gui_record_spill_recycle_if_drained(ses, channel);
     }
 
     return ok;
@@ -855,7 +968,9 @@ bool gui_record_spill_is_forced(int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
     }
-    return atomic_load(&s_record_spill[channel].forced_mode);
+    gui_record_session_t *ses = s_active;
+    if (!ses) return false;
+    return atomic_load(&ses->spill[channel].forced_mode);
 }
 
 void gui_record_spill_clear_forced(int channel) {
@@ -866,7 +981,10 @@ void gui_record_spill_clear_forced(int channel) {
     // ringbuffer writes. The spill temp file itself is recycled by the
     // existing gui_record_spill_recycle_if_drained() path once the
     // writer thread drains it.
-    atomic_store(&s_record_spill[channel].forced_mode, false);
+    gui_record_session_t *ses = s_active;
+    if (ses) {
+        atomic_store(&ses->spill[channel].forced_mode, false);
+    }
 }
 
 bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *samples, size_t bytes,
@@ -878,11 +996,18 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
         return false;
     }
 
-    if (!gui_record_spill_open_channel(app, channel, error_msg, error_msg_size)) {
+    gui_record_session_t *ses = s_active;
+    if (!ses) {
+        if (error_msg && error_msg_size > 0) {
+            snprintf(error_msg, error_msg_size, "No active recording session for spill");
+        }
+        return false;
+    }
+    if (!gui_record_spill_open_channel(ses, app, channel, error_msg, error_msg_size)) {
         return false;
     }
 
-    gui_record_spill_channel_t *spill = &s_record_spill[channel];
+    gui_record_spill_channel_t *spill = &ses->spill[channel];
     bool first_force = !atomic_exchange(&spill->forced_mode, true);
     if (first_force && app) {
         char msg[640];
@@ -915,7 +1040,7 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
     }
 
     atomic_store(&spill->write_offset, write_off + bytes);
-    uint64_t backlog = gui_record_spill_backlog_bytes_locked(channel);
+    uint64_t backlog = gui_record_spill_backlog_bytes_locked(ses, channel);
     uint64_t mark = backlog / GUI_RECORD_SPILL_LOG_STEP_BYTES;
     uint64_t last_mark = atomic_load(&spill->last_backlog_log_mark);
     if (mark > last_mark) {
@@ -933,39 +1058,7 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
     return true;
 }
 
-// File writer context
-typedef struct {
-    buffer_manager_t *bufmgr;  // Buffer manager pointer
-    buffer_id_t buf_id;        // BUF_RECORD_A or BUF_RECORD_B
-    FILE *file;
-    int channel;  // 0 = A, 1 = B
-
-    // RF bit depth requested for output
-    // - FLAC: 8/12/16
-    // - RAW:  8/16
-    uint8_t rf_bits;
-
-    // For RAW writer: bytes per sample (1=8-bit, 2=16-bit)
-    size_t raw_bytes_per_sample;
-
-    // RF resampling (rate in kHz; 0 or disabled = passthrough)
-    bool enable_resample;
-    float resample_rate_khz;
-    int resample_quality;      // 0-4
-    float resample_gain_db;
-
-#if LIBSOXR_ENABLED
-    void *soxr;                // soxr_t (NULL if not initialized)
-    float soxr_rate_khz;       // configured output rate (kHz)
-#endif
-
-#if LIBFLAC_ENABLED == 1
-    flac_writer_t *writer;
-    atomic_uint_fast64_t *compressed_bytes;
-    uint8_t flac_bits_per_sample;
-#endif
-    gui_app_t *app;  // For error reporting
-} writer_ctx_t;
+/* writer_ctx_t is defined with gui_record_session_t near the top of the file. */
 
 #if LIBSOXR_ENABLED
 #include <soxr.h>
@@ -1022,14 +1115,7 @@ static soxr_t ensure_soxr(writer_ctx_t *wctx, float out_rate_khz) {
 }
 #endif
 
-static writer_ctx_t s_ctx_a;
-static writer_ctx_t s_ctx_b;
-
 #if LIBFLAC_ENABLED == 1
-// FLAC writers (managed by shared library)
-static flac_writer_t *s_flac_writer_a = NULL;
-static flac_writer_t *s_flac_writer_b = NULL;
-
 // Error callback for GUI FLAC writer
 static void gui_flac_error_callback(void *user_data, flac_writer_error_t error, const char *message) {
     (void)error;
@@ -1041,11 +1127,18 @@ static void gui_flac_error_callback(void *user_data, flac_writer_error_t error, 
     fprintf(stderr, "FLAC ERROR: %s\n", message);
 }
 
-// Bytes written callback for compression ratio tracking
+// Bytes written callback for compression ratio tracking. Accumulates into the
+// session (survives a new recording resetting the app atomics) and mirrors the
+// app-level atomic that feeds the live ratio display.
 static void gui_flac_bytes_callback(void *user_data, size_t bytes_written) {
     writer_ctx_t *wctx = (writer_ctx_t *)user_data;
     if (wctx && wctx->compressed_bytes) {
         atomic_fetch_add(wctx->compressed_bytes, bytes_written);
+    }
+    if (wctx && wctx->app) {
+        atomic_fetch_add((wctx->channel == 0) ? &wctx->app->recording_compressed_a
+                                              : &wctx->app->recording_compressed_b,
+                         bytes_written);
     }
 }
 static inline int8_t gui_record_sample_12bit_to_i8(int16_t sample) {
@@ -1099,7 +1192,7 @@ static bool gui_record_get_next_block(writer_ctx_t *wctx, size_t block_bytes, in
         return true;
     }
 
-    if (gui_record_spill_read_block(wctx->channel, spill_block, block_bytes)) {
+    if (gui_record_spill_read_block(wctx->ses, wctx->channel, spill_block, block_bytes)) {
         *out_samples = spill_block;
         *from_ringbuffer = false;
         return true;
@@ -1172,7 +1265,7 @@ static int flac_writer_thread(void *ctx) {
         const int16_t *in = NULL;
         bool from_ringbuffer = false;
         bool encode_failed = false;
-        int timeout_ms = (atomic_load(&do_exit) || !s_recording_app || !s_recording_app->is_recording) ? 0 : 10;
+        int timeout_ms = (atomic_load(&do_exit) || !atomic_load(&wctx->ses->recording)) ? 0 : 10;
 
         if (!gui_record_get_next_block(wctx, len, timeout_ms, spill_i16, &in, &from_ringbuffer)) {
             if (timeout_ms == 0) {
@@ -1240,7 +1333,7 @@ static int flac_writer_thread(void *ctx) {
         // next flac_writer_process call's write callback will succeed and
         // encoding resumes (recovery detected below).
         if (encode_failed) {
-            atomic_store(&s_record_write_error[wctx->channel], true);
+            atomic_store(&wctx->ses->write_error[wctx->channel], true);
             if (from_ringbuffer && wctx->app) {
                 // Spill the raw block before marking it consumed (the
                 // ringbuffer memory is still valid here). Blocks that came
@@ -1263,8 +1356,8 @@ static int flac_writer_thread(void *ctx) {
 
         // Encode succeeded. If we were previously in a write-error state,
         // clear the flag and log recovery so the UI stops flashing.
-        if (atomic_load(&s_record_write_error[wctx->channel])) {
-            atomic_store(&s_record_write_error[wctx->channel], false);
+        if (atomic_load(&wctx->ses->write_error[wctx->channel])) {
+            atomic_store(&wctx->ses->write_error[wctx->channel], false);
             flac_encoder_error_logged = false;
             fprintf(stderr, "[FLAC] Channel %c write recovered\n",
                     wctx->channel == 0 ? 'A' : 'B');
@@ -1280,12 +1373,14 @@ static int flac_writer_thread(void *ctx) {
             bufmgr_read_end(wctx->bufmgr, wctx->buf_id, len);
         }
 
-        if (s_recording_app) {
-            atomic_fetch_add(&s_recording_app->recording_bytes, len);
+        if (wctx->app) {
+            atomic_fetch_add(&wctx->app->recording_bytes, len);
             if (wctx->channel == 0) {
-                atomic_fetch_add(&s_recording_app->recording_raw_a, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->app->recording_raw_a, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->ses->acc_raw[0], raw_bytes_per_block);
             } else {
-                atomic_fetch_add(&s_recording_app->recording_raw_b, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->app->recording_raw_b, raw_bytes_per_block);
+                atomic_fetch_add(&wctx->ses->acc_raw[1], raw_bytes_per_block);
             }
         }
     }
@@ -1369,7 +1464,7 @@ static int raw_writer_thread(void *ctx) {
     while (1) {
         const int16_t *in = NULL;
         bool from_ringbuffer = false;
-        int timeout_ms = (atomic_load(&do_exit) || !s_recording_app || !s_recording_app->is_recording) ? 0 : 10;
+        int timeout_ms = (atomic_load(&do_exit) || !atomic_load(&wctx->ses->recording)) ? 0 : 10;
 
         // When in write-error state (output file locked by another app),
         // drain the ringbuffer to the spill temp file to protect the capture
@@ -1401,7 +1496,7 @@ static int raw_writer_thread(void *ctx) {
                 if (written == retry_bytes && !ferror(wctx->file)) {
                     // Write recovered — resume normal operation.
                     write_error = false;
-                    atomic_store(&s_record_write_error[wctx->channel], false);
+                    atomic_store(&wctx->ses->write_error[wctx->channel], false);
                     fprintf(stderr, "[RAW] Channel %c write recovered\n",
                             wctx->channel == 0 ? 'A' : 'B');
                     if (wctx->app) {
@@ -1410,12 +1505,14 @@ static int raw_writer_thread(void *ctx) {
                             GUI_ERROR_CLASS_NONE, 0);
                     }
                     bufmgr_read_end(wctx->bufmgr, wctx->buf_id, in_len);
-                    if (s_recording_app) {
-                        atomic_fetch_add(&s_recording_app->recording_bytes, in_len);
+                    if (wctx->app) {
+                        atomic_fetch_add(&wctx->app->recording_bytes, in_len);
                         if (wctx->channel == 0) {
-                            atomic_fetch_add(&s_recording_app->recording_raw_a, in_len);
+                            atomic_fetch_add(&wctx->app->recording_raw_a, in_len);
+                            atomic_fetch_add(&wctx->ses->acc_raw[0], in_len);
                         } else {
-                            atomic_fetch_add(&s_recording_app->recording_raw_b, in_len);
+                            atomic_fetch_add(&wctx->app->recording_raw_b, in_len);
+                            atomic_fetch_add(&wctx->ses->acc_raw[1], in_len);
                         }
                     }
                     continue;
@@ -1485,7 +1582,7 @@ static int raw_writer_thread(void *ctx) {
             // viewing). Enter write-error state, spill the block to the
             // temp file to preserve the data, and keep the capture running.
             write_error = true;
-            atomic_store(&s_record_write_error[wctx->channel], true);
+            atomic_store(&wctx->ses->write_error[wctx->channel], true);
             clearerr(wctx->file);
             raw_write_err_count++;
             if (raw_write_err_count <= 5 || (raw_write_err_count % 1000) == 0) {
@@ -1508,13 +1605,15 @@ static int raw_writer_thread(void *ctx) {
             continue;
         }
 
-        if (s_recording_app) {
+        if (wctx->app) {
             // Approximate byte accounting: count input bytes consumed
-            atomic_fetch_add(&s_recording_app->recording_bytes, in_len);
+            atomic_fetch_add(&wctx->app->recording_bytes, in_len);
             if (wctx->channel == 0) {
-                atomic_fetch_add(&s_recording_app->recording_raw_a, in_len);
+                atomic_fetch_add(&wctx->app->recording_raw_a, in_len);
+                atomic_fetch_add(&wctx->ses->acc_raw[0], in_len);
             } else {
-                atomic_fetch_add(&s_recording_app->recording_raw_b, in_len);
+                atomic_fetch_add(&wctx->app->recording_raw_b, in_len);
+                atomic_fetch_add(&wctx->ses->acc_raw[1], in_len);
             }
         }
     }
@@ -1539,7 +1638,6 @@ void gui_record_init(void) {
     atomic_store(&s_record_stop_finalizing, false);
     atomic_store(&s_record_stop_finalize_done, false);
     gui_record_reset_disk_guard_state();
-    gui_record_spill_reset_all();
 }
 
 // Cleanup recording subsystem
@@ -1551,21 +1649,28 @@ void gui_record_cleanup(void) {
         thrd_join(s_finalize_thread, NULL);
         atomic_store(&s_finalize_thread_running, false);
     }
+    if (s_finalizing) {
+        free(s_finalizing);
+        s_finalizing = NULL;
+    }
     gui_record_reset_disk_guard_state();
-    gui_record_spill_reset_all();
     gui_record_close_session_log();
 }
 
 // Check if recording is active
 bool gui_record_is_active(void) {
-    return s_recording_app != NULL && s_recording_app->is_recording;
+    return s_active != NULL && s_active->app->is_recording;
 }
 
 // Check if any recording channel has a persistent output-file write error.
 bool gui_record_has_write_error(void) {
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        if (atomic_load(&s_record_write_error[i])) {
-            return true;
+    gui_record_session_t *sessions[2] = { s_active, s_finalizing };
+    for (int s = 0; s < 2; s++) {
+        if (!sessions[s]) continue;
+        for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
+            if (atomic_load(&sessions[s]->write_error[i])) {
+                return true;
+            }
         }
     }
     return false;
@@ -1601,7 +1706,7 @@ void gui_record_log_capture_event(gui_app_t *app, const char *level, const char 
             gui_app_count_system_errors(app, increment);
         }
     }
-    if (app == s_recording_app) {
+    if (s_active && app == s_active->app) {
         gui_record_log_write_line(level, clean);
     }
 }
@@ -1710,22 +1815,6 @@ static uint8_t clamp_rf_bits_flac(uint8_t bits) {
 }
 
 #if LIBFLAC_ENABLED == 1
-static bool gui_record_flac_append_comment(FLAC__StreamMetadata *block,
-                                           const char *name,
-                                           const char *value)
-{
-    if (!block || !name || !name[0] || !value) return false;
-    FLAC__StreamMetadata_VorbisComment_Entry entry;
-    if (!FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&entry, name, value)) {
-        return false;
-    }
-    if (!FLAC__metadata_object_vorbiscomment_append_comment(block, entry, /*copy=*/false)) {
-        free(entry.entry);
-        return false;
-    }
-    return true;
-}
-
 static void gui_record_embed_flac_duration_metadata(gui_app_t *app,
                                                     const char *path,
                                                     const char *channel_label,
@@ -1749,68 +1838,33 @@ static void gui_record_embed_flac_duration_metadata(gui_app_t *app,
     snprintf(sample_rate_str, sizeof(sample_rate_str), "%" PRIu64, rf_sample_rate_hz);
     snprintf(sample_rate_khz_str, sizeof(sample_rate_khz_str), "%u", sample_rate_hz);
 
-    FLAC__Metadata_SimpleIterator *it = FLAC__metadata_simple_iterator_new();
-    if (!it) {
-        if (app) {
-            gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC metadata iterator for duration tagging",
-                GUI_ERROR_CLASS_NONE, 0);
-        }
-        return;
-    }
-
-    if (!FLAC__metadata_simple_iterator_init(it, path, /*read_only=*/false, /*preserve_file_stats=*/true)) {
-        if (app) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "Failed to open FLAC metadata iterator for %s (%s)",
-                     channel_label ? channel_label : "RF", path);
-            gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_simple_iterator_delete(it);
-        return;
-    }
-
-    FLAC__StreamMetadata *block = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    if (!block) {
-        if (app) {
-            gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC Vorbis comment block for duration tagging",
-                GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_simple_iterator_delete(it);
-        return;
-    }
-
-    bool ok =
-        gui_record_flac_append_comment(block, "DURATION_SECONDS", duration_seconds_str) &&
-        gui_record_flac_append_comment(block, "LENGTH", length_ms_str) &&
-        gui_record_flac_append_comment(block, "RF_TOTAL_SAMPLES", total_samples_str) &&
-        gui_record_flac_append_comment(block, "RF_SAMPLE_RATE", sample_rate_str) &&
-        gui_record_flac_append_comment(block, "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str);
-    if (!ok) {
-        if (app) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "Failed building FLAC duration metadata for %s (%s)",
-                     channel_label ? channel_label : "RF", path);
-            gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_object_delete(block);
-        FLAC__metadata_simple_iterator_delete(it);
-        return;
-    }
-
-    // Iterator starts at STREAMINFO; insert the duration comment block directly after it.
-    if (!FLAC__metadata_simple_iterator_insert_block_after(it, block, /*use_padding=*/true)) {
+    flac_writer_tag_t tags[5] = {
+        { "DURATION_SECONDS",   duration_seconds_str },
+        { "LENGTH",             length_ms_str },
+        { "RF_TOTAL_SAMPLES",   total_samples_str },
+        { "RF_SAMPLE_RATE",     sample_rate_str },
+        { "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str },
+    };
+    bool rewrote = false;
+    if (!flac_writer_embed_tags(path, tags, 5, &rewrote)) {
         if (app) {
             char msg[512];
             snprintf(msg, sizeof(msg), "Failed writing FLAC duration metadata for %s (%s)",
                      channel_label ? channel_label : "RF", path);
             gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
         }
-        FLAC__metadata_object_delete(block);
+        return;
     }
-
-    FLAC__metadata_simple_iterator_delete(it);
+    if (rewrote && app) {
+        /* Legacy file without reserved padding: libFLAC rewrote the whole
+         * file, which takes minutes on full-tape captures. */
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "FLAC duration metadata for %s required a full-file rewrite "
+                 "(no padding block; capture predates padded layout): %s",
+                 channel_label ? channel_label : "RF", path);
+        gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
+    }
 }
 
 // STREAMINFO.total_samples must hold the true Hz-domain sample count even though
@@ -1915,7 +1969,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
         snprintf(date_tag, sizeof(date_tag), "%s", "session");
     }
 
-    snprintf(s_capture_log_path, sizeof(s_capture_log_path), "%s/%s_%s_misrc_capture.log",
+    snprintf(s_active->log_path, sizeof(s_active->log_path), "%s/%s_%s_misrc_capture.log",
              app->settings.output_path, base_name, date_tag);
 
     bool cvbs_preview_a = false;
@@ -1926,9 +1980,9 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     atomic_flag_clear(&app->panel_config_lock);
 
     gui_record_log_lock();
-    s_capture_log_file = fopen(s_capture_log_path, "w");
-    if (!s_capture_log_file) {
-        s_capture_log_path[0] = '\0';
+    s_active->log_file = fopen(s_active->log_path, "w");
+    if (!s_active->log_file) {
+        s_active->log_path[0] = '\0';
         gui_record_log_unlock();
         return;
     }
@@ -1967,7 +2021,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "datetime_start: %s", iso_ts[0] ? iso_ts : "unknown");
     gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "capture_log_path: %s", s_capture_log_path);
+    snprintf(msg, sizeof(msg), "capture_log_path: %s", s_active->log_path);
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "capture_base_name: %s", base_src);
     gui_record_log_write_line_locked("INFO", msg);
@@ -2337,7 +2391,8 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
         return;
     }
 
-    s_video_started = true;
+    s_active->video_started = true;
+    snprintf(s_active->path_video, sizeof(s_active->path_video), "%s", s_record_path_video);
     /* Stashed rather than logged here. The FLAC path opens the session log
      * before this runs and the RAW path opens it after, so logging directly
      * would silently drop the line in the RAW branch. */
@@ -2359,7 +2414,7 @@ static void gui_record_flush_video_start_log(gui_app_t *app)
      * gui_record_log_capture_event silently drops the line when the session log
      * is not open yet, which is exactly the RAW path's situation at the spawn
      * site -- clearing it there lost the line entirely. */
-    if (!s_capture_log_file) return;
+    if (!s_active || !s_active->log_file) return;
     gui_record_log_capture_event(app, "INFO", s_video_start_msg, GUI_ERROR_CLASS_NONE, 0);
     s_video_start_msg[0] = '\0';
 }
@@ -2518,8 +2573,13 @@ int gui_record_start(gui_app_t *app) {
 
     (void)gui_record_collect_finalize_if_done();
 
-    if (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running)) {
-        gui_app_set_status(app, "Finalizing previous recording...");
+    /* The previous session's finalize releases the shared record ring buffers
+     * and the video encoder once its writer threads exit (drained). Until
+     * then a second consumer on the same ring buffers would corrupt both
+     * recordings. The slow legacy-metadata phase happens after drain, so this
+     * refusal window is the writer-drain tail only. */
+    if (s_finalizing && !atomic_load(&s_finalizing->drained)) {
+        gui_app_set_status(app, "Previous recording still draining buffers...");
         return RECORD_ERROR;
     }
 
@@ -2556,6 +2616,21 @@ int gui_record_start(gui_app_t *app) {
     snprintf(path_video, sizeof(path_video), "%s/%s",
              app->settings.output_path, app->settings.video_filename);
     bool file_v_exists = app->settings.video_record_enabled && (stat(path_video, &stat_v) == 0);
+
+    // A finalizing session still owns its output files; refuse to reuse them.
+    if (s_finalizing) {
+        bool clash =
+            (app->settings.capture_a && s_finalizing->path_a[0] &&
+             strcmp(path_a, s_finalizing->path_a) == 0) ||
+            (app->settings.capture_b && s_finalizing->path_b[0] &&
+             strcmp(path_b, s_finalizing->path_b) == 0) ||
+            (app->settings.video_record_enabled && s_finalizing->path_video[0] &&
+             strcmp(path_video, s_finalizing->path_video) == 0);
+        if (clash) {
+            gui_app_set_status(app, "Previous recording is still finalizing these files");
+            return RECORD_ERROR;
+        }
+    }
 
     if (file_a_exists || file_b_exists || file_v_exists) {
         // Build detailed message with file info
@@ -2629,19 +2704,6 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     char path_b[512];
     snprintf(path_a, sizeof(path_a), "%s/%s", app->settings.output_path, app->settings.output_filename_a);
     snprintf(path_b, sizeof(path_b), "%s/%s", app->settings.output_path, app->settings.output_filename_b);
-    s_record_path_a[0] = '\0';
-    s_record_path_b[0] = '\0';
-#if LIBFLAC_ENABLED == 1
-    s_record_sample_rate_a = 0;
-    s_record_sample_rate_b = 0;
-#endif
-    if (app->settings.capture_a) {
-        snprintf(s_record_path_a, sizeof(s_record_path_a), "%s", path_a);
-    }
-    if (app->settings.capture_b) {
-        snprintf(s_record_path_b, sizeof(s_record_path_b), "%s", path_b);
-    }
-
     // Check if using simulated device (doesn't use extraction thread)
     bool is_simulated = false;
     if (app->device_count > 0 && app->selected_device < app->device_count) {
@@ -2692,9 +2754,8 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 #endif
 
     /* Reference video preflight. Deliberately here: before any output file is
-     * opened and before s_recording_app is set, so a refusal leaves nothing to
+     * opened and before the session is created, so a refusal leaves nothing to
      * unwind. */
-    s_video_started = false;
     s_record_path_video[0] = '\0';
     s_video_start_msg[0] = '\0';
     if (app->settings.video_record_enabled) {
@@ -2750,34 +2811,46 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         }
     }
 
-    s_recording_app = app;
+    gui_record_session_t *ses = calloc(1, sizeof(*ses));
+    if (!ses) {
+        gui_app_set_status(app, "Out of memory starting recording");
+        return RECORD_ERROR;
+    }
+    ses->app = app;
+    ses->capture_a = app->settings.capture_a;
+    ses->capture_b = app->settings.capture_b;
+    if (ses->capture_a) {
+        snprintf(ses->path_a, sizeof(ses->path_a), "%s", path_a);
+    }
+    if (ses->capture_b) {
+        snprintf(ses->path_b, sizeof(ses->path_b), "%s", path_b);
+    }
+    s_active = ses;
     atomic_store(&app->recording_bytes, 0);
     atomic_store(&app->recording_raw_a, 0);
     atomic_store(&app->recording_raw_b, 0);
     atomic_store(&app->recording_compressed_a, 0);
     atomic_store(&app->recording_compressed_b, 0);
     app->last_recording_duration_s = 0.0;
-    gui_record_spill_reset_all();
-    // Clear per-channel write-error flags for the new recording session.
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        atomic_store(&s_record_write_error[i], false);
-    }
+    gui_record_session_init_sync(ses);
 
     // Reset record buffers before starting
     gui_extract_reset_record_rbs(app);
 
 #if LIBFLAC_ENABLED == 1
     if (app->settings.use_flac) {
+        ses->use_flac = true;
         // Open FLAC files (respect per-channel enable)
-        s_file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
-        s_file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
+        ses->file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
 
-        if ((app->settings.capture_a && !s_file_a) || (app->settings.capture_b && !s_file_b)) {
+        if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
             gui_app_set_status(app, "Failed to open output files");
-            if (s_file_a) fclose(s_file_a);
-            if (s_file_b) fclose(s_file_b);
-            s_file_a = s_file_b = NULL;
-            s_recording_app = NULL;
+            if (ses->file_a) fclose(ses->file_a);
+            if (ses->file_b) fclose(ses->file_b);
+            ses->file_a = ses->file_b = NULL;
+            free(ses);
+            s_active = NULL;
             return RECORD_ERROR;
         }
         gui_record_open_session_log(app, path_a, path_b);
@@ -2789,41 +2862,43 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         uint8_t bits_b = clamp_rf_bits_flac(app->settings.rf_bits_b);
 
         // Setup writer contexts
-        s_ctx_a.bufmgr = &app->buffers;
-        s_ctx_a.buf_id = BUF_RECORD_A;
-        s_ctx_a.file = s_file_a;
-        s_ctx_a.channel = 0;
-        s_ctx_a.compressed_bytes = &app->recording_compressed_a;
-        s_ctx_a.flac_bits_per_sample = bits_a;
-        s_ctx_a.rf_bits = bits_a;
-        s_ctx_a.raw_bytes_per_sample = 2;  // input blocks are int16
-        s_ctx_a.enable_resample = app->settings.enable_resample_a;
-        s_ctx_a.resample_rate_khz = app->settings.resample_rate_a;
-        s_ctx_a.resample_quality = app->settings.resample_quality_a;
-        s_ctx_a.resample_gain_db = app->settings.resample_gain_a;
+        ses->ctx_a.bufmgr = &app->buffers;
+        ses->ctx_a.buf_id = BUF_RECORD_A;
+        ses->ctx_a.file = ses->file_a;
+        ses->ctx_a.channel = 0;
+        ses->ctx_a.compressed_bytes = &ses->acc_comp[0];
+        ses->ctx_a.flac_bits_per_sample = bits_a;
+        ses->ctx_a.rf_bits = bits_a;
+        ses->ctx_a.raw_bytes_per_sample = 2;  // input blocks are int16
+        ses->ctx_a.enable_resample = app->settings.enable_resample_a;
+        ses->ctx_a.resample_rate_khz = app->settings.resample_rate_a;
+        ses->ctx_a.resample_quality = app->settings.resample_quality_a;
+        ses->ctx_a.resample_gain_db = app->settings.resample_gain_a;
 #if LIBSOXR_ENABLED
-        s_ctx_a.soxr = NULL;
-        s_ctx_a.soxr_rate_khz = 0.0f;
+        ses->ctx_a.soxr = NULL;
+        ses->ctx_a.soxr_rate_khz = 0.0f;
 #endif
-        s_ctx_a.app = app;
+        ses->ctx_a.app = app;
+        ses->ctx_a.ses = ses;
 
-        s_ctx_b.bufmgr = &app->buffers;
-        s_ctx_b.buf_id = BUF_RECORD_B;
-        s_ctx_b.file = s_file_b;
-        s_ctx_b.channel = 1;
-        s_ctx_b.compressed_bytes = &app->recording_compressed_b;
-        s_ctx_b.flac_bits_per_sample = bits_b;
-        s_ctx_b.rf_bits = bits_b;
-        s_ctx_b.raw_bytes_per_sample = 2;  // input blocks are int16
-        s_ctx_b.enable_resample = app->settings.enable_resample_b;
-        s_ctx_b.resample_rate_khz = app->settings.resample_rate_b;
-        s_ctx_b.resample_quality = app->settings.resample_quality_b;
-        s_ctx_b.resample_gain_db = app->settings.resample_gain_b;
+        ses->ctx_b.bufmgr = &app->buffers;
+        ses->ctx_b.buf_id = BUF_RECORD_B;
+        ses->ctx_b.file = ses->file_b;
+        ses->ctx_b.channel = 1;
+        ses->ctx_b.compressed_bytes = &ses->acc_comp[1];
+        ses->ctx_b.flac_bits_per_sample = bits_b;
+        ses->ctx_b.rf_bits = bits_b;
+        ses->ctx_b.raw_bytes_per_sample = 2;  // input blocks are int16
+        ses->ctx_b.enable_resample = app->settings.enable_resample_b;
+        ses->ctx_b.resample_rate_khz = app->settings.resample_rate_b;
+        ses->ctx_b.resample_quality = app->settings.resample_quality_b;
+        ses->ctx_b.resample_gain_db = app->settings.resample_gain_b;
 #if LIBSOXR_ENABLED
-        s_ctx_b.soxr = NULL;
-        s_ctx_b.soxr_rate_khz = 0.0f;
+        ses->ctx_b.soxr = NULL;
+        ses->ctx_b.soxr_rate_khz = 0.0f;
 #endif
-        s_ctx_b.app = app;
+        ses->ctx_b.app = app;
+        ses->ctx_b.ses = ses;
 
         // Configure FLAC writers using shared library
         flac_writer_config_t config_a = flac_writer_default_config();
@@ -2836,8 +2911,8 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         config_b.sample_rate = (app->settings.enable_resample_b && app->settings.resample_rate_b > 0.0f)
                                  ? (uint32_t)(app->settings.resample_rate_b)
                                  : 40000;
-        s_record_sample_rate_a = config_a.sample_rate;
-        s_record_sample_rate_b = config_b.sample_rate;
+        ses->sample_rate_a = config_a.sample_rate;
+        ses->sample_rate_b = config_b.sample_rate;
 
         // bits_per_sample is set per-channel below
         config_a.bits_per_sample = 16;
@@ -2864,71 +2939,75 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         config_a.bytes_cb = gui_flac_bytes_callback;
 
         if (app->settings.capture_a) {
-            config_a.bits_per_sample = s_ctx_a.flac_bits_per_sample;
-            config_a.callback_user_data = &s_ctx_a;
-            s_flac_writer_a = flac_writer_create_stream(s_file_a, &config_a);
-            if (!s_flac_writer_a) {
+            config_a.bits_per_sample = ses->ctx_a.flac_bits_per_sample;
+            config_a.callback_user_data = &ses->ctx_a;
+            ses->flac_a = flac_writer_create_stream(ses->file_a, &config_a);
+            if (!ses->flac_a) {
                 gui_app_set_status(app, "Failed to create FLAC encoder A");
                 gui_record_log_capture_event(app, "ERROR", "Failed to create FLAC encoder A",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
                 gui_record_close_session_log();
-                s_recording_app = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
-            s_ctx_a.writer = s_flac_writer_a;
+            ses->ctx_a.writer = ses->flac_a;
         } else {
-            s_flac_writer_a = NULL;
-            s_ctx_a.writer = NULL;
+            ses->flac_a = NULL;
+            ses->ctx_a.writer = NULL;
         }
 
         // Create writer for channel B
         if (app->settings.capture_b) {
             config_b.error_cb = gui_flac_error_callback;
             config_b.bytes_cb = gui_flac_bytes_callback;
-            config_b.bits_per_sample = s_ctx_b.flac_bits_per_sample;
-            config_b.callback_user_data = &s_ctx_b;
-            s_flac_writer_b = flac_writer_create_stream(s_file_b, &config_b);
-            if (!s_flac_writer_b) {
+            config_b.bits_per_sample = ses->ctx_b.flac_bits_per_sample;
+            config_b.callback_user_data = &ses->ctx_b;
+            ses->flac_b = flac_writer_create_stream(ses->file_b, &config_b);
+            if (!ses->flac_b) {
                 gui_app_set_status(app, "Failed to create FLAC encoder B");
                 gui_record_log_capture_event(app, "ERROR", "Failed to create FLAC encoder B",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_flac_writer_a) { flac_writer_abort(s_flac_writer_a); s_flac_writer_a = NULL; }
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
+                if (ses->flac_a) { flac_writer_abort(ses->flac_a); ses->flac_a = NULL; }
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
                 gui_record_close_session_log();
-                s_recording_app = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
-            s_ctx_b.writer = s_flac_writer_b;
+            ses->ctx_b.writer = ses->flac_b;
         } else {
-            s_flac_writer_b = NULL;
-            s_ctx_b.writer = NULL;
+            ses->flac_b = NULL;
+            ses->ctx_b.writer = NULL;
         }
         bool started_a = false;
         bool started_b = false;
 
         // Capture record-buffer backpressure stats at recording start
-        s_start_rec_a_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
-        s_start_rec_a_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
-        s_start_rec_b_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
-        s_start_rec_b_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
+        ses->start_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+        ses->start_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+        ses->start_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+        ses->start_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
 
         // Mark as recording
         app->is_recording = true;
+        atomic_store(&ses->recording, true);
         app->recording_start_time = GetTime();
+        ses->recording_start_time = app->recording_start_time;
 
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
         if (app->settings.capture_a) {
-            if (thrd_create_with_priority(&s_writer_thread_a,
+            if (thrd_create_with_priority(&ses->writer_thread_a,
                                           flac_writer_thread,
-                                          &s_ctx_a,
+                                          &ses->ctx_a,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start FLAC writer A");
                 gui_record_log_capture_event(app, "ERROR", "Failed to start FLAC writer A",
@@ -2936,43 +3015,45 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                 app->is_recording = false;
                 /* Removes the tap and asks the writer to drain. Does not join --
                  * this is the render thread; the join happens in finalize. */
-                if (s_video_started) gui_video_record_request_stop();
+                if (ses->video_started) gui_video_record_request_stop();
 
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_flac_writer_a) { flac_writer_abort(s_flac_writer_a); s_flac_writer_a = NULL; }
-                if (s_flac_writer_b) { flac_writer_abort(s_flac_writer_b); s_flac_writer_b = NULL; }
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
+                if (ses->flac_a) { flac_writer_abort(ses->flac_a); ses->flac_a = NULL; }
+                if (ses->flac_b) { flac_writer_abort(ses->flac_b); ses->flac_b = NULL; }
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
                 gui_record_close_session_log();
-                s_recording_app = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
             started_a = true;
         }
         if (app->settings.capture_b) {
-            if (thrd_create_with_priority(&s_writer_thread_b,
+            if (thrd_create_with_priority(&ses->writer_thread_b,
                                           flac_writer_thread,
-                                          &s_ctx_b,
+                                          &ses->ctx_b,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start FLAC writer B");
                 gui_record_log_capture_event(app, "ERROR", "Failed to start FLAC writer B",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
                 app->is_recording = false;
-                if (started_a) thrd_join(s_writer_thread_a, NULL);
+                if (started_a) thrd_join(ses->writer_thread_a, NULL);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_flac_writer_a) { flac_writer_abort(s_flac_writer_a); s_flac_writer_a = NULL; }
-                if (s_flac_writer_b) { flac_writer_abort(s_flac_writer_b); s_flac_writer_b = NULL; }
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
+                if (ses->flac_a) { flac_writer_abort(ses->flac_a); ses->flac_a = NULL; }
+                if (ses->flac_b) { flac_writer_abort(ses->flac_b); ses->flac_b = NULL; }
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
                 gui_record_close_session_log();
-                s_recording_app = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
             started_b = true;
         }
-        s_writer_threads_running = started_a || started_b;
+        ses->writer_threads_running = started_a || started_b;
 
         gui_record_start_video_if_enabled(app);
         gui_record_flush_video_start_log(app);
@@ -2996,102 +3077,111 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 #endif
     {
         // RAW recording (respect per-channel enable)
-        s_file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
-        s_file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
+        ses->file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
 
-        if ((app->settings.capture_a && !s_file_a) || (app->settings.capture_b && !s_file_b)) {
+        if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
             gui_app_set_status(app, "Failed to open output files");
-            if (s_file_a) fclose(s_file_a);
-            if (s_file_b) fclose(s_file_b);
-            s_file_a = s_file_b = NULL;
-            s_recording_app = NULL;
+            if (ses->file_a) fclose(ses->file_a);
+            if (ses->file_b) fclose(ses->file_b);
+            ses->file_a = ses->file_b = NULL;
+            free(ses);
+            s_active = NULL;
             return RECORD_ERROR;
         }
 
         uint8_t bits_a = rf_bits_for_raw(app->settings.rf_bits_a);
         uint8_t bits_b = rf_bits_for_raw(app->settings.rf_bits_b);
 
-        s_ctx_a.bufmgr = &app->buffers;
-        s_ctx_a.buf_id = BUF_RECORD_A;
-        s_ctx_a.file = s_file_a;
-        s_ctx_a.channel = 0;
-        s_ctx_a.rf_bits = bits_a;
-        s_ctx_a.raw_bytes_per_sample = (bits_a == 8) ? 1 : 2;
-        s_ctx_a.enable_resample = app->settings.enable_resample_a;
-        s_ctx_a.resample_rate_khz = app->settings.resample_rate_a;
-        s_ctx_a.resample_quality = app->settings.resample_quality_a;
-        s_ctx_a.resample_gain_db = app->settings.resample_gain_a;
+        ses->ctx_a.bufmgr = &app->buffers;
+        ses->ctx_a.buf_id = BUF_RECORD_A;
+        ses->ctx_a.file = ses->file_a;
+        ses->ctx_a.channel = 0;
+        ses->ctx_a.app = app;
+        ses->ctx_a.ses = ses;
+        ses->ctx_a.rf_bits = bits_a;
+        ses->ctx_a.raw_bytes_per_sample = (bits_a == 8) ? 1 : 2;
+        ses->ctx_a.enable_resample = app->settings.enable_resample_a;
+        ses->ctx_a.resample_rate_khz = app->settings.resample_rate_a;
+        ses->ctx_a.resample_quality = app->settings.resample_quality_a;
+        ses->ctx_a.resample_gain_db = app->settings.resample_gain_a;
 #if LIBSOXR_ENABLED
-        s_ctx_a.soxr = NULL;
-        s_ctx_a.soxr_rate_khz = 0.0f;
+        ses->ctx_a.soxr = NULL;
+        ses->ctx_a.soxr_rate_khz = 0.0f;
 #endif
 
-        s_ctx_b.bufmgr = &app->buffers;
-        s_ctx_b.buf_id = BUF_RECORD_B;
-        s_ctx_b.file = s_file_b;
-        s_ctx_b.channel = 1;
-        s_ctx_b.rf_bits = bits_b;
-        s_ctx_b.raw_bytes_per_sample = (bits_b == 8) ? 1 : 2;
-        s_ctx_b.enable_resample = app->settings.enable_resample_b;
-        s_ctx_b.resample_rate_khz = app->settings.resample_rate_b;
-        s_ctx_b.resample_quality = app->settings.resample_quality_b;
-        s_ctx_b.resample_gain_db = app->settings.resample_gain_b;
+        ses->ctx_b.bufmgr = &app->buffers;
+        ses->ctx_b.buf_id = BUF_RECORD_B;
+        ses->ctx_b.file = ses->file_b;
+        ses->ctx_b.channel = 1;
+        ses->ctx_b.app = app;
+        ses->ctx_b.ses = ses;
+        ses->ctx_b.rf_bits = bits_b;
+        ses->ctx_b.raw_bytes_per_sample = (bits_b == 8) ? 1 : 2;
+        ses->ctx_b.enable_resample = app->settings.enable_resample_b;
+        ses->ctx_b.resample_rate_khz = app->settings.resample_rate_b;
+        ses->ctx_b.resample_quality = app->settings.resample_quality_b;
+        ses->ctx_b.resample_gain_db = app->settings.resample_gain_b;
 #if LIBSOXR_ENABLED
-        s_ctx_b.soxr = NULL;
-        s_ctx_b.soxr_rate_khz = 0.0f;
+        ses->ctx_b.soxr = NULL;
+        ses->ctx_b.soxr_rate_khz = 0.0f;
 #endif
         bool started_a = false;
         bool started_b = false;
 
         // Capture record-buffer backpressure stats at recording start
-        s_start_rec_a_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
-        s_start_rec_a_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
-        s_start_rec_b_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
-        s_start_rec_b_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
+        ses->start_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+        ses->start_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+        ses->start_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+        ses->start_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
 
         // Boost process priority during recording
         proc_set_priority(PROC_PRIORITY_ABOVE);
 
         // Mark as recording
         app->is_recording = true;
+        atomic_store(&ses->recording, true);
         app->recording_start_time = GetTime();
+        ses->recording_start_time = app->recording_start_time;
 
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
         if (app->settings.capture_a) {
-            if (thrd_create_with_priority(&s_writer_thread_a,
+            if (thrd_create_with_priority(&ses->writer_thread_a,
                                           raw_writer_thread,
-                                          &s_ctx_a,
+                                          &ses->ctx_a,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer A");
                 app->is_recording = false;
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
-                s_recording_app = NULL;
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
             started_a = true;
         }
         if (app->settings.capture_b) {
-            if (thrd_create_with_priority(&s_writer_thread_b,
+            if (thrd_create_with_priority(&ses->writer_thread_b,
                                           raw_writer_thread,
-                                          &s_ctx_b,
+                                          &ses->ctx_b,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer B");
                 app->is_recording = false;
-                if (started_a) thrd_join(s_writer_thread_a, NULL);
+                if (started_a) thrd_join(ses->writer_thread_a, NULL);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
-                if (s_file_a) fclose(s_file_a);
-                if (s_file_b) fclose(s_file_b);
-                s_file_a = s_file_b = NULL;
-                s_recording_app = NULL;
+                if (ses->file_a) fclose(ses->file_a);
+                if (ses->file_b) fclose(ses->file_b);
+                ses->file_a = ses->file_b = NULL;
+                free(ses);
+                s_active = NULL;
                 return RECORD_ERROR;
             }
             started_b = true;
         }
-        s_writer_threads_running = started_a || started_b;
+        ses->writer_threads_running = started_a || started_b;
 
         gui_record_start_video_if_enabled(app);
         gui_record_flush_video_start_log(app);
@@ -3119,20 +3209,23 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 }
 
 // Stop recording - heavy finalization runs in background thread to keep UI responsive
-static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_time) {
-    // Wait for writer threads to drain and exit
-    if (s_writer_threads_running) {
-        if (app->settings.capture_a) thrd_join(s_writer_thread_a, NULL);
-        if (app->settings.capture_b) thrd_join(s_writer_thread_b, NULL);
+static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
+    gui_app_t *app = ses->app;
+    double stop_request_time = ses->stop_request_time;
+    // Wait for writer threads to drain and exit. Keyed off the session's
+    // latched channel flags, never off live settings.
+    if (ses->writer_threads_running) {
+        if (ses->capture_a) thrd_join(ses->writer_thread_a, NULL);
+        if (ses->capture_b) thrd_join(ses->writer_thread_b, NULL);
     }
     /* After the RF joins: the master reaches a consistent state first, and the
      * video finish can block for seconds flushing an FFV1 GOP. Keyed off the
      * latched flag, never off live settings. */
-    if (s_video_started) {
+    if (ses->video_started) {
         gui_video_record_finish();
         gui_video_record_status_t vs = gui_video_record_get_status();
         gui_preview_hold_release();
-        s_video_started = false;
+        ses->video_started = false;
 
         char msg[420];
         snprintf(msg, sizeof(msg),
@@ -3152,9 +3245,9 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
         }
     }
     {
-        s_writer_threads_running = false;
+        ses->writer_threads_running = false;
     }
-    gui_record_spill_reset_all();
+    gui_record_spill_reset_all(ses);
 
     // Alert the user if a persistent output-file write error was active
     // during recording (e.g. file locked by another app for viewing). The
@@ -3170,75 +3263,76 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
 #if LIBFLAC_ENABLED == 1
     uint64_t flac_samples_a = 0;
     uint64_t flac_samples_b = 0;
-    if (s_flac_writer_a) {
-        flac_samples_a = flac_writer_get_samples_written(s_flac_writer_a);
+    if (ses->flac_a) {
+        flac_samples_a = flac_writer_get_samples_written(ses->flac_a);
     }
-    if (s_flac_writer_b) {
-        flac_samples_b = flac_writer_get_samples_written(s_flac_writer_b);
+    if (ses->flac_b) {
+        flac_samples_b = flac_writer_get_samples_written(ses->flac_b);
     }
     // Finalize FLAC writers (this also cleans them up)
-    if (s_flac_writer_a) {
-        flac_writer_finish(s_flac_writer_a);
-        s_flac_writer_a = NULL;
+    if (ses->flac_a) {
+        flac_writer_finish(ses->flac_a);
+        ses->flac_a = NULL;
     }
-    if (s_flac_writer_b) {
-        flac_writer_finish(s_flac_writer_b);
-        s_flac_writer_b = NULL;
+    if (ses->flac_b) {
+        flac_writer_finish(ses->flac_b);
+        ses->flac_b = NULL;
     }
 #endif
 
     // Close files
-    if (s_file_a) {
-        fclose(s_file_a);
-        s_file_a = NULL;
+    if (ses->file_a) {
+        fclose(ses->file_a);
+        ses->file_a = NULL;
     }
-    if (s_file_b) {
-        fclose(s_file_b);
-        s_file_b = NULL;
+    if (ses->file_b) {
+        fclose(ses->file_b);
+        ses->file_b = NULL;
     }
+
+    /* Writer threads joined, video finished, files closed: the shared record
+     * ring buffers and video encoder are free for a new recording. Only this
+     * session's private metadata/summary work remains. */
+    atomic_store(&ses->drained, true);
 
 #if LIBFLAC_ENABLED == 1
     // Embed finalized duration metadata in RF FLAC files for easier post handling.
-    if (app->settings.use_flac) {
-        if (app->settings.capture_a && s_record_path_a[0]) {
-            gui_record_finalize_flac_streaminfo(app, s_record_path_a, "CH A",
+    if (ses->use_flac) {
+        if (ses->capture_a && ses->path_a[0]) {
+            gui_record_finalize_flac_streaminfo(app, ses->path_a, "CH A",
                                                 flac_samples_a);
-            gui_record_embed_flac_duration_metadata(app, s_record_path_a, "CH A",
-                                                    flac_samples_a, s_record_sample_rate_a);
+            gui_record_embed_flac_duration_metadata(app, ses->path_a, "CH A",
+                                                    flac_samples_a, ses->sample_rate_a);
         }
-        if (app->settings.capture_b && s_record_path_b[0]) {
-            gui_record_finalize_flac_streaminfo(app, s_record_path_b, "CH B",
+        if (ses->capture_b && ses->path_b[0]) {
+            gui_record_finalize_flac_streaminfo(app, ses->path_b, "CH B",
                                                 flac_samples_b);
-            gui_record_embed_flac_duration_metadata(app, s_record_path_b, "CH B",
-                                                    flac_samples_b, s_record_sample_rate_b);
+            gui_record_embed_flac_duration_metadata(app, ses->path_b, "CH B",
+                                                    flac_samples_b, ses->sample_rate_b);
         }
     }
 #endif
 
     // Print recording summary with backpressure stats
     double stop_complete_time = GetTime();
-    double total_duration = stop_complete_time - app->recording_start_time;
-    double capture_duration = stop_request_time - app->recording_start_time;
+    double total_duration = stop_complete_time - ses->recording_start_time;
+    double capture_duration = stop_request_time - ses->recording_start_time;
     double processing_duration = stop_complete_time - stop_request_time;
     if (capture_duration < 0.0) capture_duration = 0.0;
     if (processing_duration < 0.0) processing_duration = 0.0;
     if (total_duration < 0.0) total_duration = 0.0;
     app->last_recording_duration_s = capture_duration;
-    uint64_t raw_a = atomic_load(&app->recording_raw_a);
-    uint64_t raw_b = atomic_load(&app->recording_raw_b);
-    uint64_t comp_a = atomic_load(&app->recording_compressed_a);
-    uint64_t comp_b = atomic_load(&app->recording_compressed_b);
+    uint64_t raw_a = atomic_load(&ses->acc_raw[0]);
+    uint64_t raw_b = atomic_load(&ses->acc_raw[1]);
+    uint64_t comp_a = atomic_load(&ses->acc_comp[0]);
+    uint64_t comp_b = atomic_load(&ses->acc_comp[1]);
     uint64_t raw_total = raw_a + raw_b;
     uint64_t comp_total = comp_a + comp_b;
     double ratio_total = (comp_total > 0) ? ((double)raw_total / (double)comp_total) : 0.0;
-    uint32_t end_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
-    uint32_t end_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
-    uint32_t end_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
-    uint32_t end_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
-    uint32_t rec_a_waits = end_rec_a_waits - s_start_rec_a_wait_count;
-    uint32_t rec_a_drops = end_rec_a_drops - s_start_rec_a_drop_count;
-    uint32_t rec_b_waits = end_rec_b_waits - s_start_rec_b_wait_count;
-    uint32_t rec_b_drops = end_rec_b_drops - s_start_rec_b_drop_count;
+    uint32_t rec_a_waits = ses->end_rec_a_waits - ses->start_rec_a_waits;
+    uint32_t rec_a_drops = ses->end_rec_a_drops - ses->start_rec_a_drops;
+    uint32_t rec_b_waits = ses->end_rec_b_waits - ses->start_rec_b_waits;
+    uint32_t rec_b_drops = ses->end_rec_b_drops - ses->start_rec_b_drops;
     uint32_t rec_waits = rec_a_waits + rec_b_waits;
     uint32_t rec_drops = rec_a_drops + rec_b_drops;
 
@@ -3284,30 +3378,15 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
         gui_record_build_iso8601_timestamp(end_iso, sizeof(end_iso));
         gui_record_log_writef("INFO", "datetime_end: %s", end_iso[0] ? end_iso : "unknown");
     }
-    gui_record_log_writef("INFO", "Session complete");
-    gui_record_close_session_log();
-    s_record_path_a[0] = '\0';
-    s_record_path_b[0] = '\0';
-#if LIBFLAC_ENABLED == 1
-    s_record_sample_rate_a = 0;
-    s_record_sample_rate_b = 0;
-#endif
-
-    s_recording_app = NULL;
+    gui_record_log_writef_ses(ses, "INFO", "Session complete");
+    gui_record_close_session_log_ses(ses);
 }
 
 static int gui_record_finalize_thread(void *arg) {
-    gui_record_finalize_ctx_t *ctx = (gui_record_finalize_ctx_t *)arg;
-    if (!ctx || !ctx->app) {
-        atomic_store(&s_record_stop_finalizing, false);
-        if (ctx) free(ctx);
-        return 0;
-    }
-
-    gui_record_finalize_stop_sync(ctx->app, ctx->stop_request_time);
+    gui_record_session_t *ses = (gui_record_session_t *)arg;
+    gui_record_finalize_stop_sync(ses);
     atomic_store(&s_record_stop_finalize_done, true);
     atomic_store(&s_record_stop_finalizing, false);
-    free(ctx);
     return 0;
 }
 
@@ -3315,18 +3394,47 @@ void gui_record_stop(gui_app_t *app) {
     if (!app->is_recording) {
         return;
     }
+    // One finalize in flight: if the previous one is somehow still running
+    // (rare -- its slow phases are gone for padded captures), wait for it
+    // before handing over.
     if (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running)) {
-        gui_app_set_status(app, "Finalizing previous recording...");
+        gui_app_set_status(app, "Waiting for previous finalize...");
+        while (atomic_load(&s_record_stop_finalizing)) {
+            thrd_sleep_ms(10);
+        }
+        (void)gui_record_collect_finalize_if_done();
+        if (atomic_load(&s_finalize_thread_running)) {
+            thrd_join(s_finalize_thread, NULL);
+            atomic_store(&s_finalize_thread_running, false);
+        }
+        if (s_finalizing) {
+            free(s_finalizing);
+            s_finalizing = NULL;
+        }
+    }
+    gui_record_session_t *ses = s_active;
+    if (!ses) {
+        app->is_recording = false;
         return;
     }
     gui_record_reset_disk_guard_state();
-    double stop_request_time = GetTime();
+    ses->stop_request_time = GetTime();
+
+    // Snapshot buffer-stat counters NOW: a new recording keeps incrementing
+    // the shared buffer-manager counters while this session finalizes.
+    ses->end_rec_a_waits = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+    ses->end_rec_a_drops = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+    ses->end_rec_b_waits = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+    ses->end_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
 
     // Disable recording in extraction thread first.
     gui_extract_set_recording(false, false, 16, 16);
 
-    // Signal threads to stop FIRST so the audio restart cannot reopen WAVs in record mode.
+    // Signal threads to stop FIRST so the audio restart cannot reopen WAVs in
+    // record mode. The session flag switches this session's writer threads to
+    // drain mode independently of any new recording's state.
     app->is_recording = false;
+    atomic_store(&ses->recording, false);
 
     // Stop audio output/monitoring and restart monitor-only path if still capturing.
     gui_audio_stop(app);
@@ -3337,23 +3445,19 @@ void gui_record_stop(gui_app_t *app) {
     // Restore normal process priority
     proc_set_priority(PROC_PRIORITY_NORMAL);
 
-    gui_record_finalize_ctx_t *ctx = (gui_record_finalize_ctx_t *)calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        gui_record_finalize_stop_sync(app, stop_request_time);
-        gui_app_set_status(app, "Recording stopped");
-        return;
-    }
-
-    ctx->app = app;
-    ctx->stop_request_time = stop_request_time;
+    // Hand the session to the finalize thread; the module forgets it as the
+    // active recording so a new session can be created.
+    s_active = NULL;
+    s_finalizing = ses;
 
     atomic_store(&s_record_stop_finalize_done, false);
     atomic_store(&s_record_stop_finalizing, true);
 
-    if (thrd_create(&s_finalize_thread, gui_record_finalize_thread, ctx) != thrd_success) {
+    if (thrd_create(&s_finalize_thread, gui_record_finalize_thread, ses) != thrd_success) {
         atomic_store(&s_record_stop_finalizing, false);
-        free(ctx);
-        gui_record_finalize_stop_sync(app, stop_request_time);
+        gui_record_finalize_stop_sync(ses);
+        free(ses);
+        s_finalizing = NULL;
         gui_app_set_status(app, "Recording stopped");
         return;
     }

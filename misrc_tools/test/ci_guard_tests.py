@@ -172,8 +172,10 @@ def check_meson_vendored_hsdaoh_policy(meson_path: Path) -> int:
     lacks the v1.0.9 connect fixes."""
     meson_text = read_text(meson_path)
     required_snippets = [
-        "hsdaoh_vendored_pc",
-        "fs.exists(hsdaoh_vendored_pc)",
+        # The vendored-pc probe was generalized (lib/lib64, hsdaoh/libhsdaoh)
+        # in the Fedora-build merge; these match the probing implementation.
+        "vendored_pc_dir",
+        "fs.exists(hsdaoh_deps_root / _libdir / 'pkgconfig' / (_pc + '.pc'))",
         "Using vendored hsdaoh from .deps/install (mirrors CI",
         "declare_dependency",
         "deps = [ hsdaoh_dep ]",

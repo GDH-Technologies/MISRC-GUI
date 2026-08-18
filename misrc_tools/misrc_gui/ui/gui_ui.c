@@ -3466,13 +3466,17 @@ static void render_toolbar(gui_app_t *app) {
 
         // Record button (capture) / Play-Pause button (playback mode)
         bool record_finalizing = gui_record_is_finalizing();
-        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (app->is_recording ? COLOR_CLIP_RED : COLOR_BUTTON);
-        const char *record_label = record_finalizing ? "Finalize" : (app->is_recording ? "Stop Rec" : "Record");
+        // Finalize no longer blocks a new recording; tint the idle button
+        // orange as the indicator, but recording state always wins.
+        Color record_color = app->is_recording ? COLOR_CLIP_RED
+                             : (record_finalizing ? (Color){184, 118, 20, 255} : COLOR_BUTTON);
+        const char *record_label = app->is_recording ? "Stop Rec"
+                                   : (record_finalizing ? "Finalize" : "Record");
         // Flash the finalize icon red if a persistent output-file write error
         // is active (e.g. file locked by another app) so the user knows the
         // recording had write issues. Blink at ~1 Hz between the finalize
         // orange and clip red.
-        if (record_finalizing && gui_record_has_write_error()) {
+        if (record_finalizing && !app->is_recording && gui_record_has_write_error()) {
             bool blink_on = (fmod(GetTime(), 1.0) < 0.5);
             record_color = blink_on ? COLOR_CLIP_RED : (Color){184, 118, 20, 255};
         }
@@ -5900,11 +5904,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             }
             if (app->is_capturing) {
-                if (gui_record_is_finalizing()) {
-                    gui_app_set_status(app, "Finalizing previous recording...");
-                } else if (app->is_recording) {
+                if (app->is_recording) {
                     gui_app_stop_recording(app);
                 } else {
+                    // gui_record_start itself refuses on drain/path collision
+                    // with a status message; finalize no longer blocks here.
                     gui_app_start_recording(app);
                 }
             }
