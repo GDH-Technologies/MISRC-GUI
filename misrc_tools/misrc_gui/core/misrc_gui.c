@@ -473,6 +473,7 @@ int main(int argc, char **argv) {
     Clay_SetMeasureTextFunction(Raylib_MeasureText, fonts);
 
     // Initialize application
+    gui_preview_init(argc > 0 ? argv[0] : NULL);
     gui_app_init(&app);
 
     // Set app for text rendering font access
@@ -577,6 +578,7 @@ int main(int argc, char **argv) {
 
         // Check for pending popup result (for async confirmations like file overwrite)
         gui_record_check_popup(&app);
+        gui_preview_tick();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
@@ -807,6 +809,7 @@ int main(int argc, char **argv) {
     // Save settings before cleanup
     gui_settings_save(&app.settings);
     
+    gui_preview_shutdown();
     gui_app_cleanup(&app);
     free(clay_memory);
 

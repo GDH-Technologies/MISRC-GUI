@@ -10,6 +10,7 @@
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_oscilloscope.h"
+#include "../visualization/gui_preview_panel.h"
 #include "../input/gui_cxadc_params.h"
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
@@ -4979,9 +4980,13 @@ static void gui_ui_close_channel_panel_overlays(gui_app_t *app, int channel) {
     while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
     if (config->left_view == PANEL_VIEW_WAVEFORM) {
         gui_waveform_close_overlays(config->left_state);
+    } else if (config->left_view == PANEL_VIEW_PREVIEW) {
+        gui_preview_close_overlays(config->left_state);
     }
     if (config->split && config->right_view == PANEL_VIEW_WAVEFORM) {
         gui_waveform_close_overlays(config->right_state);
+    } else if (config->split && config->right_view == PANEL_VIEW_PREVIEW) {
+        gui_preview_close_overlays(config->right_state);
     }
     atomic_flag_clear(&app->panel_config_lock);
 }

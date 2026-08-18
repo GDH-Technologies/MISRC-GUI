@@ -23,6 +23,8 @@
 #include "gui_simulated.h"
 #include "gui_playback.h"
 #include "gui_cxadc.h"
+#include "../visualization/gui_preview_panel.h"
+#include "gui_preview_v4l2.h"
 #ifdef ENABLE_FX3
 #include "gui_fx3.h"
 #endif
@@ -929,6 +931,7 @@ void gui_app_init(gui_app_t *app) {
     gui_fft_panel_register();
     gui_cvbs_panel_register();
     gui_histogram_panel_register();
+    gui_preview_panel_register();
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));

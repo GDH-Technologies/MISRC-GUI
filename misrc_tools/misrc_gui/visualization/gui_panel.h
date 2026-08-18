@@ -62,6 +62,15 @@ void panel_config_set_right_view(channel_panel_config_t *config, panel_view_type
 void panel_config_set_split(channel_panel_config_t *config, bool split);
 
 //-----------------------------------------------------------------------------
+// Shared Geometry
+//-----------------------------------------------------------------------------
+
+// Largest rectangle of the given aspect ratio that fits inside bounds, centred.
+// Shared by every panel that draws a picture (CVBS, VHS FM, Preview) so the
+// letterboxing math exists once rather than three times.
+Rectangle gui_panel_aspect_fit(Rectangle bounds, float aspect);
+
+//-----------------------------------------------------------------------------
 // Unified Panel Input Handling
 //-----------------------------------------------------------------------------
 
