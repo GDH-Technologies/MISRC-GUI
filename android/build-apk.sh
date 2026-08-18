@@ -48,16 +48,29 @@ fail() { printf '[android-apk] ERROR: %s\n' "$*" >&2; exit 1; }
 [[ -x "$ZIPALIGN" ]] || fail "zipalign not found at $ZIPALIGN"
 [[ -x "$APKSIGNER" ]] || fail "apksigner not found at $APKSIGNER"
 
-# Resolve version from git tags (mirrors build-appimage-local.sh).
+# Resolve version from the shared misrc_tools/git-version.sh (single source
+# of truth, same as CI / AppImage / the GUI About box). Derive a monotonic
+# integer versionCode from the leading semver triplet (vMAJOR.MINOR.PATCH) so
+# release builds get unique, ordered codes; dev/untagged builds fall back to
+# code 1. versionName stays as the full resolved version string (e.g.
+# "v1.1.4-dev") to match the APK filename and the About box exactly.
 VERSION="$("$REPO_ROOT/misrc_tools/git-version.sh" 2>/dev/null || true)"
 if [[ -z "$VERSION" ]]; then
   VERSION="v1.1.4-dev"
 fi
 
+SEMVER_BASE="$(printf '%s' "$VERSION" | sed -n 's/^v\?\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+VERSION_CODE=1
+if [[ -n "$SEMVER_BASE" ]]; then
+  IFS=. read -r MAJOR MINOR PATCH <<<"$SEMVER_BASE"
+  VERSION_CODE=$(( (10#${MAJOR:-0})*1000000 + (10#${MINOR:-0})*1000 + (10#${PATCH:-0}) ))
+fi
+[[ "$VERSION_CODE" -ge 1 ]] || VERSION_CODE=1
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-log "Building MISRC GUI APK version=$VERSION"
+log "Building MISRC GUI APK version=$VERSION versionCode=$VERSION_CODE"
 
 # --- 1. Prepare resources (icon) ---
 RES_DIR="$WORK/res"
@@ -82,6 +95,9 @@ log "linking manifest + resources..."
   -I "$ANDROID_JAR" \
   --min-sdk-version 30 \
   --target-sdk-version 34 \
+  --version-code "$VERSION_CODE" \
+  --version-name "$VERSION" \
+  --replace-version \
   -o "$WORK/base.apk" \
   "$WORK/resources.zip"
 
