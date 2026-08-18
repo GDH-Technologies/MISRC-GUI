@@ -132,3 +132,26 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Keep `-DGRAPHICS_API_OPENGL_ES3` in the android cflags — it must match the raylib cross-build's GRAPHICS or `rlActiveDrawBuffers` re-introduces the `glDrawBuffersEXT` link error.
   - Do not add `-lpthread` to android link flags (bionic pthread is in libc; -lpthread fails to link).
   - Keep the raylib.pc + rlgl.h sed-patches in `build-deps-android.sh` (run unconditionally so reruns stay correct).
+
+## 2026-08-18 FLAC encode failure on clipped/resampled signal (issue #1)
+
+- Issue: https://github.com/harrypm/MISRC-GUI/issues/1 ("Clipped, resampled signal causes FLAC encode to fail")
+- Symptom: when capturing and downsampling on the fly (e.g. 40 MHz -> 20 MHz), clipped input lets the soxr resampler overshoot the source 12-bit range, and the FLAC encoder aborts with:
+  - `FLAC process error: FLAC__STREAM_ENCODER_CLIENT_ERROR`
+  - `FLAC encoder error on channel A` (or B)
+- Root cause: `convert_i16_to_flac_i32()` in `misrc_tools/misrc_gui/output/gui_record.c` (at the function referenced in the issue) clamped the 8-bit path via `gui_record_sample_12bit_to_i8()`, but the 12-bit and 16-bit paths did not clamp:
+  - 12-bit path: `dst[i] = (int32_t)src[i];` could write values outside the signed 12-bit range `[-2048, 2047]` declared to the FLAC encoder.
+  - 16-bit path: `dst[i] = (int32_t)src[i] << 4;` could shift an overshooting 12-bit value outside the signed 16-bit range `[-32768, 32767]` declared to the FLAC encoder.
+  - Out-of-range samples violate the declared bits-per-sample and trigger `FLAC__STREAM_ENCODER_CLIENT_ERROR`.
+- Fix: clamp both unclamped paths to their declared bit-depth range, mirroring the existing 8-bit clamp:
+  - 12-bit: clamp to `[-2048, 2047]`.
+  - 16-bit: clamp the post-`<<4` value to `[-32768, 32767]`.
+  - RAW 16-bit path was already safe (writes `int16_t` directly, inherently bounded).
+- Files changed:
+  - `misrc_tools/misrc_gui/output/gui_record.c` (`convert_i16_to_flac_i32`).
+- Base commit: `1f6c54c` (prior to this fix).
+- Validation (local, Linux Mint):
+  - `meson compile -C build-local2 misrc_gui` -> builds clean (only pre-existing warnings).
+  - `build-local2/misrc_gui --smoke-test` -> passes.
+- Not yet validated: real on-the-fly resample capture (40 MHz -> 20 MHz) with clipped input against live hardware; confirm no `FLAC__STREAM_ENCODER_CLIENT_ERROR` under sustained clipped+resampled capture before shipping a release.
+- Restore point: zip of the patched `gui_record.c` + this note preserved on the host at `~/MISRC-GUI-restore-points/fix-issue-1-flac-resample-clamp/`.

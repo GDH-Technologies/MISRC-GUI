@@ -1062,15 +1062,30 @@ static void convert_i16_to_flac_i32(int32_t *dst, const int16_t *src, size_t n, 
     }
 
     if (bits == 12) {
+        // BUF_RECORD samples are signed 12-bit carried in int16_t, but the
+        // soxr resampler can overshoot the 12-bit range on clipped input
+        // (e.g. when downsampling on the fly). Clamp to the signed 12-bit
+        // range declared to the FLAC encoder, otherwise samples exceed the
+        // declared bit depth and FLAC__STREAM_ENCODER_CLIENT_ERROR fires.
         for (size_t i = 0; i < n; i++) {
-            dst[i] = (int32_t)src[i];
+            int32_t v = (int32_t)src[i];
+            if (v > 2047) v = 2047;
+            if (v < -2048) v = -2048;
+            dst[i] = v;
         }
         return;
     }
 
-    // 16-bit output: expand 12-bit capture samples to 16-bit range
+    // 16-bit output: expand 12-bit capture samples to 16-bit range. The
+    // resampler can overshoot the source 12-bit range; after the <<4 shift
+    // that can exceed the signed 16-bit range declared to the FLAC encoder.
+    // Clamp the shifted result so the encoder never receives out-of-range
+    // samples (mirrors the 8-bit path's clamp behavior).
     for (size_t i = 0; i < n; i++) {
-        dst[i] = (int32_t)src[i] << 4;
+        int32_t v = (int32_t)src[i] << 4;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        dst[i] = v;
     }
 }
 
