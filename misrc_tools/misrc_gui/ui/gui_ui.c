@@ -906,6 +906,7 @@ static char status_rf_buf_display[16];
 static char status_aud_buf_display[16];
 static char status_free_space_display[120];
 static char status_message_display[192];
+static char status_record_timer_display[16];
 static char record_limit_state_display[96];
 static char record_limit_timecode_display[20];
 static bool s_status_free_space_valid = false;
@@ -4730,6 +4731,28 @@ static void render_status_bar(gui_app_t *app) {
                 .childGap = status_left_gap
             }
         }) {
+
+            // Recording indicator: red dot + live HH:MM:SS timer (restored
+            // from v1.1.4). Shown whenever recording (hidden in 1/4 compact
+            // mode where bottom-bar space is at a premium), regardless of the
+            // responsive status-message gating below, so the record timer is
+            // always visible in the bottom bar while a recording is active.
+            if (app->is_recording && !status_quarter_scale) {
+                CLAY(CLAY_ID("RecIndicator"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(12), CLAY_SIZING_FIXED(12) } },
+                    .backgroundColor = to_clay_color(COLOR_CLIP_RED),
+                    .cornerRadius = CLAY_CORNER_RADIUS(6)
+                }) {}
+
+                double rec_duration = GetTime() - app->recording_start_time;
+                int rec_hours = (int)(rec_duration / 3600);
+                int rec_mins  = ((int)(rec_duration / 60)) % 60;
+                int rec_secs  = ((int)rec_duration) % 60;
+                snprintf(status_record_timer_display, sizeof(status_record_timer_display),
+                         "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
+                CLAY_TEXT(make_string(status_record_timer_display),
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
 
             if (show_status_message) {
                 const char *raw_status = (app->status_message[0] != '\0')
