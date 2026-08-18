@@ -24,6 +24,13 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#if defined(__ANDROID__)
+extern void android_set_keyboard_visible(int visible);
+extern size_t android_drain_text_input(char *out, size_t out_len);
+extern const char *android_get_storage_path(void);
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 #ifndef MIRSC_TOOLS_VERSION
 #define MIRSC_TOOLS_VERSION "dev"
@@ -230,6 +237,19 @@ static double s_record_limit_deadline_s = 0.0;
 #define RECORD_LIMIT_TIMECODE_SCALE 1.30f
 #define RECORD_LIMIT_TIMECODE_BORDER_X 5
 #define RECORD_LIMIT_TIMECODE_BORDER_Y 3
+#if defined(__ANDROID__)
+static bool s_android_keyboard_visible = false;
+#endif
+
+void gui_ui_sync_android_keyboard_state(void) {
+#if defined(__ANDROID__)
+    bool want_visible = (s_active_text_field != UI_TEXT_FIELD_NONE) || s_record_limit_timecode_edit;
+    if (want_visible != s_android_keyboard_visible) {
+        android_set_keyboard_visible(want_visible ? 1 : 0);
+        s_android_keyboard_visible = want_visible;
+    }
+#endif
+}
 
 
 bool gui_ui_click_consumed(void) {
@@ -508,6 +528,7 @@ static char status_errors_display[16];
 static char status_rf_buf_display[16];
 static char status_aud_buf_display[16];
 static char status_free_space_display[120];
+static char status_message_display[192];
 static char record_limit_state_display[96];
 static char record_limit_timecode_display[20];
 static bool s_status_free_space_valid = false;
@@ -1594,6 +1615,41 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
             }
         }
     }
+#if defined(__ANDROID__)
+    {
+        char android_text[512];
+        size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+        bool finish_edit_requested = false;
+        if (android_len > 0) {
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach == '\r' || ach == '\n') {
+                    finish_edit_requested = true;
+                    continue;
+                }
+                if (ach == '\b' || ach == 127) {
+                    if (!gui_ui_text_delete_selection(dst)) {
+                        if (gui_ui_text_backspace(dst, &s_active_text_cursor)) changed = true;
+                    } else {
+                        changed = true;
+                    }
+                    continue;
+                }
+                if (primary_mod_down) continue;
+                if (!gui_ui_text_field_char_allowed(s_active_text_field, (int)ach)) continue;
+                if (gui_ui_text_delete_selection(dst)) changed = true;
+                if (gui_ui_text_insert_char(dst, cap, (int)ach)) changed = true;
+            }
+        }
+        if (finish_edit_requested) {
+            gui_ui_text_clamp_state(dst);
+            gui_settings_save(&app->settings);
+            gui_ui_clear_text_edit();
+            return;
+        }
+    }
+#endif
     int ch = GetCharPressed();
     while (ch > 0) {
         if (!primary_mod_down && gui_ui_text_field_char_allowed(s_active_text_field, ch)) {
@@ -4135,6 +4191,8 @@ static void render_status_bar(gui_app_t *app) {
     bool show_frame_count = !status_narrow;
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
+    bool show_status_message = !status_tiny && !status_quarter_scale;
+    bool show_free_space = !show_status_message || !status_narrow;
     int sample_rate_value_width = status_narrow ? 68 : 80;
     int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
     int frames_value_width = 50;
@@ -4142,6 +4200,8 @@ static void render_status_bar(gui_app_t *app) {
     int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
     int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
     int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
+    int status_left_gap = status_tiny ? 6 : 10;
+    int status_message_value_width = status_narrow ? 220 : (status_compact ? 300 : 430);
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
     const char *samples_label = status_tiny ? "S:" : (status_narrow ? "Samp:" : "Samples:");
@@ -4161,48 +4221,96 @@ static void render_status_bar(gui_app_t *app) {
             .layout = {
                 .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = status_left_gap
             }
         }) {
-
-            Color free_space_color = COLOR_TEXT_DIM;
-            if (s_status_free_space_valid) {
-                format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
-                                               s_status_free_space_cached_bytes);
-                if (app->is_recording && s_status_output_rate_bps > 0.0) {
-                    char free_only[48];
-                    char runway_hms[24];
-                    double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
-                    format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
-                    format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
-                    if (status_tiny) {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "Rwy %s", runway_hms);
-                    } else if (status_narrow) {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "%s | Rwy %s", free_only, runway_hms);
-                    } else {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "%s | Runway %s",
-                                 free_only, runway_hms);
+            if (show_status_message) {
+                const char *raw_status = (app->status_message[0] != '\0')
+                    ? app->status_message
+                    : (app->is_capturing ? "Capturing..." : "Ready");
+                size_t max_chars = status_narrow ? 32 : (status_compact ? 44 : 72);
+                size_t raw_len = strlen(raw_status);
+                if (raw_len > max_chars && max_chars > 3) {
+                    snprintf(status_message_display, sizeof(status_message_display), "%.*s...",
+                             (int)(max_chars - 3), raw_status);
+                } else {
+                    snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+                }
+                Color status_color = COLOR_TEXT;
+                if (strstr(raw_status, "denied") != NULL ||
+                    strstr(raw_status, "Denied") != NULL ||
+                    strstr(raw_status, "error") != NULL ||
+                    strstr(raw_status, "Error") != NULL ||
+                    strstr(raw_status, "failed") != NULL ||
+                    strstr(raw_status, "Failed") != NULL ||
+                    strstr(raw_status, "not granted") != NULL ||
+                    strstr(raw_status, "timed out") != NULL) {
+                    status_color = COLOR_CLIP_RED;
+                } else if (strstr(raw_status, "Requesting") != NULL ||
+                           strstr(raw_status, "Reconnecting") != NULL ||
+                           strstr(raw_status, "Waiting") != NULL ||
+                           strstr(raw_status, "Initializing") != NULL) {
+                    status_color = COLOR_METER_YELLOW;
+                }
+                CLAY(CLAY_ID("ConnectionStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Status:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY(CLAY_ID("ConnectionStatusValue"), {
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(status_message_value_width), CLAY_SIZING_FIT(0) } }
+                    }) {
+                        CLAY_TEXT(make_string(status_message_display),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(status_color) }));
                     }
                 }
-                if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
-                    free_space_color = COLOR_CLIP_RED;
-                } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
-                    free_space_color = COLOR_METER_YELLOW;
-                }
-            } else {
-                snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
             }
 
-            CLAY(CLAY_ID("FreeSpaceStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+            if (show_free_space) {
+                Color free_space_color = COLOR_TEXT_DIM;
+                if (s_status_free_space_valid) {
+                    format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
+                                                   s_status_free_space_cached_bytes);
+                    if (app->is_recording && s_status_output_rate_bps > 0.0) {
+                        char free_only[48];
+                        char runway_hms[24];
+                        double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
+                        format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
+                        format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                        if (status_tiny) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "Rwy %s", runway_hms);
+                        } else if (status_narrow) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Rwy %s", free_only, runway_hms);
+                        } else {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Runway %s",
+                                     free_only, runway_hms);
+                        }
+                    }
+                    if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
+                        free_space_color = COLOR_CLIP_RED;
+                    } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
+                        free_space_color = COLOR_METER_YELLOW;
+                    }
+                } else {
+                    snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
                 }
-            }) {
-                CLAY_TEXT(make_string(status_free_space_display),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+
+                CLAY(CLAY_ID("FreeSpaceStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+                    }
+                }) {
+                    CLAY_TEXT(make_string(status_free_space_display),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+                }
             }
         }
 
@@ -4504,10 +4612,114 @@ void gui_render_layout(gui_app_t *app) {
     gui_popup_render();
 }
 
+#if defined(__ANDROID__)
+/* Per-frame poll for async Android results (USB permission + file/folder
+ * pickers). These run async so the render thread never blocks across a
+ * system Activity transition (permission dialog / SAF picker), which would
+ * destroy our EGL surface and hang the app on resume. */
+static void gui_ui_poll_android_results(gui_app_t *app)
+{
+    extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
+    extern int android_poll_usb_permission_result(int *out_granted);
+    extern int android_permission_pending(void);
+    extern int android_usb_has_fd(void);
+    extern int android_usb_device_present(void);
+
+    /* Re-enumerate the device list whenever the Java-reported physical USB
+     * presence changes, so the MS2130 entry appears when plugged in and
+     * disappears when unplugged (instead of being a permanent phantom that
+     * shifted selection and broke the Test Signal device). Skip while
+     * capturing or while a start/stop worker is in flight. */
+    static int s_last_usb_present = -1;
+    int usb_present_now = android_usb_device_present();
+    if (usb_present_now != s_last_usb_present) {
+        if (!app->is_capturing && !gui_app_capture_busy()) {
+            int prev_selected_type = -1;
+            if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+                prev_selected_type = (int)app->devices[app->selected_device].type;
+            }
+            gui_app_enumerate_devices(app);
+            /* Keep the user's selection on the same device type if possible
+             * (e.g. stay on Test Signal when the MS2130 appears). */
+            if (prev_selected_type >= 0) {
+                for (int i = 0; i < app->device_count; i++) {
+                    if ((int)app->devices[i].type == prev_selected_type) {
+                        app->selected_device = i;
+                        break;
+                    }
+                }
+            }
+            s_last_usb_present = usb_present_now;
+        }
+        /* else: retry on a later frame once capture/start/stop settles */
+    }
+
+    /* Picker results -> apply to settings. */
+    int pkind = 0, pok = 0;
+    char ppath[512];
+    if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
+        fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
+                pkind, pok, ppath);
+        if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
+            if (pok && ppath[0]) {
+                snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", ppath);
+                gui_settings_save(&app->settings);
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Output folder set: %s", ppath);
+                gui_app_set_status(app, msg);
+            } else if (pok) {
+                /* ok but empty path: use the scoped-storage-exempt app dir. */
+                const char *def = android_get_storage_path();
+                if (def && def[0]) {
+                    snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", def);
+                    gui_settings_save(&app->settings);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Output folder set (app dir): %s", def);
+                    gui_app_set_status(app, msg);
+                } else {
+                    gui_app_set_status(app, "No folder selected");
+                }
+            } else {
+                gui_app_set_status(app, "No folder selected");
+            }
+        } else if (pkind == 2 || pkind == 3) { /* PLAYBACK_A / PLAYBACK_B */
+            if (pok && ppath[0]) {
+                char *dst = (pkind == 3) ? app->settings.playback_file_b : app->settings.playback_file_a;
+                snprintf(dst, sizeof(app->settings.playback_file_a), "%s", ppath);
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, (pkind == 3) ? "Channel B playback file set" : "Channel A playback file set");
+            } else {
+                gui_app_set_status(app, "No file selected");
+            }
+        }
+    }
+
+    /* USB permission result -> complete the connect that the Connect button
+     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
+     * capture startup on a worker thread so the render loop stays alive. */
+    if (android_permission_pending()) {
+        int granted = 0;
+        if (android_poll_usb_permission_result(&granted)) {
+            if (granted && android_usb_has_fd()) {
+                gui_app_set_status(app, "USB permission granted, starting capture...");
+                gui_app_start_capture_async(app);
+            } else {
+                gui_app_set_status(app, "USB permission denied or no USB capture device found");
+                app->reconnect_pending = false;
+                app->reconnect_attempts = 0;
+            }
+        }
+    }
+}
+#endif
+
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
+#if defined(__ANDROID__)
+    gui_ui_poll_android_results(app);
+#endif
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
@@ -4568,6 +4780,29 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && s_record_limit_timecode_edit) {
         gui_ui_clear_text_edit();
         s_record_limit_cursor_char = record_limit_nearest_digit_cursor_char(s_record_limit_cursor_char);
+#if defined(__ANDROID__)
+        {
+            char android_text[128];
+            size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach >= '0' && ach <= '9') {
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = (char)ach;
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, +1);
+                } else if (ach == ':' || ach == '/') {
+                    if (s_record_limit_cursor_char <= 1) {
+                        s_record_limit_cursor_char = 3;
+                    } else if (s_record_limit_cursor_char <= 4) {
+                        s_record_limit_cursor_char = 6;
+                    }
+                } else if (ach == '\b' || ach == 127) {
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, -1);
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = '0';
+                }
+            }
+        }
+#endif
 
         int ch = GetCharPressed();
         while (ch > 0) {
@@ -5006,14 +5241,47 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (app->is_capturing) {
+#if defined(__ANDROID__)
+                /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
+                 * hang joining libusb/libuvc threads; never block the render
+                 * thread on it. */
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
             } else {
+#if defined(__ANDROID__)
+                /* Async USB permission: never block the render thread on the
+                 * system permission dialog (a separate Activity that destroys
+                 * our EGL surface mid-block). If the fd is already granted,
+                 * start capture now; otherwise launch the async permission
+                 * request and let the per-frame poll complete the connect. */
+                extern int android_usb_has_fd(void);
+                extern int android_request_usb_permission_async(void);
+                extern int android_permission_pending(void);
+                extern void android_usb_clear_fd(void);
+                if (android_usb_has_fd()) {
+                    /* fd already granted: start capture on a worker thread so
+                     * the render loop stays responsive during hsdaoh_open. */
+                    gui_app_start_capture_async(app);
+                    app->reconnect_pending = false;
+                    app->reconnect_attempts = 0;
+                } else if (!android_permission_pending()) {
+                    android_usb_clear_fd();
+                    if (android_request_usb_permission_async()) {
+                        gui_app_set_status(app, "Requesting USB permission...");
+                    } else {
+                        gui_app_set_status(app, "USB permission request failed to start");
+                    }
+                }
+#else
                 if (gui_app_start_capture(app) == 0) {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
                 }
+#endif
             }
         }
         if (mode_toggle_hit) {
@@ -5406,30 +5674,72 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 
             if (Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+#if defined(__ANDROID__)
+                /* Async SAF picker: launch and return; the per-frame poll in
+                 * gui_handle_interactions applies the result. Never block the
+                 * render thread across the picker Activity transition. */
+                extern int android_pick_output_folder_async(void);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_output_folder_async()) {
+                        gui_app_set_status(app, "Waiting for folder selection...");
+                    } else {
+                        gui_app_set_status(app, "Folder picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 // Best-effort folder picker (platform-specific).
                 if (gui_settings_choose_output_folder(&app->settings)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No folder selected (or folder picker unavailable)");
                 }
+#endif
             }
 
         // Playback file selection buttons
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseA"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(0)) {
+                        gui_app_set_status(app, "Waiting for CH A playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 0)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseB"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(1)) {
+                        gui_app_set_status(app, "Waiting for CH B playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 1)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileClearA"))) {
                 app->settings.playback_file_a[0] = '\0';

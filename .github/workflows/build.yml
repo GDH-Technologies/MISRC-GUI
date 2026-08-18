@@ -429,6 +429,98 @@ jobs:
           path: linux_MISRC_*_${{ matrix.artifact_suffix }}.zip
           if-no-files-found: error
 
+  android-apk:
+    name: Android APK build (arm64-v8a)
+    runs-on: ubuntu-22.04
+    needs:
+      - preflight-guard-tests
+      - preflight-cross-platform-guards
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK + NDK
+        run: |
+          set -eux
+          export ANDROID_HOME="$HOME/Android/Sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/android-cmdtools
+          mv /tmp/android-cmdtools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          rm /tmp/cmdtools.zip
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true
+          yes 2>/dev/null | sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-30" "platforms;android-34" "ndk;25.2.9519653" >/dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y cmake meson ninja-build nasm pkg-config curl zip unzip
+
+      - name: Cross-build Android deps
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/build-deps-android.sh
+
+      - name: Generate Meson cross-file
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/gen-cross-file.sh
+
+      - name: Cross-compile misrc_gui (libmisrc_gui.so)
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          export PKG_CONFIG="$PWD/android/android-pkg-config"
+          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release build-android misrc_tools
+          meson compile -C build-android misrc_gui
+          test -f build-android/libmisrc_gui.so
+
+      - name: Build + sign APK
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          export BUILD_DIR="$PWD/build-android"
+          bash android/build-apk.sh
+
+      - name: Verify APK
+        run: |
+          set -eux
+          APK=$(ls -t .ci-artifacts/android-apk/*.apk | head -1)
+          test -f "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify "$APK"
+          BADGING="$("$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$APK")"
+          echo "$BADGING" | grep -q "sdkVersion:'30'"
+          echo "$BADGING" | grep -q "targetSdkVersion:'34'"
+          echo "$BADGING" | grep -q "package: name='dev.misrc.gui'"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libmisrc_gui.so"
+          unzip -p "$APK" lib/arm64-v8a/libmisrc_gui.so | file - | grep -q "ARM aarch64"
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "${NDK_TOOLCHAIN}/llvm-readelf" -d build-android/libmisrc_gui.so | grep NEEDED | grep -iE "/usr/lib/x86_64|/usr/local/lib" && {
+            echo "ERROR: host x86_64 lib leaked into arm64 cross build"; exit 1; } || true
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk-arm64
+          path: .ci-artifacts/android-apk/*.apk
+          if-no-files-found: error
+
   windows-exe:
     name: Windows EXE build (x86_64)
     runs-on: windows-2022
@@ -1208,6 +1300,7 @@ jobs:
       - windows-exe
       - windows-exe-arm64
       - macos-app-universal
+      - android-apk
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
     permissions:
       contents: write
@@ -1267,18 +1360,21 @@ jobs:
             printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
           printf '\n%s\n' '' '## Downloads' '' >> "$BODY_FILE"
-          printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) |\n' >> "$BODY_FILE"
-          printf '|---|---|---|\n' >> "$BODY_FILE"
+          printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
+          printf '|---|---|---|---|\n' >> "$BODY_FILE"
           DL_BASE="https://github.com/harrypm/MISRC-GUI/releases/download/${TAG}"
           WIN_X86="windows_MISRC_${TAG}_x86.zip"
           WIN_ARM="windows_MISRC_${TAG}_arm64.zip"
           MAC_DMG="macos_MISRC_${TAG}_universal.dmg"
           LIN_X86="linux_MISRC_${TAG}_x86.zip"
           LIN_ARM="linux_MISRC_${TAG}_arm64.zip"
-          printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
-          printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
-          printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
+          APK_ARM64="misrc_gui-${TAG}-android-arm64.apk"
+          printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
+          printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
+          printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
+          printf '| Android 11+ | - | - | [%s](%s/%s) |\n' "$APK_ARM64" "$DL_BASE" "$APK_ARM64" >> "$BODY_FILE"
           printf '\n%s\n' '> [!NOTE]' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
+          printf '%s\n' '> Android support is very alpha and experimental.' >> "$BODY_FILE"
           # Write multi-line output to GITHUB_OUTPUT.
           {
             echo "body<<BODY_EOF"
@@ -1299,3 +1395,4 @@ jobs:
             release-assets/**/windows_MISRC_*_x86.zip
             release-assets/**/windows_MISRC_*_arm64.zip
             release-assets/**/macos_MISRC_*_universal.dmg
+            release-assets/**/misrc_gui-*-android-arm64.apk

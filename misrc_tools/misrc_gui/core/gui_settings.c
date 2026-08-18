@@ -87,7 +87,21 @@ static const char* get_settings_file_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
+        // MainActivity.onCreate calls nativeSetStoragePath(getExternalFilesDir)
+        // before main() runs, so android_get_storage_path() returns the real,
+        // scoped-storage-exempt, writable app-external files dir. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(settings_path, sizeof(settings_path),
+                    "%s/misrc_gui_settings.json", ext);
+        } else {
+            strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
+        }
+#elif defined(__APPLE__)
         // Use ~/Library/Preferences on macOS
         const char* home = getenv("HOME");
         if (home) {
@@ -141,7 +155,19 @@ const char* gui_settings_get_desktop_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android 11+: use the scoped-storage-exempt external files dir handed
+        // in from Java (getExternalFilesDir), so native fopen() can write
+        // capture logs/FLAC here and the user can adb pull them. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(desktop_path, sizeof(desktop_path), "%s", ext);
+        } else {
+            strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+        }
+#elif defined(__APPLE__)
         const char* home = getenv("HOME");
         if (home) {
             snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
@@ -648,14 +674,21 @@ static void strip_timestamp_prefix_inplace(char *s) {
     }
 }
 
-// macOS folder picker using osascript. Returns true if output_path changed.
+// Output-folder picker. Returns true if output_path changed.
+// NOTE: On Android this is no longer called — the settings click handler in
+// gui_ui.c launches the async SAF picker (android_pick_output_folder_async)
+// and applies the result via the per-frame poll, so the render thread never
+// blocks across the picker Activity transition. This sync path remains for
+// desktop platforms.
 bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     if (!settings) return false;
     char picked[512] = {0};
-
-#ifdef __APPLE__
+#if defined(__ANDROID__)
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
+#elif defined(__APPLE__)
     // Use AppleScript choose folder dialog and return POSIX path.
-    // Note: This will prompt the user and block until a selection is made.
     const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -665,7 +698,7 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker - uses GUI subsystem without console or powershell
+    // Native Win32 folder picker.
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     BROWSEINFOA bi = {0};
     bi.lpszTitle = "Select output folder for MISRC captures";
@@ -693,20 +726,17 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #endif
-
     trim_newlines(picked);
     if (picked[0] == '\0') return false;
 
-    // Remove trailing slash/backslash
     size_t len = strlen(picked);
     while (len > 1 && (picked[len - 1] == '/' || picked[len - 1] == '\\')) {
         picked[--len] = '\0';
     }
 
     if (strncmp(settings->output_path, picked, MAX_FILENAME_LEN) == 0) {
-        return false; // no change
+        return false;
     }
-
     strncpy(settings->output_path, picked, MAX_FILENAME_LEN - 1);
     settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
     return true;
@@ -718,8 +748,11 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
     if (channel != 0 && channel != 1) return false;
 
     char picked[512] = {0};
-
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
+#elif defined(__APPLE__)
     // choose file, return POSIX path
     const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
     FILE *fp = popen(cmd, "r");
@@ -774,12 +807,10 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
 #endif
 
     if (picked[0] == '\0') return false;
-
     char *dst = (channel == 0) ? settings->playback_file_a : settings->playback_file_b;
     if (strncmp(dst, picked, MAX_FILENAME_LEN) == 0) {
         return false;
     }
-
     strncpy(dst, picked, MAX_FILENAME_LEN - 1);
     dst[MAX_FILENAME_LEN - 1] = '\0';
     return true;

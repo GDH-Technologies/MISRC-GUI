@@ -1145,6 +1145,18 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         }
 #endif
         else {
+#if defined(__ANDROID__)
+            /* The patched Android hsdaoh_get_device_count() unconditionally
+             * reports 1 device (rootless libusb cannot enumerate
+             * /dev/bus/usb), which put a phantom "MS2130" in the list even
+             * with nothing plugged in — shifting selection and breaking the
+             * Test Signal device. Only list the hsdaoh entry when Java
+             * reports a capture candidate is physically attached. */
+            extern int android_usb_device_present(void);
+            if (!android_usb_device_present()) {
+                continue;
+            }
+#endif
             snprintf(dst->name, sizeof(dst->name), "%s", src->name);
             dst->type = DEVICE_TYPE_HSDAOH;
             dst->index = src->index;
@@ -1729,17 +1741,58 @@ int gui_app_start_capture(gui_app_t *app) {
     } else {
         fprintf(stderr, "[GUI] Opening hsdaoh device (backend=%s)...\n",
                 use_upstream_backend ? "upstream" : "raw-parser");
+#if !defined(__ANDROID__)
+        /* Desktop: elevate process/thread priority for low-latency capture.
+         * On Android, proc_set_priority() iterates /proc/self/task and calls
+         * setpriority() on EVERY thread (including the render thread), and
+         * thrd_set_priority(CRITICAL) attempts SCHED_FIFO realtime scheduling.
+         * Android's watchdog can ANR/kill apps that abuse realtime scheduling
+         * or process-wide nice changes, which looks like a UI lockup. The OS
+         * already drives USB callbacks with appropriate priority on Android, so
+         * skip the desktop priority elevation here. */
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+#endif
+#if defined(__ANDROID__)
+        /* Android: libusb cannot open /dev/bus/usb/* without root. The USB
+         * Host permission dialog + fd handoff is driven ASYNCHRONOUSLY by the
+         * render thread (android_request_usb_permission_async + per-frame
+         * poll in gui_handle_interactions) so the render loop never blocks
+         * across the system dialog Activity transition (which would kill EGL
+         * on resume). By the time we get here, the fd must already be granted;
+         * if not, the async connect flow hasn't completed — bail and let it
+         * finish on a future frame. */
+        extern int android_usb_has_fd(void);
+        extern void android_usb_clear_fd(void);
+        if (!android_usb_has_fd()) {
+            fprintf(stderr, "[GUI] Android connect: no USB fd yet (permission pending)\n");
+            gui_app_set_status(app, "Waiting for USB permission...");
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+            return -3;
+        }
+#endif
         r = hsdaoh_open(&app->hs_dev, dev->index);
         if (r < 0 || !app->hs_dev) {
             fprintf(stderr, "[GUI] hsdaoh_open failed: %d\n", r);
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             if (r == -3) {
+#if defined(__ANDROID__)
+                gui_app_set_status(app, "USB permission denied or device not granted");
+#else
                 gui_app_set_status(app, "Permission denied opening MS2130 via libusb; run misrc_gui with sudo");
+#endif
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 return -3;
             } else {
+#if defined(__ANDROID__)
+                char usb_open_msg[96];
+                snprintf(usb_open_msg, sizeof(usb_open_msg), "USB open failed (code %d)", r);
+                gui_app_set_status(app, usb_open_msg);
+#else
                 gui_app_set_status(app, "Failed to open device");
+#endif
             }
             app->hs_dev = NULL;
             proc_set_priority(PROC_PRIORITY_NORMAL);
@@ -1763,6 +1816,9 @@ int gui_app_start_capture(gui_app_t *app) {
             gui_app_set_status(app, "Failed to start stream");
             hsdaoh_close(app->hs_dev);
             app->hs_dev = NULL;
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
@@ -1869,6 +1925,84 @@ int gui_app_start_capture(gui_app_t *app) {
     return 0;
 }
 
+#if defined(__ANDROID__)
+/* Offload gui_app_start_capture() to a worker thread so the render loop stays
+ * responsive. hsdaoh_open + start_stream + extraction/display thread spawns can
+ * be slow or stall on the Android fd-wrap path; running them on the render
+ * thread freezes the UI (the "connect locks up" symptom). The worker sets
+ * app->is_capturing / status; the render thread just observes. */
+#include <pthread.h>
+static atomic_int s_capture_starting = 0;
+static atomic_int s_capture_stopping = 0;
+static void *capture_start_thread(void *arg)
+{
+    gui_app_t *app = (gui_app_t *)arg;
+    int rc = gui_app_start_capture(app);
+    if (rc != 0) {
+        fprintf(stderr, "[GUI] Android async capture start failed: rc=%d\n", rc);
+    }
+    atomic_store(&s_capture_starting, 0);
+    return NULL;
+}
+void gui_app_start_capture_async(gui_app_t *app)
+{
+    if (!app) return;
+    if (atomic_load(&s_capture_stopping)) {
+        /* stop still in flight; don't start on top of it */
+        return;
+    }
+    if (atomic_exchange(&s_capture_starting, 1) != 0) {
+        /* a start is already in flight; ignore */
+        return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, capture_start_thread, app) != 0) {
+        atomic_store(&s_capture_starting, 0);
+        /* fallback: run synchronously (may briefly stall UI) */
+        (void)gui_app_start_capture(app);
+    } else {
+        pthread_detach(t);
+        gui_app_set_status(app, "Starting capture...");
+    }
+}
+
+/* Offload gui_app_stop_capture() as well: hsdaoh_stop_stream/hsdaoh_close on
+ * the wrapped Android fd join libusb/libuvc transfer threads and can hang for
+ * seconds (or indefinitely) if the device never delivered data. Running stop
+ * on the render thread is what froze the app AFTER connect: the watchdog
+ * detected "no data for 2s" and called stop_capture synchronously. */
+static void *capture_stop_thread(void *arg)
+{
+    gui_app_t *app = (gui_app_t *)arg;
+    gui_app_stop_capture(app);
+    atomic_store(&s_capture_stopping, 0);
+    return NULL;
+}
+void gui_app_stop_capture_async(gui_app_t *app)
+{
+    if (!app) return;
+    if (atomic_load(&s_capture_starting)) {
+        /* start still in flight; let it finish first (watchdog will retry) */
+        return;
+    }
+    if (atomic_exchange(&s_capture_stopping, 1) != 0) {
+        return;  /* stop already in flight */
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, capture_stop_thread, app) != 0) {
+        atomic_store(&s_capture_stopping, 0);
+        gui_app_stop_capture(app);  /* fallback: sync */
+    } else {
+        pthread_detach(t);
+        gui_app_set_status(app, "Stopping capture...");
+    }
+}
+int gui_app_capture_busy(void)
+{
+    return atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping);
+}
+#endif
+
 // Stop capture
 void gui_app_stop_capture(gui_app_t *app) {
     if (!app->is_capturing) {
@@ -1936,6 +2070,12 @@ void gui_app_stop_capture(gui_app_t *app) {
         hsdaoh_stop_stream(app->hs_dev);
         hsdaoh_close(app->hs_dev);
         app->hs_dev = NULL;
+#if defined(__ANDROID__)
+        {
+            extern void android_usb_clear_fd(void);
+            android_usb_clear_fd();
+        }
+#endif
     }
     if (app->sc_dev) {
         sc_stop_capture(app->sc_dev);
