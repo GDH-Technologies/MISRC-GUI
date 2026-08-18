@@ -20,6 +20,9 @@
 #include <sys/mman.h>
 #include <sys/eventfd.h>
 #include <sys/select.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <linux/videodev2.h>
 
@@ -430,14 +433,19 @@ static void *preview_thread(void *arg)
                     drop_reason, buf.bytesused, g.frame_bytes, buf.flags);
         }
 
+        /* Sequence continuity describes what the driver delivered, so track it
+         * for every dequeued buffer including the ones we discard. Advancing
+         * last_seq only on usable frames made our own drop show up as a
+         * driver-lost frame on the following iteration. */
+        if (have_seq && buf.sequence > last_seq + 1) {
+            status_lock();
+            g.status.seq_gaps += buf.sequence - last_seq - 1;
+            status_unlock();
+        }
+        last_seq = buf.sequence;
+        have_seq = true;
+
         if (usable) {
-            if (have_seq && buf.sequence > last_seq + 1) {
-                status_lock();
-                g.status.seq_gaps += buf.sequence - last_seq - 1;
-                status_unlock();
-            }
-            last_seq = buf.sequence;
-            have_seq = true;
             preview_publish((const uint8_t *)g.bufs[buf.index].start);
         } else {
             status_lock();
@@ -834,6 +842,79 @@ void gui_preview_shutdown(void)
 
 /* ---------------------------------------------------- headless diagnostics */
 
+/* Numerical proof of the colour matrix and byte order, with no device and no
+ * window. Eyeballing a picture cannot distinguish BT.601 from BT.709, nor a
+ * Cb/Cr swap on a low-saturation source; these vectors can. */
+int gui_preview_selftest_main(void)
+{
+    struct {
+        const char *name;
+        uint8_t y, cb, cr;
+        uint8_t r, g, b;
+    } vectors[] = {
+        /* BT.601 limited range: Y 16..235, Cb/Cr centred on 128. */
+        { "black",   16, 128, 128,   0,   0,   0 },
+        { "white",  235, 128, 128, 255, 255, 255 },
+        { "red",     81,  90, 240, 255,   0,   0 },
+        { "green",  145,  54,  34,   0, 255,   0 },
+        { "blue",    41, 240, 110,   0,   0, 255 },
+        { "mid grey",126, 128, 128, 128, 128, 128 },
+    };
+    const int tolerance = 2;
+    int failures = 0;
+
+    printf("YUYV -> RGBA conversion self-test (BT.601 limited range)\n");
+    printf("  %-9s %-14s %-14s %-14s\n", "vector", "input YCbCr", "expected RGB", "got RGB");
+
+    for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        /* Two pixels of the same colour: [Y0][Cb][Y1][Cr]. */
+        uint8_t src[4] = { vectors[i].y, vectors[i].cb, vectors[i].y, vectors[i].cr };
+        uint32_t dst[2] = { 0, 0 };
+        yuyv_to_rgba(src, sizeof(src), dst, 2, 1);
+
+        /* Read back through a byte view: PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+         * means the bytes in memory must be R,G,B,A in that order. */
+        const uint8_t *px = (const uint8_t *)&dst[0];
+        int dr = abs((int)px[0] - vectors[i].r);
+        int dg = abs((int)px[1] - vectors[i].g);
+        int db = abs((int)px[2] - vectors[i].b);
+        bool ok = (dr <= tolerance && dg <= tolerance && db <= tolerance && px[3] == 255);
+        if (!ok) failures++;
+
+        printf("  %-9s %3u,%3u,%3u    %3u,%3u,%3u    %3u,%3u,%3u  a=%u  %s\n",
+               vectors[i].name, vectors[i].y, vectors[i].cb, vectors[i].cr,
+               vectors[i].r, vectors[i].g, vectors[i].b,
+               px[0], px[1], px[2], px[3], ok ? "ok" : "FAIL");
+
+        /* Both pixels of the macropixel must decode identically. */
+        if (dst[0] != dst[1]) {
+            printf("      FAIL: the two pixels of the macropixel differ\n");
+            failures++;
+        }
+    }
+
+    /* A padded stride must not shear the image: give a 2-pixel-wide frame a
+     * pitch of 8 bytes (4 bytes of padding) and check row 1 is unaffected. */
+    {
+        uint8_t src[16];
+        memset(src, 0, sizeof(src));
+        src[0] = 235; src[1] = 128; src[2] = 235; src[3] = 128;   /* row 0: white */
+        /* bytes 4..7 are padding and must be skipped */
+        src[8] = 16;  src[9] = 128; src[10] = 16; src[11] = 128;  /* row 1: black */
+        uint32_t dst[4] = { 0, 0, 0, 0 };
+        yuyv_to_rgba(src, 8, dst, 2, 2);
+        const uint8_t *r0 = (const uint8_t *)&dst[0];
+        const uint8_t *r1 = (const uint8_t *)&dst[2];
+        bool ok = (r0[0] > 250 && r1[0] < 5);
+        printf("  %-9s pitch=8 w=2       row0 white, row1 black    row0=%u row1=%u  %s\n",
+               "stride", r0[0], r1[0], ok ? "ok" : "FAIL");
+        if (!ok) failures++;
+    }
+
+    printf("%s\n", failures ? "SELF-TEST FAILED" : "self-test passed");
+    return failures ? 1 : 0;
+}
+
 int gui_preview_probe_main(void)
 {
     gui_preview_init(NULL);
@@ -850,6 +931,65 @@ int gui_preview_probe_main(void)
     }
     gui_preview_shutdown();
     return n > 0 ? 0 : 1;
+}
+
+/* Write one converted frame to a PNG, with no window and no GL: it reads the
+ * published slot directly rather than going through frame_sync. Lets the real
+ * device's output be checked numerically instead of by eye. */
+int gui_preview_dump_frame_main(const char *device, const char *out_png)
+{
+    if (!out_png) { fprintf(stderr, "usage: --preview-dump-frame <device> <out.png>\n"); return 2; }
+
+    gui_preview_init(NULL);
+    gui_preview_refresh_devices();
+    size_t n = 0;
+    const preview_device_t *devs = gui_preview_devices(&n);
+    if (n == 0) { fprintf(stderr, "no preview devices\n"); return 1; }
+
+    int idx = 0;
+    if (device) {
+        idx = -1;
+        for (size_t i = 0; i < n; i++) if (strcmp(devs[i].path, device) == 0) { idx = (int)i; break; }
+        if (idx < 0) { fprintf(stderr, "no such device: %s\n", device); return 1; }
+    }
+    gui_preview_select(idx, 0);
+    if (gui_preview_connect() != 0) {
+        preview_status_t st = gui_preview_get_status();
+        fprintf(stderr, "connect failed: %s\n", st.err_text);
+        return 2;
+    }
+
+    /* Wait up to 5s for a published frame. */
+    int rc = 2;
+    for (int i = 0; i < 500; i++) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        unsigned cur = atomic_load_explicit(&g.pub, memory_order_acquire);
+        if (cur & PV_NEW) {
+            unsigned prev = atomic_exchange_explicit(&g.pub, (unsigned)g.read_idx,
+                                                     memory_order_acq_rel);
+            g.read_idx = (int)(prev & PV_IDX);
+
+            Image img;
+            memset(&img, 0, sizeof(img));
+            img.data = g.slots[g.read_idx];
+            img.width = (int)g.width;
+            img.height = (int)g.height;
+            img.mipmaps = 1;
+            img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            /* ExportImage is pure CPU; the Image is a view onto a slot we own,
+             * so it must never be handed to UnloadImage. */
+            rc = ExportImage(img, out_png) ? 0 : 2;
+            printf("%s %ux%u -> %s (%s)\n", devs[idx].path, g.width, g.height, out_png,
+                   rc == 0 ? "ok" : "export failed");
+            break;
+        }
+    }
+    if (rc == 2) fprintf(stderr, "no frame published within 5s\n");
+
+    gui_preview_disconnect();
+    gui_preview_shutdown();
+    return rc;
 }
 
 int gui_preview_probe_stream_main(const char *device, int seconds)
@@ -910,15 +1050,139 @@ int gui_preview_probe_stream_main(const char *device, int seconds)
     return 0;
 }
 
-/* Popout and the child entry point land in a later milestone. */
+/* ------------------------------------------------------------ popout child */
+
+/* Close every descriptor above stderr. The child inherits whatever the parent
+ * had open -- X11 sockets, ALSA, libusb, and any recording file -- and holding
+ * a recording file open would keep its inode alive after the parent closed it.
+ * Safe here because this runs before the child opens anything of its own. */
+static void preview_close_inherited_fds(void)
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
+    closefrom(3);
+#else
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        int dfd = dirfd(d);
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            int fd = atoi(e->d_name);
+            if (fd > 2 && fd != dfd) close(fd);
+        }
+        closedir(d);
+    }
+#endif
+}
+
+/* "YUYV:720x576@25", "720x576@25" or "720x576@25/1". Returns the matching mode
+ * index on the selected device, or -1 to mean "leave the default". */
+static int preview_parse_mode_spec(const preview_device_t *dev, const char *spec)
+{
+    if (!dev || !spec || !spec[0]) return -1;
+    const char *p = strchr(spec, ':');
+    p = p ? p + 1 : spec;
+
+    unsigned w = 0, h = 0, num = 0, den = 1;
+    if (sscanf(p, "%ux%u@%u/%u", &w, &h, &num, &den) < 3) {
+        den = 1;
+        if (sscanf(p, "%ux%u@%u", &w, &h, &num) < 3) return -1;
+    }
+    if (den == 0) den = 1;
+
+    for (int i = 0; i < dev->n_modes; i++) {
+        if (dev->modes[i].w == w && dev->modes[i].h == h &&
+            dev->modes[i].fps_num == num && dev->modes[i].fps_den == den) {
+            return i;
+        }
+    }
+    /* Fall back to the same geometry at whatever rate it offers. */
+    for (int i = 0; i < dev->n_modes; i++) {
+        if (dev->modes[i].w == w && dev->modes[i].h == h) return i;
+    }
+    return -1;
+}
+
+int gui_preview_child_main(const char *device, const char *fmt_spec, int parent_pid)
+{
+    preview_close_inherited_fds();
+
+    /* Die with the parent. The getppid check closes the window where the parent
+     * exits between posix_spawn returning and this prctl landing -- in that case
+     * the death signal is already lost, and an orphan would hold the device
+     * forever with no route back into the app. */
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (parent_pid > 0 && getppid() != parent_pid) {
+        _exit(0);
+    }
+
+    gui_preview_init(NULL);
+    gui_preview_refresh_devices();
+
+    size_t n = 0;
+    const preview_device_t *devs = gui_preview_devices(&n);
+    if (n == 0) {
+        fprintf(stderr, "preview: no V4L2 capture device found\n");
+        return 2;
+    }
+
+    int dev_idx = 0;
+    if (device && device[0]) {
+        dev_idx = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(devs[i].path, device) == 0) { dev_idx = (int)i; break; }
+        }
+        if (dev_idx < 0) {
+            fprintf(stderr, "preview: no such device: %s\n", device);
+            return 2;
+        }
+    }
+    int mode_idx = preview_parse_mode_spec(&devs[dev_idx], fmt_spec);
+    gui_preview_select(dev_idx, mode_idx >= 0 ? mode_idx : 0);
+
+    char title[128];
+    snprintf(title, sizeof(title), "MISRC Preview - %s", devs[dev_idx].path);
+
+    /* No MSAA: nothing here is antialiased. No icon and no fonts either -- the
+     * child deliberately loads none of the app's assets, and gui_preview_draw
+     * uses only raylib's built-in DrawText. */
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    SetTraceLogLevel(LOG_WARNING);
+    InitWindow(720, 576, title);
+    SetWindowMinSize(320, 240);
+    SetTargetFPS(60);
+    SetExitKey(KEY_ESCAPE);
+
+    int rc = 0;
+    if (gui_preview_connect() != 0) {
+        preview_status_t st = gui_preview_get_status();
+        fprintf(stderr, "preview: %s\n", st.err_text[0] ? st.err_text : "connect failed");
+        rc = 2;
+    }
+
+    while (!WindowShouldClose()) {
+        gui_preview_tick();
+        gui_preview_frame_sync();
+
+        preview_status_t st = gui_preview_get_status();
+        if (st.state == PREVIEW_STATE_ERROR && rc == 0) {
+            rc = 3;   /* tell the parent the device went away */
+        }
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        gui_preview_draw((Rectangle){ 0, 0, (float)GetRenderWidth(), (float)GetRenderHeight() },
+                         true);
+        EndDrawing();
+    }
+
+    gui_preview_shutdown();
+    CloseWindow();
+    return rc;
+}
+
+/* Popout from the parent side lands in the next milestone. */
 int  gui_preview_popout(void)  { return -1; }
 void gui_preview_reclaim(void) { }
-int  gui_preview_child_main(const char *device, const char *fmt_spec, int parent_pid)
-{
-    (void)device; (void)fmt_spec; (void)parent_pid;
-    fprintf(stderr, "--preview-only is not implemented yet\n");
-    return 2;
-}
 
 #else  /* !__linux__ */
 
@@ -964,5 +1228,9 @@ int  gui_preview_child_main(const char *device, const char *fmt_spec, int parent
     fprintf(stderr, "--preview-only is not supported on this platform\n");
     return 2;
 }
+int gui_preview_probe_main(void) { fprintf(stderr, "preview requires Linux\n"); return 2; }
+int gui_preview_probe_stream_main(const char *d, int s) { (void)d; (void)s; return 2; }
+int gui_preview_selftest_main(void) { fprintf(stderr, "preview requires Linux\n"); return 2; }
+int gui_preview_dump_frame_main(const char *d, const char *o) { (void)d; (void)o; return 2; }
 
 #endif /* __linux__ */

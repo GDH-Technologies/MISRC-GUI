@@ -77,10 +77,16 @@ static void print_usage(const char *program_name) {
             "MISRC GUI %s\n"
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view]\n"
+            "  %s --preview-only <device> [--preview-format YUYV:WxH@fps]\n"
+            "  %s --preview-probe | --preview-probe-stream <device> [seconds]\n"
+            "  %s --preview-selftest\n"
             "\n"
             "No arguments launch the GUI.\n"
             "Use --debug-view to enable verbose runtime logs.\n",
             MIRSC_TOOLS_VERSION,
+            program_name ? program_name : "misrc_gui",
+            program_name ? program_name : "misrc_gui",
+            program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
 }
 static int gui_layout_width(void) {
@@ -342,6 +348,27 @@ int main(int argc, char **argv) {
          * behaviour verified -- without anyone watching a GUI. */
         if (strcmp(argv[i], "--preview-probe") == 0) {
             return gui_preview_probe_main();
+        }
+        if (strcmp(argv[i], "--preview-selftest") == 0) {
+            return gui_preview_selftest_main();
+        }
+        if (strcmp(argv[i], "--preview-dump-frame") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
+            return gui_preview_dump_frame_main(dev, out);
+        }
+        /* The popout window. Returns before InitWindow, the fonts, Clay,
+         * gui_app_init and device enumeration -- the child shares none of it,
+         * and must not touch the settings file the parent is also using. */
+        if (strcmp(argv[i], "--preview-only") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *fmt = NULL;
+            int ppid = 0;
+            for (int j = i + 1; j + 1 < argc; j++) {
+                if (strcmp(argv[j], "--preview-format") == 0) fmt = argv[j + 1];
+                else if (strcmp(argv[j], "--preview-parent-pid") == 0) ppid = atoi(argv[j + 1]);
+            }
+            return gui_preview_child_main(dev, fmt, ppid);
         }
         if (strcmp(argv[i], "--preview-probe-stream") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;

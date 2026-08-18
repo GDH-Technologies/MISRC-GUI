@@ -132,6 +132,8 @@ int  gui_preview_child_main(const char *device, const char *fmt_spec, int parent
 /* Run without a window so the reader's unplug, teardown and scheduling
  * behaviour can be verified without a GUI. */
 int gui_preview_probe_main(void);
+int gui_preview_selftest_main(void);
+int gui_preview_dump_frame_main(const char *device, const char *out_png);
 int gui_preview_probe_stream_main(const char *device, int seconds);
 
 #endif /* GUI_PREVIEW_V4L2_H */
