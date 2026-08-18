@@ -749,11 +749,14 @@ static uint64_t gui_ui_recording_output_total_bytes(const gui_app_t *app)
 {
     if (!app) return 0;
     uint64_t raw_total = atomic_load(&app->recording_raw_a) + atomic_load(&app->recording_raw_b);
+    /* Must match gui_record_get_effective_output_total_bytes exactly, or the
+     * status bar's runway disagrees with the guard that actually stops. */
+    uint64_t video_total = gui_video_record_output_bytes();
     if (!app->settings.use_flac) {
-        return raw_total;
+        return raw_total + video_total;
     }
     uint64_t encoded_total = atomic_load(&app->recording_compressed_a) + atomic_load(&app->recording_compressed_b);
-    return (encoded_total > 0) ? encoded_total : raw_total;
+    return ((encoded_total > 0) ? encoded_total : raw_total) + video_total;
 }
 
 static void format_status_runway_hhmmss(char *dst, size_t dst_len, double seconds)

@@ -353,6 +353,13 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--preview-selftest") == 0) {
             return gui_preview_selftest_main();
         }
+        if (strcmp(argv[i], "--auto-record") == 0) {
+            const char *dir = (i + 1 < argc) ? argv[i + 1] : ".";
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 5;
+            bool wv  = (i + 3 < argc) && strcmp(argv[i + 3], "video") == 0;
+            bool flac = !((i + 4 < argc) && strcmp(argv[i + 4], "raw") == 0);
+            return gui_record_auto_record_main(dir, secs, wv, flac);
+        }
         if (strcmp(argv[i], "--video-settings-test") == 0) {
             return gui_record_video_settings_test_main();
         }
@@ -831,6 +838,7 @@ int main(int argc, char **argv) {
     // Save settings before cleanup
     gui_settings_save(&app.settings);
     
+    gui_video_record_shutdown();
     gui_preview_shutdown();
     gui_app_cleanup(&app);
     free(clay_memory);

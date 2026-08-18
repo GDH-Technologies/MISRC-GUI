@@ -116,6 +116,14 @@ void gui_preview_panel_attach(void);
  * deferred to the next gui_preview_tick(). */
 void gui_preview_panel_detach(void);
 
+/* A recording holds the stream open independently of the panels. Without this,
+ * closing the preview panel mid-recording would silently end the video, and a
+ * recording could not start at all unless a panel happened to be showing
+ * Preview -- which is the usual state, not an edge case. */
+void gui_preview_hold_acquire(void);
+void gui_preview_hold_release(void);
+int  gui_preview_hold_count(void);
+
 /* Consumes a published frame and uploads it. Idempotent within a frame, so N
  * panels cost one upload. Returns true if a new frame was uploaded. */
 bool gui_preview_frame_sync(void);

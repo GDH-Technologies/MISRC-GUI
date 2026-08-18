@@ -12,6 +12,7 @@
 #include "gui_text.h"
 #include "../core/gui_app.h"
 #include "../input/gui_preview_v4l2.h"
+#include "../output/gui_video_record.h"
 #include "../ui/gui_dropdown.h"
 
 #include <stdio.h>
@@ -94,6 +95,10 @@ void gui_preview_close_overlays(void *state)
 
 static const char *pv_action_label(preview_status_t *st, preview_panel_t *pp, char *buf, size_t cap)
 {
+    if (gui_video_record_is_running() &&
+        (st->state == PREVIEW_STATE_STREAMING || st->state == PREVIEW_STATE_STALLED)) {
+        return "REC";   /* the stream is owned by a recording */
+    }
     if (pp->confirm_which == 1) return "Confirm?";
     if (pp->confirm_which == 2) return "Confirm?";
     switch (st->state) {
@@ -262,8 +267,16 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
         return true;
     }
 
+    /* A live reference-video recording owns this stream. Letting Disconnect or
+     * Pop-out through here would end the recording's source mid-file. */
+    bool video_recording = gui_video_record_is_running();
+
     if (CheckCollisionPointRec(click, pp->r_action)) {
         pp->dev_menu_open = pp->fmt_menu_open = false;
+        if (video_recording && (st.state == PREVIEW_STATE_STREAMING ||
+                                st.state == PREVIEW_STATE_STALLED)) {
+            return true;   /* swallowed: recording in progress */
+        }
         switch (st.state) {
             case PREVIEW_STATE_NO_DEVICE:
                 gui_preview_refresh_devices();
@@ -298,6 +311,7 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
 
     if (CheckCollisionPointRec(click, pp->r_pop)) {
         pp->dev_menu_open = pp->fmt_menu_open = false;
+        if (video_recording) return true;   /* swallowed: recording in progress */
         if (dismissal) return true;
         if (st.state == PREVIEW_STATE_POPPED_OUT) {
             gui_preview_reclaim();

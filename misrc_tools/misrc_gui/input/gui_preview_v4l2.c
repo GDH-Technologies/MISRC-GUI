@@ -84,6 +84,7 @@ static struct {
 
     /* --- deferred work for tick() --- */
     bool want_auto_stop;
+    int  record_holds;      /* a recording is using the stream; ignore viewers */
 
     /* --- popout --- */
     int            child_pid;
@@ -761,6 +762,10 @@ void gui_preview_panel_detach(void)
     if (last) g.want_auto_stop = true;
 }
 
+void gui_preview_hold_acquire(void) { g.record_holds++; }
+void gui_preview_hold_release(void) { if (g.record_holds > 0) g.record_holds--; }
+int  gui_preview_hold_count(void)   { return g.record_holds; }
+
 void gui_preview_tick(void)
 {
     preview_poll_child();
@@ -777,7 +782,9 @@ void gui_preview_tick(void)
     if (g.want_auto_stop) {
         g.want_auto_stop = false;
         preview_status_t st = gui_preview_get_status();
-        if (st.viewers == 0) {
+        /* A recording outranks the panels: closing the last preview panel
+         * stops the picture, not the stream. */
+        if (st.viewers == 0 && g.record_holds == 0) {
             /* The last preview panel went away. Take the child with it: an
              * orphan window with no route back into the app is worse than
              * losing it. */
@@ -1593,6 +1600,9 @@ preview_status_t gui_preview_get_status(void) { return s_unsupported; }
 
 void gui_preview_panel_attach(void) { }
 void gui_preview_panel_detach(void) { }
+void gui_preview_hold_acquire(void) { }
+void gui_preview_hold_release(void) { }
+int  gui_preview_hold_count(void) { return 0; }
 bool gui_preview_frame_sync(void) { return false; }
 
 void gui_preview_draw(Rectangle bounds, bool with_status)
