@@ -237,6 +237,7 @@ static FLAC__uint64 flac_stream_max_offset(void) {
 struct flac_writer {
     FLAC__StreamEncoder *encoder;
     FLAC__StreamMetadata *seektable;
+    FLAC__StreamMetadata *padding;
     FILE *output_file;
     bool use_stream_callbacks;       // Stream mode vs FILE mode
 
@@ -370,6 +371,7 @@ flac_writer_config_t flac_writer_default_config(void) {
         .affinity_cpu_list = "",
         .enable_seektable = true,
         .seektable_spacing = 1 << 18,  // ~6.5 seconds at 40kHz
+        .padding_bytes = 4096,
         .error_cb = NULL,
         .bytes_cb = NULL,
         .callback_user_data = NULL
@@ -411,7 +413,11 @@ static flac_writer_error_t configure_encoder(flac_writer_t *writer) {
     }
 #endif
 
-    // Seektable
+    // Metadata blocks: seektable, then trailing padding (absorbed later by
+    // in-place tag embedding -- see flac_writer_embed_tags).
+    FLAC__StreamMetadata *meta[2];
+    uint32_t n_meta = 0;
+
     if (writer->config.enable_seektable) {
         writer->seektable = FLAC__metadata_object_new(FLAC__METADATA_TYPE_SEEKTABLE);
         if (!writer->seektable) {
@@ -424,13 +430,28 @@ static flac_writer_error_t configure_encoder(flac_writer_t *writer) {
 
         // Estimate for very long recordings (up to ~1.5 years at 40kHz)
         if (!FLAC__metadata_object_seektable_template_append_spaced_points(
-                writer->seektable, spacing, (uint64_t)1 << 41) ||
-            !FLAC__stream_encoder_set_metadata(enc, &writer->seektable, 1)) {
+                writer->seektable, spacing, (uint64_t)1 << 41)) {
             report_error(writer, FLAC_WRITER_ERR_SEEKTABLE, "Failed to configure seektable");
             FLAC__metadata_object_delete(writer->seektable);
             writer->seektable = NULL;
             return FLAC_WRITER_ERR_SEEKTABLE;
         }
+        meta[n_meta++] = writer->seektable;
+    }
+
+    if (writer->config.padding_bytes > 0) {
+        writer->padding = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PADDING);
+        if (!writer->padding) {
+            report_error(writer, FLAC_WRITER_ERR_CONFIG, "Failed to allocate padding block");
+            return FLAC_WRITER_ERR_CONFIG;
+        }
+        writer->padding->length = writer->config.padding_bytes;
+        meta[n_meta++] = writer->padding;
+    }
+
+    if (n_meta > 0 && !FLAC__stream_encoder_set_metadata(enc, meta, n_meta)) {
+        report_error(writer, FLAC_WRITER_ERR_CONFIG, "Failed to set encoder metadata");
+        return FLAC_WRITER_ERR_CONFIG;
     }
 
     return FLAC_WRITER_OK;
@@ -494,6 +515,8 @@ flac_writer_t *flac_writer_create_file(FILE *output_file, const flac_writer_conf
     if (err != FLAC_WRITER_OK) {
         FLAC__stream_encoder_delete(writer->encoder);
         if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
+        if (writer->padding) FLAC__metadata_object_delete(writer->padding);
         free(writer);
         return NULL;
     }
@@ -508,6 +531,8 @@ flac_writer_t *flac_writer_create_file(FILE *output_file, const flac_writer_conf
         report_error(writer, FLAC_WRITER_ERR_INIT, msg);
         FLAC__stream_encoder_delete(writer->encoder);
         if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
+        if (writer->padding) FLAC__metadata_object_delete(writer->padding);
         free(writer);
         return NULL;
     }
@@ -537,6 +562,8 @@ flac_writer_t *flac_writer_create_stream(FILE *output_file, const flac_writer_co
     if (err != FLAC_WRITER_OK) {
         FLAC__stream_encoder_delete(writer->encoder);
         if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
+        if (writer->padding) FLAC__metadata_object_delete(writer->padding);
         free(writer);
         return NULL;
     }
@@ -561,6 +588,8 @@ flac_writer_t *flac_writer_create_stream(FILE *output_file, const flac_writer_co
         report_error(writer, FLAC_WRITER_ERR_INIT, msg);
         FLAC__stream_encoder_delete(writer->encoder);
         if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
+        if (writer->padding) FLAC__metadata_object_delete(writer->padding);
         free(writer);
         return NULL;
     }
@@ -648,6 +677,7 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer) {
 
     // Cleanup
     if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
     FLAC__stream_encoder_delete(writer->encoder);
     if (writer->conv_buffer) free(writer->conv_buffer);
     free(writer);
@@ -694,6 +724,7 @@ void flac_writer_abort(flac_writer_t *writer) {
     if (!writer) return;
 
     if (writer->seektable) FLAC__metadata_object_delete(writer->seektable);
+    if (writer->padding) FLAC__metadata_object_delete(writer->padding);
     FLAC__stream_encoder_delete(writer->encoder);
     if (writer->conv_buffer) free(writer->conv_buffer);
     free(writer);

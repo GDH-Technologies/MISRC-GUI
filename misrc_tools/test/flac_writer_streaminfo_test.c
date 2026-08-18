@@ -54,6 +54,38 @@ static int read_streaminfo_total_samples(const char *path, uint64_t *out_total) 
     return 0;
 }
 
+/* Walks the metadata block headers; returns 0 and fills *out_length if a block
+ * of the given type exists, -1 otherwise. */
+static int find_metadata_block(const char *path, uint8_t type, uint32_t *out_length) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "FAIL: cannot open %s for block walk\n", path);
+        return -1;
+    }
+    uint8_t magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "fLaC", 4) != 0) {
+        fprintf(stderr, "FAIL: %s has no fLaC magic\n", path);
+        fclose(f);
+        return -1;
+    }
+    int found = -1;
+    for (;;) {
+        uint8_t hdr[4];
+        if (fread(hdr, 1, 4, f) != 4) break;
+        uint8_t block_type = hdr[0] & 0x7F;
+        uint32_t length = ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) | hdr[3];
+        if (block_type == type) {
+            if (out_length) *out_length = length;
+            found = 0;
+            break;
+        }
+        if (fseek(f, (long)length, SEEK_CUR) != 0) break;
+        if (hdr[0] & 0x80) break; /* last-metadata-block flag */
+    }
+    fclose(f);
+    return found;
+}
+
 static int expect_total(const char *path, uint64_t expected, const char *label) {
     uint64_t total = 0;
     if (read_streaminfo_total_samples(path, &total) != 0) return -1;
@@ -127,6 +159,17 @@ int main(int argc, char **argv) {
     int rc = 1;
     do {
         if (expect_total(path, TEST_SAMPLE_COUNT, "encoded count is exact (no /1000 scaling)") != 0) break;
+
+        uint32_t pad_len = 0;
+        if (find_metadata_block(path, 1 /* PADDING */, &pad_len) != 0) {
+            fprintf(stderr, "FAIL: encoded file has no PADDING block\n");
+            break;
+        }
+        if (pad_len != 4096) {
+            fprintf(stderr, "FAIL: PADDING length %u, expected 4096\n", pad_len);
+            break;
+        }
+        printf("PASS: encoder reserves a 4096-byte PADDING block\n");
 
         if (!flac_writer_finalize_streaminfo(path, TEST_SAMPLE_COUNT)) {
             fprintf(stderr, "FAIL: finalize_streaminfo returned false for in-range count\n");

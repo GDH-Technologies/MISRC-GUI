@@ -71,6 +71,11 @@ typedef struct {
     bool enable_seektable;           // Generate seektable metadata (default: true)
     uint32_t seektable_spacing;      // Samples between seek points (0 = default: 1<<18)
 
+    // Trailing PADDING block reserved at encode time so post-capture metadata
+    // (vorbis tags) can be embedded in place instead of rewriting the whole
+    // file. 0 disables. Default: 4096 bytes.
+    uint32_t padding_bytes;
+
     // Callbacks (all optional - NULL disables)
     flac_error_callback_t error_cb;
     flac_bytes_written_callback_t bytes_cb;
@@ -87,7 +92,8 @@ typedef struct flac_writer flac_writer_t;
  * ============================================================================ */
 
 // Create default configuration with sensible defaults
-// Returns config: 40kHz, 16-bit, level 1, no verify, auto threads, seektable enabled
+// Returns config: 40kHz, 16-bit, level 1, no verify, auto threads, seektable
+// enabled, 4096B trailing padding
 flac_writer_config_t flac_writer_default_config(void);
 
 // Create writer and initialize encoder for FILE* output
