@@ -570,7 +570,18 @@ int main(int argc, char **argv) {
 #endif
 
     // Main loop
-    while (!WindowShouldClose() && !atomic_load(&do_exit)) {
+    while (!atomic_load(&do_exit)) {
+        if (WindowShouldClose()) {
+            /* Never abandon an in-flight finalize: closing mid-write leaves
+             * output files with incomplete metadata (seen 2026-08-18). Hold
+             * the window until finalize completes, then fall through -- the
+             * close request is latched, so the next check exits. */
+            if (gui_record_is_finalizing()) {
+                gui_app_set_status(&app, "Finalizing recording -- please wait...");
+            } else {
+                break;
+            }
+        }
         bool was_capturing = app.is_capturing;
         if (app.is_recording) {
             if (!recording_fps_throttle) {
@@ -834,6 +845,10 @@ int main(int argc, char **argv) {
     if (app.is_capturing) {
         gui_app_stop_capture(&app);
     }
+
+    /* Joins any in-flight finalize thread and frees its session. This is the
+     * backstop for exit paths that bypass the main loop's finalize hold. */
+    gui_record_cleanup();
 
     // Save settings before cleanup
     gui_settings_save(&app.settings);
