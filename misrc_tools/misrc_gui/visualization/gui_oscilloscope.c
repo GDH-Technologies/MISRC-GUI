@@ -158,6 +158,73 @@ static void waveform_apply_channel_trigger_source_default(waveform_panel_state_t
     state->trigger_source_defaulted_by_channel = true;
 }
 
+static size_t waveform_collect_states(channel_panel_config_t *config,
+                                      waveform_panel_state_t *states_out[2])
+{
+    if (!config || !states_out) return 0;
+    size_t count = 0;
+    if (config->left_view == PANEL_VIEW_WAVEFORM && config->left_state) {
+        states_out[count++] = (waveform_panel_state_t *)config->left_state;
+    }
+    if (config->split &&
+        config->right_view == PANEL_VIEW_WAVEFORM &&
+        config->right_state &&
+        config->right_state != config->left_state &&
+        count < 2) {
+        states_out[count++] = (waveform_panel_state_t *)config->right_state;
+    }
+    return count;
+}
+
+bool gui_waveform_panel_get_dc_offset(const channel_panel_config_t *config,
+                                      int16_t *offset_out)
+{
+    if (!config || !offset_out) return false;
+    waveform_panel_state_t *states[2] = {0};
+    size_t count = waveform_collect_states((channel_panel_config_t *)config, states);
+    if (count == 0 || !states[0] || !states[0]->initialized) {
+        return false;
+    }
+    *offset_out = states[0]->trigger_level;
+    return true;
+}
+
+bool gui_waveform_panel_adjust_dc_offset(channel_panel_config_t *config,
+                                         int channel,
+                                         int delta)
+{
+    if (!config) return false;
+    if (channel < 0) channel = 0;
+    if (channel > 1) channel = 1;
+
+    waveform_panel_state_t *states[2] = {0};
+    size_t count = waveform_collect_states(config, states);
+    if (count == 0 || !states[0] || !states[0]->initialized) {
+        return false;
+    }
+
+    int next_level = (int)states[0]->trigger_level + delta;
+    if (next_level > 2047) next_level = 2047;
+    if (next_level < -2048) next_level = -2048;
+
+    for (size_t i = 0; i < count; i++) {
+        waveform_panel_state_t *state = states[i];
+        if (!state || !state->initialized) continue;
+        waveform_apply_channel_trigger_source_default(state, channel);
+        state->trigger_enabled = true;
+        if (state->trigger_mode == TRIGGER_MODE_SYNC ||
+            state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
+            state->trigger_mode = TRIGGER_MODE_RISING;
+        }
+        if (state->trigger_source == TRIGGER_SOURCE_CH3) {
+            state->trigger_source = waveform_default_trigger_source_for_channel(channel);
+        }
+        state->trigger_level = (int16_t)next_level;
+    }
+
+    return true;
+}
+
 //-----------------------------------------------------------------------------
 // Internal Helper Functions
 //-----------------------------------------------------------------------------
