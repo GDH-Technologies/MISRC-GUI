@@ -656,6 +656,38 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer) {
 }
 
 /* ============================================================================
+ * Post-close STREAMINFO fixup
+ * ============================================================================ */
+bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written) {
+    if (!path || !path[0]) return false;
+
+    // STREAMINFO.total_samples is 36 bits wide. Below the limit libFLAC's
+    // encoder finish already wrote the exact count; no rewrite needed.
+    const uint64_t max_total_samples = ((uint64_t)1 << 36) - 1;
+    if (samples_written <= max_total_samples) return true;
+
+    FLAC__Metadata_Chain *chain = FLAC__metadata_chain_new();
+    if (!chain) return false;
+
+    bool success = false;
+    if (FLAC__metadata_chain_read(chain, path)) {
+        FLAC__Metadata_Iterator *iter = FLAC__metadata_iterator_new();
+        if (iter) {
+            FLAC__metadata_iterator_init(iter, chain);
+            FLAC__StreamMetadata *block = FLAC__metadata_iterator_get_block(iter);
+            if (block && block->type == FLAC__METADATA_TYPE_STREAMINFO) {
+                block->data.stream_info.total_samples = 0; // 0 = unknown per FLAC spec
+                success = FLAC__metadata_chain_write(chain, /*use_padding=*/true,
+                                                     /*preserve_file_stats=*/true);
+            }
+            FLAC__metadata_iterator_delete(iter);
+        }
+    }
+    FLAC__metadata_chain_delete(chain);
+    return success;
+}
+
+/* ============================================================================
  * Abort (cleanup without finalizing)
  * ============================================================================ */
 void flac_writer_abort(flac_writer_t *writer) {
@@ -732,6 +764,11 @@ int flac_writer_process_int16(flac_writer_t *w, const int16_t *s, uint32_t n) {
 flac_writer_error_t flac_writer_finish(flac_writer_t *w) {
     (void)w;
     return FLAC_WRITER_ERR_DISABLED;
+}
+
+bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written) {
+    (void)path; (void)samples_written;
+    return false;
 }
 
 void flac_writer_abort(flac_writer_t *w) { (void)w; }
