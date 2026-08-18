@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 
 #ifndef LIBASOUND_ENABLED
 #define LIBASOUND_ENABLED 0
@@ -61,7 +62,8 @@ static const PROPERTYKEY s_PKEY_Device_InstanceId = {
 extern volatile atomic_int do_exit;
 
 #define CXADC_MAX_CARDS 2
-#define CXADC_SAMPLE_RATE_HZ 40000000U
+#define CXADC_SAMPLE_RATE_8BIT_HZ 40000000U
+#define CXADC_SAMPLE_RATE_TENBIT_HZ 20000000U
 #define CXADC_READ_CHUNK_BYTES 65536
 #define CXADC_AUDIO_SAMPLE_RATE_HZ 46875U
 #define CXADC_AUDIO_CHANNEL_COUNT 3
@@ -84,6 +86,9 @@ typedef struct {
     thrd_t audio_thread;
     bool audio_thread_started;
     int card_count;
+    bool tenbit_mode[CXADC_MAX_CARDS];
+    uint32_t card_sample_rate_hz[CXADC_MAX_CARDS];
+    uint32_t rf_sample_rate_hz;
     // Audio format (shared across platforms)
     cxadc_audio_format_t audio_format;
     size_t audio_sample_bytes;
@@ -107,6 +112,199 @@ typedef struct {
 
 static cxadc_ctx_t s_cxadc = {0};
 
+#if !defined(_WIN32)
+#define CXADC_SYSFS_CARD_MAX 255
+#define CXADC_SYSFS_CENTER_OFFSET_MIN 0
+#define CXADC_SYSFS_CENTER_OFFSET_MAX 255
+
+static int cxadc_sysfs_build_param_path(int card_idx,
+                                        const char *param_name,
+                                        char *path_out,
+                                        size_t path_out_len)
+{
+    if (!param_name || !param_name[0] || !path_out || path_out_len == 0) {
+        return -1;
+    }
+    if (card_idx < 0 || card_idx > CXADC_SYSFS_CARD_MAX) {
+        return -1;
+    }
+    int n = snprintf(path_out, path_out_len,
+                     "/sys/class/cxadc/cxadc%d/device/parameters/%s",
+                     card_idx, param_name);
+    if (n <= 0 || (size_t)n >= path_out_len) {
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_sysfs_read_int_param(int card_idx,
+                                      const char *param_name,
+                                      int *value_out)
+{
+    if (!value_out) return -1;
+
+    char path[160];
+    if (cxadc_sysfs_build_param_path(card_idx, param_name, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+
+    char buf[64];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(buf, &endptr, 10);
+    if (errno != 0 || endptr == buf) {
+        return -1;
+    }
+    while (*endptr && isspace((unsigned char)*endptr)) {
+        endptr++;
+    }
+    if (*endptr != '\0') {
+        return -1;
+    }
+    if (parsed < INT_MIN || parsed > INT_MAX) {
+        return -1;
+    }
+
+    *value_out = (int)parsed;
+    return 0;
+}
+
+static int cxadc_sysfs_write_int_param(int card_idx,
+                                       const char *param_name,
+                                       int value)
+{
+    char path[160];
+    if (cxadc_sysfs_build_param_path(card_idx, param_name, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+
+    int wrote = fprintf(f, "%d\n", value);
+    int close_rc = fclose(f);
+    if (wrote <= 0 || close_rc != 0) {
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+int gui_cxadc_get_center_offset(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+#if defined(_WIN32)
+    (void)card_idx;
+    return -1;
+#else
+    return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
+#endif
+}
+
+int gui_cxadc_set_center_offset(int card_idx, int value)
+{
+#if defined(_WIN32)
+    (void)card_idx;
+    (void)value;
+    return -1;
+#else
+    if (value < CXADC_SYSFS_CENTER_OFFSET_MIN) value = CXADC_SYSFS_CENTER_OFFSET_MIN;
+    if (value > CXADC_SYSFS_CENTER_OFFSET_MAX) value = CXADC_SYSFS_CENTER_OFFSET_MAX;
+    return cxadc_sysfs_write_int_param(card_idx, "center_offset", value);
+#endif
+}
+
+int gui_cxadc_adjust_center_offset(int card_idx, int delta, int *new_value_out)
+{
+#if defined(_WIN32)
+    (void)card_idx;
+    (void)delta;
+    if (new_value_out) *new_value_out = 0;
+    return -1;
+#else
+    int current = 0;
+    if (gui_cxadc_get_center_offset(card_idx, &current) != 0) {
+        return -1;
+    }
+    int next = current + delta;
+    if (next < CXADC_SYSFS_CENTER_OFFSET_MIN) next = CXADC_SYSFS_CENTER_OFFSET_MIN;
+    if (next > CXADC_SYSFS_CENTER_OFFSET_MAX) next = CXADC_SYSFS_CENTER_OFFSET_MAX;
+    if (gui_cxadc_set_center_offset(card_idx, next) != 0) {
+        return -1;
+    }
+    if (new_value_out) {
+        *new_value_out = next;
+    }
+    return 0;
+#endif
+}
+
+int gui_cxadc_get_tenbit(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+#if defined(_WIN32)
+    (void)card_idx;
+    return -1;
+#else
+    int raw = 0;
+    if (cxadc_sysfs_read_int_param(card_idx, "tenbit", &raw) != 0) {
+        return -1;
+    }
+    *value_out = (raw != 0) ? 1 : 0;
+    return 0;
+#endif
+}
+
+int gui_cxadc_set_tenbit(int card_idx, bool enabled)
+{
+#if defined(_WIN32)
+    (void)card_idx;
+    (void)enabled;
+    return -1;
+#else
+    return cxadc_sysfs_write_int_param(card_idx, "tenbit", enabled ? 1 : 0);
+#endif
+}
+
+static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
+{
+#if defined(_WIN32)
+    (void)card_count;
+    (void)enabled;
+    return 0;
+#else
+    if (card_count < 1) card_count = 1;
+    if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
+    for (int i = 0; i < card_count; i++) {
+        bool mode = (enabled != NULL) ? enabled[i] : false;
+        if (gui_cxadc_set_tenbit(i, mode) != 0) {
+            return -1;
+        }
+        int readback = -1;
+        if (gui_cxadc_get_tenbit(i, &readback) != 0) {
+            return -1;
+        }
+        if (((readback != 0) ? true : false) != mode) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return 0;
+#endif
+}
 static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_b)
 {
     if (sample_a > 2047) sample_a = 2047;
@@ -118,10 +316,23 @@ static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_
     uint32_t ch_b = (uint32_t)((2047 - sample_b) & 0xFFF);
     return ch_a | (ch_b << 20);
 }
+static inline int16_t cxadc_decode_sample_8bit(uint8_t sample)
+{
+    return (int16_t)(((int)sample - 128) << 4);
+}
 
-static void cxadc_reset_stats(gui_app_t *app)
+static inline int16_t cxadc_decode_sample_tenbit(uint8_t lo, uint8_t hi)
+{
+    uint16_t raw = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    return (int16_t)(((int)raw - 32768) >> 4);
+}
+
+static void cxadc_reset_stats(gui_app_t *app, uint32_t rf_sample_rate_hz)
 {
     if (!app) return;
+    if (rf_sample_rate_hz == 0) {
+        rf_sample_rate_hz = CXADC_SAMPLE_RATE_8BIT_HZ;
+    }
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
 
     atomic_store(&app->total_samples, 0);
@@ -141,7 +352,7 @@ static void cxadc_reset_stats(gui_app_t *app)
     atomic_store(&app->rb_wait_count, 0);
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
-    atomic_store(&app->sample_rate, CXADC_SAMPLE_RATE_HZ);
+    atomic_store(&app->sample_rate, rf_sample_rate_hz);
     atomic_store(&app->audio_sample_rate, CXADC_AUDIO_SAMPLE_RATE_HZ);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     atomic_store(&app->dropout_stop_requested, false);
@@ -1028,9 +1239,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
         gui_app_set_status(app, "CXADC: failed to allocate capture buffers");
         return -1;
     }
+    const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
+    const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
 
     atomic_store(&app->stream_synced, true);
-    atomic_store(&app->sample_rate, CXADC_SAMPLE_RATE_HZ);
+    atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
 
     while (atomic_load(&ctx->running) && app->is_capturing && !atomic_load(&do_exit)) {
 #if defined(_WIN32)
@@ -1047,7 +1260,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
             continue;
         }
 
-        int output_samples = read_a;
+        int output_samples = read_a / input_bytes_per_sample_a;
+        if (output_samples <= 0) {
+            thrd_sleep_ms(1);
+            continue;
+        }
         if (ctx->card_count > 1) {
 #if defined(_WIN32)
             int read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
@@ -1062,8 +1279,9 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 thrd_sleep_ms(1);
                 continue;
             }
-            if (read_b < output_samples) {
-                output_samples = read_b;
+            int output_samples_b = read_b / input_bytes_per_sample_b;
+            if (output_samples_b < output_samples) {
+                output_samples = output_samples_b;
             }
         }
 
@@ -1080,10 +1298,21 @@ static int cxadc_capture_thread(void *ctx_ptr)
         }
 
         for (int i = 0; i < output_samples; i++) {
-            int16_t sample_a = (int16_t)(((int)card_buf_a[i] - 128) << 4);
+            int16_t sample_a = 0;
+            if (ctx->tenbit_mode[0]) {
+                int idx = i * 2;
+                sample_a = cxadc_decode_sample_tenbit(card_buf_a[idx], card_buf_a[idx + 1]);
+            } else {
+                sample_a = cxadc_decode_sample_8bit(card_buf_a[i]);
+            }
             int16_t sample_b = 0;
             if (ctx->card_count > 1) {
-                sample_b = (int16_t)(((int)card_buf_b[i] - 128) << 4);
+                if (ctx->tenbit_mode[1]) {
+                    int idx = i * 2;
+                    sample_b = cxadc_decode_sample_tenbit(card_buf_b[idx], card_buf_b[idx + 1]);
+                } else {
+                    sample_b = cxadc_decode_sample_8bit(card_buf_b[i]);
+                }
             }
             raw_out[i] = cxadc_encode_raw_sample(sample_a, sample_b);
         }
@@ -1111,6 +1340,17 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     memset(&s_cxadc, 0, sizeof(s_cxadc));
     s_cxadc.app = app;
     s_cxadc.card_count = card_count;
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        bool mode = app->settings.cxadc_tenbit_mode_card[i];
+        if (i >= card_count) {
+            mode = false;
+        }
+        s_cxadc.tenbit_mode[i] = mode;
+        s_cxadc.card_sample_rate_hz[i] = mode
+            ? CXADC_SAMPLE_RATE_TENBIT_HZ
+            : CXADC_SAMPLE_RATE_8BIT_HZ;
+    }
+    s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
 #if defined(_WIN32)
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
         s_cxadc.card_handles[i] = INVALID_HANDLE_VALUE;
@@ -1135,6 +1375,16 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     s_cxadc.audio_device_name[0] = '\0';
 
     gui_headswitch_lock_reset();
+#if !defined(_WIN32)
+    if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+        if (errno == EACCES || errno == EPERM) {
+            gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+        } else {
+            gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+        }
+        return -1;
+    }
+#endif
 
     if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
         gui_app_set_status(app, "CXADC: failed to open card device(s)");
@@ -1152,7 +1402,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
         return -1;
     }
 
-    cxadc_reset_stats(app);
+    cxadc_reset_stats(app, s_cxadc.rf_sample_rate_hz);
 
     bool audio_capture_available = false;
     if (cxadc_open_audio_capture(&s_cxadc) == 0) {

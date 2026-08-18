@@ -378,6 +378,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // RF bit depth defaults (per-channel)
     settings->rf_bits_a = 16;
     settings->rf_bits_b = 16;
+    settings->cxadc_tenbit_mode_card[0] = false;
+    settings->cxadc_tenbit_mode_card[1] = false;
     
     // Individual channel filenames
     for (int i = 0; i < 4; i++) {
@@ -498,6 +500,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
     fprintf(f, "  \"rf_bits_a\": %u,\n", (unsigned)settings->rf_bits_a);
     fprintf(f, "  \"rf_bits_b\": %u,\n", (unsigned)settings->rf_bits_b);
+    fprintf(f, "  \"cxadc_tenbit_mode_a\": %s,\n", settings->cxadc_tenbit_mode_card[0] ? "true" : "false");
+    fprintf(f, "  \"cxadc_tenbit_mode_b\": %s,\n", settings->cxadc_tenbit_mode_card[1] ? "true" : "false");
     fprintf(f, "  \"rf_tag_a\": \"%s\",\n", settings->rf_channel_tags[0]);
     fprintf(f, "  \"rf_tag_b\": \"%s\",\n", settings->rf_channel_tags[1]);
     fprintf(f, "  \"output_filename_a\": \"%s\",\n", settings->output_filename_a);
@@ -878,6 +882,25 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "rf_bits_b")) != NULL) {
         settings->rf_bits_b = (uint8_t)atoi(value);
+    }
+    bool cxadc_mode_legacy_loaded = false;
+    if ((value = find_value(content, "cxadc_tenbit_mode")) != NULL) {
+        bool mode = (strcmp(value, "true") == 0);
+        settings->cxadc_tenbit_mode_card[0] = mode;
+        settings->cxadc_tenbit_mode_card[1] = mode;
+        cxadc_mode_legacy_loaded = true;
+    }
+    if ((value = find_value(content, "cxadc_tenbit_mode_a")) != NULL) {
+        settings->cxadc_tenbit_mode_card[0] = (strcmp(value, "true") == 0);
+        cxadc_mode_legacy_loaded = true;
+    }
+    if ((value = find_value(content, "cxadc_tenbit_mode_b")) != NULL) {
+        settings->cxadc_tenbit_mode_card[1] = (strcmp(value, "true") == 0);
+        cxadc_mode_legacy_loaded = true;
+    }
+    if (!cxadc_mode_legacy_loaded) {
+        settings->cxadc_tenbit_mode_card[0] = false;
+        settings->cxadc_tenbit_mode_card[1] = false;
     }
     if ((value = find_value(content, "rf_tag_a")) != NULL) {
         strncpy(settings->rf_channel_tags[0], value, sizeof(settings->rf_channel_tags[0]) - 1);

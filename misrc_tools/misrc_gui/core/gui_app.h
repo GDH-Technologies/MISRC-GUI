@@ -183,6 +183,10 @@ typedef struct {
     // FLAC supports 8/12/16; RAW supports 8/16 (12 is disabled in RAW UI).
     uint8_t rf_bits_a;
     uint8_t rf_bits_b;
+    // CXADC capture mode per card: false=8-bit @ base 40 MSPS,
+    // true=driver tenbit (16-bit samples @ base 20 MSPS).
+    // [0]=card A (cxadc0), [1]=card B (cxadc1).
+    bool cxadc_tenbit_mode_card[2];
     // Optional per-channel RF tags used in auto naming (e.g. "luma", "chroma")
     char rf_channel_tags[2][32];
 

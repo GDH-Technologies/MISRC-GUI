@@ -7,9 +7,11 @@
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "../visualization/gui_fft.h"
+#include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../input/gui_playback.h"
+#include "../input/gui_cxadc.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
@@ -24,6 +26,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 #if defined(__ANDROID__)
 extern void android_set_keyboard_visible(int visible);
 extern size_t android_drain_text_input(char *out, size_t out_len);
@@ -61,6 +64,10 @@ static bool s_capture_mode_render_last_recording = false;
 static bool s_capture_mode_render_last_capturing = false;
 static bool s_capture_mode_render_last_source_runtime = false;
 static bool s_capture_b_forced_off_by_single_channel = false;
+static int s_cxadc_dc_anchor_device_index = -1;
+static bool s_cxadc_dc_anchor_valid[2] = { false, false };
+static int s_cxadc_dc_anchor_raw[2] = { 0, 0 };
+static int s_cxadc_dc_relative[2] = { 0, 0 };
 
 static const char *gui_ui_capture_mode_name(bool misrc_mode) {
     return misrc_mode ? "MISRC" : "HSDAOH";
@@ -77,6 +84,75 @@ static bool gui_ui_selected_device_is_cxadc(const gui_app_t *app, bool *clockgen
 
     if (clockgen_mode) {
         *clockgen_mode = (dev->index > 1);
+    }
+    return true;
+}
+
+static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 40000.0f;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 20000.0f : 40000.0f;
+}
+static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 8;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 16 : 8;
+}
+static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
+{
+    if (!app) return;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    app->settings.cxadc_tenbit_mode_card[card_idx] = !app->settings.cxadc_tenbit_mode_card[card_idx];
+    uint8_t cxadc_bits = gui_ui_cxadc_rf_bits(app, card_idx);
+    float cxadc_base_rate_khz = gui_ui_cxadc_base_rate_khz(app, card_idx);
+    if (card_idx == 0) {
+        app->settings.rf_bits_a = cxadc_bits;
+        if (!app->settings.enable_resample_a || app->settings.resample_rate_a > cxadc_base_rate_khz) {
+            app->settings.resample_rate_a = cxadc_base_rate_khz;
+        }
+    } else {
+        app->settings.rf_bits_b = cxadc_bits;
+        if (!app->settings.enable_resample_b || app->settings.resample_rate_b > cxadc_base_rate_khz) {
+            app->settings.resample_rate_b = cxadc_base_rate_khz;
+        }
+    }
+    gui_settings_save(&app->settings);
+    const char *card_label = (card_idx == 0) ? "A" : "B";
+    bool enabled = app->settings.cxadc_tenbit_mode_card[card_idx];
+    if (app->is_capturing) {
+        gui_app_set_status(app, enabled
+            ? ((card_idx == 0) ? "CXADC card A 10-bit mode enabled (applies on next capture start)"
+                               : "CXADC card B 10-bit mode enabled (applies on next capture start)")
+            : ((card_idx == 0) ? "CXADC card A 8-bit mode enabled (applies on next capture start)"
+                               : "CXADC card B 8-bit mode enabled (applies on next capture start)"));
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "CXADC card %s %s (%s base)",
+                 card_label,
+                 enabled ? "10-bit mode enabled" : "8-bit mode enabled",
+                 enabled ? "20 MSPS" : "40 MSPS");
+        gui_app_set_status(app, msg);
+    }
+}
+
+static bool gui_ui_map_cxadc_channel_to_card(const gui_app_t *app, int channel, int *card_idx_out)
+{
+    if (!app) return false;
+    if (channel < 0 || channel > 1) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+
+    const device_info_t *dev = &app->devices[app->selected_device];
+    if (dev->type != DEVICE_TYPE_CXADC) return false;
+
+    int card_count = dev->index;
+    if (card_count < 1) card_count = 1;
+    if (card_count > 2) card_count = 2;
+    if (channel >= card_count) return false;
+
+    if (card_idx_out) {
+        *card_idx_out = channel;
     }
     return true;
 }
@@ -589,18 +665,40 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     }
     if (cxadc_mode) {
         bool cxadc_settings_changed = false;
+        uint8_t cxadc_rf_bits_a = gui_ui_cxadc_rf_bits(app, 0);
+        uint8_t cxadc_rf_bits_b = gui_ui_cxadc_rf_bits(app, cxadc_has_channel_b ? 1 : 0);
+        float cxadc_base_rate_a_khz = gui_ui_cxadc_base_rate_khz(app, 0);
+        float cxadc_base_rate_b_khz = gui_ui_cxadc_base_rate_khz(app, cxadc_has_channel_b ? 1 : 0);
         // Single-card CXADC has no RF-B source.
         if (!cxadc_has_channel_b && app->settings.capture_b) {
             app->settings.capture_b = false;
             cxadc_settings_changed = true;
             s_capture_b_forced_off_by_single_channel = true;
         }
-        if (app->settings.rf_bits_a != 8) {
-            app->settings.rf_bits_a = 8;
+        if (app->settings.rf_bits_a != cxadc_rf_bits_a) {
+            app->settings.rf_bits_a = cxadc_rf_bits_a;
             cxadc_settings_changed = true;
         }
-        if (app->settings.rf_bits_b != 8) {
-            app->settings.rf_bits_b = 8;
+        if (app->settings.rf_bits_b != cxadc_rf_bits_b) {
+            app->settings.rf_bits_b = cxadc_rf_bits_b;
+            cxadc_settings_changed = true;
+        }
+        if (!app->settings.enable_resample_a) {
+            if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
+                app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+                cxadc_settings_changed = true;
+            }
+        } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
+            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+            cxadc_settings_changed = true;
+        }
+        if (!app->settings.enable_resample_b) {
+            if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
+                app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+                cxadc_settings_changed = true;
+            }
+        } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
+            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
             cxadc_settings_changed = true;
         }
         if (cxadc_settings_changed) {
@@ -942,21 +1040,33 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 
-static float cycle_resample_khz(float current_khz) {
+static float cycle_resample_khz(float current_khz, float max_khz) {
     // User-facing presets (stored as kHz), including 40 MSPS passthrough base.
     static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 40000.0f };
     const int n = (int)(sizeof(presets_khz) / sizeof(presets_khz[0]));
+    if (max_khz < 5000.0f) max_khz = 5000.0f;
+
+    float allowed[n];
+    int allowed_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (presets_khz[i] <= max_khz + 0.5f) {
+            allowed[allowed_count++] = presets_khz[i];
+        }
+    }
+    if (allowed_count <= 0) {
+        return 5000.0f;
+    }
 
     // Find nearest preset (within 1 kHz), otherwise start from first.
     int idx = -1;
-    for (int i = 0; i < n; i++) {
-        if (fabsf(current_khz - presets_khz[i]) < 1.0f) {
+    for (int i = 0; i < allowed_count; i++) {
+        if (fabsf(current_khz - allowed[i]) < 1.0f) {
             idx = i;
             break;
         }
     }
-    if (idx < 0) return presets_khz[0];
-    return presets_khz[(idx + 1) % n];
+    if (idx < 0) return allowed[0];
+    return allowed[(idx + 1) % allowed_count];
 }
 
 static bool gui_ui_flac_affinity_supported(void) {
@@ -1944,8 +2054,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // RF bit depth selector (moved up into Capture segment)
                         CLAY(CLAY_ID("CaptureRowSpacerA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
                         snprintf(settings_rf_bits_a_display, sizeof(settings_rf_bits_a_display), "%s-bit", rf_bits_label(app->settings.rf_bits_a));
-                        Color rf_bits_a_bg = settings_cxadc_mode ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rf_bits_a_fg = settings_cxadc_mode ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        Color rf_bits_a_bg = COLOR_BUTTON;
+                        Color rf_bits_a_fg = COLOR_TEXT;
                         CLAY(CLAY_ID("RfBitsABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_a_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_rf_bits_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_a_fg) }));
                         }
@@ -1972,8 +2082,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
 
                         CLAY(CLAY_ID("CaptureRowSpacerB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
                         snprintf(settings_rf_bits_b_display, sizeof(settings_rf_bits_b_display), "%s-bit", rf_bits_label(app->settings.rf_bits_b));
-                        Color rf_bits_b_bg = (settings_cxadc_mode || settings_b_controls_disabled) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rf_bits_b_fg = (settings_cxadc_mode || settings_b_controls_disabled) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        Color rf_bits_b_bg = settings_b_disabled ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color rf_bits_b_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("RfBitsBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_b_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_rf_bits_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_b_fg) }));
                         }
@@ -3724,6 +3834,35 @@ static void render_channel_stats(gui_app_t *app, int channel) {
                 CLAY_TEXT(CLAY_STRING("RST"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(COLOR_TEXT) }));
             }
         }
+        if (gui_ui_selected_device_is_cxadc(app, NULL)) {
+            int card_idx = -1;
+            bool dc_card_available = gui_ui_map_cxadc_channel_to_card(app, channel, &card_idx);
+            Color dc_btn_bg = dc_card_available ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+            Color dc_btn_fg = dc_card_available ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+
+            CLAY(CLAY_IDI("DcOffsetRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                CLAY(CLAY_IDI("LblDcOffset", channel), { .layout = { .sizing = { CLAY_SIZING_FIXED(LABEL_WIDTH), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("DC:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_IDI("DcOffsetDown", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("\\/"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
+                CLAY(CLAY_IDI("DcOffsetUp", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("/\\"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
+            }
+        }
 
 
         {
@@ -4192,7 +4331,9 @@ static void render_status_bar(gui_app_t *app) {
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
     bool show_status_message = !status_tiny && !status_quarter_scale;
-    bool show_free_space = !show_status_message || !status_narrow;
+    /* Keep free-space visible during normal startup/layout sizes; only hide on
+     * very tiny widths where preserving right-side counters takes priority. */
+    bool show_free_space = !status_tiny;
     int sample_rate_value_width = status_narrow ? 68 : 80;
     int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
     int frames_value_width = 50;
@@ -4200,8 +4341,9 @@ static void render_status_bar(gui_app_t *app) {
     int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
     int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
     int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
-    int status_left_gap = status_tiny ? 6 : 10;
-    int status_message_value_width = status_narrow ? 220 : (status_compact ? 300 : 430);
+    int status_left_gap = show_status_message ? (status_tiny ? 4 : 8) : 0;
+    int status_message_max_chars = status_narrow ? 16 : (status_compact ? 22 : 30);
+    int status_font_size = FONT_SIZE_STATUS - 1;
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
     const char *samples_label = status_tiny ? "S:" : (status_narrow ? "Samp:" : "Samples:");
@@ -4216,7 +4358,7 @@ static void render_status_bar(gui_app_t *app) {
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
-        // Left side: free space/runway
+        // Left side: status + free space/runway
         CLAY(CLAY_ID("StatusLeft"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
@@ -4225,11 +4367,12 @@ static void render_status_bar(gui_app_t *app) {
                 .childGap = status_left_gap
             }
         }) {
+
             if (show_status_message) {
                 const char *raw_status = (app->status_message[0] != '\0')
                     ? app->status_message
                     : (app->is_capturing ? "Capturing..." : "Ready");
-                size_t max_chars = status_narrow ? 32 : (status_compact ? 44 : 72);
+                size_t max_chars = (size_t)status_message_max_chars;
                 size_t raw_len = strlen(raw_status);
                 if (raw_len > max_chars && max_chars > 3) {
                     snprintf(status_message_display, sizeof(status_message_display), "%.*s...",
@@ -4237,7 +4380,7 @@ static void render_status_bar(gui_app_t *app) {
                 } else {
                     snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
                 }
-                Color status_color = COLOR_TEXT;
+                Color status_color = COLOR_TEXT_DIM;
                 if (strstr(raw_status, "denied") != NULL ||
                     strstr(raw_status, "Denied") != NULL ||
                     strstr(raw_status, "error") != NULL ||
@@ -4257,42 +4400,42 @@ static void render_status_bar(gui_app_t *app) {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
+                        .childGap = status_compact ? 2 : 4
                     }
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Status:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                    CLAY(CLAY_ID("ConnectionStatusValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(status_message_value_width), CLAY_SIZING_FIT(0) } }
-                    }) {
-                        CLAY_TEXT(make_string(status_message_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(status_color) }));
-                    }
+                    CLAY_TEXT(make_string(status_message_display),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(status_color) }));
                 }
             }
 
             if (show_free_space) {
                 Color free_space_color = COLOR_TEXT_DIM;
                 if (s_status_free_space_valid) {
-                    format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
-                                                   s_status_free_space_cached_bytes);
-                    if (app->is_recording && s_status_output_rate_bps > 0.0) {
-                        char free_only[48];
-                        char runway_hms[24];
-                        double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
-                        format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
-                        format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                    char free_only[48];
+                    char runway_hms[24];
+                    format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
+                    if (app->is_recording) {
+                        bool runway_known = s_status_output_rate_bps > 0.0;
+                        if (runway_known) {
+                            double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
+                            format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                        } else {
+                            snprintf(runway_hms, sizeof(runway_hms), "--:--:--");
+                        }
+
                         if (status_tiny) {
                             snprintf(status_free_space_display, sizeof(status_free_space_display),
                                      "Rwy %s", runway_hms);
-                        } else if (status_narrow) {
+                        } else if (status_narrow || status_compact) {
                             snprintf(status_free_space_display, sizeof(status_free_space_display),
                                      "%s | Rwy %s", free_only, runway_hms);
                         } else {
                             snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                     "%s | Runway %s",
-                                     free_only, runway_hms);
+                                     "%s | Runway %s", free_only, runway_hms);
                         }
+                    } else {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "%s", free_only);
                     }
                     if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
                         free_space_color = COLOR_CLIP_RED;
@@ -4300,7 +4443,13 @@ static void render_status_bar(gui_app_t *app) {
                         free_space_color = COLOR_METER_YELLOW;
                     }
                 } else {
-                    snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
+                    if (app->is_recording) {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "Free: N/A | Runway --:--:--");
+                    } else {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "Free: N/A");
+                    }
                 }
 
                 CLAY(CLAY_ID("FreeSpaceStatus"), {
@@ -4309,7 +4458,7 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(status_free_space_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
                 }
             }
         }
@@ -4339,9 +4488,9 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Sync:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(sync_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color) }));
                 }
             }
             // Sample rate
@@ -4353,7 +4502,7 @@ static void render_status_bar(gui_app_t *app) {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
                 }
             }
@@ -4381,12 +4530,12 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(samples_label),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("SamplesValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_samples_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                     }
                 }
                 if (show_frame_count) {
@@ -4401,12 +4550,12 @@ static void render_status_bar(gui_app_t *app) {
                         }
                     }) {
                         CLAY_TEXT(CLAY_STRING("Frames:"),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                         CLAY(CLAY_ID("FrameValue"), {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_frames_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
                     }
                 }
@@ -4424,12 +4573,12 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Missed:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("MissedValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_missed_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
                     }
                 }
             }
@@ -4446,12 +4595,12 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Errors:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("ErrorValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_errors_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
                     }
                 }
             }
@@ -4471,13 +4620,13 @@ static void render_status_bar(gui_app_t *app) {
                 }
             }) {
                 CLAY_TEXT(make_string(rf_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 CLAY(CLAY_ID("RFBufValue"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_rf_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(rf_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color) }));
                 }
             }
 
@@ -4496,13 +4645,13 @@ static void render_status_bar(gui_app_t *app) {
                 }
             }) {
                 CLAY_TEXT(make_string(audio_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 CLAY(CLAY_ID("AudBufValue"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_aud_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(aud_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color) }));
                 }
             }
         }
@@ -5396,6 +5545,69 @@ void gui_handle_interactions(gui_app_t *app) {
             atomic_store(&app->clip_count_b_pos, 0);
             atomic_store(&app->clip_count_b_neg, 0);
         }
+        if (gui_ui_selected_device_is_cxadc(app, NULL)) {
+            const int dc_step = 1;
+            if (app->selected_device != s_cxadc_dc_anchor_device_index) {
+                s_cxadc_dc_anchor_device_index = app->selected_device;
+                memset(s_cxadc_dc_anchor_valid, 0, sizeof(s_cxadc_dc_anchor_valid));
+                memset(s_cxadc_dc_anchor_raw, 0, sizeof(s_cxadc_dc_anchor_raw));
+                memset(s_cxadc_dc_relative, 0, sizeof(s_cxadc_dc_relative));
+            }
+            for (int ch = 0; ch < 2; ch++) {
+                bool dc_down = Clay_PointerOver(CLAY_IDI("DcOffsetDown", ch));
+                bool dc_up = Clay_PointerOver(CLAY_IDI("DcOffsetUp", ch));
+                if (!dc_down && !dc_up) continue;
+                int card_idx = -1;
+                if (!gui_ui_map_cxadc_channel_to_card(app, ch, &card_idx)) {
+                    gui_app_set_status(app, "CXADC card not available for this channel");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                if (card_idx < 0 || card_idx > 1) {
+                    gui_app_set_status(app, "Invalid CXADC card index");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                int current_raw = 0;
+                if (gui_cxadc_get_center_offset(card_idx, &current_raw) != 0) {
+                    if (errno == EACCES || errno == EPERM) {
+                        gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+                    } else {
+                        gui_app_set_status(app, "Failed to read CXADC DC offset");
+                    }
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                if (!s_cxadc_dc_anchor_valid[card_idx]) {
+                    s_cxadc_dc_anchor_raw[card_idx] = current_raw;
+                    s_cxadc_dc_relative[card_idx] = 0;
+                    s_cxadc_dc_anchor_valid[card_idx] = true;
+                }
+                int delta = dc_down ? -dc_step : dc_step;
+                int target_relative = s_cxadc_dc_relative[card_idx] + delta;
+                int target_raw = s_cxadc_dc_anchor_raw[card_idx] + target_relative;
+                if (target_raw < 0) target_raw = 0;
+                if (target_raw > 255) target_raw = 255;
+                target_relative = target_raw - s_cxadc_dc_anchor_raw[card_idx];
+
+                if (gui_cxadc_set_center_offset(card_idx, target_raw) == 0) {
+                    s_cxadc_dc_relative[card_idx] = target_relative;
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "CH %c CXADC%d DC: %+d (raw %d)", (ch == 0) ? 'A' : 'B', card_idx, target_relative, target_raw);
+                    gui_app_set_status(app, msg);
+                } else {
+                    if (errno == EACCES || errno == EPERM) {
+                        gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+                    } else {
+                        gui_app_set_status(app, "Failed to update CXADC DC offset");
+                    }
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+        }
 
         // Settings panel interactions
         if (app->settings_panel_open) {
@@ -5413,6 +5625,8 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
             bool settings_b_disabled = settings_ddd_mode || settings_fx3_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
             bool settings_b_controls_disabled = settings_b_disabled || !app->settings.capture_b;
+            float settings_base_rate_a_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, 0) : 40000.0f;
+            float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
             if (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton"))) {
                 app->settings_panel_open = false;
                 gui_ui_clear_text_edit();
@@ -5443,7 +5657,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     app->settings.capture_b = !app->settings.capture_b;
                     if (!app->settings.capture_b) {
                         app->settings.enable_resample_b = false;
-                        app->settings.resample_rate_b = 40000.0f;
+                        app->settings.resample_rate_b = settings_base_rate_b_khz;
                     }
                     gui_settings_save(&app->settings);
                 }
@@ -5500,12 +5714,12 @@ void gui_handle_interactions(gui_app_t *app) {
                 bool enable = !app->settings.enable_resample_a;
                 app->settings.enable_resample_a = enable;
                 if (!enable) {
-                    app->settings.resample_rate_a = 40000.0f;
+                    app->settings.resample_rate_a = settings_base_rate_a_khz;
                 }
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
-                app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a);
+                app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
@@ -5523,7 +5737,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     bool enable = !app->settings.enable_resample_b;
                     app->settings.enable_resample_b = enable;
                     if (!enable) {
-                        app->settings.resample_rate_b = 40000.0f;
+                        app->settings.resample_rate_b = settings_base_rate_b_khz;
                     }
                     gui_settings_save(&app->settings);
                 }
@@ -5540,7 +5754,7 @@ void gui_handle_interactions(gui_app_t *app) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B resample settings");
                     }
                 } else {
-                    app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b);
+                    app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
                     gui_settings_save(&app->settings);
                 }
             }
@@ -5590,7 +5804,7 @@ void gui_handle_interactions(gui_app_t *app) {
 
             if (Clay_PointerOver(CLAY_ID("RfBitsABox"))) {
                 if (settings_cxadc_mode) {
-                    gui_app_set_status(app, "CXADC RF is fixed at 8-bit 40MSPS");
+                    gui_ui_toggle_cxadc_bit_mode(app, 0);
                 } else {
                     uint8_t b = app->settings.rf_bits_a;
                     if (app->settings.use_flac) {
@@ -5605,8 +5819,10 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
             if (Clay_PointerOver(CLAY_ID("RfBitsBBox"))) {
-                if (settings_cxadc_mode) {
-                    gui_app_set_status(app, "CXADC RF is fixed at 8-bit 40MSPS");
+                if (settings_cxadc_mode && settings_b_disabled) {
+                    gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
+                } else if (settings_cxadc_mode) {
+                    gui_ui_toggle_cxadc_bit_mode(app, 1);
                 } else if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B bit depth not applicable");

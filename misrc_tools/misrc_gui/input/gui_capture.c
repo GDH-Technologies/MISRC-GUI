@@ -512,17 +512,42 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
     if (card_count > 2) card_count = 2;
 
     bool changed = false;
+    const bool tenbit_mode_a = app->settings.cxadc_tenbit_mode_card[0];
+    const bool tenbit_mode_b = app->settings.cxadc_tenbit_mode_card[(card_count > 1) ? 1 : 0];
+    const uint8_t cxadc_rf_bits_a = tenbit_mode_a ? 16 : 8;
+    const uint8_t cxadc_rf_bits_b = tenbit_mode_b ? 16 : 8;
+    const float cxadc_base_rate_a_khz = tenbit_mode_a ? 20000.0f : 40000.0f;
+    const float cxadc_base_rate_b_khz = tenbit_mode_b ? 20000.0f : 40000.0f;
 
-    // Fixed RF assumptions for CXADC mode.
-    if (app->settings.rf_bits_a != 8) {
-        app->settings.rf_bits_a = 8;
+    // Fixed RF assumptions for CXADC mode depend on driver tenbit mode.
+    if (app->settings.rf_bits_a != cxadc_rf_bits_a) {
+        app->settings.rf_bits_a = cxadc_rf_bits_a;
         changed = true;
     }
-    if (app->settings.rf_bits_b != 8) {
-        app->settings.rf_bits_b = 8;
+    if (app->settings.rf_bits_b != cxadc_rf_bits_b) {
+        app->settings.rf_bits_b = cxadc_rf_bits_b;
         changed = true;
     }
-    // Keep user-selected resample modes/rates and RF A toggle in CXADC mode.
+    if (!app->settings.enable_resample_a) {
+        if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
+            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+            changed = true;
+        }
+    } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
+        app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+        changed = true;
+    }
+    if (!app->settings.enable_resample_b) {
+        if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
+            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+            changed = true;
+        }
+    } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
+        app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+        changed = true;
+    }
+
+    // Keep user-selected RF A toggle in CXADC mode.
     // Only clamp RF-B capture when there is no second CXADC card source.
     if (card_count < 2 && app->settings.capture_b) {
         app->settings.capture_b = false;
