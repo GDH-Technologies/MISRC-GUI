@@ -49,11 +49,10 @@ fail() { printf '[android-apk] ERROR: %s\n' "$*" >&2; exit 1; }
 [[ -x "$APKSIGNER" ]] || fail "apksigner not found at $APKSIGNER"
 
 # Resolve version from git tags (mirrors build-appimage-local.sh).
-VERSION="$(git -C "$REPO_ROOT" describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+VERSION="$("$REPO_ROOT/misrc_tools/git-version.sh" 2>/dev/null || true)"
 if [[ -z "$VERSION" ]]; then
-  VERSION="dev-$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  VERSION="v1.1.4-dev"
 fi
-case "$VERSION" in misrc_tools-*) VERSION="${VERSION#misrc_tools-}";; esac
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

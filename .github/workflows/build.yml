@@ -103,14 +103,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA::7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
@@ -584,14 +581,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA:0:7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE
@@ -788,14 +782,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA:0:7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE (ARM64)
@@ -948,14 +939,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA::7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
