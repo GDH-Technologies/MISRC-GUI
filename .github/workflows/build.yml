@@ -1359,6 +1359,23 @@ jobs:
           if [[ "$(tail -1 "$BODY_FILE")" == '## Highlights' ]]; then
             printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
+          printf '\n%s\n' '' '## Contributions' '' >> "$BODY_FILE"
+          printf '%s\n' '### Contributors' '' >> "$BODY_FILE"
+          CONTRIBUTOR_LINES="$(git shortlog -sne --no-merges "$LOG_RANGE" 2>/dev/null || true)"
+          if [[ -n "$CONTRIBUTOR_LINES" ]]; then
+            while IFS= read -r line; do
+              printf -- '- %s\n' "$line" >> "$BODY_FILE"
+            done <<< "$CONTRIBUTOR_LINES"
+          else
+            printf '%s\n' "- (no contributors found in range ${LOG_RANGE})" >> "$BODY_FILE"
+          fi
+          printf '\n%s\n' '### Commit attribution' '' >> "$BODY_FILE"
+          COMMIT_ATTR_LINES="$(git log --pretty=format:'- %s (%h) by %an' --no-merges "$LOG_RANGE" 2>/dev/null || true)"
+          if [[ -n "$COMMIT_ATTR_LINES" ]]; then
+            printf '%s\n' "$COMMIT_ATTR_LINES" >> "$BODY_FILE"
+          else
+            printf '%s\n' "- (no commit attribution found in range ${LOG_RANGE})" >> "$BODY_FILE"
+          fi
           printf '\n%s\n' '' '## Downloads' '' >> "$BODY_FILE"
           printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
           printf '|---|---|---|---|\n' >> "$BODY_FILE"
