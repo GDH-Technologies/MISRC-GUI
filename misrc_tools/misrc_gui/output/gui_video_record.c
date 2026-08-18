@@ -711,7 +711,31 @@ int gui_video_record_test_main(const char *device, const char *out_path,
            (unsigned long long)vs.frames_dropped, (unsigned long long)vs.frames_duped,
            (unsigned long long)vs.output_bytes);
     if (vs.error) printf("error: %s\n", vs.err_text);
-    return vs.error ? 1 : 0;
+
+    /* Assertions, so the harness can actually fail. Without these it reports
+     * success for a run that wrote nothing at all. */
+    int rc = 0;
+    if (vs.frames_written == 0) {
+        printf("FAIL: no frames reached the encoder\n");
+        rc = 1;
+    }
+    /* Every frame the capture thread handed over, plus every duplicate
+     * inserted to cover a drop, must reach ffmpeg -- otherwise the file is
+     * short and slides out of alignment with the RF timeline. */
+    if (vs.frames_written != vs.frames_submitted + vs.frames_duped) {
+        printf("FAIL: written(%llu) != submitted(%llu) + duped(%llu)\n",
+               (unsigned long long)vs.frames_written,
+               (unsigned long long)vs.frames_submitted,
+               (unsigned long long)vs.frames_duped);
+        rc = 1;
+    }
+    if (vs.output_bytes == 0) {
+        printf("FAIL: output file is empty\n");
+        rc = 1;
+    }
+    if (vs.error) rc = 1;
+    printf("%s\n", rc ? "VIDEO RECORD TEST FAILED" : "video record test passed");
+    return rc;
 }
 
 #else  /* !__linux__ */
