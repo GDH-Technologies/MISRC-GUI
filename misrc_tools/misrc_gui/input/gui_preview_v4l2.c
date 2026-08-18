@@ -105,6 +105,28 @@ static double preview_now(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* Frame tap. A single atomic pointer publishes fn and user together, so a
+ * concurrent install can never be seen half-applied. The in-flight counter
+ * lets remove() wait out a callback that is already running -- a minimal RCU
+ * quiescence, which is what makes it safe for the tap owner to free its
+ * buffers immediately after remove() returns. */
+static _Atomic(const preview_tap_t *) g_tap;
+static atomic_int g_tap_inflight;
+
+void gui_preview_tap_install(const preview_tap_t *tap)
+{
+    atomic_store_explicit(&g_tap, tap, memory_order_release);
+}
+
+void gui_preview_tap_remove(void)
+{
+    atomic_store_explicit(&g_tap, NULL, memory_order_release);
+    while (atomic_load_explicit(&g_tap_inflight, memory_order_acquire) != 0) {
+        struct timespec ts = { 0, 200 * 1000 };   /* 200us */
+        nanosleep(&ts, NULL);
+    }
+}
+
 /* Defined further down with the rest of the popout machinery, but needed by
  * the per-frame tick above them. */
 static void preview_poll_child(void);
@@ -460,6 +482,20 @@ static void *preview_thread(void *arg)
         have_seq = true;
 
         if (usable) {
+            /* Tap before publish: publish converts to RGBA and drops frames
+             * when the renderer is slow, neither of which suits a recording. */
+            const preview_tap_t *t = atomic_load_explicit(&g_tap, memory_order_acquire);
+            if (t) {
+                atomic_fetch_add_explicit(&g_tap_inflight, 1, memory_order_acquire);
+                /* Re-load inside the counter: install/remove is not atomic with
+                 * it, so the pointer may have been cleared just now. */
+                const preview_tap_t *t2 = atomic_load_explicit(&g_tap, memory_order_acquire);
+                if (t2 && t2->fn) {
+                    t2->fn((const uint8_t *)g.bufs[buf.index].start, g.pitch,
+                           g.width, g.height, t2->user);
+                }
+                atomic_fetch_sub_explicit(&g_tap_inflight, 1, memory_order_release);
+            }
             preview_publish((const uint8_t *)g.bufs[buf.index].start);
         } else {
             status_lock();
@@ -871,6 +907,126 @@ void gui_preview_shutdown(void)
 }
 
 /* ---------------------------------------------------- headless diagnostics */
+
+/* Exercises the frame tap with no encoder attached: counts what the capture
+ * thread hands over and checksums line 0 so a stride or ordering mistake shows
+ * up as a constant or wildly varying digest rather than silently. */
+typedef struct {
+    _Atomic uint64_t frames;
+    _Atomic uint64_t bytes;
+    _Atomic uint32_t last_digest;
+    _Atomic uint32_t distinct_digests;
+    uint32_t         prev_digest;
+} tap_probe_t;
+
+static void tap_probe_cb(const uint8_t *yuyv, size_t pitch,
+                         uint32_t w, uint32_t h, void *user)
+{
+    tap_probe_t *tp = user;
+    /* FNV-1a over the first line only -- cheap enough for the capture thread. */
+    uint32_t d = 2166136261u;
+    size_t n = (size_t)w * 2;
+    if (n > pitch) n = pitch;
+    for (size_t i = 0; i < n; i++) { d ^= yuyv[i]; d *= 16777619u; }
+
+    atomic_fetch_add_explicit(&tp->frames, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&tp->bytes, (uint64_t)pitch * h, memory_order_relaxed);
+    if (d != tp->prev_digest) {
+        tp->prev_digest = d;
+        atomic_fetch_add_explicit(&tp->distinct_digests, 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&tp->last_digest, d, memory_order_relaxed);
+}
+
+static tap_probe_t s_tap_probe;
+static const preview_tap_t s_tap_probe_tap = { tap_probe_cb, &s_tap_probe };
+
+int gui_preview_tap_test_main(const char *device, int seconds)
+{
+    gui_preview_init(NULL);
+    gui_preview_refresh_devices();
+
+    size_t n = 0;
+    const preview_device_t *devs = gui_preview_devices(&n);
+    if (n == 0) { fprintf(stderr, "no preview devices\n"); return 1; }
+
+    int idx = 0;
+    if (device) {
+        idx = -1;
+        for (size_t i = 0; i < n; i++) if (strcmp(devs[i].path, device) == 0) { idx = (int)i; break; }
+        if (idx < 0) { fprintf(stderr, "no such device: %s\n", device); return 1; }
+    }
+    gui_preview_select(idx, 0);
+
+    if (gui_preview_connect() != 0) {
+        preview_status_t st = gui_preview_get_status();
+        fprintf(stderr, "connect failed: %s\n", st.err_text);
+        return 2;
+    }
+
+    memset(&s_tap_probe, 0, sizeof(s_tap_probe));
+    /* Latch the publish count at install so the comparison is over the tap's
+     * own window, not the whole session. */
+    uint64_t base_published = gui_preview_get_status().frames;
+    gui_preview_tap_install(&s_tap_probe_tap);
+
+    if (seconds <= 0) seconds = 10;
+    for (int i = 0; i < seconds; i++) {
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
+        preview_status_t st = gui_preview_get_status();
+        printf("  t=%2ds tapped=%llu published=%llu drops=%llu gaps=%llu fps=%.2f\n",
+               i + 1,
+               (unsigned long long)atomic_load(&s_tap_probe.frames),
+               (unsigned long long)st.frames,
+               (unsigned long long)st.drops,
+               (unsigned long long)st.seq_gaps, st.fps_measured);
+        fflush(stdout);
+        if (st.state == PREVIEW_STATE_ERROR) { printf("  device lost: %s\n", st.err_text); break; }
+    }
+
+    double t0 = preview_now();
+    gui_preview_tap_remove();
+    double remove_us = (preview_now() - t0) * 1e6;
+
+    /* Let a frame that was mid-publish when the tap was removed finish. This
+     * only has to outlast one YUYV->RGBA conversion (~0.5ms), NOT one frame
+     * period (40ms) -- sleeping a whole period would admit several untapped
+     * publishes and manufacture the very skew being measured. */
+    struct timespec settle = { 0, 5 * 1000 * 1000 };
+    nanosleep(&settle, NULL);
+
+    preview_status_t st = gui_preview_get_status();
+    uint64_t tapped = atomic_load(&s_tap_probe.frames);
+    uint64_t published_in_window = st.frames - base_published;
+    uint32_t distinct = atomic_load(&s_tap_probe.distinct_digests);
+
+    printf("tapped=%llu published_in_window=%llu bytes=%llu distinct_line0=%u tap_remove=%.0fus\n",
+           (unsigned long long)tapped, (unsigned long long)published_in_window,
+           (unsigned long long)atomic_load(&s_tap_probe.bytes), distinct, remove_us);
+
+    /* The tap sits immediately before publish on the same branch, so every
+     * good frame inside the window must reach both. A tolerance of 2 covers
+     * the frames that can slip in between latching the base count and the
+     * install, and between the remove and the settle. A tap on the wrong side
+     * of a drop, or one that is skipped, shows up as a large deficit. */
+    int rc = 0;
+    long long skew = (long long)published_in_window - (long long)tapped;
+    if (skew < -2 || skew > 2) {
+        printf("FAIL: tapped vs published skew %lld (expected within 2)\n", skew);
+        rc = 1;
+    }
+    if (tapped > 0 && distinct < 2) {
+        printf("FAIL: line 0 never changed across %llu frames - stale or wrong pointer\n",
+               (unsigned long long)tapped);
+        rc = 1;
+    }
+    printf("%s\n", rc ? "TAP TEST FAILED" : "tap test passed");
+
+    gui_preview_disconnect();
+    gui_preview_shutdown();
+    return rc;
+}
 
 /* Numerical proof of the colour matrix and byte order, with no device and no
  * window. Eyeballing a picture cannot distinguish BT.601 from BT.709, nor a
@@ -1458,5 +1614,8 @@ int gui_preview_probe_main(void) { fprintf(stderr, "preview requires Linux\n"); 
 int gui_preview_probe_stream_main(const char *d, int s) { (void)d; (void)s; return 2; }
 int gui_preview_selftest_main(void) { fprintf(stderr, "preview requires Linux\n"); return 2; }
 int gui_preview_dump_frame_main(const char *d, const char *o) { (void)d; (void)o; return 2; }
+int gui_preview_tap_test_main(const char *d, int s) { (void)d; (void)s; return 2; }
+void gui_preview_tap_install(const preview_tap_t *t) { (void)t; }
+void gui_preview_tap_remove(void) { }
 
 #endif /* __linux__ */

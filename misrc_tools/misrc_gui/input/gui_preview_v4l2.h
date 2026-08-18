@@ -122,6 +122,30 @@ bool gui_preview_frame_sync(void);
  * of them. */
 void gui_preview_draw(Rectangle bounds, bool with_status);
 
+/* ---- frame tap ----------------------------------------------------------- */
+/*
+ * Tee the raw YUYV of every good frame, before the RGBA conversion. The
+ * published RGBA slots are the wrong source for anything archival: the triple
+ * buffer is deliberately lossy, and it has already discarded the YUYV.
+ *
+ * The callback runs ON THE CAPTURE THREAD, between VIDIOC_DQBUF and
+ * VIDIOC_QBUF. It must not block, must not call GL, and must copy anything it
+ * wants to keep -- the buffer is requeued the moment it returns.
+ */
+typedef void (*preview_tap_fn)(const uint8_t *yuyv, size_t pitch,
+                               uint32_t w, uint32_t h, void *user);
+
+typedef struct {
+    preview_tap_fn fn;
+    void          *user;
+} preview_tap_t;
+
+/* The tap must have static storage and outlive the install. One pointer
+ * publishes fn and user together so neither can be seen half-updated. */
+void gui_preview_tap_install(const preview_tap_t *tap);
+/* Returns only once no tap callback is still in flight. */
+void gui_preview_tap_remove(void);
+
 /* ---- popout ------------------------------------------------------------- */
 
 int  gui_preview_popout(void);
@@ -133,6 +157,7 @@ int  gui_preview_child_main(const char *device, const char *fmt_spec, int parent
  * behaviour can be verified without a GUI. */
 int gui_preview_probe_main(void);
 int gui_preview_selftest_main(void);
+int gui_preview_tap_test_main(const char *device, int seconds);
 int gui_preview_dump_frame_main(const char *device, const char *out_png);
 int gui_preview_probe_stream_main(const char *device, int seconds);
 

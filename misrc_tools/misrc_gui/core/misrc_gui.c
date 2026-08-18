@@ -352,6 +352,11 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--preview-selftest") == 0) {
             return gui_preview_selftest_main();
         }
+        if (strcmp(argv[i], "--video-tap-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
+            return gui_preview_tap_test_main(dev, secs);
+        }
         if (strcmp(argv[i], "--preview-dump-frame") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
             const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
