@@ -175,6 +175,7 @@ typedef struct {
 	bool flac_verify;
 	uint32_t flac_threads;
 	uint8_t flac_bits;
+	const char *path;                 /* Output path for post-close STREAMINFO fixup ("-" = stdout) */
 #endif
 } filewriter_ctx_t;
 
@@ -837,10 +838,21 @@ int flac_file_writer(void *ctx)
 		rb_read_finished(&file_ctx->rb, len);
 	}
 
+	uint64_t samples_written = flac_writer_get_samples_written(writer);
 	flac_writer_error_t err = flac_writer_finish(writer);
 	if (err != FLAC_WRITER_OK) {
 		fprintf(stderr, "ERROR: FLAC encoder did not finish correctly\n");
 		new_line = 1;
+	}
+
+	// Captures beyond 2^36 samples overflow STREAMINFO.total_samples; rewrite it
+	// to 0 (unknown) so readers don't truncate at the wrapped count. No-op below
+	// the limit. Requires the closed file, so not possible in stdout mode.
+	if (err == FLAC_WRITER_OK && file_ctx->path && strcmp(file_ctx->path, "-") != 0) {
+		if (!flac_writer_finalize_streaminfo(file_ctx->path, samples_written)) {
+			fprintf(stderr, "WARN: failed to finalize FLAC STREAMINFO for %s\n", file_ctx->path);
+			new_line = 1;
+		}
 	}
 
 #if LIBSOXR_ENABLED == 1
@@ -1234,6 +1246,7 @@ int main(int argc, char **argv)
 			thread_out_ctx[i].flac_level = flac_level;
 			thread_out_ctx[i].flac_verify = flac_verify;
 			thread_out_ctx[i].flac_threads = flac_threads;
+			thread_out_ctx[i].path = output_names[i];
 #if LIBSOXR_ENABLED == 1
 			thread_out_ctx[i].flac_bits = reduce_8bit[i] ? 8 : (flac_12bit ? 12 : 16);
 			thread_out_ctx[i].conv_func = reduce_8bit[i] ? conv_16to8to32 : (flac_12bit ? conv_16to12to32 : conv_16to32);

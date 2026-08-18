@@ -130,6 +130,16 @@ int flac_writer_process_int16(
 // After this call, the writer is destroyed and should not be used
 flac_writer_error_t flac_writer_finish(flac_writer_t *writer);
 
+// Post-close STREAMINFO fixup for captures exceeding the 36-bit total_samples
+// field (2^36 samples, ~28.6 min at 40 MSps). libFLAC wraps the count modulo
+// 2^36 on finish, which makes STREAMINFO-trusting readers (libsndfile) stop
+// early and silently truncate. For such captures this rewrites total_samples
+// to 0 ("unknown" per the FLAC spec) so readers fall through to actual EOF.
+// Below the limit libFLAC's finalized count is already exact and the file is
+// left untouched. Call after flac_writer_finish() and fclose() of the output.
+// Returns true on success or when no rewrite was needed.
+bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written);
+
 // Abort without finalizing (useful for error paths)
 // Does not write final frames or fix seektable
 void flac_writer_abort(flac_writer_t *writer);

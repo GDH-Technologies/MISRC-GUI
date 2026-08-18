@@ -728,6 +728,74 @@ def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_flac_streaminfo_total_samples_runtime(repo_root: Path) -> int:
+    """Encode a real FLAC via flac_writer and assert the STREAMINFO
+    total_samples contract: exact count below 2^36, 0 (unknown) above.
+    Guards against reintroducing the /1000 "duration scaling" that made
+    libsndfile readers (hifi-decode) silently truncate decodes."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: FLAC STREAMINFO runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    pkg_config = shutil.which("pkg-config")
+    in_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    if cc is None or pkg_config is None:
+        if in_ci:
+            return fail("cc and pkg-config are required for FLAC STREAMINFO runtime guard")
+        print("SKIP: FLAC STREAMINFO runtime guard (cc/pkg-config not available)")
+        return 0
+    flac_flags = subprocess.run(
+        [pkg_config, "--cflags", "--libs", "flac"], capture_output=True, text=True
+    )
+    if flac_flags.returncode != 0:
+        if in_ci:
+            return fail("libFLAC (pkg-config 'flac') is required for FLAC STREAMINFO runtime guard")
+        print("SKIP: FLAC STREAMINFO runtime guard (libFLAC not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/flac_writer_streaminfo_test.c"
+    flac_writer_path = repo_root / "misrc_tools/common/flac_writer.c"
+    include_dir = repo_root / "misrc_tools/common"
+    if not harness_path.exists():
+        return fail(f"FLAC STREAMINFO harness source is missing: {harness_path}")
+    if not flac_writer_path.exists():
+        return fail(f"flac_writer.c is missing: {flac_writer_path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_flac_streaminfo_guard_") as temp_root:
+        exe_path = Path(temp_root) / "flac_writer_streaminfo_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-DLIBFLAC_ENABLED=1",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(flac_writer_path),
+        ] + flac_flags.stdout.split() + [
+            "-lpthread",
+            "-o",
+            str(exe_path),
+        ]
+        try:
+            run_checked(compile_cmd)
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "Failed to compile FLAC STREAMINFO runtime harness\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+        try:
+            run_checked([str(exe_path), str(Path(temp_root) / "guard.flac")])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "FLAC STREAMINFO runtime harness failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -784,6 +852,7 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
+        checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(9, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
