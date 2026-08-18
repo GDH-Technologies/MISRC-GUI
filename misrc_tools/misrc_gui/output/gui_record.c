@@ -450,10 +450,17 @@ struct gui_record_session {
      * session's writer threads switch to drain mode. */
     atomic_bool recording;
 
+    /* Set by finalize once the writer threads have exited and the output
+     * files are closed. The shared record ring buffers and the single video
+     * encoder are free again -- a new recording may start; only this
+     * session's private metadata/summary work remains. */
+    atomic_bool drained;
+
     /* Latched at start -- finalize must never read live settings. */
     bool use_flac;
     bool capture_a, capture_b;
     bool video_started;
+    char path_video[600];
 
     FILE *file_a, *file_b;
     char path_a[512], path_b[512];
@@ -506,6 +513,7 @@ static void gui_record_session_init_sync(gui_record_session_t *ses) {
         atomic_store(&ses->acc_comp[i], 0);
     }
     atomic_store(&ses->recording, false);
+    atomic_store(&ses->drained, false);
 }
 
 static void gui_record_log_lock(void) {
@@ -2384,6 +2392,7 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
     }
 
     s_active->video_started = true;
+    snprintf(s_active->path_video, sizeof(s_active->path_video), "%s", s_record_path_video);
     /* Stashed rather than logged here. The FLAC path opens the session log
      * before this runs and the RAW path opens it after, so logging directly
      * would silently drop the line in the RAW branch. */
@@ -2564,8 +2573,13 @@ int gui_record_start(gui_app_t *app) {
 
     (void)gui_record_collect_finalize_if_done();
 
-    if (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running)) {
-        gui_app_set_status(app, "Finalizing previous recording...");
+    /* The previous session's finalize releases the shared record ring buffers
+     * and the video encoder once its writer threads exit (drained). Until
+     * then a second consumer on the same ring buffers would corrupt both
+     * recordings. The slow legacy-metadata phase happens after drain, so this
+     * refusal window is the writer-drain tail only. */
+    if (s_finalizing && !atomic_load(&s_finalizing->drained)) {
+        gui_app_set_status(app, "Previous recording still draining buffers...");
         return RECORD_ERROR;
     }
 
@@ -2602,6 +2616,21 @@ int gui_record_start(gui_app_t *app) {
     snprintf(path_video, sizeof(path_video), "%s/%s",
              app->settings.output_path, app->settings.video_filename);
     bool file_v_exists = app->settings.video_record_enabled && (stat(path_video, &stat_v) == 0);
+
+    // A finalizing session still owns its output files; refuse to reuse them.
+    if (s_finalizing) {
+        bool clash =
+            (app->settings.capture_a && s_finalizing->path_a[0] &&
+             strcmp(path_a, s_finalizing->path_a) == 0) ||
+            (app->settings.capture_b && s_finalizing->path_b[0] &&
+             strcmp(path_b, s_finalizing->path_b) == 0) ||
+            (app->settings.video_record_enabled && s_finalizing->path_video[0] &&
+             strcmp(path_video, s_finalizing->path_video) == 0);
+        if (clash) {
+            gui_app_set_status(app, "Previous recording is still finalizing these files");
+            return RECORD_ERROR;
+        }
+    }
 
     if (file_a_exists || file_b_exists || file_v_exists) {
         // Build detailed message with file info
@@ -3261,6 +3290,11 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         ses->file_b = NULL;
     }
 
+    /* Writer threads joined, video finished, files closed: the shared record
+     * ring buffers and video encoder are free for a new recording. Only this
+     * session's private metadata/summary work remains. */
+    atomic_store(&ses->drained, true);
+
 #if LIBFLAC_ENABLED == 1
     // Embed finalized duration metadata in RF FLAC files for easier post handling.
     if (ses->use_flac) {
@@ -3360,9 +3394,23 @@ void gui_record_stop(gui_app_t *app) {
     if (!app->is_recording) {
         return;
     }
+    // One finalize in flight: if the previous one is somehow still running
+    // (rare -- its slow phases are gone for padded captures), wait for it
+    // before handing over.
     if (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running)) {
-        gui_app_set_status(app, "Finalizing previous recording...");
-        return;
+        gui_app_set_status(app, "Waiting for previous finalize...");
+        while (atomic_load(&s_record_stop_finalizing)) {
+            thrd_sleep_ms(10);
+        }
+        (void)gui_record_collect_finalize_if_done();
+        if (atomic_load(&s_finalize_thread_running)) {
+            thrd_join(s_finalize_thread, NULL);
+            atomic_store(&s_finalize_thread_running, false);
+        }
+        if (s_finalizing) {
+            free(s_finalizing);
+            s_finalizing = NULL;
+        }
     }
     gui_record_session_t *ses = s_active;
     if (!ses) {
