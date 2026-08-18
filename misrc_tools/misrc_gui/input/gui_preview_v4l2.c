@@ -23,6 +23,7 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <spawn.h>
 #include <time.h>
 #include <linux/videodev2.h>
 
@@ -84,6 +85,13 @@ static struct {
     /* --- deferred work for tick() --- */
     bool want_auto_stop;
 
+    /* --- popout --- */
+    int            child_pid;
+    double         reclaim_deadline;   /* 0 = not reclaiming */
+    bool           auto_reconnect;     /* child exited cleanly; go back in-app */
+    char           popout_path[32];    /* device to restore when it comes back */
+    preview_mode_t popout_mode;
+
     char argv0[512];
 } g;
 
@@ -96,6 +104,12 @@ static double preview_now(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
+
+/* Defined further down with the rest of the popout machinery, but needed by
+ * the per-frame tick above them. */
+static void preview_poll_child(void);
+static void preview_restore_popout_selection(void);
+static void preview_kill_child(void);
 
 /* ------------------------------------------------------------------ status */
 
@@ -711,11 +725,26 @@ void gui_preview_panel_detach(void)
 
 void gui_preview_tick(void)
 {
+    preview_poll_child();
+
+    if (g.auto_reconnect) {
+        g.auto_reconnect = false;
+        preview_status_t st = gui_preview_get_status();
+        if (st.viewers > 0) {
+            preview_restore_popout_selection();
+            gui_preview_connect();
+        }
+    }
+
     if (g.want_auto_stop) {
         g.want_auto_stop = false;
         preview_status_t st = gui_preview_get_status();
-        if (st.viewers == 0 && g.fd >= 0) {
-            gui_preview_disconnect();
+        if (st.viewers == 0) {
+            /* The last preview panel went away. Take the child with it: an
+             * orphan window with no route back into the app is worse than
+             * losing it. */
+            if (g.child_pid > 0) preview_kill_child();
+            if (g.fd >= 0) gui_preview_disconnect();
         }
     }
 }
@@ -835,6 +864,7 @@ void gui_preview_init(const char *argv0)
 
 void gui_preview_shutdown(void)
 {
+    preview_kill_child();
     preview_release_device();
     memset(&g.status, 0, sizeof(g.status));
     g.status.state = PREVIEW_STATE_NO_DEVICE;
@@ -1180,9 +1210,205 @@ int gui_preview_child_main(const char *device, const char *fmt_spec, int parent_
     return rc;
 }
 
-/* Popout from the parent side lands in the next milestone. */
-int  gui_preview_popout(void)  { return -1; }
-void gui_preview_reclaim(void) { }
+/* --------------------------------------------------------- popout (parent) */
+
+extern char **environ;
+
+/* Locate an executable to spawn the popout window from.
+ *
+ * $APPIMAGE comes first deliberately. Under AppImage the running binary lives
+ * in a squashfuse mount owned by this process's AppImage runtime, which is
+ * unmounted when we exit -- an orphaned child's file-backed text pages would
+ * then fault with SIGBUS rather than any interpretable error. Re-launching the
+ * AppImage gives the child its own mount and removes that failure entirely.
+ * AppRun passes unrecognised arguments straight through to misrc_gui. */
+static bool preview_resolve_exe(char *out, size_t cap)
+{
+    const char *appimage = getenv("APPIMAGE");
+    if (appimage && appimage[0] && access(appimage, X_OK) == 0) {
+        snprintf(out, cap, "%s", appimage);
+        return true;
+    }
+
+    char buf[512];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        /* A deleted image cannot be re-executed. */
+        if (!strstr(buf, " (deleted)") && access(buf, X_OK) == 0) {
+            snprintf(out, cap, "%s", buf);
+            return true;
+        }
+    }
+
+    if (g.argv0[0]) {
+        char resolved[512];
+        if (realpath(g.argv0, resolved) && access(resolved, X_OK) == 0) {
+            snprintf(out, cap, "%s", resolved);
+            return true;
+        }
+    }
+    return false;
+}
+
+int gui_preview_popout(void)
+{
+    if (g.child_pid > 0) return 0;            /* already out */
+    if (g.n_devices == 0) return -1;
+
+    /* Resolve before releasing anything: if we cannot find our own executable
+     * the user should be no worse off than before they clicked. */
+    char exe[512];
+    if (!preview_resolve_exe(exe, sizeof(exe))) {
+        preview_fail("cannot locate the misrc_gui executable to pop out", 0);
+        return -1;
+    }
+
+    const preview_device_t *dev = &g.devices[g.sel_device];
+    const preview_mode_t *mode = &dev->modes[g.sel_mode];
+    snprintf(g.popout_path, sizeof(g.popout_path), "%s", dev->path);
+    g.popout_mode = *mode;
+
+    char fmt_spec[48];
+    snprintf(fmt_spec, sizeof(fmt_spec), "YUYV:%ux%u@%u/%u",
+             mode->w, mode->h, mode->fps_num, mode->fps_den ? mode->fps_den : 1);
+    char ppid_str[16];
+    snprintf(ppid_str, sizeof(ppid_str), "%d", (int)getpid());
+
+    /* The child's REQBUFS/STREAMON would fail EBUSY while we still hold
+     * buffers, so release fully first. */
+    gui_preview_disconnect();
+
+    char *argv[] = {
+        exe,
+        (char *)"--preview-only",       g.popout_path,
+        (char *)"--preview-format",     fmt_spec,
+        (char *)"--preview-parent-pid", ppid_str,
+        NULL
+    };
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    /* Give the child its own stdin; keep stdout/stderr so its diagnostics land
+     * wherever ours do -- indispensable when the window fails to appear. */
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+
+    pid_t pid = 0;
+    /* posix_spawn, not fork+exec: this process has display, audio, capture and
+     * libusb threads plus a live GL context, and only async-signal-safe calls
+     * are legal between fork and exec. glibc implements posix_spawn with
+     * CLONE_VM|CLONE_VFORK, so no user code runs in that window at all.
+     * Note it returns the error directly and does NOT set errno. */
+    int rc = posix_spawn(&pid, exe, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+
+    if (rc != 0) {
+        preview_fail("could not start the preview window", rc);
+        /* We already released the device; put it back the way it was. */
+        gui_preview_connect();
+        return -1;
+    }
+
+    g.child_pid = (int)pid;
+    status_lock();
+    g.status.state = PREVIEW_STATE_POPPED_OUT;
+    g.status.child_pid = (int)pid;
+    snprintf(g.status.device_path, sizeof(g.status.device_path), "%s", g.popout_path);
+    status_unlock();
+    return 0;
+}
+
+void gui_preview_reclaim(void)
+{
+    if (g.child_pid <= 0) return;
+    kill(g.child_pid, SIGTERM);
+    g.reclaim_deadline = preview_now() + 2.0;
+}
+
+/* Restore the selection the popout was using, so coming back lands on the same
+ * device and mode even if the picker moved meanwhile. */
+static void preview_restore_popout_selection(void)
+{
+    if (!g.popout_path[0]) return;
+    for (size_t i = 0; i < g.n_devices; i++) {
+        if (strcmp(g.devices[i].path, g.popout_path) != 0) continue;
+        g.sel_device = (int)i;
+        for (int m = 0; m < g.devices[i].n_modes; m++) {
+            if (g.devices[i].modes[m].w == g.popout_mode.w &&
+                g.devices[i].modes[m].h == g.popout_mode.h &&
+                g.devices[i].modes[m].fps_num == g.popout_mode.fps_num) {
+                g.sel_mode = m;
+                break;
+            }
+        }
+        return;
+    }
+}
+
+/* Polled from tick() rather than handled with SIGCHLD: a signal handler lands
+ * on an arbitrary thread and may only use async-signal-safe calls, so it would
+ * have to set a flag and be polled from here anyway -- while adding a
+ * process-wide disposition change to a process that links libusb and ALSA and
+ * currently installs no handlers at all. */
+static void preview_poll_child(void)
+{
+    if (g.child_pid <= 0) return;
+
+    if (g.reclaim_deadline > 0.0 && preview_now() > g.reclaim_deadline) {
+        kill(g.child_pid, SIGKILL);
+        g.reclaim_deadline = 0.0;
+    }
+
+    int wstatus = 0;
+    pid_t r = waitpid(g.child_pid, &wstatus, WNOHANG);
+    if (r != g.child_pid) return;
+
+    int pid = g.child_pid;
+    g.child_pid = 0;
+    g.reclaim_deadline = 0.0;
+    status_lock();
+    g.status.child_pid = 0;
+    status_unlock();
+
+    if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) {
+        /* User closed the window: make pop-out/close feel like a round trip. */
+        g.auto_reconnect = true;
+        preview_set_state(PREVIEW_STATE_DISCONNECTED);
+    } else if (WIFEXITED(wstatus)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "preview window exited (code %d)", WEXITSTATUS(wstatus));
+        preview_fail(msg, 0);
+    } else if (WIFSIGNALED(wstatus)) {
+        char msg[96];
+        int sig = WTERMSIG(wstatus);
+        snprintf(msg, sizeof(msg), "preview window terminated by signal %d (%s)",
+                 sig, strsignal(sig));
+        preview_fail(msg, 0);
+    } else {
+        preview_set_state(PREVIEW_STATE_DISCONNECTED);
+    }
+    (void)pid;
+}
+
+/* Kill any popout child before we go. Mandatory, for two reasons: an orphan
+ * holds /dev/video0 open forever with no route back into the app, and under
+ * AppImage its text pages are backed by a mount that disappears with us. */
+static void preview_kill_child(void)
+{
+    if (g.child_pid <= 0) return;
+    kill(g.child_pid, SIGTERM);
+    for (int i = 0; i < 200; i++) {           /* up to ~2s */
+        if (waitpid(g.child_pid, NULL, WNOHANG) == g.child_pid) {
+            g.child_pid = 0;
+            return;
+        }
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    kill(g.child_pid, SIGKILL);
+    waitpid(g.child_pid, NULL, 0);
+    g.child_pid = 0;
+}
 
 #else  /* !__linux__ */
 
