@@ -105,6 +105,9 @@ void gui_preview_select(int device_index, int mode_index);
 int  gui_preview_connect(void);     /* 0 on success; sets state/err_text on failure */
 void gui_preview_disconnect(void);  /* render thread only; returns in microseconds */
 preview_status_t gui_preview_get_status(void);
+/* Negotiated bytes-per-line. May exceed width*2; a consumer that assumes
+ * width*2 will shear the picture. */
+uint32_t gui_preview_negotiated_pitch(void);
 
 /* ---- panel facing ------------------------------------------------------- */
 

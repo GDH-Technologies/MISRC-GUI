@@ -21,6 +21,7 @@
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
 #include "../input/gui_preview_v4l2.h"
+#include "../output/gui_video_record.h"
 #include "../processing/gui_extract.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
@@ -351,6 +352,16 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--preview-selftest") == 0) {
             return gui_preview_selftest_main();
+        }
+        if (strcmp(argv[i], "--video-probe") == 0) {
+            return gui_video_record_probe_main();
+        }
+        if (strcmp(argv[i], "--video-record-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
+            const char *codec = (i + 4 < argc) ? argv[i + 4] : NULL;
+            return gui_video_record_test_main(dev, out, secs, codec);
         }
         if (strcmp(argv[i], "--video-tap-test") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;

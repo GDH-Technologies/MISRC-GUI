@@ -171,6 +171,8 @@ preview_status_t gui_preview_get_status(void)
 
 bool gui_preview_supported(void) { return true; }
 
+uint32_t gui_preview_negotiated_pitch(void) { return g.pitch; }
+
 /* ------------------------------------------------------------- enumeration */
 
 static int mode_cmp(const void *a, const void *b)
@@ -1577,6 +1579,7 @@ void gui_preview_init(const char *argv0) { (void)argv0; }
 void gui_preview_shutdown(void) { }
 void gui_preview_tick(void) { }
 bool gui_preview_supported(void) { return false; }
+uint32_t gui_preview_negotiated_pitch(void) { return 0; }
 
 void gui_preview_refresh_devices(void) { }
 const preview_device_t *gui_preview_devices(size_t *count) { if (count) *count = 0; return NULL; }
