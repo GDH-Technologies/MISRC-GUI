@@ -57,13 +57,4 @@ void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
                                              const int16_t *samples_ch2,
                                              size_t count);
 
-// Waveform DC offset helpers (implemented via waveform trigger-level line).
-// These operate on waveform panel state within a channel panel config.
-// Returns false when no waveform panel is active in the config.
-bool gui_waveform_panel_get_dc_offset(const channel_panel_config_t *config,
-                                      int16_t *offset_out);
-bool gui_waveform_panel_adjust_dc_offset(channel_panel_config_t *config,
-                                         int channel,
-                                         int delta);
-
 #endif // GUI_OSCILLOSCOPE_H
