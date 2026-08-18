@@ -2,13 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.misrc.gui">
 
-    <!-- android:versionCode / android:versionName are intentionally NOT set
-         here. They are injected at APK link time by android/build-apk.sh via
-         aapt2 --version-code/--version-name/--replace-version, derived from
-         the shared misrc_tools/git-version.sh (the single source of truth
-         shared with CI, the AppImage build, and the GUI About box). Keeping
-         them out of the manifest prevents the installed APK from reporting a
-         stale hardcoded version that drifts from the filename and About box. -->
+    <!-- android:versionCode and android:versionName are intentionally NOT
+         set here. They are injected at APK link time by android/build-apk.sh
+         via the aapt2 version-code, version-name, and replace-version flags,
+         derived from the shared misrc_tools/git-version.sh (the single source
+         of truth shared with CI, the AppImage build, and the GUI About box).
+         Keeping them out of the manifest prevents the installed APK from
+         reporting a stale hardcoded version that drifts from the filename and
+         About box. -->
 
     <!-- CAMERA permission: REQUIRED for USB Host access to UVC-class devices
          (the MS2130/MS2131 are USB Video Class devices). On Android API 28+
