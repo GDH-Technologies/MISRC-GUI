@@ -401,6 +401,7 @@ if raylib_dep.found()
   # Add DdD support to GUI if available
   if ddd_enabled
     sources_gui += 'misrc_gui/input/gui_ddd.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
 
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]

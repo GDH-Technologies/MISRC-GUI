@@ -28,6 +28,7 @@
 #endif
 #ifdef ENABLE_DDD
 #include "gui_ddd.h"
+#include "gui_ddd_clockgen.h"
 #endif
 #include "../visualization/gui_panel.h"
 #include "../visualization/panel_interface.h"
@@ -1139,6 +1140,11 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         return;
     }
 
+#ifdef ENABLE_DDD
+    bool ddd_device_added = false;
+    int first_ddd_src_index = -1;
+#endif
+
     // Copy devices to GUI format
     for (size_t i = 0; i < devices.count && app->device_count < MAX_DEVICES; i++) {
         misrc_device_info_t *src = &devices.devices[i];
@@ -1167,6 +1173,12 @@ void gui_app_enumerate_devices(gui_app_t *app) {
             dst->type = DEVICE_TYPE_DDD;
             dst->index = src->index;
             snprintf(dst->serial, sizeof(dst->serial), "%s", src->device_id);
+            // Remember the first DdD device so the synthetic "[DdD] Clockgen"
+            // entry below can target the same physical device for its RF path.
+            if (!ddd_device_added) {
+                ddd_device_added = true;
+                first_ddd_src_index = src->index;
+            }
         }
 #endif
         else {
@@ -1193,11 +1205,29 @@ void gui_app_enumerate_devices(gui_app_t *app) {
 
     misrc_device_list_free(&devices);
 
-    // Add CXADC mode option if cards are detected on host.
-    int cxadc_cards = gui_cxadc_detect_cards();
-    if (cxadc_cards > 0 && app->device_count < MAX_DEVICES) {
+    int cxadc_card_count = gui_cxadc_detect_cards();
+
+#ifdef ENABLE_DDD
+    // Add the synthetic "[DdD] Clockgen" entry when a DdD device is present,
+    // a Clockgen Lite audio device is detected, and no CXADC RF cards are
+    // found (CXADC already has its own Clockgen mode). Reuses DEVICE_TYPE_DDD
+    // for the RF path; the marker serial distinguishes it from the plain DdD
+    // entry so the start/stop/reconnect/label paths can detect it.
+    if (ddd_device_added && cxadc_card_count == 0 &&
+        gui_ddd_clockgen_detect() && app->device_count < MAX_DEVICES) {
         device_info_t *dst = &app->devices[app->device_count];
-        if (cxadc_cards > 1) {
+        snprintf(dst->name, sizeof(dst->name), "[DdD] Clockgen");
+        snprintf(dst->serial, sizeof(dst->serial), "%s", DDD_CLOCKGEN_MARKER_SERIAL);
+        dst->type = DEVICE_TYPE_DDD;
+        dst->index = first_ddd_src_index;
+        app->device_count++;
+    }
+#endif
+
+    // Add CXADC mode option if cards are detected on host.
+    if (cxadc_card_count > 0 && app->device_count < MAX_DEVICES) {
+        device_info_t *dst = &app->devices[app->device_count];
+        if (cxadc_card_count > 1) {
             snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC Clockgen");
             dst->index = 2;
         } else {
@@ -1677,6 +1707,25 @@ int gui_app_start_capture(gui_app_t *app) {
                          (tmv.tm_hour), (tmv.tm_min), (tmv.tm_sec));
             }
             gui_capture_hold_power_assertions();
+
+            // If this is the "[DdD] Clockgen" variant, start the Clockgen Lite
+            // audio capture in parallel with the DdD RF capture (the in-process
+            // equivalent of ddd-capture-toolkit's simultaneous
+            // DomesdayDuplicator + sox|flac start). Both threads feed the GUI
+            // record pipeline so RF and audio are captured in sync. On audio
+            // open failure, continue RF-only with a warning.
+            if (gui_ddd_clockgen_device_mode(dev)) {
+                int cg_rc = gui_ddd_clockgen_start(app);
+                if (cg_rc == 0) {
+                    (void)gui_audio_start(app, &app->buffers);
+                    gui_app_set_status(app, "DdD Clockgen capture running");
+                } else {
+                    gui_record_log_capture_event(app, "WARN",
+                        "DdD Clockgen audio device unavailable; continuing RF-only",
+                        GUI_ERROR_CLASS_NONE, 0);
+                    gui_app_set_status(app, "DdD capture running (clockgen audio unavailable)");
+                }
+            }
         } else {
             proc_set_priority(PROC_PRIORITY_NORMAL);
         }
@@ -2069,7 +2118,18 @@ void gui_app_stop_capture(gui_app_t *app) {
 #endif
 #ifdef ENABLE_DDD
     if (dev->type == DEVICE_TYPE_DDD) {
+        bool was_clockgen = gui_ddd_clockgen_device_mode(dev);
         gui_ddd_stop(app);
+        if (was_clockgen) {
+            // Stop the Clockgen Lite audio capture that ran in parallel with
+            // the DdD RF capture. gui_ddd_stop already set is_capturing=false,
+            // so the audio thread's loop has exited; join + close ALSA here.
+            gui_ddd_clockgen_stop(app);
+            // The DdD RF stop path (gui_ddd_stop) does not call gui_audio_stop
+            // (the generic stop below is unreachable due to this early return),
+            // so stop the audio monitor/writer thread here for the clockgen variant.
+            gui_audio_stop(app);
+        }
         gui_app_clear_display(app);
         return;
     }

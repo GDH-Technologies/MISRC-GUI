@@ -191,7 +191,18 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
             if (target->name[0] && strcmp(dev->name, target->name) == 0) {
                 return i;
             }
-        } else {
+        }
+#ifdef ENABLE_DDD
+        else if (target->type == DEVICE_TYPE_DDD) {
+            // Match by name so the synthetic "[DdD] Clockgen" entry reconnects
+            // to itself rather than the plain "[DdD] Domesday Duplicator" entry
+            // (both share DEVICE_TYPE_DDD; the name disambiguates them).
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+                return i;
+            }
+        }
+#endif
+        else {
             return i;
         }
     }

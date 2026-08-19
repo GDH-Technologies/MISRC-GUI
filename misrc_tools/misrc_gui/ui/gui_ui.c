@@ -12,6 +12,9 @@
 #include "../visualization/gui_panel.h"
 #include "../input/gui_playback.h"
 #include "../input/gui_cxadc.h"
+#ifdef ENABLE_DDD
+#include "../input/gui_ddd_clockgen.h"
+#endif
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
@@ -171,6 +174,14 @@ static bool gui_ui_selected_device_is_ddd(const gui_app_t *app)
     if (!app) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     return app->devices[app->selected_device].type == DEVICE_TYPE_DDD;
+}
+
+// True iff the selected device is the synthetic "[DdD] Clockgen" entry.
+static bool gui_ui_selected_device_is_ddd_clockgen(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return gui_ddd_clockgen_device_mode(&app->devices[app->selected_device]);
 }
 #endif
 
@@ -3718,8 +3729,10 @@ static void render_toolbar(gui_app_t *app) {
 #endif
 #ifdef ENABLE_DDD
     bool ddd_mode = gui_ui_selected_device_is_ddd(app);
+    bool ddd_clockgen_mode = gui_ui_selected_device_is_ddd_clockgen(app);
 #else
     bool ddd_mode = false;
+    bool ddd_clockgen_mode = false;
 #endif
     bool mode_source_runtime = app->is_recording;
     bool mode_misrc = mode_source_runtime ? app->capture_mode_runtime_misrc
@@ -3742,7 +3755,7 @@ static void render_toolbar(gui_app_t *app) {
     } else if (fx3_mode) {
         mode_label = "Mode: FX3ADC";
     } else if (ddd_mode) {
-        mode_label = "Mode: DdD";
+        mode_label = ddd_clockgen_mode ? "Mode: DdD Clockgen" : "Mode: DdD";
     } else {
         mode_label = mode_misrc ? "Mode: MISRC" : "Mode: HSDAOH";
     }
@@ -3752,7 +3765,7 @@ static void render_toolbar(gui_app_t *app) {
         } else if (fx3_mode) {
             mode_label = "FX3ADC";
         } else if (ddd_mode) {
-            mode_label = "DdD";
+            mode_label = ddd_clockgen_mode ? "DdDCg" : "DdD";
         } else {
             mode_label = mode_misrc ? "MIS" : "HSD";
         }
@@ -3762,7 +3775,7 @@ static void render_toolbar(gui_app_t *app) {
         } else if (fx3_mode) {
             mode_label = "FX3ADC";
         } else if (ddd_mode) {
-            mode_label = "DdD";
+            mode_label = ddd_clockgen_mode ? "DdDClk" : "DdD";
         } else {
             mode_label = mode_misrc ? "MISRC" : "HSDAOH";
         }
