@@ -462,10 +462,16 @@ if raylib_dep.found()
   # The static lib's extern symbols (usage/list_devices/audio_file_writer/etc.)
   # are unique to this TU and don't collide with the GUI's; common symbols are
   # resolved from the GUI's own common/ objects at link time.
+  # version_target is listed so the generated version.h is built before this TU
+  # compiles (misrc_capture.c does #include "../version.h") and the build root
+  # is on its include path -- without it, a fresh parallel build can compile
+  # this TU before version.h exists (the standalone misrc_capture gets this via
+  # version_target in sources_capture).
   gui_extra_link_with = []
   if host_system != 'android'
     misrc_capture_cli_lib = static_library('misrc_capture_cli',
                 'misrc_capture/misrc_capture.c',
+                version_target,
                 include_directories: include_directories('misrc_capture'),
                 dependencies: deps,
                 c_args: cflags + ['-Dmain=misrc_capture_main'])
