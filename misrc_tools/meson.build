@@ -456,6 +456,22 @@ if raylib_dep.found()
     gui_win_resources = windows_mod.compile_resources('misrc_gui/assets/misrc_gui.rc')
   endif
 
+  # Headless CLI capture mode: compile misrc_capture.c into the GUI binary
+  # (non-Android only) with main renamed to misrc_capture_main, so the GUI
+  # binary can run as the full misrc_capture CLI when capture args are passed.
+  # The static lib's extern symbols (usage/list_devices/audio_file_writer/etc.)
+  # are unique to this TU and don't collide with the GUI's; common symbols are
+  # resolved from the GUI's own common/ objects at link time.
+  gui_extra_link_with = []
+  if host_system != 'android'
+    misrc_capture_cli_lib = static_library('misrc_capture_cli',
+                'misrc_capture/misrc_capture.c',
+                include_directories: include_directories('misrc_capture'),
+                dependencies: deps,
+                c_args: cflags + ['-Dmain=misrc_capture_main'])
+    gui_extra_link_with += [ misrc_capture_cli_lib ]
+  endif
+
   if host_system == 'android'
     # NativeActivity loads a shared library libmisrc_gui.so that exports
     # ANativeActivity_onCreate (pulled from raylib.a by the -u link flag in the
@@ -475,6 +491,7 @@ if raylib_dep.found()
                 dependencies: gui_deps,
                 include_directories: gui_includes,
                 link_args: gui_ldflags,
+                link_with: gui_extra_link_with,
                 c_args: gui_cflags,
                 win_subsystem: gui_win_subsystem,
                 install: true)

@@ -17,6 +17,9 @@
 #include "../assets/space_mono_font_data.h"
 
 #include "gui_app.h"
+#if !defined(__ANDROID__)
+#include "../../misrc_capture/misrc_capture_cli.h"
+#endif
 #include "../ui/gui_ui.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
@@ -78,9 +81,21 @@ static void print_usage(const char *program_name) {
             "  %s [--help] [--version] [--smoke-test] [--debug-view]\n"
             "\n"
             "No arguments launch the GUI.\n"
-            "Use --debug-view to enable verbose runtime logs.\n",
+            "--debug-view enables verbose runtime logs.\n"
+            "\n"
+            "Headless CLI capture mode:\n"
+            "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
+            "  binary as the full misrc_capture CLI without opening a window.\n"
+            "  --device-list / --devices  list available capture devices and exit.\n"
+            "\n",
             MIRSC_TOOLS_VERSION,
             program_name ? program_name : "misrc_gui");
+#if !defined(__ANDROID__)
+    /* Append the full misrc_capture CLI option list (single source of truth). */
+    misrc_capture_print_usage();
+#else
+    fprintf(stdout, "(Headless CLI capture mode is not available in the Android build.)\n");
+#endif
 }
 static int gui_layout_width(void) {
 #if defined(__APPLE__)
@@ -335,21 +350,52 @@ static void gui_enable_debug_console(void) {
 
 int main(int argc, char **argv) {
     bool debug_view = false;
+    bool show_help = false;
+    bool show_version = false;
+    bool smoke_test = false;
+    bool has_capture_arg = false;
+    // First pass: classify args. Any arg that isn't a pure GUI flag is treated
+    // as a capture arg and routes the process into headless CLI capture mode
+    // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
+    // when invoked from a terminal with capture options.
     for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--help") == 0) || (strcmp(argv[i], "-h") == 0)) {
-            print_usage(argv[0]);
-            return 0;
+        const char *a = argv[i];
+        if ((strcmp(a, "--help") == 0) || (strcmp(a, "-h") == 0)) {
+            show_help = true;
+            continue;
         }
-        if (strcmp(argv[i], "--debug-view") == 0) {
+        if (strcmp(a, "--version") == 0) {
+            show_version = true;
+            continue;
+        }
+        if (strcmp(a, "--smoke-test") == 0) {
+            smoke_test = true;
+            continue;
+        }
+        if (strcmp(a, "--debug-view") == 0) {
             debug_view = true;
+            continue;
         }
-        if (strcmp(argv[i], "--version") == 0) {
-            fprintf(stdout, "%s\n", MIRSC_TOOLS_VERSION);
-            return 0;
-        }
-        if (strcmp(argv[i], "--smoke-test") == 0) {
-            return 0;
-        }
+        has_capture_arg = true;
+    }
+#if !defined(__ANDROID__)
+    // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
+    // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
+    // resample/audio opts, and prints full CLI usage on an incomplete combo.
+    if (has_capture_arg) {
+        return misrc_capture_main(argc, argv);
+    }
+#endif
+    if (show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (show_version) {
+        fprintf(stdout, "%s\n", MIRSC_TOOLS_VERSION);
+        return 0;
+    }
+    if (smoke_test) {
+        return 0;
     }
 #if defined(__APPLE__)
     int elevate_rc = gui_macos_relaunch_as_admin_if_needed(argc, argv);

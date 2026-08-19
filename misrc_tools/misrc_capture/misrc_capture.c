@@ -110,6 +110,7 @@ static const char* const _FLAC_StreamEncoderSetNumThreadsStatusString[] = {
 #include "../common/extract.h"
 #include "../common/wave.h"
 #include "../common/file_utils.h"
+#include "misrc_capture_cli.h"
 
 #if LIBFLAC_ENABLED == 1 && defined(FLAC_API_VERSION_CURRENT) && FLAC_API_VERSION_CURRENT >= 14
 #include "numcores.h"
@@ -207,6 +208,7 @@ static struct option getopt_long_options[] =
 {
   {"device",               required_argument, 0, 'd'},
   {"devices",              no_argument,       0, OPT_LIST_DEVICES},
+  {"device-list",          no_argument,       0, OPT_LIST_DEVICES},
   {"count",                required_argument, 0, 'n'},
   {"time",                 required_argument, 0, 't'},
   {"overwrite",            no_argument,       0, 'w'},
@@ -253,6 +255,7 @@ static char* usage_options[][2] =
 {
   { "device index (default: 0)", "[device index]" },
   { "list available devices", NULL },
+  { "list available devices (alias for --devices)", NULL },
   { "number of samples to read (default: 0, infinite)", "[samples]" },
   { "time to capture (seconds, m:s or h:m:s; -n takes priority, assumes 40msps)", "[time]" },
   { "overwrite any files without asking", NULL },
@@ -312,7 +315,7 @@ void create_getopt_string(char *getopt_string)
 	*s = 0;
 }
 
-void usage(void)
+void misrc_capture_print_usage(void)
 {
 	fprintf(stderr,
 		"A simple program to capture from MISRC using hsdaoh\n\n"
@@ -335,6 +338,11 @@ void usage(void)
 		fprintf(stderr,"         %s\n", usage_options[i][0]);
 		i++;
 	}
+}
+
+void usage(void)
+{
+	misrc_capture_print_usage();
 	exit(1);
 }
 
