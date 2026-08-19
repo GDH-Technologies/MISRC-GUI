@@ -372,7 +372,7 @@ int main(int argc, char **argv) {
             smoke_test = true;
             continue;
         }
-        if (strcmp(a, "--debug-view") == 0) {
+        if (strcmp(argv[i], "--debug-view") == 0) {
             debug_view = true;
             continue;
         }
