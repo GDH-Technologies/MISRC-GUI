@@ -437,7 +437,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -947,6 +947,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
+        env:
+          # GitHub-hosted macOS runners ship a recently-updated Homebrew, so
+          # skip the slow `brew update` (which also triggers re-linking that
+          # emits the 'files were overwritten during the brew link step'
+          # annotation). Only install formulas that are not already present.
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
           set -eux
           for tap_dir in \
@@ -958,7 +965,6 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          brew update
           for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
@@ -1400,7 +1406,13 @@ jobs:
           printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
           printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
           printf '| Android 11+ | - | - | [%s](%s/%s) |\n' "$APK_ARM64" "$DL_BASE" "$APK_ARM64" >> "$BODY_FILE"
-          printf '\n%s\n' '> [!NOTE]' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
+          # GitHub admonition: the > [!NOTE] line MUST be immediately followed
+          # by the > content lines with NO blank line between them, or GitHub
+          # renders it as plain quoted text instead of a note box. Do NOT use
+          # printf '\n%s\n' with multiple args here — printf reuses the format
+          # per arg, which inserts a blank line after [!NOTE] and breaks the box.
+          printf '\n%s\n' '> [!NOTE]' >> "$BODY_FILE"
+          printf '%s\n' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
           printf '%s\n' '> Android support is very alpha and experimental.' >> "$BODY_FILE"
           # Write multi-line output to GITHUB_OUTPUT.
           {

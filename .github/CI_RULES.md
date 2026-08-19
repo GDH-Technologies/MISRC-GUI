@@ -1,0 +1,121 @@
+# MISRC GUI — CI rules (GitHub Actions alignment)
+
+Internal checklist for editing `.github/workflows/build.yml` and related build
+scripts. Keep CI green and free of avoidable deprecation annotations.
+
+## Action versions
+
+Track the latest major of each first-party action; do NOT pin to a deprecated
+major. GitHub emits deprecation annotations for actions still on Node 20 and
+for actions whose current major no longer receives updates.
+
+Current pinned versions (verify before bumping):
+
+| Action | Pinned | Notes |
+|---|---|---|
+| actions/checkout | v6 | |
+| actions/setup-python | v6 | |
+| actions/setup-java | v5 | Bumped from v4 (v4 targets Node 20 and is deprecated). |
+| actions/upload-artifact | v7 | |
+| actions/download-artifact | v8 | |
+| msys2/setup-msys2 | v2 | |
+| softprops/action-gh-release | v3 | |
+
+Rules:
+- When a deprecation annotation appears naming an action version, bump that
+  action's major in the same PR/commit that addresses it. Do not leave a
+  deprecated action version in the workflow.
+- Do not add `uses:` without a `@vN` major pin (no `@main`/`@master`/SHA-only
+  in this repo's workflow — keep it readable and bumpable).
+- Node 20 is deprecated on GitHub runners; any action that still targets Node
+  20 will be force-run on Node 24 and emit an annotation. Prefer actions whose
+  current major targets Node 24 (setup-java v5, checkout v6, etc.).
+
+## Runner OS alignment
+
+Runners used and their support status (re-verify quarterly — GitHub retires
+old runner images):
+
+| Job | Runner | Notes |
+|---|---|---|
+| preflight / android-apk / release | ubuntu-22.04 / ubuntu-24.04 | ubuntu-22.04 is the AppImage glibc baseline. |
+| windows-exe (x86_64) | windows-2022 | |
+| windows-exe (arm64) | windows-11-arm | ARM64 Windows is experimental; flagged in release notes. |
+| macos-app (arm64) | macos-14 | Apple Silicon. |
+| macos-app (x86_64) | macos-15-intel | Intel. |
+
+Rules:
+- Do not introduce a retired runner image (e.g. `macos-11`, `ubuntu-20.04`).
+  GitHub removes retired images and the job will fail to acquire a runner.
+- When bumping a runner OS, re-check every dependency install path for that OS
+  (brew formulas, apt packages, MSYS2 packages) — older runners may have had
+  packages preinstalled that newer ones do not.
+
+## Version single source of truth
+
+All version strings (CI, AppImage script, Android APK script, GUI About box)
+MUST resolve through `misrc_tools/git-version.sh`. Do not re-implement
+`git describe` inline in a job/script.
+
+- `git-version.sh` prefers an exact-tag describe, then the top-level `VERSION`
+  file, then `v1.1.4-dev`, appending SHA+dirty only for `-dev`/untagged builds.
+- The Android APK injects `versionCode` (semver triplet -> MAJOR*1e6 +
+  MINOR*1e3 + PATCH) and `versionName` (full resolved string) at `aapt2 link`
+  via `--version-code`/`--version-name`/`--replace-version`. The manifest must
+  NOT hardcode `versionCode`/`versionName` (that drifts from the filename and
+  About box).
+- AndroidManifest.xml comments must NOT contain `--` (double-hyphen); it is
+  illegal inside XML comments and aapt2 rejects the manifest. Spell flag names
+  without leading dashes in comments (e.g. `version-code`, not `--version-code`).
+
+## Release notes structure
+
+The release body (`release` job, "Build release summary" step) is built in
+this order, then `generate_release_notes: true` appends GitHub's auto-generated
+What's Changed:
+
+1. `## Highlights` — one line per commit: `- subject (hash)`.
+2. `## Contributors` — GitHub `@handle` per author, deduplicated. Derived from
+   author emails: `<handle>@users.noreply.github.com` and
+   `<id>+<handle>@users.noreply.github.com` resolve automatically; non-noreply
+   emails need an entry in `CONTRIBUTOR_HANDLE_MAP`. Do NOT publish author
+   emails or raw git names. Do NOT duplicate the per-commit list here (Highlights
+   + GitHub's What's Changed already cover it).
+3. `## Downloads` — platform/arch download table.
+4. `> [!NOTE]` admonition for the experimental-build caveats.
+
+Admonition formatting (critical — this has broken twice):
+- The `> [!NOTE]` line MUST be immediately followed by the `>` content lines
+  with NO blank line between them, or GitHub renders it as plain quoted text
+  instead of a note box.
+- There MUST be a blank line before `> [!NOTE]` (to separate it from the
+  preceding table/section).
+- Never write `printf '\n%s\n' '> [!NOTE]' 'content'` — `printf` reuses the
+  format string per argument, so the second arg gets a leading `\n` and inserts
+  a blank line after `[!NOTE]`. Use separate `printf '%s\n' ...` calls for each
+  content line.
+
+## Annotation hygiene targets
+
+A clean run should produce zero annotations. Known sources and fixes:
+
+- `Node.js 20 is deprecated ... actions/X@vN` → bump that action to a major
+  that targets Node 24.
+- `setup-java v4 is deprecated` → use `actions/setup-java@v5`.
+- `These files were overwritten during the brew link step` (macOS) → do not run
+  `brew update` on GitHub macOS runners (they are already current); set
+  `HOMEBREW_NO_AUTO_UPDATE=1` and install only missing formulas.
+- Any `deprecation of Node 20` or `vN is deprecated` annotation is actionable;
+  do not ignore it across runs.
+
+## Pre-commit CI check (manual)
+
+Before pushing workflow edits, run locally if possible:
+
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/build.yml'))"`
+  — YAML well-formedness.
+- For Android manifest edits: `python3 -c "import
+  xml.dom.minidom;m.parse('android/AndroidManifest.xml')"` and check for `--`
+  inside comments.
+- For release-body printf changes: reproduce the exact `printf` pipeline in a
+  shell and `cat -A` the output to confirm blank-line placement.
