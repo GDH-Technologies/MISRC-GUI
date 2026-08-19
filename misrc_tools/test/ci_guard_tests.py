@@ -633,9 +633,15 @@ def check_release_artifact_naming_contract(workflow_path: Path) -> int:
         "release-assets/**/linux_MISRC_*_arm64.zip",
         "release-assets/**/windows_MISRC_*_x86.zip",
         "release-assets/**/macos_MISRC_*_universal.dmg",
-        "release-assets/**/misrc_gui-*-android-arm64.apk",
+        "APK_ARM64=\"android_MISRC_${TAG}_arm64.apk\"",
+        "release-assets/**/android_MISRC_*_arm64.apk",
     ]
     forbidden_snippets = [
+        # Legacy Android APK naming (pre-convention-alignment). The APK must
+        # follow <platform>_MISRC_<version>_<arch>.<ext> like the other
+        # platforms, not misrc_gui-<version>-android-arm64.apk.
+        "misrc_gui-${TAG}-android-arm64.apk",
+        "release-assets/**/misrc_gui-*-android-arm64.apk",
         "misrc_gui-*-windows-x86_64.zip",
         "misrc_gui-*-macos-universal-app.tar.gz",
         "MISRC_*_windows_x86.zip",
