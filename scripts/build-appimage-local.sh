@@ -45,13 +45,10 @@ EOF
 
 resolve_version() {
   local version
-  version="$(git -C "$REPO_ROOT" describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+  version="$("$REPO_ROOT/misrc_tools/git-version.sh" 2>/dev/null || true)"
   if [[ -z "$version" ]]; then
-    version="dev-$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    version="v1.1.4-dev"
   fi
-  case "$version" in
-    misrc_tools-*) version="${version#misrc_tools-}" ;;
-  esac
   printf '%s\n' "$version"
 }
 

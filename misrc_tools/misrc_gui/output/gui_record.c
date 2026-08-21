@@ -347,7 +347,7 @@ static const char *gui_record_device_type_name(const gui_app_t *app) {
             return "playback";
 #ifdef ENABLE_FX3
         case DEVICE_TYPE_FX3:
-            return "fx3";
+            return "fx3adc";
 #endif
 #ifdef ENABLE_DDD
         case DEVICE_TYPE_DDD:
@@ -409,6 +409,7 @@ struct writer_ctx {
 
     // RF resampling (rate in kHz; 0 or disabled = passthrough)
     bool enable_resample;
+    float input_sample_rate_khz;  // source/capture sample rate in kHz
     float resample_rate_khz;
     int resample_quality;      // 0-4
     float resample_gain_db;
@@ -1078,9 +1079,10 @@ static soxr_quality_spec_t soxr_quality_from_setting(int q) {
 
 static soxr_t ensure_soxr(writer_ctx_t *wctx, float out_rate_khz) {
     if (!wctx) return NULL;
+    float in_rate_khz = (wctx->input_sample_rate_khz > 0.0f) ? wctx->input_sample_rate_khz : 40000.0f;
 
     // Only support downsampling (or passthrough) like CLI
-    if (out_rate_khz <= 0.0f || out_rate_khz >= 40000.0f) {
+    if (out_rate_khz <= 0.0f || out_rate_khz >= in_rate_khz) {
         return NULL;
     }
 
@@ -1103,7 +1105,7 @@ static soxr_t ensure_soxr(writer_ctx_t *wctx, float out_rate_khz) {
 
     soxr_quality_spec_t qual_spec = soxr_quality_from_setting(wctx->resample_quality);
 
-    soxr_t s = soxr_create(40000.0, (double)out_rate_khz, 1, &err, &io_spec, &qual_spec, NULL);
+    soxr_t s = soxr_create((double)in_rate_khz, (double)out_rate_khz, 1, &err, &io_spec, &qual_spec, NULL);
     if (!s || err) {
         if (s) soxr_delete(s);
         return NULL;
@@ -1166,15 +1168,30 @@ static void convert_i16_to_flac_i32(int32_t *dst, const int16_t *src, size_t n, 
     }
 
     if (bits == 12) {
+        // BUF_RECORD samples are signed 12-bit carried in int16_t, but the
+        // soxr resampler can overshoot the 12-bit range on clipped input
+        // (e.g. when downsampling on the fly). Clamp to the signed 12-bit
+        // range declared to the FLAC encoder, otherwise samples exceed the
+        // declared bit depth and FLAC__STREAM_ENCODER_CLIENT_ERROR fires.
         for (size_t i = 0; i < n; i++) {
-            dst[i] = (int32_t)src[i];
+            int32_t v = (int32_t)src[i];
+            if (v > 2047) v = 2047;
+            if (v < -2048) v = -2048;
+            dst[i] = v;
         }
         return;
     }
 
-    // 16-bit output: expand 12-bit capture samples to 16-bit range
+    // 16-bit output: expand 12-bit capture samples to 16-bit range. The
+    // resampler can overshoot the source 12-bit range; after the <<4 shift
+    // that can exceed the signed 16-bit range declared to the FLAC encoder.
+    // Clamp the shifted result so the encoder never receives out-of-range
+    // samples (mirrors the 8-bit path's clamp behavior).
     for (size_t i = 0; i < n; i++) {
-        dst[i] = (int32_t)src[i] << 4;
+        int32_t v = (int32_t)src[i] << 4;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        dst[i] = v;
     }
 }
 
@@ -1206,6 +1223,7 @@ static int flac_writer_thread(void *ctx) {
     writer_ctx_t *wctx = (writer_ctx_t *)ctx;
     size_t len = GUI_RECORD_WRITER_BLOCK_BYTES;
     size_t raw_bytes_per_block = GUI_RECORD_WRITER_BLOCK_BYTES;
+    float input_rate_khz = (wctx && wctx->input_sample_rate_khz > 0.0f) ? wctx->input_sample_rate_khz : 40000.0f;
     bool flac_encoder_error_logged = false;
 
     // Boost thread priority to avoid backpressure when window is minimized
@@ -1279,7 +1297,7 @@ static int flac_writer_thread(void *ctx) {
 #if LIBSOXR_ENABLED
         if (wctx->enable_resample &&
             wctx->resample_rate_khz > 0.0f &&
-            wctx->resample_rate_khz < 40000.0f) {
+            wctx->resample_rate_khz < input_rate_khz) {
             soxr_t s = ensure_soxr(wctx, wctx->resample_rate_khz);
             if (s) {
                 size_t in_done = 0, out_done = 0;
@@ -2860,6 +2878,18 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // Determine per-channel RF bit depth
         uint8_t bits_a = clamp_rf_bits_flac(app->settings.rf_bits_a);
         uint8_t bits_b = clamp_rf_bits_flac(app->settings.rf_bits_b);
+        uint32_t capture_rate_hz = (uint32_t)atomic_load(&app->sample_rate);
+        if (capture_rate_hz == 0) {
+            capture_rate_hz = 40000000u;
+        }
+        uint32_t capture_rate_khz = (capture_rate_hz + 500u) / 1000u;
+        if (capture_rate_khz == 0) {
+            capture_rate_khz = 40000u;
+        }
+        float capture_rate_khz_f = ((float)capture_rate_hz) / 1000.0f;
+        if (capture_rate_khz_f <= 0.0f) {
+            capture_rate_khz_f = (float)capture_rate_khz;
+        }
 
         // Setup writer contexts
         ses->ctx_a.bufmgr = &app->buffers;
@@ -2871,6 +2901,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_a.rf_bits = bits_a;
         ses->ctx_a.raw_bytes_per_sample = 2;  // input blocks are int16
         ses->ctx_a.enable_resample = app->settings.enable_resample_a;
+        ses->ctx_a.input_sample_rate_khz = capture_rate_khz_f;
         ses->ctx_a.resample_rate_khz = app->settings.resample_rate_a;
         ses->ctx_a.resample_quality = app->settings.resample_quality_a;
         ses->ctx_a.resample_gain_db = app->settings.resample_gain_a;
@@ -2890,6 +2921,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_b.rf_bits = bits_b;
         ses->ctx_b.raw_bytes_per_sample = 2;  // input blocks are int16
         ses->ctx_b.enable_resample = app->settings.enable_resample_b;
+        ses->ctx_b.input_sample_rate_khz = capture_rate_khz_f;
         ses->ctx_b.resample_rate_khz = app->settings.resample_rate_b;
         ses->ctx_b.resample_quality = app->settings.resample_quality_b;
         ses->ctx_b.resample_gain_db = app->settings.resample_gain_b;
@@ -2904,13 +2936,19 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         flac_writer_config_t config_a = flac_writer_default_config();
         flac_writer_config_t config_b = flac_writer_default_config();
 
-        // Sample rate is stored in kHz for RF capture (40000 = 40 MSPS)
-        config_a.sample_rate = (app->settings.enable_resample_a && app->settings.resample_rate_a > 0.0f)
-                                 ? (uint32_t)(app->settings.resample_rate_a)
-                                 : 40000;
-        config_b.sample_rate = (app->settings.enable_resample_b && app->settings.resample_rate_b > 0.0f)
-                                 ? (uint32_t)(app->settings.resample_rate_b)
-                                 : 40000;
+        // Sample rate is stored in kHz for RF capture.
+        bool use_resample_a = app->settings.enable_resample_a &&
+                              app->settings.resample_rate_a > 0.0f &&
+                              app->settings.resample_rate_a < capture_rate_khz_f;
+        bool use_resample_b = app->settings.enable_resample_b &&
+                              app->settings.resample_rate_b > 0.0f &&
+                              app->settings.resample_rate_b < capture_rate_khz_f;
+        config_a.sample_rate = use_resample_a
+                                 ? (uint32_t)lroundf(app->settings.resample_rate_a)
+                                 : capture_rate_khz;
+        config_b.sample_rate = use_resample_b
+                                 ? (uint32_t)lroundf(app->settings.resample_rate_b)
+                                 : capture_rate_khz;
         ses->sample_rate_a = config_a.sample_rate;
         ses->sample_rate_b = config_b.sample_rate;
 
@@ -3092,6 +3130,14 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 
         uint8_t bits_a = rf_bits_for_raw(app->settings.rf_bits_a);
         uint8_t bits_b = rf_bits_for_raw(app->settings.rf_bits_b);
+        uint32_t capture_rate_hz = (uint32_t)atomic_load(&app->sample_rate);
+        if (capture_rate_hz == 0) {
+            capture_rate_hz = 40000000u;
+        }
+        float capture_rate_khz_f = ((float)capture_rate_hz) / 1000.0f;
+        if (capture_rate_khz_f <= 0.0f) {
+            capture_rate_khz_f = 40000.0f;
+        }
 
         ses->ctx_a.bufmgr = &app->buffers;
         ses->ctx_a.buf_id = BUF_RECORD_A;
@@ -3102,6 +3148,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_a.rf_bits = bits_a;
         ses->ctx_a.raw_bytes_per_sample = (bits_a == 8) ? 1 : 2;
         ses->ctx_a.enable_resample = app->settings.enable_resample_a;
+        ses->ctx_a.input_sample_rate_khz = capture_rate_khz_f;
         ses->ctx_a.resample_rate_khz = app->settings.resample_rate_a;
         ses->ctx_a.resample_quality = app->settings.resample_quality_a;
         ses->ctx_a.resample_gain_db = app->settings.resample_gain_a;
@@ -3119,6 +3166,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_b.rf_bits = bits_b;
         ses->ctx_b.raw_bytes_per_sample = (bits_b == 8) ? 1 : 2;
         ses->ctx_b.enable_resample = app->settings.enable_resample_b;
+        ses->ctx_b.input_sample_rate_khz = capture_rate_khz_f;
         ses->ctx_b.resample_rate_khz = app->settings.resample_rate_b;
         ses->ctx_b.resample_quality = app->settings.resample_quality_b;
         ses->ctx_b.resample_gain_db = app->settings.resample_gain_b;

@@ -8,3 +8,7 @@ Build instructions for Steve's hardware can be found:
 
 
 This project is licensed under the GNU General Public License v3 or later - see the LICENSE file for details.
+
+## Building from source
+
+See [INSTALLATION.md](../INSTALLATION.md) at the repository root for build prerequisites, the local build quick start, and the vendored deps caching model (local == CI).

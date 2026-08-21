@@ -35,7 +35,7 @@ typedef struct
 	uint32_t dataSize;
 } __attribute__((packed, aligned(2))) wave_header_t;
 
-void create_wave_header(wave_header_t *h, uint64_t samples, uint32_t sample_rate, uint16_t channels, uint16_t bits)
+static void create_wave_header(wave_header_t *h, uint64_t samples, uint32_t sample_rate, uint16_t channels, uint16_t bits)
 {
 	uint64_t data_size = (bits / 8) * channels * samples;
 	if (data_size > (2147483647 - sizeof(wave_header_t))) {

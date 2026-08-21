@@ -7,12 +7,16 @@
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "../visualization/gui_fft.h"
+#include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_oscilloscope.h"
 #include "../visualization/gui_preview_panel.h"
-#include "../input/gui_cxadc_params.h"
 #include "../input/gui_playback.h"
+#include "../input/gui_cxadc.h"
+#ifdef ENABLE_DDD
+#include "../input/gui_ddd_clockgen.h"
+#endif
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../output/gui_video_record.h"
@@ -20,6 +24,7 @@
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/threading.h"
 #include <clay.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +33,14 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
+#if defined(__ANDROID__)
+extern void android_set_keyboard_visible(int visible);
+extern size_t android_drain_text_input(char *out, size_t out_len);
+extern const char *android_get_storage_path(void);
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 #ifndef MIRSC_TOOLS_VERSION
 #define MIRSC_TOOLS_VERSION "dev"
@@ -57,6 +70,11 @@ static bool s_capture_mode_render_last_settings = true;
 static bool s_capture_mode_render_last_recording = false;
 static bool s_capture_mode_render_last_capturing = false;
 static bool s_capture_mode_render_last_source_runtime = false;
+static bool s_capture_b_forced_off_by_single_channel = false;
+static int s_cxadc_dc_anchor_device_index = -1;
+static bool s_cxadc_dc_anchor_valid[2] = { false, false };
+static int s_cxadc_dc_anchor_raw[2] = { 0, 0 };
+static int s_cxadc_dc_relative[2] = { 0, 0 };
 
 static const char *gui_ui_capture_mode_name(bool misrc_mode) {
     return misrc_mode ? "MISRC" : "HSDAOH";
@@ -76,6 +94,99 @@ static bool gui_ui_selected_device_is_cxadc(const gui_app_t *app, bool *clockgen
     }
     return true;
 }
+
+static bool gui_ui_selected_device_is_cxadc_misrc_clockgen(const gui_app_t *app)
+{
+    // MISRC Clockgen is now its own device type (DEVICE_TYPE_MISRC_CLOCKGEN).
+    // Also accept the legacy CXADC-typed marker serial for older saved selections.
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+
+    const device_info_t *dev = &app->devices[app->selected_device];
+    if (dev->type == DEVICE_TYPE_MISRC_CLOCKGEN) return true;
+    if (dev->type == DEVICE_TYPE_CXADC &&
+        strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0) {
+        return true;
+    }
+    return false;
+}
+
+// True iff the selected device is the first-class MISRC Clockgen entry.
+static bool gui_ui_selected_device_is_misrc_clockgen(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_MISRC_CLOCKGEN;
+}
+
+static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 40000.0f;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 20000.0f : 40000.0f;
+}
+static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 8;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 16 : 8;
+}
+static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
+{
+    if (!app) return;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    app->settings.cxadc_tenbit_mode_card[card_idx] = !app->settings.cxadc_tenbit_mode_card[card_idx];
+    uint8_t cxadc_bits = gui_ui_cxadc_rf_bits(app, card_idx);
+    float cxadc_base_rate_khz = gui_ui_cxadc_base_rate_khz(app, card_idx);
+    if (card_idx == 0) {
+        app->settings.rf_bits_a = cxadc_bits;
+        if (!app->settings.enable_resample_a || app->settings.resample_rate_a > cxadc_base_rate_khz) {
+            app->settings.resample_rate_a = cxadc_base_rate_khz;
+        }
+    } else {
+        app->settings.rf_bits_b = cxadc_bits;
+        if (!app->settings.enable_resample_b || app->settings.resample_rate_b > cxadc_base_rate_khz) {
+            app->settings.resample_rate_b = cxadc_base_rate_khz;
+        }
+    }
+    gui_settings_save(&app->settings);
+    const char *card_label = (card_idx == 0) ? "A" : "B";
+    bool enabled = app->settings.cxadc_tenbit_mode_card[card_idx];
+    if (app->is_capturing) {
+        gui_app_set_status(app, enabled
+            ? ((card_idx == 0) ? "CXADC card A 10-bit mode enabled (applies on next capture start)"
+                               : "CXADC card B 10-bit mode enabled (applies on next capture start)")
+            : ((card_idx == 0) ? "CXADC card A 8-bit mode enabled (applies on next capture start)"
+                               : "CXADC card B 8-bit mode enabled (applies on next capture start)"));
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "CXADC card %s %s (%s base)",
+                 card_label,
+                 enabled ? "10-bit mode enabled" : "8-bit mode enabled",
+                 enabled ? "20 MSPS" : "40 MSPS");
+        gui_app_set_status(app, msg);
+    }
+}
+
+static bool gui_ui_map_cxadc_channel_to_card(const gui_app_t *app, int channel, int *card_idx_out)
+{
+    if (!app) return false;
+    if (channel < 0 || channel > 1) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+
+    const device_info_t *dev = &app->devices[app->selected_device];
+    if (dev->type != DEVICE_TYPE_CXADC) return false;
+
+    int card_count = dev->index;
+    if (card_count < 1) card_count = 1;
+    if (card_count > 2) card_count = 2;
+    if (channel >= card_count) return false;
+
+    if (card_idx_out) {
+        *card_idx_out = channel;
+    }
+    return true;
+}
 static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
 {
     if (!app) return false;
@@ -90,6 +201,14 @@ static bool gui_ui_selected_device_is_ddd(const gui_app_t *app)
     if (!app) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     return app->devices[app->selected_device].type == DEVICE_TYPE_DDD;
+}
+
+// True iff the selected device is the synthetic "[DdD] Clockgen" entry.
+static bool gui_ui_selected_device_is_ddd_clockgen(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return gui_ddd_clockgen_device_mode(&app->devices[app->selected_device]);
 }
 #endif
 
@@ -201,38 +320,30 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_OPERATOR,
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
-    // CXADC gain controls in the gear popover. Unlike every other field here,
-    // these do not edit app->settings -- they edit a scratch buffer that is
-    // pushed to sysfs on Enter and thrown away on Escape.
-    UI_TEXT_FIELD_CX_LEVEL_A,
-    UI_TEXT_FIELD_CX_LEVEL_B,
-    UI_TEXT_FIELD_CX_CENTER_A,
-    UI_TEXT_FIELD_CX_CENTER_B
 } ui_text_field_t;
-
-// [channel][0 = level, 1 = center_offset]
-static char s_cx_edit_buf[2][2][8];
 
 // Above this the CX front end's own noise starts interfering with the signal,
 // so the value is tinted as a warning rather than blocked.
 #define CX_LEVEL_NOISE_WARN 10
 
-// Defined further down with the rest of the gear popover, but needed by the
-// text-edit pump above it.
-static void gui_ui_commit_cx_text_field(gui_app_t *app, ui_text_field_t field);
+// The CXADC capture gain shown in the stats panel. Reading sysfs once a frame
+// would be a syscall per channel per frame for a value that only moves when
+// the user clicks (or when something outside the GUI writes it), so the read
+// is rate-limited and the last good value is reused in between. -1 means the
+// card did not answer, and the row renders the value as "--".
+#define CX_LEVEL_POLL_INTERVAL_S 0.5
+static int    s_cx_level_value[2]     = { -1, -1 };
+static double s_cx_level_polled_at[2] = { 0.0, 0.0 };
 
-static inline bool gui_ui_field_is_cx(ui_text_field_t f) {
-    return f == UI_TEXT_FIELD_CX_LEVEL_A || f == UI_TEXT_FIELD_CX_LEVEL_B ||
-           f == UI_TEXT_FIELD_CX_CENTER_A || f == UI_TEXT_FIELD_CX_CENTER_B;
-}
-static inline int gui_ui_cx_field_channel(ui_text_field_t f) {
-    return (f == UI_TEXT_FIELD_CX_LEVEL_B || f == UI_TEXT_FIELD_CX_CENTER_B) ? 1 : 0;
-}
-static inline int gui_ui_cx_field_slot(ui_text_field_t f) {
-    return (f == UI_TEXT_FIELD_CX_CENTER_A || f == UI_TEXT_FIELD_CX_CENTER_B) ? 1 : 0;
-}
-static inline cxp_attr_t gui_ui_cx_field_attr(ui_text_field_t f) {
-    return gui_ui_cx_field_slot(f) ? CXP_ATTR_CENTER_OFFSET : CXP_ATTR_LEVEL;
+static int gui_ui_cxadc_level_cached(int card_idx, bool force) {
+    if (card_idx < 0 || card_idx > 1) return -1;
+    double now = GetTime();
+    if (force || now - s_cx_level_polled_at[card_idx] >= CX_LEVEL_POLL_INTERVAL_S) {
+        int v = 0;
+        s_cx_level_value[card_idx] = (gui_cxadc_get_level(card_idx, &v) == 0) ? v : -1;
+        s_cx_level_polled_at[card_idx] = now;
+    }
+    return s_cx_level_value[card_idx];
 }
 
 // Unified cursor-based text editing state (settings panel)
@@ -266,6 +377,319 @@ static double s_record_limit_deadline_s = 0.0;
 #define RECORD_LIMIT_TIMECODE_SCALE 1.30f
 #define RECORD_LIMIT_TIMECODE_BORDER_X 5
 #define RECORD_LIMIT_TIMECODE_BORDER_Y 3
+#if defined(__ANDROID__)
+static bool s_android_keyboard_visible = false;
+#endif
+// Update checker (GitHub release tag lookup).
+#define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
+#define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
+
+typedef struct {
+    bool manual;
+} gui_ui_update_check_task_t;
+
+static thrd_t s_update_check_thread;
+static bool s_update_check_thread_started = false;
+static atomic_bool s_update_check_running = false;
+static atomic_bool s_update_check_result_pending = false;
+static bool s_update_check_result_manual = false;
+static bool s_update_check_result_success = false;
+static char s_update_check_result_tag[64] = {0};
+static char s_update_check_result_error[160] = {0};
+
+static void gui_ui_trim_ascii_whitespace_inplace(char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+}
+
+static bool gui_ui_ci_starts_with(const char *value, const char *prefix)
+{
+    if (!value || !prefix) return false;
+    while (*prefix) {
+        if (!*value) return false;
+        if (tolower((unsigned char)*value) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+        value++;
+        prefix++;
+    }
+    return true;
+}
+
+static bool gui_ui_extract_release_tag_from_url(const char *url, char *tag_out, size_t tag_out_len)
+{
+    if (!url || !tag_out || tag_out_len == 0) return false;
+    tag_out[0] = '\0';
+    const char *marker = "/releases/tag/";
+    const char *start = strstr(url, marker);
+    if (!start) return false;
+    start += strlen(marker);
+    if (*start == '\0') return false;
+
+    size_t i = 0;
+    while (start[i] &&
+           !isspace((unsigned char)start[i]) &&
+           start[i] != '?' &&
+           start[i] != '#' &&
+           start[i] != '/') {
+        if (i + 1 >= tag_out_len) break;
+        tag_out[i] = start[i];
+        i++;
+    }
+    tag_out[i] = '\0';
+    return (i > 0);
+}
+
+static bool gui_ui_parse_semver_triplet(const char *version, int *major_out, int *minor_out, int *patch_out)
+{
+    if (!version || !major_out || !minor_out || !patch_out) return false;
+    const char *p = version;
+    if (*p == 'v' || *p == 'V') p++;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    char *end = NULL;
+    long major = strtol(p, &end, 10);
+    if (!end || end == p || *end != '.') return false;
+    p = end + 1;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    long minor = strtol(p, &end, 10);
+    if (!end || end == p || *end != '.') return false;
+    p = end + 1;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    long patch = strtol(p, &end, 10);
+    if (!end || end == p) return false;
+
+    *major_out = (int)major;
+    *minor_out = (int)minor;
+    *patch_out = (int)patch;
+    return true;
+}
+
+static int gui_ui_compare_versions(const char *current_version, const char *latest_version)
+{
+    int cmaj = 0, cmin = 0, cpat = 0;
+    int lmaj = 0, lmin = 0, lpat = 0;
+    bool current_ok = gui_ui_parse_semver_triplet(current_version, &cmaj, &cmin, &cpat);
+    bool latest_ok = gui_ui_parse_semver_triplet(latest_version, &lmaj, &lmin, &lpat);
+    if (current_ok && latest_ok) {
+        if (cmaj != lmaj) return (cmaj < lmaj) ? -1 : 1;
+        if (cmin != lmin) return (cmin < lmin) ? -1 : 1;
+        if (cpat != lpat) return (cpat < lpat) ? -1 : 1;
+        return 0;
+    }
+    int text_cmp = strcmp(current_version ? current_version : "",
+                          latest_version ? latest_version : "");
+    if (text_cmp < 0) return -1;
+    if (text_cmp > 0) return 1;
+    return 0;
+}
+
+static bool gui_ui_fetch_latest_release_tag(char *tag_out, size_t tag_out_len, char *error_out, size_t error_out_len)
+{
+    if (!tag_out || tag_out_len == 0 || !error_out || error_out_len == 0) return false;
+    tag_out[0] = '\0';
+    error_out[0] = '\0';
+
+#if defined(_WIN32)
+    const char *cmd = "curl.exe -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
+    FILE *fp = _popen(cmd, "r");
+#else
+    const char *cmd = "curl -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
+    FILE *fp = popen(cmd, "r");
+#endif
+    if (!fp) {
+        snprintf(error_out, error_out_len, "unable to launch curl");
+        return false;
+    }
+
+    char line[512];
+    char location[512] = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        gui_ui_trim_ascii_whitespace_inplace(line);
+        if (line[0] == '\0') continue;
+        if (gui_ui_ci_starts_with(line, "location:")) {
+            const char *value = line + 9;
+            while (*value && isspace((unsigned char)*value)) value++;
+            snprintf(location, sizeof(location), "%s", value);
+        }
+    }
+
+#if defined(_WIN32)
+    int rc = _pclose(fp);
+#else
+    int rc = pclose(fp);
+#endif
+
+    if (location[0] == '\0') {
+        if (rc != 0) {
+            snprintf(error_out, error_out_len, "curl request failed");
+        } else {
+            snprintf(error_out, error_out_len, "latest release redirect header missing");
+        }
+        return false;
+    }
+
+    if (!gui_ui_extract_release_tag_from_url(location, tag_out, tag_out_len)) {
+        snprintf(error_out, error_out_len, "unable to parse release tag");
+        return false;
+    }
+    return true;
+}
+
+static int gui_ui_update_check_thread_main(void *arg_ptr)
+{
+    gui_ui_update_check_task_t task = {0};
+    if (arg_ptr) {
+        task = *((gui_ui_update_check_task_t *)arg_ptr);
+        free(arg_ptr);
+    }
+
+    char latest_tag[64] = {0};
+    char error_text[160] = {0};
+    bool ok = gui_ui_fetch_latest_release_tag(latest_tag, sizeof(latest_tag), error_text, sizeof(error_text));
+
+    s_update_check_result_manual = task.manual;
+    s_update_check_result_success = ok;
+    if (ok) {
+        snprintf(s_update_check_result_tag, sizeof(s_update_check_result_tag), "%s", latest_tag);
+        s_update_check_result_error[0] = '\0';
+    } else {
+        s_update_check_result_tag[0] = '\0';
+        snprintf(s_update_check_result_error, sizeof(s_update_check_result_error), "%s",
+                 error_text[0] ? error_text : "unknown error");
+    }
+
+    atomic_store_explicit(&s_update_check_result_pending, true, memory_order_release);
+    atomic_store_explicit(&s_update_check_running, false, memory_order_release);
+    return 0;
+}
+
+static bool gui_ui_start_update_check(bool manual)
+{
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+        return false;
+    }
+    if (atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) {
+        return false;
+    }
+    gui_ui_update_check_task_t *task = (gui_ui_update_check_task_t *)malloc(sizeof(gui_ui_update_check_task_t));
+    if (!task) {
+        return false;
+    }
+    task->manual = manual;
+
+    atomic_store_explicit(&s_update_check_running, true, memory_order_release);
+    if (thrd_create_with_priority(&s_update_check_thread,
+                                  gui_ui_update_check_thread_main,
+                                  task,
+                                  THRD_PRIORITY_NORMAL) != thrd_success) {
+        atomic_store_explicit(&s_update_check_running, false, memory_order_release);
+        free(task);
+        return false;
+    }
+    s_update_check_thread_started = true;
+    return true;
+}
+
+static void gui_ui_join_update_check_thread_if_needed(void)
+{
+    if (!s_update_check_thread_started) return;
+    (void)thrd_join(s_update_check_thread, NULL);
+    s_update_check_thread_started = false;
+}
+
+static void gui_ui_process_update_check_result(gui_app_t *app)
+{
+    if (!app) return;
+    if (!atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) return;
+    atomic_store_explicit(&s_update_check_result_pending, false, memory_order_release);
+    gui_ui_join_update_check_thread_if_needed();
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    app->settings.update_last_check_unix_s = now_s;
+
+    if (s_update_check_result_success) {
+        snprintf(app->settings.update_last_release_tag,
+                 sizeof(app->settings.update_last_release_tag),
+                 "%s",
+                 s_update_check_result_tag);
+        int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        app->settings.update_available_cached = (cmp < 0);
+        gui_settings_save(&app->settings);
+
+        if (s_update_check_result_manual) {
+            char msg[196];
+            if (cmp < 0) {
+                snprintf(msg, sizeof(msg), "Update available: %s (current %s)",
+                         app->settings.update_last_release_tag, MIRSC_TOOLS_VERSION);
+            } else if (cmp == 0) {
+                snprintf(msg, sizeof(msg), "No update available (latest %s)",
+                         app->settings.update_last_release_tag);
+            } else {
+                snprintf(msg, sizeof(msg), "Running newer build than release %s",
+                         app->settings.update_last_release_tag);
+            }
+            gui_app_set_status(app, msg);
+        } else if (app->settings.update_available_cached) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Update available: %s", app->settings.update_last_release_tag);
+            gui_app_set_status(app, msg);
+        }
+    } else {
+        gui_settings_save(&app->settings);
+        if (s_update_check_result_manual) {
+            char msg[220];
+            snprintf(msg, sizeof(msg), "Update check failed: %s",
+                     s_update_check_result_error[0] ? s_update_check_result_error : "unknown error");
+            gui_app_set_status(app, msg);
+        }
+    }
+}
+
+static bool gui_ui_update_check_due(const gui_settings_t *settings, uint64_t now_s)
+{
+    if (!settings) return false;
+    if (settings->update_last_check_unix_s == 0) return true;
+    if (now_s < settings->update_last_check_unix_s) return true;
+    uint64_t elapsed = now_s - settings->update_last_check_unix_s;
+    return elapsed >= GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS;
+}
+
+static void gui_ui_update_check_tick(gui_app_t *app)
+{
+    if (!app) return;
+    gui_ui_process_update_check_result(app);
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) return;
+    if (atomic_load_explicit(&s_update_check_result_pending, memory_order_acquire)) return;
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    if (gui_ui_update_check_due(&app->settings, now_s)) {
+        (void)gui_ui_start_update_check(false);
+    }
+}
+
+void gui_ui_sync_android_keyboard_state(void) {
+#if defined(__ANDROID__)
+    bool want_visible = (s_active_text_field != UI_TEXT_FIELD_NONE) || s_record_limit_timecode_edit;
+    if (want_visible != s_android_keyboard_visible) {
+        android_set_keyboard_visible(want_visible ? 1 : 0);
+        s_android_keyboard_visible = want_visible;
+    }
+#endif
+}
 
 
 bool gui_ui_click_consumed(void) {
@@ -502,7 +926,6 @@ static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, flo
 }
 
 // Format helpers - use separate buffers to avoid overwriting
-static char temp_buf1[64];
 static char device_dropdown_buf[64];
 
 // Per-channel stat buffers (separate for A and B to avoid overwrite)
@@ -510,12 +933,10 @@ static char stat_a_peak_pos[16];
 static char stat_a_peak_neg[16];
 static char stat_a_clip_pos[16];
 static char stat_a_clip_neg[16];
-static char stat_a_errors[16];
 static char stat_b_peak_pos[16];
 static char stat_b_peak_neg[16];
 static char stat_b_clip_pos[16];
 static char stat_b_clip_neg[16];
-static char stat_b_errors[16];
 static char stat_rec_raw[2][32];
 static char stat_rec_flac[2][32];
 static char stat_rec_ratio[2][24];
@@ -547,6 +968,8 @@ static char status_errors_display[16];
 static char status_rf_buf_display[16];
 static char status_aud_buf_display[16];
 static char status_free_space_display[120];
+static char status_message_display[192];
+static char status_record_timer_display[16];
 static char record_limit_state_display[96];
 static char record_limit_timecode_display[20];
 static bool s_status_free_space_valid = false;
@@ -559,7 +982,7 @@ static double s_status_output_rate_bps = 0.0;
 #define STATUS_FREE_SPACE_LOW_BYTES ((uint64_t)10 * 1000 * 1000 * 1000)
 #define STATUS_FREE_SPACE_WARN_BYTES ((uint64_t)25 * 1000 * 1000 * 1000)
 
-static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
+void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     if (!app) return;
     if (!s_capture_mode_state_initialized) {
         s_capture_mode_state_misrc = app->settings.misrc_mode;
@@ -571,7 +994,17 @@ static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
 #else
     bool ddd_mode = false;
 #endif
+#ifdef ENABLE_FX3
+    bool fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+    bool fx3_mode = false;
+#endif
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+    bool cxadc_has_channel_b = false;
+    if (cxadc_mode && app->selected_device >= 0 && app->selected_device < app->device_count) {
+        cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
+    }
+    bool single_channel_device = ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_channel_b);
     bool expected_mode = s_capture_mode_state_misrc;
     if (cxadc_mode) {
         expected_mode = false;
@@ -597,46 +1030,77 @@ static void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     }
     if (cxadc_mode) {
         bool cxadc_settings_changed = false;
-        bool cxadc_has_channel_b = false;
-        if (app->selected_device >= 0 && app->selected_device < app->device_count) {
-            cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
-        }
+        uint8_t cxadc_rf_bits_a = gui_ui_cxadc_rf_bits(app, 0);
+        uint8_t cxadc_rf_bits_b = gui_ui_cxadc_rf_bits(app, cxadc_has_channel_b ? 1 : 0);
+        float cxadc_base_rate_a_khz = gui_ui_cxadc_base_rate_khz(app, 0);
+        float cxadc_base_rate_b_khz = gui_ui_cxadc_base_rate_khz(app, cxadc_has_channel_b ? 1 : 0);
         // Single-card CXADC has no RF-B source.
         if (!cxadc_has_channel_b && app->settings.capture_b) {
             app->settings.capture_b = false;
             cxadc_settings_changed = true;
+            s_capture_b_forced_off_by_single_channel = true;
         }
-        if (app->settings.rf_bits_a != 8) {
-            app->settings.rf_bits_a = 8;
+        if (app->settings.rf_bits_a != cxadc_rf_bits_a) {
+            app->settings.rf_bits_a = cxadc_rf_bits_a;
             cxadc_settings_changed = true;
         }
-        if (app->settings.rf_bits_b != 8) {
-            app->settings.rf_bits_b = 8;
+        if (app->settings.rf_bits_b != cxadc_rf_bits_b) {
+            app->settings.rf_bits_b = cxadc_rf_bits_b;
+            cxadc_settings_changed = true;
+        }
+        if (!app->settings.enable_resample_a) {
+            if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
+                app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+                cxadc_settings_changed = true;
+            }
+        } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
+            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+            cxadc_settings_changed = true;
+        }
+        if (!app->settings.enable_resample_b) {
+            if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
+                app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+                cxadc_settings_changed = true;
+            }
+        } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
+            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
             cxadc_settings_changed = true;
         }
         if (cxadc_settings_changed) {
             gui_settings_save(&app->settings);
         }
     }
-#ifdef ENABLE_DDD
-    if (ddd_mode) {
-        // DdD is single-channel: force channel A on, channel B off. Channel B
-        // has no signal source (the 32-bit packed B field is always 0), so
-        // recording it would produce a silent empty file.
-        bool ddd_settings_changed = false;
+#if defined(ENABLE_DDD) || defined(ENABLE_FX3)
+    if (ddd_mode || fx3_mode) {
+        // DdD and FX3 are single-channel: force channel A on, channel B off.
+        // Channel B has no signal source, so recording it would only create a
+        // silent/empty output.
+        bool single_channel_settings_changed = false;
         if (!app->settings.capture_a) {
             app->settings.capture_a = true;
-            ddd_settings_changed = true;
+            single_channel_settings_changed = true;
         }
         if (app->settings.capture_b) {
             app->settings.capture_b = false;
-            ddd_settings_changed = true;
+            single_channel_settings_changed = true;
+            s_capture_b_forced_off_by_single_channel = true;
         }
-        if (ddd_settings_changed) {
+        if (single_channel_settings_changed) {
             gui_settings_save(&app->settings);
         }
     }
 #endif
+    if (!single_channel_device) {
+        bool restore_capture_b = false;
+        if (s_capture_b_forced_off_by_single_channel && !app->settings.capture_b) {
+            app->settings.capture_b = true;
+            restore_capture_b = true;
+        }
+        s_capture_b_forced_off_by_single_channel = false;
+        if (restore_capture_b) {
+            gui_settings_save(&app->settings);
+        }
+    }
     gui_ui_trace_capture_mode_state(app, "gui_ui_sync_capture_mode_state", false);
 }
 
@@ -875,6 +1339,32 @@ static Color ui_disabled_color(Color c) {
     // Dim and slightly transparent.
     return (Color){ (unsigned char)(c.r * 0.55f), (unsigned char)(c.g * 0.55f), (unsigned char)(c.b * 0.55f), (unsigned char)(c.a * 0.80f) };
 }
+static int gui_ui_clamp_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+static int gui_ui_measure_button_width(const gui_app_t *app,
+                                       const char *text,
+                                       int font_size,
+                                       int horizontal_padding,
+                                       int extra_width,
+                                       int min_width,
+                                       int max_width)
+{
+    Font font = GetFontDefault();
+    if (app && app->fonts && app->fonts[0].texture.id != 0) {
+        font = app->fonts[0];
+    }
+    if (!font.glyphs) {
+        font = GetFontDefault();
+    }
+    const char *safe_text = (text && text[0]) ? text : " ";
+    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    int measured_width = (int)ceilf(m.x) + (horizontal_padding * 2) + extra_width;
+    return gui_ui_clamp_int(measured_width, min_width, max_width);
+}
 
 static const char *rf_bits_label(uint8_t bits) {
     switch (bits) {
@@ -918,21 +1408,33 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 
-static float cycle_resample_khz(float current_khz) {
+static float cycle_resample_khz(float current_khz, float max_khz) {
     // User-facing presets (stored as kHz), including 40 MSPS passthrough base.
     static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 40000.0f };
     const int n = (int)(sizeof(presets_khz) / sizeof(presets_khz[0]));
+    if (max_khz < 5000.0f) max_khz = 5000.0f;
+
+    float allowed[n];
+    int allowed_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (presets_khz[i] <= max_khz + 0.5f) {
+            allowed[allowed_count++] = presets_khz[i];
+        }
+    }
+    if (allowed_count <= 0) {
+        return 5000.0f;
+    }
 
     // Find nearest preset (within 1 kHz), otherwise start from first.
     int idx = -1;
-    for (int i = 0; i < n; i++) {
-        if (fabsf(current_khz - presets_khz[i]) < 1.0f) {
+    for (int i = 0; i < allowed_count; i++) {
+        if (fabsf(current_khz - allowed[i]) < 1.0f) {
             idx = i;
             break;
         }
     }
-    if (idx < 0) return presets_khz[0];
-    return presets_khz[(idx + 1) % n];
+    if (idx < 0) return allowed[0];
+    return allowed[(idx + 1) % allowed_count];
 }
 
 static bool gui_ui_flac_affinity_supported(void) {
@@ -989,16 +1491,6 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.flac_affinity_cpu_list;
             *cap = sizeof(app->settings.flac_affinity_cpu_list);
             return true;
-        case UI_TEXT_FIELD_CX_LEVEL_A:
-        case UI_TEXT_FIELD_CX_LEVEL_B:
-        case UI_TEXT_FIELD_CX_CENTER_A:
-        case UI_TEXT_FIELD_CX_CENTER_B: {
-            int ch = gui_ui_cx_field_channel(field);
-            int slot = gui_ui_cx_field_slot(field);
-            *dst = s_cx_edit_buf[ch][slot];
-            *cap = sizeof(s_cx_edit_buf[ch][slot]);
-            return true;
-        }
         case UI_TEXT_FIELD_RF_TAG_A:
             *dst = app->settings.rf_channel_tags[0];
             *cap = sizeof(app->settings.rf_channel_tags[0]);
@@ -1109,19 +1601,6 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_INGEST_NOTES) {
         return s_metadata_window_open;
     }
-    // CX gain fields live only in the gear popover and, unlike everything else
-    // here, stay editable while capturing and recording: they change analogue
-    // gain that the driver re-applies on every read(), and touch no filename,
-    // header or buffer geometry.
-    if (gui_ui_field_is_cx(field)) {
-        int cx_ch = gui_ui_cx_field_channel(field);
-        if (!gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)cx_ch)) return false;
-        bool cx_has_b = false;
-        if (!gui_ui_selected_device_is_cxadc(app, &cx_has_b)) return false;
-        if (cx_ch == 1 && !cx_has_b) return false;
-        const cxp_card_t *card = gui_cxadc_params_get(cx_ch);
-        return card->present && card->writable;
-    }
     // The RF tag fields have a second home in the per-channel gear popover, so
     // they must be editable there without the settings panel being open. Same
     // rules otherwise: auto-naming supplies the filename these tags go into,
@@ -1176,10 +1655,6 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) {
         // Integer percent only.
-        return (ch >= '0' && ch <= '9');
-    }
-    if (gui_ui_field_is_cx(field)) {
-        // Unsigned integers; the write path clamps to the attribute's range.
         return (ch >= '0' && ch <= '9');
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) {
@@ -1643,6 +2118,41 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
             }
         }
     }
+#if defined(__ANDROID__)
+    {
+        char android_text[512];
+        size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+        bool finish_edit_requested = false;
+        if (android_len > 0) {
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach == '\r' || ach == '\n') {
+                    finish_edit_requested = true;
+                    continue;
+                }
+                if (ach == '\b' || ach == 127) {
+                    if (!gui_ui_text_delete_selection(dst)) {
+                        if (gui_ui_text_backspace(dst, &s_active_text_cursor)) changed = true;
+                    } else {
+                        changed = true;
+                    }
+                    continue;
+                }
+                if (primary_mod_down) continue;
+                if (!gui_ui_text_field_char_allowed(s_active_text_field, (int)ach)) continue;
+                if (gui_ui_text_delete_selection(dst)) changed = true;
+                if (gui_ui_text_insert_char(dst, cap, (int)ach)) changed = true;
+            }
+        }
+        if (finish_edit_requested) {
+            gui_ui_text_clamp_state(dst);
+            gui_settings_save(&app->settings);
+            gui_ui_clear_text_edit();
+            return;
+        }
+    }
+#endif
     int ch = GetCharPressed();
     while (ch > 0) {
         if (!primary_mod_down && gui_ui_text_field_char_allowed(s_active_text_field, ch)) {
@@ -1694,25 +2204,8 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
 
     gui_ui_text_clamp_state(dst);
 
-    // CX fields edit a scratch buffer, not app->settings, so per-keystroke
-    // saving would rewrite settings.json for nothing.
-    bool cx_field = gui_ui_field_is_cx(s_active_text_field);
-
-    if (changed && !cx_field) {
+    if (changed) {
         gui_settings_save(&app->settings);
-    }
-
-    if (cx_field) {
-        // Deliberate divergence from every other field here, which commits on
-        // both keys: a CX value goes to hardware, so Escape has to mean
-        // "discard" rather than "write whatever is in the box".
-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-            gui_ui_commit_cx_text_field(app, s_active_text_field);
-            gui_ui_clear_text_edit();
-        } else if (IsKeyPressed(KEY_ESCAPE)) {
-            gui_ui_clear_text_edit();  // buffer is refilled from the card on the next frame
-        }
-        return;
     }
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_ESCAPE)) {
@@ -1744,9 +2237,14 @@ static void render_settings_panel(gui_app_t *app) {
 #else
     bool settings_ddd_mode = false;
 #endif
-    // DdD is single-channel and single-card CXADC has no RF-B source.
+#ifdef ENABLE_FX3
+    bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+    bool settings_fx3_mode = false;
+#endif
+    // DdD/FX3 are single-channel and single-card CXADC has no RF-B source.
     // In both cases RF-B controls are disabled (grayed out).
-    bool settings_b_disabled = settings_ddd_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
+    bool settings_b_disabled = settings_ddd_mode || settings_fx3_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
     // CH-B settings controls (bits/tags/resample) are editable only when
     // channel B is both available and enabled for capture.
     bool settings_b_controls_disabled = settings_b_disabled || !app->settings.capture_b;
@@ -1766,7 +2264,7 @@ static void render_settings_panel(gui_app_t *app) {
     // Panel
     CLAY(CLAY_ID("SettingsPanel"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 760, .max = 1080), CLAY_SIZING_FIT(.min = 520, .max = 780) },
+            .sizing = { CLAY_SIZING_FIT(.min = 620, .max = 1080), CLAY_SIZING_FIT(.min = 420, .max = 780) },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { 16, 16, 16, 16 },
             .childGap = 12
@@ -1953,8 +2451,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // RF bit depth selector (moved up into Capture segment)
                         CLAY(CLAY_ID("CaptureRowSpacerA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
                         snprintf(settings_rf_bits_a_display, sizeof(settings_rf_bits_a_display), "%s-bit", rf_bits_label(app->settings.rf_bits_a));
-                        Color rf_bits_a_bg = settings_cxadc_mode ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rf_bits_a_fg = settings_cxadc_mode ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        Color rf_bits_a_bg = COLOR_BUTTON;
+                        Color rf_bits_a_fg = COLOR_TEXT;
                         CLAY(CLAY_ID("RfBitsABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_a_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_rf_bits_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_a_fg) }));
                         }
@@ -1981,8 +2479,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
 
                         CLAY(CLAY_ID("CaptureRowSpacerB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
                         snprintf(settings_rf_bits_b_display, sizeof(settings_rf_bits_b_display), "%s-bit", rf_bits_label(app->settings.rf_bits_b));
-                        Color rf_bits_b_bg = (settings_cxadc_mode || settings_b_controls_disabled) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rf_bits_b_fg = (settings_cxadc_mode || settings_b_controls_disabled) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        Color rf_bits_b_bg = settings_b_disabled ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color rf_bits_b_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("RfBitsBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_b_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_rf_bits_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_b_fg) }));
                         }
@@ -1997,6 +2495,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             }
                         }
                     }
+
 
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
@@ -2394,7 +2893,7 @@ static void render_record_limit_window(gui_app_t *app)
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(34) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 12
+                .childGap = 8
             }
         }) {
             CLAY(CLAY_ID("RecordLimitArmToggle"), {
@@ -2617,7 +3116,7 @@ static const char *gui_ui_device_type_name(device_type_t type) {
         case DEVICE_TYPE_SIMULATED:      return "Simulated";
         case DEVICE_TYPE_PLAYBACK:       return "Playback";
 #ifdef ENABLE_FX3
-        case DEVICE_TYPE_FX3:            return "FX3";
+        case DEVICE_TYPE_FX3:            return "FX3ADC";
 #endif
 #ifdef ENABLE_DDD
         case DEVICE_TYPE_DDD:            return "DdD";
@@ -2635,6 +3134,7 @@ static void render_version_info_window(gui_app_t *app)
     static char vi_state[24];
     static char vi_device[96];
     static char vi_rate[32];
+    static char vi_update_status[160];
 
     snprintf(vi_version, sizeof(vi_version), "%s", MIRSC_TOOLS_VERSION);
 
@@ -2661,6 +3161,24 @@ static void render_version_info_window(gui_app_t *app)
         snprintf(vi_rate, sizeof(vi_rate), "%.3f kSPS", (double)sr / 1000.0);
     } else {
         snprintf(vi_rate, sizeof(vi_rate), "%u Hz", sr);
+    }
+
+    Color update_status_color = COLOR_TEXT_DIM;
+    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+        snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
+    } else if (app->settings.update_last_release_tag[0]) {
+        int update_cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        if (update_cmp < 0) {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Available: %s", app->settings.update_last_release_tag);
+            update_status_color = COLOR_METER_YELLOW;
+        } else if (update_cmp == 0) {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Up to date (%s)", app->settings.update_last_release_tag);
+            update_status_color = COLOR_SYNC_GREEN;
+        } else {
+            snprintf(vi_update_status, sizeof(vi_update_status), "Running newer build (latest %s)", app->settings.update_last_release_tag);
+        }
+    } else {
+        snprintf(vi_update_status, sizeof(vi_update_status), "Not checked yet");
     }
     bool ab_swap_cxadc = gui_ui_selected_device_is_cxadc(app, NULL);
 #ifdef ENABLE_FX3
@@ -2730,7 +3248,7 @@ static void render_version_info_window(gui_app_t *app)
 
         // Version row
         CLAY(CLAY_ID("VersionInfoVersionRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
         }) {
             CLAY(CLAY_ID("VersionInfoVersionLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
                 CLAY_TEXT(CLAY_STRING("Version:"),
@@ -2738,6 +3256,37 @@ static void render_version_info_window(gui_app_t *app)
             }
             CLAY_TEXT(make_string(vi_version),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+            Color update_btn_bg = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? ui_disabled_color(COLOR_BUTTON)
+                : COLOR_BUTTON;
+            Color update_btn_fg = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? ui_disabled_color(COLOR_TEXT)
+                : COLOR_TEXT;
+            const char *update_btn_label = atomic_load_explicit(&s_update_check_running, memory_order_acquire)
+                ? "Checking..."
+                : "Check for Update";
+            CLAY(CLAY_ID("VersionInfoCheckUpdateButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(132), CLAY_SIZING_FIXED(24) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(update_btn_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(make_string(update_btn_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_btn_fg) }));
+            }
+        }
+
+        CLAY(CLAY_ID("VersionInfoUpdateRow"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+        }) {
+            CLAY(CLAY_ID("VersionInfoUpdateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                CLAY_TEXT(CLAY_STRING("Update:"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+            CLAY_TEXT(make_string(vi_update_status),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
         }
 
         // Capture state row
@@ -3247,211 +3796,341 @@ static void render_toolbar(gui_app_t *app) {
         version_icon_state = GUI_VERSION_ICON_CAPTURING;
     }
     s_version_icon_element.customData.version_icon.state = version_icon_state;
+    int toolbar_width = GetScreenWidth();
+    bool toolbar_tiny = toolbar_width < 760;
+    bool toolbar_ultra_narrow = toolbar_width < 900;
+    bool toolbar_very_narrow = toolbar_width < 1020;
+    bool toolbar_narrow = toolbar_width < 1180;
+    bool toolbar_medium = toolbar_width < 1360;
+    int toolbar_padding_h = toolbar_tiny ? 4 : 8;
+    int toolbar_gap = toolbar_tiny ? 2 : (toolbar_ultra_narrow ? 4 : (toolbar_very_narrow ? 6 : 12));
+    int toolbar_text_size = toolbar_very_narrow ? FONT_SIZE_DROPDOWN : FONT_SIZE_NORMAL;
+    int toolbar_icon_button_size = toolbar_tiny ? 28 : 32;
+    int toolbar_version_icon_size = toolbar_tiny ? 16 : 20;
+    int toolbar_metadata_icon_size = toolbar_tiny ? 14 : 18;
+    int device_dropdown_min_width = toolbar_tiny ? 100 : (toolbar_ultra_narrow ? 120 : (toolbar_very_narrow ? 138 : (toolbar_narrow ? 160 : 180)));
+    int device_dropdown_max_width = toolbar_tiny ? 170 : (toolbar_ultra_narrow ? 190 : (toolbar_very_narrow ? 210 : (toolbar_narrow ? 230 : 280)));
+    int device_dropdown_width = 0;
+    int connect_button_width = toolbar_tiny ? 52 : (toolbar_ultra_narrow ? 66 : (toolbar_very_narrow ? 82 : (toolbar_narrow ? 92 : 100)));
+    int mode_toggle_min_width = toolbar_tiny ? 58 : (toolbar_ultra_narrow ? 78 : (toolbar_very_narrow ? 96 : 112));
+    int mode_toggle_max_width = toolbar_tiny ? 118 : (toolbar_ultra_narrow ? 136 : (toolbar_very_narrow ? 156 : (toolbar_narrow ? 178 : 230)));
+    int mode_toggle_width = 0;
+    int audio_mon_width = toolbar_tiny ? 44 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 68 : 90));
+    int audio_ch_width = toolbar_tiny ? 46 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 64 : 70));
+    int record_button_width = toolbar_tiny ? 56 : (toolbar_ultra_narrow ? 68 : (toolbar_very_narrow ? 74 : 80));
+    int icon_button_size = toolbar_tiny ? 28 : 32;
+    int toolbar_center_gap = toolbar_narrow ? 4 : 0;
+    int dropdown_padding = toolbar_very_narrow ? 6 : 10;
+    int audio_bars_panel_width = toolbar_tiny ? 132 : (toolbar_ultra_narrow ? 164 : (toolbar_very_narrow ? 200 : 240));
+    int audio_meter_col_width = toolbar_tiny ? 30 : (toolbar_ultra_narrow ? 36 : (toolbar_very_narrow ? 44 : 54));
+    int audio_meter_width = toolbar_tiny ? 26 : (toolbar_ultra_narrow ? 30 : (toolbar_very_narrow ? 38 : 50));
+    int audio_meter_height = toolbar_tiny ? 6 : 8;
+    int audio_meter_gap = toolbar_tiny ? 2 : 4;
+    bool show_audio_meter_labels = !toolbar_tiny;
+    bool show_version_icon = !toolbar_ultra_narrow;
+    bool show_metadata_icon = true;
+    bool show_device_label = !toolbar_very_narrow;
+    bool show_audio_monitor_controls = true;
+    bool show_audio_level_bars = true;
+    const char *device_name = app->device_count > 0
+        ? app->devices[app->selected_device].name
+        : "No devices";
+    snprintf(device_dropdown_buf, sizeof(device_dropdown_buf), "%s", device_name);
+    device_dropdown_width = gui_ui_measure_button_width(app,
+                                                        device_dropdown_buf,
+                                                        toolbar_text_size,
+                                                        dropdown_padding,
+                                                        16,
+                                                        device_dropdown_min_width,
+                                                        device_dropdown_max_width);
+    bool cxadc_clockgen_mode = false;
+    bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_mode);
+    bool cxadc_misrc_clockgen_mode = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
+#ifdef ENABLE_FX3
+    bool fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+    bool fx3_mode = false;
+#endif
+#ifdef ENABLE_DDD
+    bool ddd_mode = gui_ui_selected_device_is_ddd(app);
+    bool ddd_clockgen_mode = gui_ui_selected_device_is_ddd_clockgen(app);
+#else
+    bool ddd_mode = false;
+    bool ddd_clockgen_mode = false;
+#endif
+    bool mode_source_runtime = app->is_recording;
+    bool mode_misrc = mode_source_runtime ? app->capture_mode_runtime_misrc
+                                          : app->user_capture_mode_misrc;
+    if (cxadc_mode || fx3_mode || ddd_mode) {
+        mode_misrc = false;
+    }
+    gui_ui_trace_capture_mode_render(app, mode_misrc, mode_source_runtime);
+    // Toggle is only clickable for hsdaoh/simple_capture backends where
+    // the MISRC/HSDAOH A/B-swap is meaningful.
+    bool mode_change_allowed = !app->is_recording && !cxadc_mode && !fx3_mode && !ddd_mode;
+    Color mode_bg = mode_misrc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+    if (!mode_change_allowed) {
+        mode_bg = ui_disabled_color(mode_bg);
+    }
+    Color mode_fg = mode_change_allowed ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+    const char *mode_label = NULL;
+    if (cxadc_mode) {
+        if (cxadc_clockgen_mode) {
+            mode_label = cxadc_misrc_clockgen_mode ? "Mode: MISRC Clockgen" : "Mode: CXADC Clockgen";
+        } else {
+            mode_label = "Mode: CXADC";
+        }
+    } else if (fx3_mode) {
+        mode_label = "Mode: FX3ADC";
+    } else if (ddd_mode) {
+        mode_label = ddd_clockgen_mode ? "Mode: DdD Clockgen" : "Mode: DdD";
+    } else {
+        mode_label = mode_misrc ? "Mode: MISRC" : "Mode: HSDAOH";
+    }
+    if (toolbar_tiny) {
+        if (cxadc_mode) {
+            mode_label = cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MiCg" : "CxCg")
+                : "CXA";
+        } else if (fx3_mode) {
+            mode_label = "FX3ADC";
+        } else if (ddd_mode) {
+            mode_label = ddd_clockgen_mode ? "DdDCg" : "DdD";
+        } else {
+            mode_label = mode_misrc ? "MIS" : "HSD";
+        }
+    } else if (toolbar_very_narrow) {
+        if (cxadc_mode) {
+            mode_label = cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MisClk" : "CxClk")
+                : "CXADC";
+        } else if (fx3_mode) {
+            mode_label = "FX3ADC";
+        } else if (ddd_mode) {
+            mode_label = ddd_clockgen_mode ? "DdDClk" : "DdD";
+        } else {
+            mode_label = mode_misrc ? "MISRC" : "HSDAOH";
+        }
+    }
+    mode_toggle_width = gui_ui_measure_button_width(app,
+                                                    mode_label,
+                                                    toolbar_text_size,
+                                                    6,
+                                                    16,
+                                                    mode_toggle_min_width,
+                                                    mode_toggle_max_width);
     CLAY(CLAY_ID("Toolbar"), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(48) },
             .layoutDirection = CLAY_LEFT_TO_RIGHT,
             .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-            .padding = { 8, 8, 8, 8 },
-            .childGap = 12
+            .padding = { toolbar_padding_h, toolbar_padding_h, 8, 8 },
+            .childGap = toolbar_gap
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
-        // Version/status icon (fixed 32x32, no variable-width text)
-        CLAY(CLAY_ID("VersionIconButton"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) },
-                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-            },
-            .backgroundColor = to_clay_color(COLOR_BUTTON),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY(CLAY_ID("VersionIcon"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(20), CLAY_SIZING_FIXED(20) } },
-                .custom = { .customData = &s_version_icon_element }
-            }) {}
+        // Version/status icon (fixed, compact-hidden in tiny layouts)
+        if (show_version_icon) {
+            CLAY(CLAY_ID("VersionIconButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(toolbar_icon_button_size), CLAY_SIZING_FIXED(toolbar_icon_button_size) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(COLOR_BUTTON),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY(CLAY_ID("VersionIcon"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(toolbar_version_icon_size), CLAY_SIZING_FIXED(toolbar_version_icon_size) } },
+                    .custom = { .customData = &s_version_icon_element }
+                }) {}
+            }
         }
-        CLAY(CLAY_ID("MetadataIconButton"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) },
-                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-            },
-            .backgroundColor = to_clay_color(COLOR_BUTTON),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY(CLAY_ID("MetadataIcon"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(18), CLAY_SIZING_FIXED(18) } },
-                .custom = { .customData = &s_metadata_icon_element }
-            }) {}
+        if (show_metadata_icon) {
+            CLAY(CLAY_ID("MetadataIconButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(toolbar_icon_button_size), CLAY_SIZING_FIXED(toolbar_icon_button_size) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(COLOR_BUTTON),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY(CLAY_ID("MetadataIcon"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(toolbar_metadata_icon_size), CLAY_SIZING_FIXED(toolbar_metadata_icon_size) } },
+                    .custom = { .customData = &s_metadata_icon_element }
+                }) {}
+            }
         }
 
         // Spacer
         CLAY(CLAY_ID("ToolbarSpacer1"), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(8), CLAY_SIZING_GROW(0) } }
+            .layout = { .sizing = { CLAY_SIZING_FIXED(show_metadata_icon ? 8 : (show_version_icon ? 4 : 0)), CLAY_SIZING_GROW(0) } }
         }) {}
 
         // Device label
-        CLAY_TEXT(CLAY_STRING("Device:"),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        if (show_device_label) {
+            CLAY_TEXT(CLAY_STRING("Device:"),
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
 
         // Device dropdown button
         bool device_dropdown_open = gui_dropdown_is_open(DROPDOWN_DEVICE, 0);
         Color dropdown_color = device_dropdown_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
         CLAY(CLAY_ID("DeviceDropdown"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(250), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(device_dropdown_width), CLAY_SIZING_FIXED(32) },
                 .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                .padding = { 10, 10, 0, 0 }
+                .padding = { dropdown_padding, dropdown_padding, 0, 0 }
             },
             .backgroundColor = to_clay_color(dropdown_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            const char *device_name = app->device_count > 0 ?
-                app->devices[app->selected_device].name : "No devices";
-            snprintf(device_dropdown_buf, sizeof(device_dropdown_buf), "%s", device_name);
             CLAY_TEXT(make_string(device_dropdown_buf),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
         }
 
         // Connect/Disconnect button (next to device dropdown)
         Color connect_color = app->is_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
+        const char *connect_label = app->is_capturing
+            ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
+            : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
         CLAY(CLAY_ID("ConnectButton"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
             .backgroundColor = to_clay_color(connect_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            CLAY_TEXT(app->is_capturing ? CLAY_STRING("Disconnect") : CLAY_STRING("Connect"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = { 255, 255, 255, 255 } }));
+            CLAY_TEXT(make_string(connect_label),
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = { 255, 255, 255, 255 } }));
         }
         // Capture mode toggle also selects HSDAOH backend at connect time:
         // MISRC -> raw/parser backend, HSDAOH -> upstream backend.
         // For non-hsdaoh USB backends (CXADC, FX3, DdD) the MISRC/HSDAOH A/B-swap
         // concept does not apply, so the toggle shows the backend name as the
         // mode label and is disabled.
-        bool cxadc_clockgen_mode = false;
-        bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_mode);
-#ifdef ENABLE_FX3
-        bool fx3_mode = gui_ui_selected_device_is_fx3(app);
-#else
-        bool fx3_mode = false;
-#endif
-#ifdef ENABLE_DDD
-        bool ddd_mode = gui_ui_selected_device_is_ddd(app);
-#else
-        bool ddd_mode = false;
-#endif
-        bool mode_source_runtime = app->is_recording;
-        bool mode_misrc = mode_source_runtime ? app->capture_mode_runtime_misrc
-                                              : app->user_capture_mode_misrc;
-        if (cxadc_mode || ddd_mode) {
-            mode_misrc = false;
-        }
-        gui_ui_trace_capture_mode_render(app, mode_misrc, mode_source_runtime);
-        // Toggle is only clickable for hsdaoh/simple_capture backends where
-        // the MISRC/HSDAOH A/B-swap is meaningful.
-        bool mode_change_allowed = !app->is_recording && !cxadc_mode && !fx3_mode && !ddd_mode;
-        Color mode_bg = mode_misrc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-        if (!mode_change_allowed) {
-            mode_bg = ui_disabled_color(mode_bg);
-        }
-        Color mode_fg = mode_change_allowed ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
         CLAY(CLAY_ID("CaptureModeToggle"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(185), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(mode_toggle_width), CLAY_SIZING_FIXED(32) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
             .backgroundColor = to_clay_color(mode_bg),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            const char *mode_label = NULL;
-            if (cxadc_mode) {
-                mode_label = cxadc_clockgen_mode ? "Mode: CXADC Clockgen" : "Mode: CXADC";
-            } else if (fx3_mode) {
-                mode_label = "Mode: FX3";
-            } else if (ddd_mode) {
-                mode_label = "Mode: DdD";
-            } else {
-                mode_label = mode_misrc ? "Mode: MISRC" : "Mode: HSDAOH";
-            }
             CLAY_TEXT(make_string(mode_label),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(mode_fg) }));
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(mode_fg) }));
         }
 
         // Spacer
         CLAY(CLAY_ID("ToolbarSpacer2"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
+            .layout = {
+                .sizing = {
+                    toolbar_medium ? CLAY_SIZING_FIXED(toolbar_center_gap) : CLAY_SIZING_GROW(0),
+                    CLAY_SIZING_GROW(0)
+                }
+            }
         }) {}
 
-        // Audio playback monitoring toggle
-        Color mon_bg = app->settings.audio_monitor_playback ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-        CLAY(CLAY_ID("AudioPlaybackToggle"), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-            .backgroundColor = to_clay_color(mon_bg),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY_TEXT(CLAY_STRING("Audio Mon"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+        if (show_audio_monitor_controls) {
+            // Audio playback monitoring toggle
+            Color mon_bg = app->settings.audio_monitor_playback ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            const char *audio_mon_label = toolbar_very_narrow ? "Mon" : "Audio Mon";
+            CLAY(CLAY_ID("AudioPlaybackToggle"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(audio_mon_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(mon_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(make_string(audio_mon_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            // Audio channel select (CH1/2 vs CH3/4)
+            Color ch_bg = app->settings.audio_monitor_ch34 ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+#if defined(_WIN32)
+            bool cxadc_win_audio_map = cxadc_mode;
+#else
+            bool cxadc_win_audio_map = false;
+#endif
+            const char *audio_ch_toggle_label = NULL;
+            if (cxadc_win_audio_map) {
+                audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                    ? (toolbar_ultra_narrow ? "HSW" : "HSW CH3")
+                    : (toolbar_ultra_narrow ? "A1/2" : "AUD 1/2");
+            } else {
+                audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                    ? (toolbar_ultra_narrow ? "3/4" : "CH3/4")
+                    : (toolbar_ultra_narrow ? "1/2" : "CH1/2");
+            }
+            CLAY(CLAY_ID("AudioChannelToggle"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(audio_ch_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(ch_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(make_string(audio_ch_toggle_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
         }
-        
-        // Audio channel select (CH1/2 vs CH3/4)
-        Color ch_bg = app->settings.audio_monitor_ch34 ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-        CLAY(CLAY_ID("AudioChannelToggle"), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(70), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-            .backgroundColor = to_clay_color(ch_bg),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY_TEXT(app->settings.audio_monitor_ch34 ? CLAY_STRING("CH3/4") : CLAY_STRING("CH1/2"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-        }
 
+        if (show_audio_level_bars) {
+            // 4 channel horizontal audio meters (compact for toolbar)
+            CLAY(CLAY_ID("AudioLevelBars"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(audio_bars_panel_width), CLAY_SIZING_FIXED(32) },
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .childGap = audio_meter_gap,
+                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                    .padding = { 4, 4, 4, 4 }
+                },
+                .backgroundColor = to_clay_color((Color){25,25,30,255}),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                // 4 horizontal meters in a row with labels
+                for (int i = 0; i < 4; i++) {
+                    uint32_t p = atomic_load(&app->audio_peak[i]);
+                    float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
+                    if (frac > 1.0f) frac = 1.0f;
+                    int fill_w = (int)(frac * (float)audio_meter_width);
+                    if (fill_w < 0) fill_w = 0;
+                    if (fill_w > audio_meter_width) fill_w = audio_meter_width;
 
-        // 4 channel horizontal audio meters (compact for toolbar)
-        CLAY(CLAY_ID("AudioLevelBars"), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(240), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 4, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 4, 4, 4, 4 } },
-            .backgroundColor = to_clay_color((Color){25,25,30,255}),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            // 4 horizontal meters in a row with labels
-            for (int i = 0; i < 4; i++) {
-                uint32_t p = atomic_load(&app->audio_peak[i]);
-                float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
-                if (frac > 1.0f) frac = 1.0f;
+                    // Color thresholds
+                    Color bar_col = (frac > 0.95f) ? COLOR_CLIP_RED : (frac > 0.75f) ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN;
 
-                const int meter_w = 50;
-                int fill_w = (int)(frac * (float)meter_w);
-                if (fill_w < 0) fill_w = 0;
-                if (fill_w > meter_w) fill_w = meter_w;
-
-                // Color thresholds
-                Color bar_col = (frac > 0.95f) ? COLOR_CLIP_RED : (frac > 0.75f) ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN;
-
-                // Column: channel label above meter
-                CLAY(CLAY_IDI("AudioMeterCol", i), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(54), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_TOP_TO_BOTTOM, .childGap = 1, .childAlignment = { .x = CLAY_ALIGN_X_CENTER } }
-                }) {
-                    // Channel label (CH1-CH4)
-                    snprintf(audio_ch_label[i], sizeof(audio_ch_label[i]), "CH%d", i + 1);
-                    CLAY(CLAY_IDI("AudioChLabel", i), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) } } }) {
-                        CLAY_TEXT(make_string(audio_ch_label[i]),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                    }
-
-                    // Horizontal meter bar container
-                    CLAY(CLAY_IDI("AudioMeter", i), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(meter_w), CLAY_SIZING_FIXED(8) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 0 },
-                        .backgroundColor = to_clay_color((Color){40,40,48,255}),
-                        .cornerRadius = CLAY_CORNER_RADIUS(2)
+                    // Column: channel label above meter
+                    CLAY(CLAY_IDI("AudioMeterCol", i), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(audio_meter_col_width), CLAY_SIZING_FIXED(24) },
+                            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                            .childGap = show_audio_meter_labels ? 1 : 0,
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER }
+                        }
                     }) {
-                        // Fill bar (left side)
-                        if (fill_w > 0) {
-                            CLAY(CLAY_IDI("AudioMeterFill", i), {
-                                .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
-                                .backgroundColor = to_clay_color(bar_col),
-                                .cornerRadius = CLAY_CORNER_RADIUS(2)
-                            }) { }
+                        // Channel label (CH1-CH4)
+                        if (show_audio_meter_labels) {
+                            snprintf(audio_ch_label[i], sizeof(audio_ch_label[i]), "CH%d", i + 1);
+                            CLAY(CLAY_IDI("AudioChLabel", i), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) } } }) {
+                                CLAY_TEXT(make_string(audio_ch_label[i]),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            }
+                        }
+
+                        // Horizontal meter bar container
+                        CLAY(CLAY_IDI("AudioMeter", i), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(audio_meter_width), CLAY_SIZING_FIXED(audio_meter_height) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childGap = 0
+                            },
+                            .backgroundColor = to_clay_color((Color){40,40,48,255}),
+                            .cornerRadius = CLAY_CORNER_RADIUS(2)
+                        }) {
+                            // Fill bar (left side)
+                            if (fill_w > 0) {
+                                CLAY(CLAY_IDI("AudioMeterFill", i), {
+                                    .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
+                                    .backgroundColor = to_clay_color(bar_col),
+                                    .cornerRadius = CLAY_CORNER_RADIUS(2)
+                                }) { }
+                            }
                         }
                     }
                 }
@@ -3484,18 +4163,28 @@ static void render_toolbar(gui_app_t *app) {
             record_label = (!app->is_capturing || playback_paused) ? "Play" : "Pause";
             record_color = playback_paused ? COLOR_SYNC_GREEN : COLOR_BUTTON_ACTIVE;
         }
+        const char *record_display_label = record_label;
+        if (!playback_mode && toolbar_very_narrow) {
+            if (record_finalizing) {
+                record_display_label = "Fin";
+            } else if (app->is_recording) {
+                record_display_label = "Stop";
+            } else {
+                record_display_label = "Rec";
+            }
+        }
         if (!app->is_capturing) record_color = (Color){ 50, 50, 55, 255 };
         CLAY(CLAY_ID("RecordButton"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(record_button_width), CLAY_SIZING_FIXED(32) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
             .backgroundColor = to_clay_color(record_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
             Color text_color = app->is_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
-            CLAY_TEXT(make_string(record_label),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_color) }));
+            CLAY_TEXT(make_string(record_display_label),
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(text_color) }));
         }
         // Record-limit button (normal mode) / Loop button (playback mode)
         bool playback_loop_on = playback_mode && gui_playback_get_loop(app);
@@ -3517,14 +4206,14 @@ static void render_toolbar(gui_app_t *app) {
         }
         CLAY(CLAY_ID("RecordLimitButton"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(icon_button_size), CLAY_SIZING_FIXED(icon_button_size) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
             .backgroundColor = to_clay_color(limit_button_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
             CLAY(CLAY_ID("RecordLimitIcon"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(record_limit_icon_size), CLAY_SIZING_FIXED(record_limit_icon_size) } },
+                .layout = { .sizing = { CLAY_SIZING_FIXED(toolbar_tiny ? (record_limit_icon_size - 3) : record_limit_icon_size), CLAY_SIZING_FIXED(toolbar_tiny ? (record_limit_icon_size - 3) : record_limit_icon_size) } },
                 .custom = { .customData = &s_record_limit_icon_element }
             }) {}
         }
@@ -3532,7 +4221,7 @@ static void render_toolbar(gui_app_t *app) {
         // Settings button
         CLAY(CLAY_ID("SettingsButton"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(32) },
+                .sizing = { CLAY_SIZING_FIXED(icon_button_size), CLAY_SIZING_FIXED(icon_button_size) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
             .backgroundColor = to_clay_color(app->settings_panel_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
@@ -3540,7 +4229,7 @@ static void render_toolbar(gui_app_t *app) {
         }) {
             // Font-independent settings icon (rendered as a custom Clay element)
             CLAY(CLAY_ID("SettingsIcon"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(18), CLAY_SIZING_FIXED(18) } },
+                .layout = { .sizing = { CLAY_SIZING_FIXED(toolbar_tiny ? 14 : 18), CLAY_SIZING_FIXED(toolbar_tiny ? 14 : 18) } },
                 .custom = { .customData = &s_settings_icon_element }
             }) {}
         }
@@ -3561,24 +4250,25 @@ static void render_toolbar(gui_app_t *app) {
 
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
 static void render_channel_stats(gui_app_t *app, int channel) {
+    int screen_w = GetScreenWidth();
+    int screen_h = GetScreenHeight();
+    bool quarter_scale_layout = (screen_w <= 1000 && screen_h <= 700);
     // Get per-channel stats
-    uint32_t clip_pos, clip_neg, errors;
+    uint32_t clip_pos, clip_neg;
     float peak_pos, peak_neg;
-    char *buf_peak_pos, *buf_peak_neg, *buf_clip_pos, *buf_clip_neg, *buf_errors;
+    char *buf_peak_pos, *buf_peak_neg, *buf_clip_pos, *buf_clip_neg;
     char *buf_rec_raw, *buf_rec_flac, *buf_rec_ratio, *buf_rec_duration;
     Color channel_value_color = (channel == 0) ? COLOR_CHANNEL_A : COLOR_CHANNEL_B;
 
     if (channel == 0) {
         clip_pos = atomic_load(&app->clip_count_a_pos);
         clip_neg = atomic_load(&app->clip_count_a_neg);
-        errors = atomic_load(&app->error_count_a);
         peak_pos = app->vu_a.peak_pos;
         peak_neg = app->vu_a.peak_neg;
         buf_peak_pos = stat_a_peak_pos;
         buf_peak_neg = stat_a_peak_neg;
         buf_clip_pos = stat_a_clip_pos;
         buf_clip_neg = stat_a_clip_neg;
-        buf_errors = stat_a_errors;
         buf_rec_raw = stat_rec_raw[0];
         buf_rec_flac = stat_rec_flac[0];
         buf_rec_ratio = stat_rec_ratio[0];
@@ -3586,14 +4276,12 @@ static void render_channel_stats(gui_app_t *app, int channel) {
     } else {
         clip_pos = atomic_load(&app->clip_count_b_pos);
         clip_neg = atomic_load(&app->clip_count_b_neg);
-        errors = atomic_load(&app->error_count_b);
         peak_pos = app->vu_b.peak_pos;
         peak_neg = app->vu_b.peak_neg;
         buf_peak_pos = stat_b_peak_pos;
         buf_peak_neg = stat_b_peak_neg;
         buf_clip_pos = stat_b_clip_pos;
         buf_clip_neg = stat_b_clip_neg;
-        buf_errors = stat_b_errors;
         buf_rec_raw = stat_rec_raw[1];
         buf_rec_flac = stat_rec_flac[1];
         buf_rec_ratio = stat_rec_ratio[1];
@@ -3605,7 +4293,6 @@ static void render_channel_stats(gui_app_t *app, int channel) {
     snprintf(buf_peak_neg, 16, "-%.0f%%", peak_neg * 100.0f);
     snprintf(buf_clip_pos, 16, "+%u", clip_pos);
     snprintf(buf_clip_neg, 16, "-%u", clip_neg);
-    snprintf(buf_errors, 16, "%u", errors);
 
     CLAY(CLAY_IDI("StatsPanel", channel), {
         .layout = {
@@ -3660,16 +4347,77 @@ static void render_channel_stats(gui_app_t *app, int channel) {
                 CLAY_TEXT(CLAY_STRING("RST"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(COLOR_TEXT) }));
             }
         }
+        if (gui_ui_selected_device_is_cxadc(app, NULL)) {
+            int card_idx = -1;
+            bool dc_card_available = gui_ui_map_cxadc_channel_to_card(app, channel, &card_idx);
+            Color dc_btn_bg = dc_card_available ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+            Color dc_btn_fg = dc_card_available ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
 
-        // Errors row
-        CLAY(CLAY_IDI("StatErrors", channel), { .layout = STAT_ROW_LAYOUT }) {
-            CLAY(CLAY_IDI("LblErrors", channel), { .layout = { .sizing = { CLAY_SIZING_FIXED(LABEL_WIDTH), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Errors:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            CLAY(CLAY_IDI("DcOffsetRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                CLAY(CLAY_IDI("LblDcOffset", channel), { .layout = { .sizing = { CLAY_SIZING_FIXED(LABEL_WIDTH), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("DC:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_IDI("DcOffsetDown", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("\\/"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
+                CLAY(CLAY_IDI("DcOffsetUp", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("/\\"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
             }
-            CLAY_TEXT(make_string(buf_errors),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+#if !defined(_WIN32)
+            // Capture gain. cxadc-win exposes no equivalent, so this row is
+            // Linux-only; the DC row above works on both. Unlike DC, the value
+            // is shown, because gain past CX_LEVEL_NOISE_WARN starts adding the
+            // front end's own noise and the operator needs to see where it sits.
+            int cx_level = dc_card_available ? gui_ui_cxadc_level_cached(card_idx, false) : -1;
+            char buf_cx_level[16];
+            if (cx_level >= 0) {
+                snprintf(buf_cx_level, sizeof(buf_cx_level), "%d", cx_level);
+            } else {
+                snprintf(buf_cx_level, sizeof(buf_cx_level), "--");
+            }
+            Color cx_level_fg = (cx_level > CX_LEVEL_NOISE_WARN) ? COLOR_CLIP_RED
+                              : (cx_level >= 0)                  ? COLOR_TEXT
+                                                                 : COLOR_TEXT_DIM;
+
+            CLAY(CLAY_IDI("CxLevelRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                CLAY(CLAY_IDI("LblCxLevel", channel), { .layout = { .sizing = { CLAY_SIZING_FIXED(LABEL_WIDTH), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Gain:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_IDI("CxLevelDown", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("\\/"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
+                CLAY(CLAY_IDI("CxLevelUp", channel), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(22), CLAY_SIZING_FIXED(18) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(dc_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("/\\"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(dc_btn_fg) }));
+                }
+                CLAY_TEXT(make_string(buf_cx_level),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(cx_level_fg) }));
+            }
+#endif
         }
+
 
         {
             uint64_t raw_bytes = (channel == 0)
@@ -3707,14 +4455,15 @@ static void render_channel_stats(gui_app_t *app, int channel) {
                     buf_rec_flac[0] = '\0';
                     buf_rec_ratio[0] = '\0';
                 }
-
                 CLAY(CLAY_IDI("RecDurationRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                     CLAY_TEXT(make_string(buf_rec_duration),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                 }
-                CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                    CLAY_TEXT(make_string(buf_rec_raw),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                if (!quarter_scale_layout) {
+                    CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                        CLAY_TEXT(make_string(buf_rec_raw),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                    }
                 }
                 if (buf_rec_flac[0]) {
                     CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
@@ -3931,6 +4680,10 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
     Color timeline_text_color = enabled ? COLOR_TEXT : COLOR_TEXT_DIM;
     Color timeline_track_color = enabled ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = enabled ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM;
+    int screen_width = GetScreenWidth();
+    int left_pad_width = screen_width < 900 ? 60 : 74;
+    int label_width = screen_width < 900 ? 120 : 150;
+    int right_pad_width = screen_width < 900 ? 0 : 189;
     CLAY(CLAY_IDI("PlaybackTimelineRow", channel_index), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) },
@@ -3940,7 +4693,7 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
         }
     }) {
         CLAY(CLAY_IDI("PlaybackTimelineLeftPad", channel_index), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(74), CLAY_SIZING_GROW(0) } }
+            .layout = { .sizing = { CLAY_SIZING_FIXED(left_pad_width), CLAY_SIZING_GROW(0) } }
         }) {}
 
         CLAY(CLAY_IDI("PlaybackTimeline", channel_index), {
@@ -3952,7 +4705,7 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
             }
         }) {
             CLAY(CLAY_IDI("PlaybackTimelineLabel", channel_index), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIT(0) } }
+                .layout = { .sizing = { CLAY_SIZING_FIXED(label_width), CLAY_SIZING_FIT(0) } }
             }) {
                 CLAY_TEXT(make_string(timeline_text),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(timeline_text_color) }));
@@ -3977,71 +4730,9 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
         }
 
         CLAY(CLAY_IDI("PlaybackTimelineRightPad", channel_index), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(189), CLAY_SIZING_GROW(0) } }
+            .layout = { .sizing = { CLAY_SIZING_FIXED(right_pad_width), CLAY_SIZING_GROW(0) } }
         }) {}
     }
-}
-
-// Render the channels panel - each channel has VU meter + waveform + stats grouped together
-// Push a CX value to the card and report the outcome.
-//
-// The write path clamps before writing and reads back afterwards; a successful
-// write() proves nothing, because the driver's store handlers return success
-// even when the value failed to parse, and two of the three attributes are
-// never range-checked in the kernel at all.
-//
-// A gain change during a recording is archivally significant, so it goes in
-// the capture log as well as the status line.
-static void gui_ui_cx_apply(gui_app_t *app, int channel, cxp_attr_t attr, int value) {
-    int readback = value;
-    cxp_status_t st = gui_cxadc_params_write_one(channel, attr, value, &readback);
-    const char *name = gui_cxadc_params_attr_name(attr);
-    char msg[160];
-
-    switch (st) {
-        case CXP_OK:
-            if (readback != value) {
-                snprintf(msg, sizeof(msg), "cxadc%d %s clamped to %d", channel, name, readback);
-            } else {
-                snprintf(msg, sizeof(msg), "cxadc%d %s = %d", channel, name, readback);
-            }
-            gui_app_set_status(app, msg);
-            if (app->is_recording) {
-                gui_record_log_capture_event(app, "INFO", msg, GUI_ERROR_CLASS_NONE, 0);
-            }
-            break;
-        case CXP_ERR_REJECTED:
-            snprintf(msg, sizeof(msg), "cxadc%d rejected %s (card still reports %d)",
-                     channel, name, readback);
-            gui_app_set_status(app, msg);
-            break;
-        case CXP_ERR_PERM:
-            snprintf(msg, sizeof(msg),
-                     "No write access to cxadc%d %s - add your user to the 'video' group",
-                     channel, name);
-            gui_app_set_status(app, msg);
-            break;
-        case CXP_ERR_NO_CARD:
-            snprintf(msg, sizeof(msg), "cxadc%d is not present", channel);
-            gui_app_set_status(app, msg);
-            break;
-        case CXP_ERR_NO_ATTR:
-            snprintf(msg, sizeof(msg), "cxadc driver does not expose '%s'", name);
-            gui_app_set_status(app, msg);
-            break;
-        default:
-            snprintf(msg, sizeof(msg), "cxadc%d: could not write %s", channel, name);
-            gui_app_set_status(app, msg);
-            break;
-    }
-}
-
-static void gui_ui_commit_cx_text_field(gui_app_t *app, ui_text_field_t field) {
-    int channel = gui_ui_cx_field_channel(field);
-    int slot = gui_ui_cx_field_slot(field);
-    const char *text = s_cx_edit_buf[channel][slot];
-    if (!text[0]) return;   // empty box: leave the card alone
-    gui_ui_cx_apply(app, channel, gui_ui_cx_field_attr(field), atoi(text));
 }
 
 // Click-and-hold repeat for the stepper buttons. The codebase's steppers are
@@ -4121,7 +4812,20 @@ static void render_channel_gear(gui_app_t *app, int channel) {
 
     bool cxadc_has_b = false;
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_has_b);
-    bool channel_b_missing = (channel == 1) && cxadc_mode && !cxadc_has_b;
+#ifdef ENABLE_DDD
+    bool gear_ddd_mode = gui_ui_selected_device_is_ddd(app);
+#else
+    bool gear_ddd_mode = false;
+#endif
+#ifdef ENABLE_FX3
+    bool gear_fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+    bool gear_fx3_mode = false;
+#endif
+    // Same rule as settings_b_disabled and the gear's click handler, so what
+    // renders disabled and what the handler refuses cannot drift apart.
+    bool channel_b_missing = (channel == 1) &&
+                             (gear_ddd_mode || gear_fx3_mode || (cxadc_mode && !cxadc_has_b));
 
     static char gear_title[32];
     snprintf(gear_title, sizeof(gear_title), "Channel %s", channel == 0 ? "A" : "B");
@@ -4316,245 +5020,24 @@ static void render_channel_gear(gui_app_t *app, int channel) {
             }
         }
 
-        // ---- CX values: only for a CXADC card that actually exists ----
-        if (!cxadc_mode || channel_b_missing) return;
-
-        const cxp_card_t *card = gui_cxadc_params_get(channel);
-        bool cx_editable = card->present && card->writable;
-
-        CLAY(CLAY_IDI("ChannelGearSep", channel), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } },
-            .backgroundColor = to_clay_color(COLOR_TEXT_DIM)
-        }) {}
-
-        CLAY_TEXT(CLAY_STRING("CX values"), CLAY_TEXT_CONFIG({
-            .fontSize = FONT_SIZE_STATS,
-            .textColor = to_clay_color(COLOR_TEXT_DIM)
-        }));
-
-        if (!card->present) {
-            CLAY_TEXT(make_string(card->last_error_text[0] ? card->last_error_text
-                                                           : "card not present"),
-                CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_STATS,
-                    .textColor = to_clay_color(COLOR_SYNC_RED)
-                }));
-            return;
-        }
-
-        // Level: [-] value [+], with the noise warning above 10.
-        static char cx_level_text[2][8];
-        int level_val = card->valid[CXP_ATTR_LEVEL] ? card->value[CXP_ATTR_LEVEL] : 0;
-        bool level_editing = gui_ui_is_text_field_active(
-            channel == 0 ? UI_TEXT_FIELD_CX_LEVEL_A : UI_TEXT_FIELD_CX_LEVEL_B);
-        if (!level_editing) {
-            snprintf(s_cx_edit_buf[channel][0], sizeof(s_cx_edit_buf[channel][0]), "%d", level_val);
-        }
-        snprintf(cx_level_text[channel], sizeof(cx_level_text[channel]), "%d", level_val);
-        Color level_fg = (level_val > CX_LEVEL_NOISE_WARN) ? COLOR_METER_YELLOW : COLOR_TEXT;
-        if (!cx_editable) level_fg = ui_disabled_color(level_fg);
-
-        CLAY(CLAY_IDI("ChannelGearLevelRow", channel), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 6,
-                .layoutDirection = CLAY_LEFT_TO_RIGHT
-            }
-        }) {
-            CLAY(CLAY_IDI("ChannelGearLevelLabel", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
-            }) {
-                CLAY_TEXT(CLAY_STRING("Level:"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM)
-                }));
-            }
-            CLAY(CLAY_IDI("ChannelGearLevelMinus", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(26), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(cx_editable ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            CLAY(CLAY_IDI("ChannelGearLevelField", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(48), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
-                            .padding = { 4, 4, 0, 0 } },
-                .backgroundColor = to_clay_color((Color){ 25, 25, 30, 255 }),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                if (level_editing) {
-                    gui_ui_render_active_text(
-                        channel == 0 ? UI_TEXT_FIELD_CX_LEVEL_A : UI_TEXT_FIELD_CX_LEVEL_B,
-                        s_cx_edit_buf[channel][0], FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(make_string(cx_level_text[channel]), CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_STATS, .fontId = 1,
-                        .textColor = to_clay_color(level_fg) }));
-                }
-            }
-            CLAY(CLAY_IDI("ChannelGearLevelPlus", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(26), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(cx_editable ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            if (level_val > CX_LEVEL_NOISE_WARN) {
-                CLAY_TEXT(CLAY_STRING("(>10 adds noise)"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_METER_YELLOW) }));
-            }
-        }
-
-        // 6 dB boost
-        bool sixdb_on = card->valid[CXP_ATTR_SIXDB] && card->value[CXP_ATTR_SIXDB] != 0;
-        CLAY(CLAY_IDI("ChannelGearSixdbRow", channel), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 8,
-                .layoutDirection = CLAY_LEFT_TO_RIGHT
-            }
-        }) {
-            CLAY(CLAY_IDI("ChannelGearSixdbLabel", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
-            }) {
-                CLAY_TEXT(CLAY_STRING("6 dB gain:"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            Color sx_bg = sixdb_on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-            CLAY(CLAY_IDI("ChannelGearSixdbToggle", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(cx_editable ? sx_bg : ui_disabled_color(sx_bg)),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(sixdb_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS,
-                                       .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-
-        // Center offset: [-] value [+]
-        static char cx_center_text[2][8];
-        int center_val = card->valid[CXP_ATTR_CENTER_OFFSET] ? card->value[CXP_ATTR_CENTER_OFFSET] : 0;
-        bool center_editing = gui_ui_is_text_field_active(
-            channel == 0 ? UI_TEXT_FIELD_CX_CENTER_A : UI_TEXT_FIELD_CX_CENTER_B);
-        if (!center_editing) {
-            snprintf(s_cx_edit_buf[channel][1], sizeof(s_cx_edit_buf[channel][1]), "%d", center_val);
-        }
-        snprintf(cx_center_text[channel], sizeof(cx_center_text[channel]), "%d", center_val);
-
-        CLAY(CLAY_IDI("ChannelGearCenterRow", channel), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 6,
-                .layoutDirection = CLAY_LEFT_TO_RIGHT
-            }
-        }) {
-            CLAY(CLAY_IDI("ChannelGearCenterLabel", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIT(0) } }
-            }) {
-                CLAY_TEXT(CLAY_STRING("Center off:"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_IDI("ChannelGearCenterMinus", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(26), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(cx_editable ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            CLAY(CLAY_IDI("ChannelGearCenterField", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(48), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
-                            .padding = { 4, 4, 0, 0 } },
-                .backgroundColor = to_clay_color((Color){ 25, 25, 30, 255 }),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                if (center_editing) {
-                    gui_ui_render_active_text(
-                        channel == 0 ? UI_TEXT_FIELD_CX_CENTER_A : UI_TEXT_FIELD_CX_CENTER_B,
-                        s_cx_edit_buf[channel][1], FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(make_string(cx_center_text[channel]), CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_STATS, .fontId = 1,
-                        .textColor = to_clay_color(cx_editable ? COLOR_TEXT
-                                                               : ui_disabled_color(COLOR_TEXT)) }));
-                }
-            }
-            CLAY(CLAY_IDI("ChannelGearCenterPlus", channel), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(26), CLAY_SIZING_FIXED(26) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(cx_editable ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({
-                    .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-
-        // ---- Read-only status ----
-        CLAY(CLAY_IDI("ChannelGearSep2", channel), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } },
-            .backgroundColor = to_clay_color(COLOR_TEXT_DIM)
-        }) {}
-
-        static char cx_status_a[2][96];
-        static char cx_status_b[2][96];
-        snprintf(cx_status_a[channel], sizeof(cx_status_a[channel]),
-                 "vmux %d   tenbit %d   tenxfsc %d",
-                 card->value[CXP_ATTR_VMUX], card->value[CXP_ATTR_TENBIT],
-                 card->value[CXP_ATTR_TENXFSC]);
-        double rate_hz = gui_cxadc_params_effective_rate_hz(card);
-        snprintf(cx_status_b[channel], sizeof(cx_status_b[channel]),
-                 "crystal %.3f MHz   rate %.3f MSPS",
-                 card->value[CXP_ATTR_CRYSTAL] / 1e6, rate_hz / 1e6);
-
-        CLAY_TEXT(make_string(cx_status_a[channel]), CLAY_TEXT_CONFIG({
-            .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1,
-            .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-        CLAY_TEXT(make_string(cx_status_b[channel]), CLAY_TEXT_CONFIG({
-            .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1,
-            .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-        static char cx_overrun[2][48];
-        snprintf(cx_overrun[channel], sizeof(cx_overrun[channel]),
-                 "overruns %d", card->value[CXP_ATTR_OVERRUN_COUNT]);
-        CLAY_TEXT(make_string(cx_overrun[channel]), CLAY_TEXT_CONFIG({
-            .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1,
-            .textColor = to_clay_color(card->value[CXP_ATTR_OVERRUN_COUNT] > 0
-                                       ? COLOR_CLIP_RED : COLOR_TEXT_DIM) }));
-
-        CLAY_TEXT(CLAY_STRING("vmux/tenbit/tenxfsc/crystal apply at capture start"),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP,
-                               .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-        if (card->last_error != CXP_OK && card->last_error_text[0]) {
-            CLAY_TEXT(make_string(card->last_error_text), CLAY_TEXT_CONFIG({
-                .fontSize = FONT_SIZE_VU_CLIP,
-                .textColor = to_clay_color(COLOR_SYNC_RED) }));
-        }
     }
 }
 
 static void render_channels_panel(gui_app_t *app) {
 #ifdef ENABLE_DDD
-    // DdD is single-channel: hide the Channel B row entirely so channel A
-    // expands to fill the preview area. Channel B has no signal source (the
-    // 32-bit packed B field is always 0), so showing it would just display a
-    // flat zero line and dead stats.
     bool ddd_single_channel = gui_ui_selected_device_is_ddd(app);
 #else
     bool ddd_single_channel = false;
 #endif
+#ifdef ENABLE_FX3
+    bool fx3_single_channel = gui_ui_selected_device_is_fx3(app);
+#else
+    bool fx3_single_channel = false;
+#endif
+    // DdD and FX3 are single-channel: hide the Channel B row and apply a
+    // natural fill layout for Channel A height (no reserved spacer/dead area).
+    bool single_channel_preview = ddd_single_channel || fx3_single_channel;
+    Clay_SizingAxis channel_a_height = CLAY_SIZING_GROW(0);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
 
     // Setup custom element data for this frame
@@ -4592,7 +5075,8 @@ static void render_channels_panel(gui_app_t *app) {
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG)
     }) {
-        const int playback_track_width_px = 300;
+        int screen_width = GetScreenWidth();
+        int playback_track_width_px = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
         int playback_fill_w_a = 0;
         int playback_fill_w_b = 0;
         bool playback_has_file_a = false;
@@ -4621,7 +5105,7 @@ static void render_channels_panel(gui_app_t *app) {
         // Channel A row: VU meter + waveform + stats
         CLAY(CLAY_ID("ChannelARow"), {
             .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                .sizing = { CLAY_SIZING_GROW(0), channel_a_height },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childGap = 4
             }
@@ -4644,9 +5128,8 @@ static void render_channels_panel(gui_app_t *app) {
         }
 
         // Channel B row: VU meter + waveform + stats
-        // Hidden entirely for DdD (single-channel device) — channel A expands
-        // to fill the full preview height instead.
-        if (!ddd_single_channel) {
+        // Hidden entirely for single-channel devices (DdD/FX3).
+        if (!single_channel_preview) {
             if (playback_mode) {
                 // Second playback scrub row aligned with Channel B preview.
                 render_playback_timeline_row(1, playback_timeline_display_b, playback_track_width_px, playback_fill_w_b, playback_has_file_b);
@@ -4680,6 +5163,34 @@ static void render_channels_panel(gui_app_t *app) {
 
 // Render status bar
 static void render_status_bar(gui_app_t *app) {
+    int status_width = GetScreenWidth();
+    int status_height = GetScreenHeight();
+    bool status_quarter_scale = (status_width <= 1000 && status_height <= 700);
+    bool status_compact = status_width < 1040;
+    bool status_narrow = status_width < 900;
+    bool status_tiny = status_width < 760;
+    bool show_sync_status = !status_tiny && !status_quarter_scale;
+    bool show_sample_rate = !status_tiny && !status_quarter_scale;
+    bool show_frame_count = !status_narrow;
+    bool show_missed_count = !status_narrow;
+    bool show_error_count = !status_narrow;
+    bool show_status_message = !status_tiny && !status_quarter_scale;
+    /* Keep free-space visible during normal startup/layout sizes; only hide on
+     * very tiny widths where preserving right-side counters takes priority. */
+    bool show_free_space = !status_tiny;
+    int sample_rate_value_width = status_narrow ? 68 : 80;
+    int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
+    int frames_value_width = 50;
+    int small_counter_width = 20;
+    int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
+    int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
+    int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
+    int status_left_gap = show_status_message ? (status_tiny ? 4 : 8) : 0;
+    int status_message_max_chars = status_narrow ? 16 : (status_compact ? 22 : 30);
+    int status_font_size = FONT_SIZE_STATUS - 1;
+    const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
+    const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
+    const char *samples_label = status_tiny ? "S:" : (status_narrow ? "Samp:" : "Samples:");
     update_status_free_space(app);
     CLAY(CLAY_ID("StatusBar"), {
         .layout = {
@@ -4687,112 +5198,177 @@ static void render_status_bar(gui_app_t *app) {
             .layoutDirection = CLAY_LEFT_TO_RIGHT,
             .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
             .padding = { 12, 12, 0, 0 },
-            .childGap = 20
+            .childGap = status_bar_gap
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
-        // Left side: Recording indicators / Status message
+        // Left side: status + free space/runway
         CLAY(CLAY_ID("StatusLeft"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 12
+                .childGap = status_left_gap
             }
         }) {
-            if (app->is_recording) {
+
+            // Recording indicator: red dot + live HH:MM:SS timer (restored
+            // from v1.1.4). Shown whenever recording (hidden in 1/4 compact
+            // mode where bottom-bar space is at a premium), regardless of the
+            // responsive status-message gating below, so the record timer is
+            // always visible in the bottom bar while a recording is active.
+            if (app->is_recording && !status_quarter_scale) {
                 CLAY(CLAY_ID("RecIndicator"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(12), CLAY_SIZING_FIXED(12) } },
                     .backgroundColor = to_clay_color(COLOR_CLIP_RED),
                     .cornerRadius = CLAY_CORNER_RADIUS(6)
                 }) {}
 
-                double duration = GetTime() - app->recording_start_time;
-                int hours = (int)(duration / 3600);
-                int mins = ((int)(duration / 60)) % 60;
-                int secs = ((int)duration) % 60;
-                snprintf(temp_buf1, sizeof(temp_buf1), "%02d:%02d:%02d", hours, mins, secs);
-                CLAY_TEXT(make_string(temp_buf1),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-            } else {
-                snprintf(temp_buf1, sizeof(temp_buf1), "%s", app->status_message);
-                CLAY_TEXT(make_string(temp_buf1),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                double rec_duration = GetTime() - app->recording_start_time;
+                int rec_hours = (int)(rec_duration / 3600);
+                int rec_mins  = ((int)(rec_duration / 60)) % 60;
+                int rec_secs  = ((int)rec_duration) % 60;
+                snprintf(status_record_timer_display, sizeof(status_record_timer_display),
+                         "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
+                CLAY_TEXT(make_string(status_record_timer_display),
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
             }
 
-            Color free_space_color = COLOR_TEXT_DIM;
-            if (s_status_free_space_valid) {
-                format_status_free_space_label(status_free_space_display, sizeof(status_free_space_display),
-                                               s_status_free_space_cached_bytes);
-                if (app->is_recording && s_status_output_rate_bps > 0.0) {
+            if (show_status_message) {
+                const char *raw_status = (app->status_message[0] != '\0')
+                    ? app->status_message
+                    : (app->is_capturing ? "Capturing..." : "Ready");
+                size_t max_chars = (size_t)status_message_max_chars;
+                size_t raw_len = strlen(raw_status);
+                if (raw_len > max_chars && max_chars > 3) {
+                    snprintf(status_message_display, sizeof(status_message_display), "%.*s...",
+                             (int)(max_chars - 3), raw_status);
+                } else {
+                    snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+                }
+                Color status_color = COLOR_TEXT_DIM;
+                if (strstr(raw_status, "denied") != NULL ||
+                    strstr(raw_status, "Denied") != NULL ||
+                    strstr(raw_status, "error") != NULL ||
+                    strstr(raw_status, "Error") != NULL ||
+                    strstr(raw_status, "failed") != NULL ||
+                    strstr(raw_status, "Failed") != NULL ||
+                    strstr(raw_status, "not granted") != NULL ||
+                    strstr(raw_status, "timed out") != NULL) {
+                    status_color = COLOR_CLIP_RED;
+                } else if (strstr(raw_status, "Requesting") != NULL ||
+                           strstr(raw_status, "Reconnecting") != NULL ||
+                           strstr(raw_status, "Waiting") != NULL ||
+                           strstr(raw_status, "Initializing") != NULL) {
+                    status_color = COLOR_METER_YELLOW;
+                }
+                CLAY(CLAY_ID("ConnectionStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childGap = status_compact ? 2 : 4
+                    }
+                }) {
+                    CLAY_TEXT(make_string(status_message_display),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(status_color) }));
+                }
+            }
+
+            if (show_free_space) {
+                Color free_space_color = COLOR_TEXT_DIM;
+                if (s_status_free_space_valid) {
                     char free_only[48];
                     char runway_hms[24];
-                    double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
                     format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
-                    format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
-                    snprintf(status_free_space_display, sizeof(status_free_space_display),
-                             "%s | Runway %s @ %.1f MB/s",
-                             free_only, runway_hms, s_status_output_rate_bps / (1024.0 * 1024.0));
-                }
-                if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
-                    free_space_color = COLOR_CLIP_RED;
-                } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
-                    free_space_color = COLOR_METER_YELLOW;
-                }
-            } else {
-                snprintf(status_free_space_display, sizeof(status_free_space_display), "Free: N/A");
-            }
+                    if (app->is_recording) {
+                        bool runway_known = s_status_output_rate_bps > 0.0;
+                        if (runway_known) {
+                            double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
+                            format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                        } else {
+                            snprintf(runway_hms, sizeof(runway_hms), "--:--:--");
+                        }
 
-            CLAY(CLAY_ID("FreeSpaceStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+                        if (status_tiny) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "Rwy %s", runway_hms);
+                        } else if (status_narrow || status_compact) {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Rwy %s", free_only, runway_hms);
+                        } else {
+                            snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                     "%s | Runway %s", free_only, runway_hms);
+                        }
+                    } else {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "%s", free_only);
+                    }
+                    if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
+                        free_space_color = COLOR_CLIP_RED;
+                    } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
+                        free_space_color = COLOR_METER_YELLOW;
+                    }
+                } else {
+                    if (app->is_recording) {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "Free: N/A | Runway --:--:--");
+                    } else {
+                        snprintf(status_free_space_display, sizeof(status_free_space_display),
+                                 "Free: N/A");
+                    }
                 }
-            }) {
-                CLAY_TEXT(make_string(status_free_space_display),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+
+                CLAY(CLAY_ID("FreeSpaceStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
+                    }
+                }) {
+                    CLAY_TEXT(make_string(status_free_space_display),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+                }
             }
         }
 
-        // Spacer to push right side to the right
+        // Flexible spacer between left and right sections.
         CLAY(CLAY_ID("StatusSpacer"), {
             .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
         }) {}
 
-        // Right side: Connection stats
+        // Right side: stream/capture counters
         CLAY(CLAY_ID("StatusRight"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 16
+                .childGap = status_right_gap
             }
         }) {
-            // Sync status indicator
-            bool synced = atomic_load(&app->stream_synced);
-            Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
-            CLAY(CLAY_ID("SyncStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .childGap = 4
+            if (show_sync_status) {
+                bool synced = atomic_load(&app->stream_synced);
+                Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
+                CLAY(CLAY_ID("SyncStatus"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childGap = 4
+                    }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Sync:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color) }));
                 }
-            }) {
-                CLAY_TEXT(CLAY_STRING("Sync:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(sync_color) }));
             }
-
-            // Sample rate (placed next to Sync status)
-            {
+            // Sample rate
+            if (show_sample_rate) {
                 uint32_t srate = atomic_load(&app->sample_rate);
                 if (srate > 0) {
                     format_live_msps_label(status_sample_rate_display, sizeof(status_sample_rate_display), srate);
                     CLAY(CLAY_ID("SampleRate"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIT(0) } }
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
                 }
             }
@@ -4819,40 +5395,41 @@ static void render_status_bar(gui_app_t *app) {
                         .childGap = 4
                     }
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Samples:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT(make_string(samples_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("SamplesValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(60), CLAY_SIZING_FIT(0) } }
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_samples_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                     }
                 }
-
-                // Frames count placed next to Samples
-                uint32_t frames = atomic_load(&app->frame_count);
-                snprintf(status_frames_display, sizeof(status_frames_display), "%u", frames);
-                CLAY(CLAY_ID("FrameStatus"), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
-                    }
-                }) {
-                    CLAY_TEXT(CLAY_STRING("Frames:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                    CLAY(CLAY_ID("FrameValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(50), CLAY_SIZING_FIT(0) } }
+                if (show_frame_count) {
+                    // Frames count placed next to Samples
+                    uint32_t frames = atomic_load(&app->frame_count);
+                    snprintf(status_frames_display, sizeof(status_frames_display), "%u", frames);
+                    CLAY(CLAY_ID("FrameStatus"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childGap = 4
+                        }
                     }) {
-                        CLAY_TEXT(make_string(status_frames_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                        CLAY_TEXT(CLAY_STRING("Frames:"),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY(CLAY_ID("FrameValue"), {
+                            .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
+                        }) {
+                            CLAY_TEXT(make_string(status_frames_display),
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
                     }
                 }
             }
 
             // Missed frames count
             uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
-            //if (missed > 0) {
+            if (show_missed_count) {
                 snprintf(status_missed_display, sizeof(status_missed_display), "%u", missed);
                 CLAY(CLAY_ID("MissedStatus"), {
                     .layout = {
@@ -4862,19 +5439,19 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Missed:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("MissedValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(20), CLAY_SIZING_FIT(0) } }
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_missed_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
                     }
                 }
-            //}
+            }
 
             // Total errors (single combined counter)
             uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
-            //if (errors > 0) {
+            if (show_error_count) {
                 snprintf(status_errors_display, sizeof(status_errors_display), "%u", errors);
                 CLAY(CLAY_ID("ErrorStatus"), {
                     .layout = {
@@ -4884,15 +5461,15 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Errors:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     CLAY(CLAY_ID("ErrorValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(20), CLAY_SIZING_FIT(0) } }
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_errors_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
                     }
                 }
-            //}
+            }
 
             // RF Buffer usage
             size_t rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
@@ -4908,14 +5485,14 @@ static void render_status_bar(gui_app_t *app) {
                     .childGap = 4
                 }
             }) {
-                CLAY_TEXT(CLAY_STRING("RF Buffer:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                CLAY_TEXT(make_string(rf_buffer_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 CLAY(CLAY_ID("RFBufValue"), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(35), CLAY_SIZING_FIT(0) } }
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_rf_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(rf_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color) }));
                 }
             }
 
@@ -4933,14 +5510,14 @@ static void render_status_bar(gui_app_t *app) {
                     .childGap = 4
                 }
             }) {
-                CLAY_TEXT(CLAY_STRING("Audio Buffer:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                CLAY_TEXT(make_string(audio_buffer_label),
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 CLAY(CLAY_ID("AudBufValue"), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(35), CLAY_SIZING_FIT(0) } }
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_aud_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(aud_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color) }));
                 }
             }
         }
@@ -4985,9 +5562,37 @@ void gui_render_layout(gui_app_t *app) {
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
+        int overlay_screen_width = GetScreenWidth();
+        bool overlay_toolbar_tiny = overlay_screen_width < 760;
+        bool overlay_toolbar_ultra_narrow = overlay_screen_width < 900;
+        bool overlay_toolbar_very_narrow = overlay_screen_width < 1020;
+        int overlay_text_size = overlay_toolbar_very_narrow ? FONT_SIZE_DROPDOWN : FONT_SIZE_NORMAL;
+        int overlay_padding = overlay_toolbar_very_narrow ? 6 : 10;
+        int overlay_row_height = overlay_toolbar_tiny ? 24 : 28;
+        int overlay_min_width = overlay_toolbar_tiny ? 100 : (overlay_toolbar_ultra_narrow ? 120 : (overlay_toolbar_very_narrow ? 138 : 160));
+        int overlay_max_width = overlay_toolbar_tiny ? 190 : (overlay_toolbar_ultra_narrow ? 220 : (overlay_toolbar_very_narrow ? 250 : 320));
+        int device_dropdown_overlay_width = overlay_min_width;
+        Clay_ElementData device_dropdown_data = Clay_GetElementData(CLAY_ID("DeviceDropdown"));
+        if (device_dropdown_data.found) {
+            device_dropdown_overlay_width = gui_ui_clamp_int((int)roundf(device_dropdown_data.boundingBox.width),
+                                                             overlay_min_width,
+                                                             overlay_max_width);
+        }
+        for (int i = 0; i < app->device_count; i++) {
+            int option_width = gui_ui_measure_button_width(app,
+                                                           app->devices[i].name,
+                                                           overlay_text_size,
+                                                           overlay_padding,
+                                                           16,
+                                                           overlay_min_width,
+                                                           overlay_max_width);
+            if (option_width > device_dropdown_overlay_width) {
+                device_dropdown_overlay_width = option_width;
+            }
+        }
         CLAY(CLAY_ID("DeviceDropdownOverlay"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(250), CLAY_SIZING_FIT(0) },
+                .sizing = { CLAY_SIZING_FIXED(device_dropdown_overlay_width), CLAY_SIZING_FIT(0) },
                 .layoutDirection = CLAY_TOP_TO_BOTTOM
             },
             .floating = {
@@ -5004,15 +5609,15 @@ void gui_render_layout(gui_app_t *app) {
 
                 CLAY(CLAY_IDI("DeviceOption", i), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(overlay_row_height) },
                         .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                        .padding = { 10, 10, 0, 0 }
+                        .padding = { overlay_padding, overlay_padding, 0, 0 }
                     },
                     .backgroundColor = to_clay_color(item_color)
                 }) {
                     // Use device name directly - it's already in persistent storage
                     CLAY_TEXT(make_string(app->devices[i].name),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN, .textColor = to_clay_color(COLOR_TEXT) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = overlay_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
             }
         }
@@ -5021,6 +5626,107 @@ void gui_render_layout(gui_app_t *app) {
     // Popup overlay (renders on top of everything)
     gui_popup_render();
 }
+
+#if defined(__ANDROID__)
+/* Per-frame poll for async Android results (USB permission + file/folder
+ * pickers). These run async so the render thread never blocks across a
+ * system Activity transition (permission dialog / SAF picker), which would
+ * destroy our EGL surface and hang the app on resume. */
+static void gui_ui_poll_android_results(gui_app_t *app)
+{
+    extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
+    extern int android_poll_usb_permission_result(int *out_granted);
+    extern int android_permission_pending(void);
+    extern int android_usb_has_fd(void);
+    extern int android_usb_device_present(void);
+
+    /* Re-enumerate the device list whenever the Java-reported physical USB
+     * presence changes, so the MS2130 entry appears when plugged in and
+     * disappears when unplugged (instead of being a permanent phantom that
+     * shifted selection and broke the Test Signal device). Skip while
+     * capturing or while a start/stop worker is in flight. */
+    static int s_last_usb_present = -1;
+    int usb_present_now = android_usb_device_present();
+    if (usb_present_now != s_last_usb_present) {
+        if (!app->is_capturing && !gui_app_capture_busy()) {
+            int prev_selected_type = -1;
+            if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+                prev_selected_type = (int)app->devices[app->selected_device].type;
+            }
+            gui_app_enumerate_devices(app);
+            /* Keep the user's selection on the same device type if possible
+             * (e.g. stay on Test Signal when the MS2130 appears). */
+            if (prev_selected_type >= 0) {
+                for (int i = 0; i < app->device_count; i++) {
+                    if ((int)app->devices[i].type == prev_selected_type) {
+                        app->selected_device = i;
+                        break;
+                    }
+                }
+            }
+            s_last_usb_present = usb_present_now;
+        }
+        /* else: retry on a later frame once capture/start/stop settles */
+    }
+
+    /* Picker results -> apply to settings. */
+    int pkind = 0, pok = 0;
+    char ppath[512];
+    if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
+        fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
+                pkind, pok, ppath);
+        if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
+            if (pok && ppath[0]) {
+                snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", ppath);
+                gui_settings_save(&app->settings);
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Output folder set: %s", ppath);
+                gui_app_set_status(app, msg);
+            } else if (pok) {
+                /* ok but empty path: use the scoped-storage-exempt app dir. */
+                const char *def = android_get_storage_path();
+                if (def && def[0]) {
+                    snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", def);
+                    gui_settings_save(&app->settings);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Output folder set (app dir): %s", def);
+                    gui_app_set_status(app, msg);
+                } else {
+                    gui_app_set_status(app, "No folder selected");
+                }
+            } else {
+                gui_app_set_status(app, "No folder selected");
+            }
+        } else if (pkind == 2 || pkind == 3) { /* PLAYBACK_A / PLAYBACK_B */
+            if (pok && ppath[0]) {
+                char *dst = (pkind == 3) ? app->settings.playback_file_b : app->settings.playback_file_a;
+                snprintf(dst, sizeof(app->settings.playback_file_a), "%s", ppath);
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, (pkind == 3) ? "Channel B playback file set" : "Channel A playback file set");
+            } else {
+                gui_app_set_status(app, "No file selected");
+            }
+        }
+    }
+
+    /* USB permission result -> complete the connect that the Connect button
+     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
+     * capture startup on a worker thread so the render loop stays alive. */
+    if (android_permission_pending()) {
+        int granted = 0;
+        if (android_poll_usb_permission_result(&granted)) {
+            if (granted && android_usb_has_fd()) {
+                gui_app_set_status(app, "USB permission granted, starting capture...");
+                gui_app_start_capture_async(app);
+            } else {
+                gui_app_set_status(app, "USB permission denied or no USB capture device found");
+                app->reconnect_pending = false;
+                app->reconnect_attempts = 0;
+            }
+        }
+    }
+}
+#endif
 
 // Handle UI interactions
 // Close the panel's own Mode/Trig overlay dropdowns for a channel. They live in
@@ -5054,8 +5760,23 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
 #else
     bool ddd_mode = false;
 #endif
-    bool b_missing = (channel == 1) && (ddd_mode || (cxadc_mode && !cxadc_has_b));
+#ifdef ENABLE_FX3
+    bool fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+    bool fx3_mode = false;
+#endif
+    // Must match settings_b_disabled in the settings panel exactly. When it
+    // did not, the gear would happily flip capture_b on a single-channel FX3
+    // while the panel refused, and gui_ui_sync_capture_mode_state -- which now
+    // runs every frame -- stomped the change back the same frame.
+    bool b_missing = (channel == 1) && (ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_b));
     bool locked = gui_ui_settings_locked(app);
+    // CXADC in tenbit mode captures at 20 MSps, not 40. Falling back to the
+    // literal here left the gear writing a rate the panel would re-clamp on
+    // the next frame, taking a settings.json write with it.
+    float base_rate_a_khz = cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, 0) : 40000.0f;
+    float base_rate_b_khz = cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, cxadc_has_b ? 1 : 0)
+                                       : 40000.0f;
 
     if (Clay_PointerOver(CLAY_IDI("ChannelGearRecordToggle", channel))) {
         if (locked) {
@@ -5076,7 +5797,7 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
             // otherwise a disabled channel keeps a rate that goes nowhere.
             if (!app->settings.capture_b) {
                 app->settings.enable_resample_b = false;
-                app->settings.resample_rate_b = 40000.0f;
+                app->settings.resample_rate_b = base_rate_b_khz;
             }
         }
         gui_settings_save(&app->settings);
@@ -5104,51 +5825,14 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
         if (channel == 0) {
             bool enable = !app->settings.enable_resample_a;
             app->settings.enable_resample_a = enable;
-            if (!enable) app->settings.resample_rate_a = 40000.0f;
+            if (!enable) app->settings.resample_rate_a = base_rate_a_khz;
         } else {
             bool enable = !app->settings.enable_resample_b;
             app->settings.enable_resample_b = enable;
-            if (!enable) app->settings.resample_rate_b = 40000.0f;
+            if (!enable) app->settings.resample_rate_b = base_rate_b_khz;
         }
         gui_settings_save(&app->settings);
         return;
-    }
-
-    // CX controls. Deliberately NOT gated on is_recording: these change
-    // analogue gain that the driver re-applies on every read(), and touch no
-    // filename, header or buffer geometry.
-    if (cxadc_mode && !b_missing) {
-        const cxp_card_t *card = gui_cxadc_params_get(channel);
-        bool cx_editable = card->present && card->writable;
-
-        bool over_cx = Clay_PointerOver(CLAY_IDI("ChannelGearSixdbToggle", channel)) ||
-                       Clay_PointerOver(CLAY_IDI("ChannelGearLevelField", channel)) ||
-                       Clay_PointerOver(CLAY_IDI("ChannelGearCenterField", channel));
-
-        if (!cx_editable && over_cx) {
-            gui_app_set_status(app, card->last_error_text[0] ? card->last_error_text
-                                                             : "cxadc parameters are not writable");
-            return;
-        }
-
-        if (cx_editable && Clay_PointerOver(CLAY_IDI("ChannelGearSixdbToggle", channel))) {
-            int cur = card->valid[CXP_ATTR_SIXDB] ? card->value[CXP_ATTR_SIXDB] : 0;
-            gui_ui_cx_apply(app, channel, CXP_ATTR_SIXDB, cur ? 0 : 1);
-            return;
-        }
-
-        if (cx_editable && Clay_PointerOver(CLAY_IDI("ChannelGearLevelField", channel))) {
-            gui_ui_begin_text_edit(app,
-                channel == 0 ? UI_TEXT_FIELD_CX_LEVEL_A : UI_TEXT_FIELD_CX_LEVEL_B,
-                CLAY_IDI("ChannelGearLevelField", channel), 4.0f, 4.0f);
-            return;
-        }
-        if (cx_editable && Clay_PointerOver(CLAY_IDI("ChannelGearCenterField", channel))) {
-            gui_ui_begin_text_edit(app,
-                channel == 0 ? UI_TEXT_FIELD_CX_CENTER_A : UI_TEXT_FIELD_CX_CENTER_B,
-                CLAY_IDI("ChannelGearCenterField", channel), 4.0f, 4.0f);
-            return;
-        }
     }
 
     if (Clay_PointerOver(CLAY_IDI("ChannelGearTagField", channel))) {
@@ -5171,39 +5855,62 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
     }
 }
 
-// Stepper buttons need IsMouseButtonDown for hold-repeat, so unlike every
-// other control here they cannot live inside the IsMouseButtonPressed block.
-// Returns true if a stepper is being held, so the caller can consume the click.
-static bool gui_ui_handle_channel_gear_steppers(gui_app_t *app) {
-    bool cxadc_has_b = false;
-    if (!gui_ui_selected_device_is_cxadc(app, &cxadc_has_b)) return false;
+// The gain steppers need IsMouseButtonDown for hold-repeat, so unlike every
+// other control in the stats panel they cannot live inside the
+// IsMouseButtonPressed block. Returns true if a stepper is being held, so the
+// caller can consume the click.
+//
+// Deliberately NOT gated on is_recording: gain is analogue, the driver
+// re-applies it on every read(), and it touches no filename, header or buffer
+// geometry. A gain change mid-recording is archivally significant though, so
+// it goes in the capture log as well as the status line.
+static bool gui_ui_handle_cxadc_level_steppers(gui_app_t *app) {
+#if defined(_WIN32)
+    (void)app;
+    return false;
+#else
+    if (!gui_ui_selected_device_is_cxadc(app, NULL)) return false;
 
     bool active = false;
     for (int ch = 0; ch < 2; ch++) {
-        if (!gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)ch)) continue;
-        if (ch == 1 && !cxadc_has_b) continue;
-
-        const cxp_card_t *card = gui_cxadc_params_get(ch);
-        if (!card->present || !card->writable) continue;
+        int card_idx = -1;
+        if (!gui_ui_map_cxadc_channel_to_card(app, ch, &card_idx)) continue;
 
         int step = 1;
-        if (gui_ui_repeat_button(CLAY_IDI("ChannelGearLevelMinus", ch), &step)) {
-            gui_ui_cx_apply(app, ch, CXP_ATTR_LEVEL, card->value[CXP_ATTR_LEVEL] - step);
-            active = true;
-        } else if (gui_ui_repeat_button(CLAY_IDI("ChannelGearLevelPlus", ch), &step)) {
-            gui_ui_cx_apply(app, ch, CXP_ATTR_LEVEL, card->value[CXP_ATTR_LEVEL] + step);
-            active = true;
-        } else if (gui_ui_repeat_button(CLAY_IDI("ChannelGearCenterMinus", ch), &step)) {
-            gui_ui_cx_apply(app, ch, CXP_ATTR_CENTER_OFFSET,
-                            card->value[CXP_ATTR_CENTER_OFFSET] - step);
-            active = true;
-        } else if (gui_ui_repeat_button(CLAY_IDI("ChannelGearCenterPlus", ch), &step)) {
-            gui_ui_cx_apply(app, ch, CXP_ATTR_CENTER_OFFSET,
-                            card->value[CXP_ATTR_CENTER_OFFSET] + step);
-            active = true;
+        int delta = 0;
+        if (gui_ui_repeat_button(CLAY_IDI("CxLevelDown", ch), &step)) {
+            delta = -step;
+        } else if (gui_ui_repeat_button(CLAY_IDI("CxLevelUp", ch), &step)) {
+            delta = step;
+        } else {
+            continue;
+        }
+        active = true;
+
+        int applied = 0;
+        if (gui_cxadc_adjust_level(card_idx, delta, &applied) == 0) {
+            (void)gui_ui_cxadc_level_cached(card_idx, true);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "CH %c cxadc%d gain = %d%s",
+                     (ch == 0) ? 'A' : 'B', card_idx, applied,
+                     (applied > CX_LEVEL_NOISE_WARN) ? " (front-end noise)" : "");
+            gui_app_set_status(app, msg);
+            if (app->is_recording) {
+                gui_record_log_capture_event(app, "INFO", msg, GUI_ERROR_CLASS_NONE, 0);
+            }
+        } else if (errno == EACCES || errno == EPERM) {
+            gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+        } else if (errno == ERANGE) {
+            // The driver's store handler accepted the write but the register
+            // did not take the value; re-read so the row stops lying.
+            (void)gui_ui_cxadc_level_cached(card_idx, true);
+            gui_app_set_status(app, "cxadc rejected the gain value");
+        } else {
+            gui_app_set_status(app, "Failed to update CXADC gain");
         }
     }
     return active;
+#endif
 }
 
 // Returns true when the click was consumed.
@@ -5255,8 +5962,12 @@ static bool gui_ui_handle_channel_gear_click(gui_app_t *app) {
 void gui_handle_interactions(gui_app_t *app) {
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
+#if defined(__ANDROID__)
+    gui_ui_poll_android_results(app);
+#endif
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
+    gui_ui_update_check_tick(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
     if (playback_mode) {
         s_record_limit_window_open = false;
@@ -5335,6 +6046,29 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && s_record_limit_timecode_edit) {
         gui_ui_clear_text_edit();
         s_record_limit_cursor_char = record_limit_nearest_digit_cursor_char(s_record_limit_cursor_char);
+#if defined(__ANDROID__)
+        {
+            char android_text[128];
+            size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
+            for (size_t i = 0; i < android_len; i++) {
+                unsigned char ach = (unsigned char)android_text[i];
+                if (ach == '\0') break;
+                if (ach >= '0' && ach <= '9') {
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = (char)ach;
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, +1);
+                } else if (ach == ':' || ach == '/') {
+                    if (s_record_limit_cursor_char <= 1) {
+                        s_record_limit_cursor_char = 3;
+                    } else if (s_record_limit_cursor_char <= 4) {
+                        s_record_limit_cursor_char = 6;
+                    }
+                } else if (ach == '\b' || ach == 127) {
+                    s_record_limit_cursor_char = record_limit_move_cursor_char(s_record_limit_cursor_char, -1);
+                    s_record_limit_timecode_edit_buffer[s_record_limit_cursor_char] = '0';
+                }
+            }
+        }
+#endif
 
         int ch = GetCharPressed();
         while (ch > 0) {
@@ -5413,22 +6147,9 @@ void gui_handle_interactions(gui_app_t *app) {
         }
     }
 
-    // Keep the CX cache fresh. Costs nothing unless a CXADC is selected, and
-    // the driver mutates these values behind us (level is re-clamped on every
-    // read, tenxfsc is rewritten at open), so polling is not optional.
-    {
-        bool cx_has_b = false;
-        bool cx_mode = gui_ui_selected_device_is_cxadc(app, &cx_has_b);
-        int focus = -1;
-        if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0)) focus = 0;
-        else if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)) focus = 1;
-        gui_cxadc_params_tick(cx_mode, GetTime(), focus >= 0, focus,
-                              app->is_capturing || app->is_recording);
-    }
-
     // Steppers use hold-repeat, so they need IsMouseButtonDown and cannot sit
     // inside the press-only block below.
-    if (gui_ui_handle_channel_gear_steppers(app)) {
+    if (gui_ui_handle_cxadc_level_steppers(app)) {
         gui_ui_set_click_consumed();
         return;
     }
@@ -5442,6 +6163,18 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
+            if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
+                gui_ui_process_update_check_result(app);
+                if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+                    gui_app_set_status(app, "Update check already running");
+                } else if (gui_ui_start_update_check(true)) {
+                    gui_app_set_status(app, "Checking for updates...");
+                } else {
+                    gui_app_set_status(app, "Unable to start update check");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCorePinningToggle"))) {
                 app->settings.show_core_pinning_in_settings = !app->settings.show_core_pinning_in_settings;
                 if (!app->settings.show_core_pinning_in_settings && s_active_text_field == UI_TEXT_FIELD_FLAC_AFFINITY) {
@@ -5786,6 +6519,8 @@ void gui_handle_interactions(gui_app_t *app) {
         bool mode_toggle_hit = Clay_PointerOver(CLAY_ID("CaptureModeToggle"));
         bool mode_toggle_cxadc_clockgen = false;
         bool mode_toggle_is_cxadc = gui_ui_selected_device_is_cxadc(app, &mode_toggle_cxadc_clockgen);
+        bool mode_toggle_is_cxadc_misrc_clockgen = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
+        bool mode_toggle_is_misrc_clockgen = gui_ui_selected_device_is_misrc_clockgen(app);
 #ifdef ENABLE_FX3
         bool mode_toggle_is_fx3 = gui_ui_selected_device_is_fx3(app);
 #else
@@ -5809,23 +6544,62 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (app->is_capturing) {
+#if defined(__ANDROID__)
+                /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
+                 * hang joining libusb/libuvc threads; never block the render
+                 * thread on it. */
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
             } else {
+#if defined(__ANDROID__)
+                /* Async USB permission: never block the render thread on the
+                 * system permission dialog (a separate Activity that destroys
+                 * our EGL surface mid-block). If the fd is already granted,
+                 * start capture now; otherwise launch the async permission
+                 * request and let the per-frame poll complete the connect. */
+                extern int android_usb_has_fd(void);
+                extern int android_request_usb_permission_async(void);
+                extern int android_permission_pending(void);
+                extern void android_usb_clear_fd(void);
+                if (android_usb_has_fd()) {
+                    /* fd already granted: start capture on a worker thread so
+                     * the render loop stays responsive during hsdaoh_open. */
+                    gui_app_start_capture_async(app);
+                    app->reconnect_pending = false;
+                    app->reconnect_attempts = 0;
+                } else if (!android_permission_pending()) {
+                    android_usb_clear_fd();
+                    if (android_request_usb_permission_async()) {
+                        gui_app_set_status(app, "Requesting USB permission...");
+                    } else {
+                        gui_app_set_status(app, "USB permission request failed to start");
+                    }
+                }
+#else
                 if (gui_app_start_capture(app) == 0) {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
                 }
+#endif
             }
         }
         if (mode_toggle_hit) {
-            if (mode_toggle_is_cxadc) {
-                gui_app_set_status(app, mode_toggle_cxadc_clockgen
-                    ? "CXADC Clockgen mode is fixed by detected card count"
-                    : "CXADC mode is fixed by detected card count");
+            if (mode_toggle_is_misrc_clockgen) {
+                gui_app_set_status(app, "MISRC Clockgen mode is selected from the device list");
+            } else if (mode_toggle_is_cxadc) {
+                if (mode_toggle_cxadc_clockgen) {
+                    gui_app_set_status(app, mode_toggle_is_cxadc_misrc_clockgen
+                        ? "MISRC Clockgen mode is selected from the device list"
+                        : "CXADC Clockgen mode is selected from the device list");
+                } else {
+                    gui_app_set_status(app, "CXADC mode is selected from the device list");
+                }
             } else if (mode_toggle_is_fx3) {
-                gui_app_set_status(app, "FX3 backend selected; MISRC/HSDAOH mode not applicable");
+                gui_app_set_status(app, "FX3ADC backend selected; MISRC/HSDAOH mode not applicable");
             } else if (mode_toggle_is_ddd) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
             } else if (app->is_recording) {
@@ -5879,13 +6653,40 @@ void gui_handle_interactions(gui_app_t *app) {
 
         // Audio playback monitoring toggle
         if (Clay_PointerOver(CLAY_ID("AudioPlaybackToggle"))) {
-            gui_audio_set_playback_enabled(app, !app->settings.audio_monitor_playback);
+            bool enable = !app->settings.audio_monitor_playback;
+            gui_audio_set_playback_enabled(app, enable);
+            bool mon_cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+            if (mon_cxadc_mode) {
+                gui_app_set_status(app, enable
+                    ? "CXADC audio monitoring enabled"
+                    : "CXADC audio monitoring disabled");
+            } else {
+                gui_app_set_status(app, enable
+                    ? "Audio monitoring enabled"
+                    : "Audio monitoring disabled");
+            }
         }
         
-        // Audio channel select toggle (CH1/2 vs CH3/4)
+        // Audio channel select toggle
         if (Clay_PointerOver(CLAY_ID("AudioChannelToggle"))) {
             app->settings.audio_monitor_ch34 = !app->settings.audio_monitor_ch34;
             gui_settings_save(&app->settings);
+#if defined(_WIN32)
+            bool mon_cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+            if (mon_cxadc_mode) {
+                gui_app_set_status(app, app->settings.audio_monitor_ch34
+                    ? "CXADC monitor source: headswitch (CH3)"
+                    : "CXADC monitor source: audio pair (CH1/2)");
+            } else {
+                gui_app_set_status(app, app->settings.audio_monitor_ch34
+                    ? "Audio monitor source: CH3/4"
+                    : "Audio monitor source: CH1/2");
+            }
+#else
+            gui_app_set_status(app, app->settings.audio_monitor_ch34
+                ? "Audio monitor source: CH3/4"
+                : "Audio monitor source: CH1/2");
+#endif
         }
 
         // Check record button - UI indicates record-write to disk finialization
@@ -5931,6 +6732,69 @@ void gui_handle_interactions(gui_app_t *app) {
             atomic_store(&app->clip_count_b_pos, 0);
             atomic_store(&app->clip_count_b_neg, 0);
         }
+        if (gui_ui_selected_device_is_cxadc(app, NULL)) {
+            const int dc_step = 1;
+            if (app->selected_device != s_cxadc_dc_anchor_device_index) {
+                s_cxadc_dc_anchor_device_index = app->selected_device;
+                memset(s_cxadc_dc_anchor_valid, 0, sizeof(s_cxadc_dc_anchor_valid));
+                memset(s_cxadc_dc_anchor_raw, 0, sizeof(s_cxadc_dc_anchor_raw));
+                memset(s_cxadc_dc_relative, 0, sizeof(s_cxadc_dc_relative));
+            }
+            for (int ch = 0; ch < 2; ch++) {
+                bool dc_down = Clay_PointerOver(CLAY_IDI("DcOffsetDown", ch));
+                bool dc_up = Clay_PointerOver(CLAY_IDI("DcOffsetUp", ch));
+                if (!dc_down && !dc_up) continue;
+                int card_idx = -1;
+                if (!gui_ui_map_cxadc_channel_to_card(app, ch, &card_idx)) {
+                    gui_app_set_status(app, "CXADC card not available for this channel");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                if (card_idx < 0 || card_idx > 1) {
+                    gui_app_set_status(app, "Invalid CXADC card index");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                int current_raw = 0;
+                if (gui_cxadc_get_center_offset(card_idx, &current_raw) != 0) {
+                    if (errno == EACCES || errno == EPERM) {
+                        gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+                    } else {
+                        gui_app_set_status(app, "Failed to read CXADC DC offset");
+                    }
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                if (!s_cxadc_dc_anchor_valid[card_idx]) {
+                    s_cxadc_dc_anchor_raw[card_idx] = current_raw;
+                    s_cxadc_dc_relative[card_idx] = 0;
+                    s_cxadc_dc_anchor_valid[card_idx] = true;
+                }
+                int delta = dc_down ? -dc_step : dc_step;
+                int target_relative = s_cxadc_dc_relative[card_idx] + delta;
+                int target_raw = s_cxadc_dc_anchor_raw[card_idx] + target_relative;
+                if (target_raw < 0) target_raw = 0;
+                if (target_raw > 255) target_raw = 255;
+                target_relative = target_raw - s_cxadc_dc_anchor_raw[card_idx];
+
+                if (gui_cxadc_set_center_offset(card_idx, target_raw) == 0) {
+                    s_cxadc_dc_relative[card_idx] = target_relative;
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "CH %c CXADC%d DC: %+d (raw %d)", (ch == 0) ? 'A' : 'B', card_idx, target_relative, target_raw);
+                    gui_app_set_status(app, msg);
+                } else {
+                    if (errno == EACCES || errno == EPERM) {
+                        gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+                    } else {
+                        gui_app_set_status(app, "Failed to update CXADC DC offset");
+                    }
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+        }
 
         // Settings panel interactions
         if (app->settings_panel_open) {
@@ -5941,8 +6805,15 @@ void gui_handle_interactions(gui_app_t *app) {
 #else
             bool settings_ddd_mode = false;
 #endif
-            bool settings_b_disabled = settings_ddd_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
+#ifdef ENABLE_FX3
+            bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
+#else
+            bool settings_fx3_mode = false;
+#endif
+            bool settings_b_disabled = settings_ddd_mode || settings_fx3_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
             bool settings_b_controls_disabled = settings_b_disabled || !app->settings.capture_b;
+            float settings_base_rate_a_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, 0) : 40000.0f;
+            float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
             if (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton"))) {
                 app->settings_panel_open = false;
                 gui_ui_clear_text_edit();
@@ -5964,6 +6835,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 if (settings_b_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B has no signal source");
+                    } else if (settings_fx3_mode) {
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B has no signal source");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     }
@@ -5971,7 +6844,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     app->settings.capture_b = !app->settings.capture_b;
                     if (!app->settings.capture_b) {
                         app->settings.enable_resample_b = false;
-                        app->settings.resample_rate_b = 40000.0f;
+                        app->settings.resample_rate_b = settings_base_rate_b_khz;
                     }
                     gui_settings_save(&app->settings);
                 }
@@ -6028,18 +6901,20 @@ void gui_handle_interactions(gui_app_t *app) {
                 bool enable = !app->settings.enable_resample_a;
                 app->settings.enable_resample_a = enable;
                 if (!enable) {
-                    app->settings.resample_rate_a = 40000.0f;
+                    app->settings.resample_rate_a = settings_base_rate_a_khz;
                 }
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
-                app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a);
+                app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
                 if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
+                    } else if (settings_fx3_mode) {
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B resample not applicable");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     } else if (!app->settings.capture_b) {
@@ -6049,7 +6924,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     bool enable = !app->settings.enable_resample_b;
                     app->settings.enable_resample_b = enable;
                     if (!enable) {
-                        app->settings.resample_rate_b = 40000.0f;
+                        app->settings.resample_rate_b = settings_base_rate_b_khz;
                     }
                     gui_settings_save(&app->settings);
                 }
@@ -6058,13 +6933,15 @@ void gui_handle_interactions(gui_app_t *app) {
                 if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
+                    } else if (settings_fx3_mode) {
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B resample not applicable");
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     } else if (!app->settings.capture_b) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B resample settings");
                     }
                 } else {
-                    app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b);
+                    app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
                     gui_settings_save(&app->settings);
                 }
             }
@@ -6114,7 +6991,7 @@ void gui_handle_interactions(gui_app_t *app) {
 
             if (Clay_PointerOver(CLAY_ID("RfBitsABox"))) {
                 if (settings_cxadc_mode) {
-                    gui_app_set_status(app, "CXADC RF is fixed at 8-bit 40MSPS");
+                    gui_ui_toggle_cxadc_bit_mode(app, 0);
                 } else {
                     uint8_t b = app->settings.rf_bits_a;
                     if (app->settings.use_flac) {
@@ -6129,11 +7006,15 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
             if (Clay_PointerOver(CLAY_ID("RfBitsBBox"))) {
-                if (settings_cxadc_mode) {
-                    gui_app_set_status(app, "CXADC RF is fixed at 8-bit 40MSPS");
+                if (settings_cxadc_mode && settings_b_disabled) {
+                    gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
+                } else if (settings_cxadc_mode) {
+                    gui_ui_toggle_cxadc_bit_mode(app, 1);
                 } else if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B bit depth not applicable");
+                    } else if (settings_fx3_mode) {
+                        gui_app_set_status(app, "FX3ADC is single-channel; channel B bit depth not applicable");
                     } else if (!app->settings.capture_b) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B bit depth");
                     }
@@ -6217,30 +7098,72 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 
             if (Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+#if defined(__ANDROID__)
+                /* Async SAF picker: launch and return; the per-frame poll in
+                 * gui_handle_interactions applies the result. Never block the
+                 * render thread across the picker Activity transition. */
+                extern int android_pick_output_folder_async(void);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_output_folder_async()) {
+                        gui_app_set_status(app, "Waiting for folder selection...");
+                    } else {
+                        gui_app_set_status(app, "Folder picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 // Best-effort folder picker (platform-specific).
                 if (gui_settings_choose_output_folder(&app->settings)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No folder selected (or folder picker unavailable)");
                 }
+#endif
             }
 
         // Playback file selection buttons
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseA"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(0)) {
+                        gui_app_set_status(app, "Waiting for CH A playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 0)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseB"))) {
+#if defined(__ANDROID__)
+                extern int android_pick_playback_file_async(int channel);
+                extern int android_picker_active(void);
+                if (!android_picker_active()) {
+                    if (android_pick_playback_file_async(1)) {
+                        gui_app_set_status(app, "Waiting for CH B playback file...");
+                    } else {
+                        gui_app_set_status(app, "File picker unavailable");
+                    }
+                }
+                gui_ui_set_click_consumed();
+#else
                 if (gui_settings_choose_playback_file(&app->settings, 1)) {
                     gui_settings_save(&app->settings);
                 } else {
                     gui_app_set_status(app, "No file selected (or file picker unavailable)");
                 }
                 gui_ui_set_click_consumed();
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileClearA"))) {
                 app->settings.playback_file_a[0] = '\0';

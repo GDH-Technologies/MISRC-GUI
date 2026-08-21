@@ -17,6 +17,9 @@
 #include "../assets/space_mono_font_data.h"
 
 #include "gui_app.h"
+#if !defined(__ANDROID__)
+#include "../../misrc_capture/misrc_capture_cli.h"
+#endif
 #include "../ui/gui_ui.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
@@ -82,13 +85,32 @@ static void print_usage(const char *program_name) {
             "  %s --preview-probe | --preview-probe-stream <device> [seconds]\n"
             "  %s --preview-selftest\n"
             "\n"
+            "Diagnostics (headless, no window):\n"
+            "  --preview-dump-frame <device> <out.ppm>\n"
+            "  --video-probe | --video-settings-test | --video-name-test\n"
+            "  --video-record-test <device> <out> [seconds] [codec]\n"
+            "  --video-tap-test <device> [seconds]\n"
+            "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
+            "\n"
             "No arguments launch the GUI.\n"
-            "Use --debug-view to enable verbose runtime logs.\n",
+            "--debug-view enables verbose runtime logs.\n"
+            "\n"
+            "Headless CLI capture mode:\n"
+            "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
+            "  binary as the full misrc_capture CLI without opening a window.\n"
+            "  --device-list / --devices  list available capture devices and exit.\n"
+            "\n",
             MIRSC_TOOLS_VERSION,
             program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
+#if !defined(__ANDROID__)
+    /* Append the full misrc_capture CLI option list (single source of truth). */
+    misrc_capture_print_usage();
+#else
+    fprintf(stdout, "(Headless CLI capture mode is not available in the Android build.)\n");
+#endif
 }
 static int gui_layout_width(void) {
 #if defined(__APPLE__)
@@ -114,7 +136,10 @@ static int gui_layout_height(void) {
 }
 static bool gui_status_is_permission_denied(const gui_app_t *app) {
     if (!app) return false;
-    return strstr(app->status_message, "Permission denied") != NULL;
+    return strstr(app->status_message, "Permission denied") != NULL ||
+           strstr(app->status_message, "permission denied") != NULL ||
+           strstr(app->status_message, "device not granted") != NULL ||
+           strstr(app->status_message, "USB open failed") != NULL;
 }
 static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
     switch (reason) {
@@ -196,7 +221,40 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
             if (target->name[0] && strcmp(dev->name, target->name) == 0) {
                 return i;
             }
-        } else {
+        } else if (target->type == DEVICE_TYPE_CXADC) {
+            // Multiple synthetic CXADC entries can exist (e.g. CXADC Clockgen).
+            // Match by marker serial/name first so reconnect preserves the
+            // selected variant. (MISRC Clockgen now has its own device type.)
+            if (target->serial[0] && strcmp(dev->serial, target->serial) == 0) {
+                return i;
+            }
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+                return i;
+            }
+            if (target->index >= 0 && dev->index == target->index) {
+                return i;
+            }
+        } else if (target->type == DEVICE_TYPE_MISRC_CLOCKGEN) {
+            // MISRC Clockgen is a single synthetic entry; match by marker
+            // serial/name so reconnect stays on it across re-enumeration.
+            if (target->serial[0] && strcmp(dev->serial, target->serial) == 0) {
+                return i;
+            }
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+                return i;
+            }
+        }
+#ifdef ENABLE_DDD
+        else if (target->type == DEVICE_TYPE_DDD) {
+            // Match by name so the synthetic "[DdD] Clockgen" entry reconnects
+            // to itself rather than the plain "[DdD] Domesday Duplicator" entry
+            // (both share DEVICE_TYPE_DDD; the name disambiguates them).
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+                return i;
+            }
+        }
+#endif
+        else {
             return i;
         }
     }
@@ -329,20 +387,31 @@ static void gui_enable_debug_console(void) {
 
 int main(int argc, char **argv) {
     bool debug_view = false;
+    bool show_help = false;
+    bool show_version = false;
+    bool smoke_test = false;
+    bool has_capture_arg = false;
+    // First pass: classify args. Any arg that isn't a pure GUI flag is treated
+    // as a capture arg and routes the process into headless CLI capture mode
+    // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
+    // when invoked from a terminal with capture options.
     for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--help") == 0) || (strcmp(argv[i], "-h") == 0)) {
-            print_usage(argv[0]);
-            return 0;
+        const char *a = argv[i];
+        if ((strcmp(a, "--help") == 0) || (strcmp(a, "-h") == 0)) {
+            show_help = true;
+            continue;
+        }
+        if (strcmp(a, "--version") == 0) {
+            show_version = true;
+            continue;
+        }
+        if (strcmp(a, "--smoke-test") == 0) {
+            smoke_test = true;
+            continue;
         }
         if (strcmp(argv[i], "--debug-view") == 0) {
             debug_view = true;
-        }
-        if (strcmp(argv[i], "--version") == 0) {
-            fprintf(stdout, "%s\n", MIRSC_TOOLS_VERSION);
-            return 0;
-        }
-        if (strcmp(argv[i], "--smoke-test") == 0) {
-            return 0;
+            continue;
         }
         /* Headless preview diagnostics. These run without a window so the
          * reader can be exercised -- and its unplug, teardown and scheduling
@@ -404,6 +473,26 @@ int main(int argc, char **argv) {
             int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
             return gui_preview_probe_stream_main(dev, secs);
         }
+        has_capture_arg = true;
+    }
+#if !defined(__ANDROID__)
+    // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
+    // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
+    // resample/audio opts, and prints full CLI usage on an incomplete combo.
+    if (has_capture_arg) {
+        return misrc_capture_main(argc, argv);
+    }
+#endif
+    if (show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (show_version) {
+        fprintf(stdout, "%s\n", MIRSC_TOOLS_VERSION);
+        return 0;
+    }
+    if (smoke_test) {
+        return 0;
     }
 #if defined(__APPLE__)
     int elevate_rc = gui_macos_relaunch_as_admin_if_needed(argc, argv);
@@ -449,8 +538,9 @@ int main(int argc, char **argv) {
     // Keep defaults usable while fitting common laptop screens.
     const int default_window_width = 1425;
     const int default_window_height = 720;
-    const int min_window_width = 1040;
-    const int min_window_height = 650;
+    // Allow quarter-screen tiling and compact desktop snapping on common displays.
+    const int min_window_width = 640;
+    const int min_window_height = 360;
     char window_title[128];
     snprintf(window_title, sizeof(window_title), "MISRC Capture %s", MIRSC_TOOLS_VERSION);
     InitWindow(default_window_width, default_window_height, window_title);
@@ -523,9 +613,14 @@ int main(int argc, char **argv) {
         if (hs_idx >= 0) {
             app.selected_device = hs_idx;
         } else {
-            int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
-            if (cxadc_idx >= 0) {
-                app.selected_device = cxadc_idx;
+            int misrc_cg_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_MISRC_CLOCKGEN);
+            if (misrc_cg_idx >= 0) {
+                app.selected_device = misrc_cg_idx;
+            } else {
+                int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
+                if (cxadc_idx >= 0) {
+                    app.selected_device = cxadc_idx;
+                }
             }
         }
     }
@@ -542,19 +637,26 @@ int main(int argc, char **argv) {
             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
             gui_app_set_status(&app, "Ready. Click Connect to start capture.");
         } else {
-            int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
-            if (cxadc_idx >= 0) {
-                app.selected_device = cxadc_idx;
+            int misrc_cg_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_MISRC_CLOCKGEN);
+            if (misrc_cg_idx >= 0) {
+                app.selected_device = misrc_cg_idx;
                 gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                 gui_app_set_status(&app, "Ready. Click Connect to start capture.");
             } else {
-                int sc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_SIMPLE_CAPTURE);
-                if (sc_idx >= 0) {
-                    app.selected_device = sc_idx;
+                int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
+                if (cxadc_idx >= 0) {
+                    app.selected_device = cxadc_idx;
                     gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                     gui_app_set_status(&app, "Ready. Click Connect to start capture.");
                 } else {
-                    gui_app_set_status(&app, "No hsdaoh/CXADC devices found. Select device and click Connect.");
+                    int sc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_SIMPLE_CAPTURE);
+                    if (sc_idx >= 0) {
+                        app.selected_device = sc_idx;
+                        gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+                        gui_app_set_status(&app, "Ready. Click Connect to start capture.");
+                    } else {
+                        gui_app_set_status(&app, "No hsdaoh/CXADC devices found. Select device and click Connect.");
+                    }
                 }
             }
         }
@@ -737,6 +839,23 @@ int main(int argc, char **argv) {
                 && gui_capture_device_timeout(&app, 2000)) {
                 // Device was disconnected unexpectedly - clean up properly
                 fprintf(stderr, "[GUI] Device timeout detected, disconnecting...\n");
+#if defined(__ANDROID__)
+                /* Async stop: hsdaoh_stop_stream/close on the wrapped Android
+                 * fd can hang joining libusb/libuvc threads. Blocking here on
+                 * the render thread was the post-connect freeze: watchdog
+                 * fired ~7s after connect (5s grace + 2s no-data) and stalled
+                 * the UI inside stop_capture. Only fire once per episode
+                 * (gui_app_capture_busy gate). */
+                if (!gui_app_capture_busy()) {
+                    gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+                    gui_app_stop_capture_async(&app);
+                    gui_app_clear_display(&app);
+                    app.reconnect_pending = true;
+                    app.reconnect_attempt_time = now;
+                    app.reconnect_attempts = 0;
+                    gui_app_set_status(&app, "Connection lost (no data). Reconnecting...");
+                }
+#else
                 gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                 gui_app_stop_capture(&app);
                 gui_app_clear_display(&app);
@@ -744,10 +863,25 @@ int main(int argc, char **argv) {
                 app.reconnect_attempt_time = now;
                 app.reconnect_attempts = 0;
                 gui_app_set_status(&app, "Connection lost. Reconnecting...");
+#endif
             }
 
             // Attempt reconnection if pending
             if (app.reconnect_pending && !app.is_capturing) {
+#if defined(__ANDROID__)
+                /* If a USB permission request is mid-flight, the per-frame
+                 * poll in gui_handle_interactions completes the connect; just
+                 * wait and don't burn a reconnect attempt. */
+                extern int android_permission_pending(void);
+                extern int android_usb_has_fd(void);
+                extern int android_request_usb_permission_async(void);
+                extern void android_usb_clear_fd(void);
+                if (android_permission_pending() || gui_app_capture_busy()) {
+                    /* wait for the async permission poll / in-flight start-stop
+                     * worker to finish before attempting reconnect */
+                } else
+#endif
+                {
                 double retry_delay = (app.reconnect_attempts < 3) ? 1.0 : 3.0;  // 1s for first 3, then 3s
                 if (now - app.reconnect_attempt_time >= retry_delay) {
                     app.reconnect_attempt_time = now;
@@ -775,11 +909,29 @@ int main(int argc, char **argv) {
                             }
                             app.selected_device = reconnect_dev;
                         }
-                        int reconnect_rc = 0;
                         char status_buf[128];
                         snprintf(status_buf, sizeof(status_buf), "Reconnecting (attempt %d)...", app.reconnect_attempts);
                         gui_app_set_status(&app, status_buf);
-                        reconnect_rc = gui_app_start_capture(&app);
+#if defined(__ANDROID__)
+                        /* Async permission: never block the render thread on the
+                         * USB dialog. If fd is already granted, start capture
+                         * on a worker thread (gui_app_start_capture_async) so
+                         * the render loop stays responsive; otherwise request
+                         * async permission and let the per-frame poll complete
+                         * the connect. */
+                        if (android_usb_has_fd()) {
+                            gui_app_start_capture_async(&app);
+                            gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+                            app.reconnect_pending = false;
+                            app.reconnect_attempts = 0;
+                            gui_app_set_status(&app, "Reconnecting...");
+                        } else {
+                            android_usb_clear_fd();
+                            android_request_usb_permission_async();
+                            gui_app_set_status(&app, "Requesting USB permission (reconnect)...");
+                        }
+#else
+                        int reconnect_rc = gui_app_start_capture(&app);
                         if (reconnect_rc == 0) {
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;
@@ -788,11 +940,13 @@ int main(int argc, char **argv) {
                         } else if (reconnect_rc == -3 || gui_status_is_permission_denied(&app)) {
                             app.reconnect_pending = false;
                         }
+#endif
                     } else {
                         char status_buf_no_dev[128];
                         snprintf(status_buf_no_dev, sizeof(status_buf_no_dev), "No device found (attempt %d)", app.reconnect_attempts);
                         gui_app_set_status(&app, status_buf_no_dev);
                     }
+                }
                 }
             }
         }
@@ -813,6 +967,7 @@ int main(int argc, char **argv) {
 
         // Handle Clay interactions
         gui_handle_interactions(&app);
+        gui_ui_sync_android_keyboard_state();
         if (!was_capturing && app.is_capturing) {
             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
         }

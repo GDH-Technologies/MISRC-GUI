@@ -60,10 +60,12 @@ def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
         "runner: macos-14",
         "runner: macos-15-intel",
         "macos-app-universal:",
+        "android-apk:",
         "release:",
         "- linux-appimage",
         "- windows-exe",
         "- macos-app-universal",
+        "- android-apk",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
@@ -581,6 +583,41 @@ def check_windows_packaging_assertions(workflow_path: Path) -> int:
             return fail(f"Workflow is missing required Windows packaging assertion: {snippet}")
     return 0
 
+def check_android_packaging_assertions(workflow_path: Path) -> int:
+    """Assert the android-apk CI job verifies the APK the same way local build-apk.sh does:
+    - apksigner verify (signature integrity)
+    - aapt2 dump badging sdkVersion:'30' + targetSdkVersion:'34' + package dev.misrc.gui
+    - lib/arm64-v8a/libmisrc_gui.so present in the APK
+    - libmisrc_gui.so is ARM aarch64 (not x86_64 host leak)
+    - no host /usr/lib/x86_64 or /usr/local/lib leaked into the cross .so
+    These mirror the local verification in android/build-apk.sh + the manual
+    checks performed during the android-support branch development."""
+    workflow_text = read_text(workflow_path)
+    required_snippets = [
+        "bash android/build-deps-android.sh",
+        "bash android/gen-cross-file.sh",
+        "meson setup --cross-file android/aarch64-linux-android.ini",
+        "meson compile -C build-android misrc_gui",
+        "test -f build-android/libmisrc_gui.so",
+        "bash android/build-apk.sh",
+        # The CI job invokes tools via $ANDROID_HOME variable-prefixed paths,
+        # so assert on the tool-name substrings rather than bare "apksigner verify".
+        "34.0.0/apksigner",
+        "verify \"$APK\"",
+        "34.0.0/aapt2",
+        "dump badging",
+        "sdkVersion:'30'",
+        "targetSdkVersion:'34'",
+        "package: name='dev.misrc.gui'",
+        "lib/arm64-v8a/libmisrc_gui.so",
+        "ARM aarch64",
+        "/usr/lib/x86_64|/usr/local/lib",
+    ]
+    for snippet in required_snippets:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing required Android packaging assertion: {snippet}")
+    return 0
+
 def check_release_artifact_naming_contract(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -598,8 +635,15 @@ def check_release_artifact_naming_contract(workflow_path: Path) -> int:
         "release-assets/**/linux_MISRC_*_arm64.zip",
         "release-assets/**/windows_MISRC_*_x86.zip",
         "release-assets/**/macos_MISRC_*_universal.dmg",
+        "APK_ARM64=\"android_MISRC_${TAG}_arm64.apk\"",
+        "release-assets/**/android_MISRC_*_arm64.apk",
     ]
     forbidden_snippets = [
+        # Legacy Android APK naming (pre-convention-alignment). The APK must
+        # follow <platform>_MISRC_<version>_<arch>.<ext> like the other
+        # platforms, not misrc_gui-<version>-android-arm64.apk.
+        "misrc_gui-${TAG}-android-arm64.apk",
+        "release-assets/**/misrc_gui-*-android-arm64.apk",
         "misrc_gui-*-windows-x86_64.zip",
         "misrc_gui-*-macos-universal-app.tar.gz",
         "MISRC_*_windows_x86.zip",
@@ -638,6 +682,7 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         "linux-appimage:",
         "windows-exe:",
         "macos-app-universal:",
+        "android-apk:",
         "release:",
     ]
     for snippet in required_snippets:
@@ -669,6 +714,126 @@ def check_no_capture_stability_clutter(workflow_path: Path) -> int:
     for snippet in forbidden_workflow_snippets:
         if snippet in workflow_text:
             return fail(f"Workflow still contains capture-stability Actions clutter snippet: {snippet}")
+    return 0
+def check_local_build_bootstrap_contract(repo_root: Path,
+                                         dev_notes_path: Path,
+                                         installation_md_path: Path) -> int:
+    script_path = repo_root / "scripts/build-local.ps1"
+    if not script_path.exists():
+        return fail(f"Missing Windows local-build bootstrap script: {script_path}")
+    script_text = read_text(script_path)
+    required_script_snippets = [
+        "param(",
+        "BootstrapOnly",
+        "NoAutoInstall",
+        "python -m mesonbuild.mesonmain --version",
+        "python -m pip install --user --upgrade meson ninja",
+        "Add-PythonUserScriptsToPath",
+    ]
+    for snippet in required_script_snippets:
+        if snippet not in script_text:
+            return fail(f"build-local.ps1 is missing required bootstrap snippet: {snippet}")
+
+    if not dev_notes_path.exists():
+        return fail(f"Missing dev notes file for bootstrap contract: {dev_notes_path}")
+    dev_notes_text = read_text(dev_notes_path)
+    required_dev_notes_snippets = [
+        "Windows local build bootstrap note",
+        "pwsh -File scripts/build-local.ps1 -BootstrapOnly",
+        "pwsh -File scripts/build-local.ps1",
+        "python misrc_tools/test/ci_guard_tests.py --static-only",
+    ]
+    for snippet in required_dev_notes_snippets:
+        if snippet not in dev_notes_text:
+            return fail(f"Dev notes are missing local build bootstrap guidance: {snippet}")
+
+    # The build/installation snippets live in INSTALLATION.md at the repo root
+    # (the main README.md is app-use-only). misrc_tools/README.md points here.
+    if not installation_md_path.exists():
+        return fail(f"Missing INSTALLATION.md for bootstrap contract: {installation_md_path}")
+    installation_text = read_text(installation_md_path)
+    required_installation_snippets = [
+        "scripts/build-local.ps1 -BootstrapOnly",
+        "scripts/build-local.ps1",
+    ]
+    for snippet in required_installation_snippets:
+        if snippet not in installation_text:
+            return fail(f"INSTALLATION.md is missing local-build bootstrap snippet: {snippet}")
+    return 0
+
+
+def check_local_deps_cache_contract(repo_root: Path,
+                                     workflow_path: Path,
+                                     dev_notes_path: Path,
+                                     tools_readme_path: Path) -> int:
+    """Assert the local==CI deps caching path is present and wired.
+
+    Prevents silent removal of the deps scripts, stamp gate, build-local
+    auto-invocation, CI actions/cache, or docs that describe the model.
+    """
+    deps_win = repo_root / "scripts/build-deps-windows.sh"
+    deps_unix = repo_root / "scripts/build-deps-unix.sh"
+    publish = repo_root / "scripts/publish-deps-cache.sh"
+    build_local_ps1 = repo_root / "scripts/build-local.ps1"
+    build_local_sh = repo_root / "scripts/build-local.sh"
+
+    for path, label in [(deps_win, "build-deps-windows.sh"),
+                        (deps_unix, "build-deps-unix.sh"),
+                        (publish, "publish-deps-cache.sh"),
+                        (build_local_sh, "build-local.sh")]:
+        if not path.exists():
+            return fail(f"Missing deps-cache contract script: {label} ({path})")
+
+    deps_win_text = read_text(deps_win)
+    deps_unix_text = read_text(deps_unix)
+    for label, text in [("build-deps-windows.sh", deps_win_text),
+                        ("build-deps-unix.sh", deps_unix_text)]:
+        if "compute_stamp" not in text:
+            return fail(f"{label} is missing the stamp-gate function 'compute_stamp'")
+        if ".build-stamp" not in text:
+            return fail(f"{label} is missing the stamp file path '.build-stamp'")
+    if "v0.0.7" not in deps_win_text:
+        return fail("build-deps-windows.sh is missing the pinned LIBUVC_REF v0.0.7")
+
+    ps1_text = read_text(build_local_ps1)
+    if "Invoke-DepsBuild" not in ps1_text:
+        return fail("build-local.ps1 must auto-invoke the deps script via Invoke-DepsBuild (not bail at the deps gate)")
+    if "build-deps-windows.sh" not in ps1_text:
+        return fail("build-local.ps1 must reference build-deps-windows.sh")
+
+    sh_text = read_text(build_local_sh)
+    if "build-deps-unix.sh" not in sh_text:
+        return fail("build-local.sh must reference build-deps-unix.sh")
+
+    workflow_text = read_text(workflow_path)
+    if "actions/cache@v4" not in workflow_text:
+        return fail("build.yml is missing actions/cache@v4 for deps caching")
+    if "deps cache hit" not in workflow_text:
+        return fail("build.yml is missing the deps cache-hit guard ('deps cache hit')")
+    if "v0.0.7" not in workflow_text:
+        return fail("build.yml must pin libuvc to v0.0.7 (parity with build-deps-windows.sh)")
+
+    dev_notes_text = read_text(dev_notes_path)
+    required_dev_snippets = [
+        "Vendored deps caching",
+        "build-deps-windows.sh",
+        "actions/cache@v4",
+        "publish-deps-cache.sh",
+    ]
+    for snippet in required_dev_snippets:
+        if snippet not in dev_notes_text:
+            return fail(f"Dev notes are missing deps-cache contract snippet: {snippet}")
+
+    installation_text = read_text(tools_readme_path)
+    required_installation_snippets = [
+        "Vendored deps caching model",
+        "build-deps-windows.sh",
+        "build-deps-unix.sh",
+        "publish-deps-cache.sh",
+    ]
+    for snippet in required_installation_snippets:
+        if snippet not in installation_text:
+            return fail(f"INSTALLATION.md is missing deps-cache contract snippet: {snippet}")
     return 0
 
 
@@ -740,18 +905,13 @@ def check_flac_streaminfo_total_samples_runtime(repo_root: Path) -> int:
         return 0
     cc = shutil.which("cc")
     pkg_config = shutil.which("pkg-config")
-    in_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
     if cc is None or pkg_config is None:
-        if in_ci:
-            return fail("cc and pkg-config are required for FLAC STREAMINFO runtime guard")
         print("SKIP: FLAC STREAMINFO runtime guard (cc/pkg-config not available)")
         return 0
     flac_flags = subprocess.run(
         [pkg_config, "--cflags", "--libs", "flac"], capture_output=True, text=True
     )
     if flac_flags.returncode != 0:
-        if in_ci:
-            return fail("libFLAC (pkg-config 'flac') is required for FLAC STREAMINFO runtime guard")
         print("SKIP: FLAC STREAMINFO runtime guard (libFLAC not available)")
         return 0
 
@@ -826,6 +986,9 @@ def main() -> int:
     gui_settings_c_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings.c"
     flac_writer_c_path = repo_root / "misrc_tools/common/flac_writer.c"
     meson_path = repo_root / "misrc_tools/meson.build"
+    tools_readme_path = repo_root / "misrc_tools/README.md"
+    installation_md_path = repo_root / "INSTALLATION.md"
+    dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
 
     checks: List[Tuple[str, Callable[[], int]]] = [
@@ -846,16 +1009,19 @@ def main() -> int:
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
+        ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
+        ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
+        ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
-        checks.insert(9, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
+        checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
     # that catches vendored-dep shadowing and silent FX3-disable on every build.

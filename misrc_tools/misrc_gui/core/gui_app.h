@@ -135,16 +135,20 @@ typedef struct {
 // Device info for enumeration
 // Device type enumeration
 typedef enum {
-    DEVICE_TYPE_HSDAOH,         // Hardware device via hsdaoh
-    DEVICE_TYPE_SIMPLE_CAPTURE, // OS video capture
-    DEVICE_TYPE_CXADC,          // CXADC RF capture card(s)
-    DEVICE_TYPE_SIMULATED,      // Simulated device for testing
-    DEVICE_TYPE_PLAYBACK,       // Playback from recorded FLAC files
+    DEVICE_TYPE_HSDAOH,                  // Hardware device via hsdaoh
+    DEVICE_TYPE_SIMPLE_CAPTURE,           // OS video capture
+    DEVICE_TYPE_CXADC,                   // CXADC RF capture card(s)
+    DEVICE_TYPE_MISRC_CLOCKGEN,          // MISRC Clockgen: pure USB-audio clockgen
+                                         // (MISRC v1.5 + shared-clock clockgen),
+                                         // distinct from CXADC (no PCI RF cards,
+                                         // no DC-offset/tenbit profile)
+    DEVICE_TYPE_SIMULATED,               // Simulated device for testing
+    DEVICE_TYPE_PLAYBACK,                // Playback from recorded FLAC files
 #ifdef ENABLE_FX3
-    DEVICE_TYPE_FX3,            // Cypress FX3 USB device
+    DEVICE_TYPE_FX3,                     // Cypress FX3 USB device
 #endif
 #ifdef ENABLE_DDD
-    DEVICE_TYPE_DDD,            // DomesdayDuplicator USB device
+    DEVICE_TYPE_DDD,                     // DomesdayDuplicator USB device
 #endif
 } device_type_t;
 
@@ -184,6 +188,10 @@ typedef struct {
     // FLAC supports 8/12/16; RAW supports 8/16 (12 is disabled in RAW UI).
     uint8_t rf_bits_a;
     uint8_t rf_bits_b;
+    // CXADC capture mode per card: false=8-bit @ base 40 MSPS,
+    // true=driver tenbit (16-bit samples @ base 20 MSPS).
+    // [0]=card A (cxadc0), [1]=card B (cxadc1).
+    bool cxadc_tenbit_mode_card[2];
     // Optional per-channel RF tags used in auto naming (e.g. "luma", "chroma")
     char rf_channel_tags[2][32];
 
@@ -289,6 +297,12 @@ typedef struct {
     // mirrors the older code's ~4 GB target. Record A/B get the remainder
     // after fixed RF/Audio/Display allocations; record buffers stay lazy.
     uint32_t memory_budget_gb;
+
+    // Update check metadata (GitHub releases). last_check_unix_s is persisted
+    // so the automatic checker runs at most once every 7 days.
+    uint64_t update_last_check_unix_s;
+    char update_last_release_tag[64];
+    bool update_available_cached;
 
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
@@ -485,6 +499,14 @@ void gui_app_cleanup(gui_app_t *app);
 // Device management
 void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
+/* Android-only: run gui_app_start_capture() on a worker thread so the render
+ * loop stays responsive during hsdaoh_open + stream start. On non-Android
+ * builds this is not declared/defined. */
+#if defined(__ANDROID__)
+void gui_app_start_capture_async(gui_app_t *app);
+void gui_app_stop_capture_async(gui_app_t *app);
+int gui_app_capture_busy(void);
+#endif
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
 void gui_app_stop_recording(gui_app_t *app);
