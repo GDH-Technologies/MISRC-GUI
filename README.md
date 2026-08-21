@@ -4,7 +4,7 @@
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
 
-A universal cross platform GUI tool for interfacing with and visualising monitoring and control of FM RF archival focused, capture device workflows.
+A universal cross platform GUI tool for interfacing with and visualizing monitoring and control of FM RF archival focused, capture device workflows.
 
 ### Current Supported Hardware
 
@@ -86,7 +86,7 @@ Record button is clear when not in use.
 
 Record button is RED when capturing is in use.
 
-The record button will turn orange and state finalising when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
+The record button will turn orange and state finalizing when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
 
 Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
 
@@ -283,4 +283,4 @@ Log Example:
 - April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
-- August 13th 20206 - Official release!
+- August 13th 2026 - Official release!
