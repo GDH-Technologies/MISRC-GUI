@@ -14,6 +14,21 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
 
+## 2026-08-21 Windows WASAPI audio capture: use device format, not system mix format (cxadc-win capture-server pattern)
+
+- Problem: clockgen audio (PCM1802 2ch + headswitch CH3) captured via WASAPI shared mode was distorted on Windows, and Ch3/Ch4 showed red/clipping. Recorded audio was unusable.
+- Root cause: `cxadc_open_audio_capture()` used `IAudioClient::GetMixFormat()` to discover the audio format. GetMixFormat returns the *system mix format* (typically 48000 Hz), NOT the device's actual hardware format. In shared mode Windows silently resamples the device's real stream (e.g. 46875 Hz) up to the system mix rate, corrupting the headswitch signal — a fast binary control signal that resampling destroys.
+- Fix (ported from the proven `cxadc-win` capture-server `src/capture-server/audio_wasapi.c`):
+  - `misrc_tools/misrc_gui/input/gui_cxadc.c` (`cxadc_open_audio_capture`)
+    - Read `PKEY_AudioEngine_DeviceFormat` (the device's actual hardware format, a `WAVEFORMATEXTENSIBLE` blob) from the endpoint's property store instead of `GetMixFormat`.
+    - Validate the device format with `IAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, ...)` BEFORE `Initialize`.
+    - If supported, `Initialize` in **exclusive mode** with the device's native format — no Windows resampling, clean data on all 3 channels. Buffer-size alignment retry: if `Initialize` returns `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`, recalculate the duration from `GetBufferSize` + the device sample rate and retry once (mirrors capture-server).
+    - If exclusive is not supported, fall back to shared mode with `GetMixFormat` + a clear warning that Windows may resample.
+  - Added `s_PKEY_AudioEngine_DeviceFormat` PROPERTYKEY + `REFTIMES_PER_SEC` define locally (MinGW headers don't provide them).
+- Why this works: exclusive mode at the device's real format forces Windows to clock the USB audio device at that rate with no resampling engine in the path. The headswitch CH3 comes through clean. This is the same approach the cxadc-win capture-server uses for its working Windows audio capture.
+- Validated locally: `misrc_gui.exe` builds clean, `--smoke-test` passes. Runtime exclusive-mode success + clean Ch3/Ch4 still pending real-hardware confirmation.
+- Key constraint: do NOT revert to `GetMixFormat`-only shared mode — that is the bug that corrupts the headswitch. The device-format + exclusive path must stay.
+
 ## 2026-08-21 Vendored deps caching + CI parity (any terminal just works)
 
 - Problem: building the Windows exe locally snagged because `.deps/install` (compiled hsdaoh + libuvc + raylib) never existed locally. CI rebuilt these from scratch every run with no cache, and the local scripts bailed at the deps gate pointing at a Linux-only script. The dev notes only covered the Meson PATH snag, not the deps-build step.
