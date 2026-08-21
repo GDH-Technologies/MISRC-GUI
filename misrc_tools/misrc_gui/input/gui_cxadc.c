@@ -1409,37 +1409,13 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                                 dst[0] = dst[1] = dst[2] = 0;
                             }
                         }
-                        uint8_t *dst_ch4 = dst_frame + 9;
-                        if (dev_channels >= 4) {
-                            const uint8_t *src = src_frame + ((size_t)3 * ctx->audio_sample_bytes);
-                            if (ctx->audio_format == CXADC_AUDIO_FMT_S24_3LE) {
-                                dst_ch4[0] = src[0]; dst_ch4[1] = src[1]; dst_ch4[2] = src[2];
-                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_S32_LE) {
-                                int32_t s32 = (int32_t)((uint32_t)src[0] |
-                                                        ((uint32_t)src[1] << 8) |
-                                                        ((uint32_t)src[2] << 16) |
-                                                        ((uint32_t)src[3] << 24));
-                                cxadc_store_s24le(dst_ch4, s32 >> 8);
-                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_S16_LE) {
-                                int16_t s16 = (int16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
-                                cxadc_store_s24le(dst_ch4, ((int32_t)s16) << 8);
-                            } else if (ctx->audio_format == CXADC_AUDIO_FMT_FLOAT32) {
-                                float f;
-                                memcpy(&f, src, 4);
-                                int32_t s32 = (int32_t)(f * 8388607.0f);
-                                cxadc_store_s24le(dst_ch4, s32);
-                            } else {
-                                dst_ch4[0] = dst_ch4[1] = dst_ch4[2] = 0;
-                            }
-                        } else if (dev_channels >= 3) {
-                            // Mirror headswitch (CH3) into CH4 for control paths
-                            // that operate on CH3/4 pairs.
-                            dst_ch4[0] = dst_frame[6];
-                            dst_ch4[1] = dst_frame[7];
-                            dst_ch4[2] = dst_frame[8];
-                        } else {
-                            dst_ch4[0] = dst_ch4[1] = dst_ch4[2] = 0;
-                        }
+                        // CH4: the clockgen device is 3-channel (CH1/CH2 + headswitch
+                        // CH3). There is no CH4 input — always leave it zero. Do
+                        // NOT mirror CH3 into CH4 (the clockgen has no CH3/4
+                        // pair control path on any platform).
+                        dst_frame[9] = 0;
+                        dst_frame[10] = 0;
+                        dst_frame[11] = 0;
                     }
                     gui_headswitch_lock_ingest_s24le_interleaved(out, output_bytes, ctx->audio_sample_rate_hz);
                     bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);

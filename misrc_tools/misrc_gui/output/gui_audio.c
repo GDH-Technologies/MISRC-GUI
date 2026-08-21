@@ -172,10 +172,20 @@ static void audio_update_peaks(gui_app_t *app, const uint8_t *buf, size_t len)
 
     uint32_t peak[4] = {0, 0, 0, 0};
 
+    // The clockgen device streams 3 channels (CH1/CH2 + headswitch CH3).
+    // CH4 is a mirror of CH3 written by the capture thread, but on MISRC
+    // Clockgen the 3-channel device data may be mangled by Windows shared-
+    // mode resampling, so CH3/CH4 contain invalid data. Only update peaks
+    // for CH1/CH2 on MISRC Clockgen; leave CH3/CH4 at 0 (no valid signal).
+    const bool is_misrc_clockgen =
+        app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_MISRC_CLOCKGEN;
+    const int peak_channels = is_misrc_clockgen ? 2 : 4;
+
     // 4ch 24-bit, little-endian, interleaved per sample frame:
     // ch1: b0 b1 b2, ch2: b3 b4 b5, ch3: b6 b7 b8, ch4: b9 b10 b11
     for (size_t i = 0; i + 12 <= len; i += 12) {
-        for (int ch = 0; ch < 4; ch++) {
+        for (int ch = 0; ch < peak_channels; ch++) {
             size_t o = i + (size_t)ch * 3;
             uint32_t raw = (uint32_t)buf[o] | ((uint32_t)buf[o + 1] << 8) | ((uint32_t)buf[o + 2] << 16);
             int32_t s = signext24(raw);
@@ -292,11 +302,20 @@ static int audio_thread_main(void *ctx)
             // CH3/4 monitor mode so the control always produces valid output.
             const bool use_ch34 = a->app->settings.audio_monitor_ch34;
             const bool cxadc_mode = gui_audio_selected_device_is_cxadc(a->app);
+            // MISRC Clockgen: CH3/CH4 contain invalid data (Windows shared-
+            // mode resampling corrupts the headswitch). Force CH1/2 monitoring
+            // regardless of the user's CH3/4 toggle so monitoring produces valid
+            // audio from the baseband channels only.
+            const bool misrc_clockgen =
+                a->app->selected_device >= 0 &&
+                a->app->selected_device < a->app->device_count &&
+                a->app->devices[a->app->selected_device].type == DEVICE_TYPE_MISRC_CLOCKGEN;
+            const bool effective_use_ch34 = use_ch34 && cxadc_mode && !misrc_clockgen;
             
             for (size_t i = 0; i < frames_in; i++) {
                 const uint8_t *frame = b + (i * 12);
                 int16_t s16 = 0;
-                if (use_ch34 && cxadc_mode) {
+                if (effective_use_ch34 && cxadc_mode) {
                     int32_t hs = audio_read_s24le_channel(frame, 2); // CH3 headswitch
                     s16 = pcm24_to_i16(hs);
                 } else {
