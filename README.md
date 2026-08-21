@@ -45,6 +45,8 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
 
+Building from source? See [INSTALLATION.md](INSTALLATION.md).
+
 
 ## Visual Overview & Use
 

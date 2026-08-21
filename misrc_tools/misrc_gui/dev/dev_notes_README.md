@@ -14,6 +14,33 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
 
+## 2026-08-21 Vendored deps caching + CI parity (any terminal just works)
+
+- Problem: building the Windows exe locally snagged because `.deps/install` (compiled hsdaoh + libuvc + raylib) never existed locally. CI rebuilt these from scratch every run with no cache, and the local scripts bailed at the deps gate pointing at a Linux-only script. The dev notes only covered the Meson PATH snag, not the deps-build step.
+- Root cause: hsdaoh/libuvc/raylib are not system packages; they must be compiled from `third_party/hsdaoh` + upstream clones into `.deps/install`. This is what CI does every run (`windows-exe` job, `.github/workflows/build.yml`), but it was never scripted or documented for local Windows use.
+- Fix: `scripts/build-deps-windows.sh` mirrors the CI `windows-exe` deps block (static libuvc v0.0.7 + vendored hsdaoh + vendored raylib with internal GLFW) into `.deps/install`. It is stamp-gated: a content-addressed hash of the hsdaoh source + raylib tag + libuvc ref + pacman dep versions skips the rebuild when unchanged. `scripts/build-local.ps1` auto-invokes it via MSYS2 MINGW64 on first run or when inputs change — one command builds everything, no manual deps step, no shell restart.
+- Cross-platform parity: `scripts/build-deps-unix.sh` mirrors the `linux-appimage`/`macos` CI deps blocks with the same stamp gate. `scripts/build-local.sh` auto-invokes it.
+- CI caching: `actions/cache@v4` on `.deps/install` (keyed on `hashFiles(third_party/hsdaoh/**)` + raylib/libuvc versions) added to all four build jobs, with a cache-hit guard that skips the rebuild when the install is already present.
+- Prebuilt publishing: `scripts/publish-deps-cache.sh <platform> <arch>` packages `.deps/install` into a tar.xz + sha256 for upload to `harrypm/MISRC-ci-cache` (same flow as libFLAC 1.5.0). Not auto-uploaded; prints the `gh release upload` command for manual review.
+- Local CI/dev guard: `python misrc_tools/test/ci_guard_tests.py --static-only` now checks the deps scripts exist, the stamp gate is present, `build-local.ps1` invokes the deps script (not bails), and docs snippets exist — so the local==CI path can't be silently removed.
+- Validated locally: `misrc_gui.exe` (10.7 MB) builds clean, `--smoke-test` exits 0, deps stamp cache skips on second run.
+
+## 2026-08-21 Windows local build bootstrap note (Meson PATH snag)
+
+- Symptom:
+  - `meson: The term 'meson' is not recognized...` in PowerShell.
+- Root cause:
+  - Local shell does not have Meson/Ninja on `PATH`, even when Python is installed.
+- Standard recovery (now the expected flow):
+  - Bootstrap and verify build-tool connection:
+    - `pwsh -File scripts/build-local.ps1 -BootstrapOnly`
+  - Build locally:
+    - `pwsh -File scripts/build-local.ps1`
+- Why this avoids repeat breakage:
+  - `scripts/build-local.ps1` auto-installs user-level `meson` + `ninja` when missing and adds the Python user `Scripts` directory to session `PATH` before invoking Meson.
+- Local CI/dev guard:
+  - `python misrc_tools/test/ci_guard_tests.py --static-only` now checks this contract (script + note snippets), so future edits don’t accidentally remove the bootstrap path.
+
 ## 2026-04-16 capture/runtime snapshot
 
 - Timestamp (UTC): `2026-04-16T03:38:18Z`

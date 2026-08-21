@@ -713,6 +713,126 @@ def check_no_capture_stability_clutter(workflow_path: Path) -> int:
         if snippet in workflow_text:
             return fail(f"Workflow still contains capture-stability Actions clutter snippet: {snippet}")
     return 0
+def check_local_build_bootstrap_contract(repo_root: Path,
+                                         dev_notes_path: Path,
+                                         installation_md_path: Path) -> int:
+    script_path = repo_root / "scripts/build-local.ps1"
+    if not script_path.exists():
+        return fail(f"Missing Windows local-build bootstrap script: {script_path}")
+    script_text = read_text(script_path)
+    required_script_snippets = [
+        "param(",
+        "BootstrapOnly",
+        "NoAutoInstall",
+        "python -m mesonbuild.mesonmain --version",
+        "python -m pip install --user --upgrade meson ninja",
+        "Add-PythonUserScriptsToPath",
+    ]
+    for snippet in required_script_snippets:
+        if snippet not in script_text:
+            return fail(f"build-local.ps1 is missing required bootstrap snippet: {snippet}")
+
+    if not dev_notes_path.exists():
+        return fail(f"Missing dev notes file for bootstrap contract: {dev_notes_path}")
+    dev_notes_text = read_text(dev_notes_path)
+    required_dev_notes_snippets = [
+        "Windows local build bootstrap note",
+        "pwsh -File scripts/build-local.ps1 -BootstrapOnly",
+        "pwsh -File scripts/build-local.ps1",
+        "python misrc_tools/test/ci_guard_tests.py --static-only",
+    ]
+    for snippet in required_dev_notes_snippets:
+        if snippet not in dev_notes_text:
+            return fail(f"Dev notes are missing local build bootstrap guidance: {snippet}")
+
+    # The build/installation snippets live in INSTALLATION.md at the repo root
+    # (the main README.md is app-use-only). misrc_tools/README.md points here.
+    if not installation_md_path.exists():
+        return fail(f"Missing INSTALLATION.md for bootstrap contract: {installation_md_path}")
+    installation_text = read_text(installation_md_path)
+    required_installation_snippets = [
+        "scripts/build-local.ps1 -BootstrapOnly",
+        "scripts/build-local.ps1",
+    ]
+    for snippet in required_installation_snippets:
+        if snippet not in installation_text:
+            return fail(f"INSTALLATION.md is missing local-build bootstrap snippet: {snippet}")
+    return 0
+
+
+def check_local_deps_cache_contract(repo_root: Path,
+                                     workflow_path: Path,
+                                     dev_notes_path: Path,
+                                     tools_readme_path: Path) -> int:
+    """Assert the local==CI deps caching path is present and wired.
+
+    Prevents silent removal of the deps scripts, stamp gate, build-local
+    auto-invocation, CI actions/cache, or docs that describe the model.
+    """
+    deps_win = repo_root / "scripts/build-deps-windows.sh"
+    deps_unix = repo_root / "scripts/build-deps-unix.sh"
+    publish = repo_root / "scripts/publish-deps-cache.sh"
+    build_local_ps1 = repo_root / "scripts/build-local.ps1"
+    build_local_sh = repo_root / "scripts/build-local.sh"
+
+    for path, label in [(deps_win, "build-deps-windows.sh"),
+                        (deps_unix, "build-deps-unix.sh"),
+                        (publish, "publish-deps-cache.sh"),
+                        (build_local_sh, "build-local.sh")]:
+        if not path.exists():
+            return fail(f"Missing deps-cache contract script: {label} ({path})")
+
+    deps_win_text = read_text(deps_win)
+    deps_unix_text = read_text(deps_unix)
+    for label, text in [("build-deps-windows.sh", deps_win_text),
+                        ("build-deps-unix.sh", deps_unix_text)]:
+        if "compute_stamp" not in text:
+            return fail(f"{label} is missing the stamp-gate function 'compute_stamp'")
+        if ".build-stamp" not in text:
+            return fail(f"{label} is missing the stamp file path '.build-stamp'")
+    if "v0.0.7" not in deps_win_text:
+        return fail("build-deps-windows.sh is missing the pinned LIBUVC_REF v0.0.7")
+
+    ps1_text = read_text(build_local_ps1)
+    if "Invoke-DepsBuild" not in ps1_text:
+        return fail("build-local.ps1 must auto-invoke the deps script via Invoke-DepsBuild (not bail at the deps gate)")
+    if "build-deps-windows.sh" not in ps1_text:
+        return fail("build-local.ps1 must reference build-deps-windows.sh")
+
+    sh_text = read_text(build_local_sh)
+    if "build-deps-unix.sh" not in sh_text:
+        return fail("build-local.sh must reference build-deps-unix.sh")
+
+    workflow_text = read_text(workflow_path)
+    if "actions/cache@v4" not in workflow_text:
+        return fail("build.yml is missing actions/cache@v4 for deps caching")
+    if "deps cache hit" not in workflow_text:
+        return fail("build.yml is missing the deps cache-hit guard ('deps cache hit')")
+    if "v0.0.7" not in workflow_text:
+        return fail("build.yml must pin libuvc to v0.0.7 (parity with build-deps-windows.sh)")
+
+    dev_notes_text = read_text(dev_notes_path)
+    required_dev_snippets = [
+        "Vendored deps caching",
+        "build-deps-windows.sh",
+        "actions/cache@v4",
+        "publish-deps-cache.sh",
+    ]
+    for snippet in required_dev_snippets:
+        if snippet not in dev_notes_text:
+            return fail(f"Dev notes are missing deps-cache contract snippet: {snippet}")
+
+    installation_text = read_text(tools_readme_path)
+    required_installation_snippets = [
+        "Vendored deps caching model",
+        "build-deps-windows.sh",
+        "build-deps-unix.sh",
+        "publish-deps-cache.sh",
+    ]
+    for snippet in required_installation_snippets:
+        if snippet not in installation_text:
+            return fail(f"INSTALLATION.md is missing deps-cache contract snippet: {snippet}")
+    return 0
 
 
 def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
@@ -801,6 +921,9 @@ def main() -> int:
     gui_settings_c_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings.c"
     flac_writer_c_path = repo_root / "misrc_tools/common/flac_writer.c"
     meson_path = repo_root / "misrc_tools/meson.build"
+    tools_readme_path = repo_root / "misrc_tools/README.md"
+    installation_md_path = repo_root / "INSTALLATION.md"
+    dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
 
     checks: List[Tuple[str, Callable[[], int]]] = [
@@ -826,6 +949,8 @@ def main() -> int:
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
+        ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
+        ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))

@@ -72,9 +72,32 @@ for candidate in "${MISRC_DEPS_PREFIX:-}" "$REPO_ROOT/.deps/install" "$REPO_ROOT
   done
 done
 
+# Ensure vendored deps exist and are fresh. The deps script mirrors the
+# linux-appimage/macos CI deps blocks and self-skips via a stamp when inputs
+# are unchanged, so new terminals reuse until an input changes (local == CI).
+# Skip only when the caller points at a prebuilt prefix via MISRC_DEPS_PREFIX.
+if [[ -z "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]]; then
+  deps_script="$SCRIPT_DIR/build-deps-unix.sh"
+  if [[ ! -f "$deps_script" ]]; then
+    fail "Deps build script not found: $deps_script"
+  fi
+  log "Ensuring local deps via $deps_script (skips instantly if already built)"
+  bash "$deps_script"
+  # Re-detect the deps prefix after the build.
+  for candidate in "$REPO_ROOT/.deps/install" "$REPO_ROOT/.deps/install-appimage-local"; do
+    for pcdir in "$candidate/lib/pkgconfig" "$candidate/lib64/pkgconfig"; do
+      if [[ -f "$pcdir/hsdaoh.pc" || -f "$pcdir/libhsdaoh.pc" ]]; then
+        DEPS_PREFIX="$candidate"; break 2
+      fi
+    done
+  done
+  if [[ -z "$DEPS_PREFIX" ]]; then
+    fail "Deps build reported success but hsdaoh.pc still not found under .deps/install."
+  fi
+fi
+
 if [[ -z "$DEPS_PREFIX" ]]; then
-  fail "No vendored hsdaoh.pc found under .deps/install or .deps/install-appimage-local. \
-Run 'scripts/build-appimage-local.sh --native' first to build the deps, or set MISRC_DEPS_PREFIX."
+  fail "No vendored hsdaoh.pc found under .deps/install or .deps/install-appimage-local, and MISRC_DEPS_PREFIX not set."
 fi
 log "Using deps prefix: $DEPS_PREFIX"
 

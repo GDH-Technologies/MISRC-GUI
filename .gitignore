@@ -2,6 +2,7 @@
 /build/
 /build-android/
 /build-gha/
+/build-local/
 /builddir/
 /dist/
 /misrc_tools/build/
