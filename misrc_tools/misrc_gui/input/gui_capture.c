@@ -608,6 +608,13 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
     }
 }
 
+static bool gui_capture_device_is_misrc_clockgen(const device_info_t *dev)
+{
+    if (!dev) return false;
+    if (dev->type != DEVICE_TYPE_CXADC) return false;
+    return strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0;
+}
+
 /*-----------------------------------------------------------------------------
  * GUI-Specific Capture Handler Callbacks
  *-----------------------------------------------------------------------------*/
@@ -1224,19 +1231,35 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     }
 #endif
 
-    // Add CXADC mode option if cards are detected on host.
-    if (cxadc_card_count > 0 && app->device_count < MAX_DEVICES) {
-        device_info_t *dst = &app->devices[app->device_count];
+    // Add CXADC mode options if cards are detected on host.
+    // Two-card hosts expose both clockgen variants so MISRC v1.5 can be
+    // selected explicitly without replacing the existing CXADC mode.
+    if (cxadc_card_count > 0) {
         if (cxadc_card_count > 1) {
-            snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC Clockgen");
-            dst->index = 2;
-        } else {
+            if (app->device_count < MAX_DEVICES) {
+                device_info_t *dst = &app->devices[app->device_count];
+                snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC Clockgen");
+                snprintf(dst->serial, sizeof(dst->serial), "%s", CXADC_MARKER_SERIAL_2CARD_CX_CLOCKGEN);
+                dst->type = DEVICE_TYPE_CXADC;
+                dst->index = 2;
+                app->device_count++;
+            }
+            if (app->device_count < MAX_DEVICES) {
+                device_info_t *dst = &app->devices[app->device_count];
+                snprintf(dst->name, sizeof(dst->name), "[CXADC] MISRC Clockgen");
+                snprintf(dst->serial, sizeof(dst->serial), "%s", CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN);
+                dst->type = DEVICE_TYPE_CXADC;
+                dst->index = 2;
+                app->device_count++;
+            }
+        } else if (app->device_count < MAX_DEVICES) {
+            device_info_t *dst = &app->devices[app->device_count];
             snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC");
+            snprintf(dst->serial, sizeof(dst->serial), "%s", CXADC_MARKER_SERIAL_1CARD);
+            dst->type = DEVICE_TYPE_CXADC;
             dst->index = 1;
+            app->device_count++;
         }
-        snprintf(dst->serial, sizeof(dst->serial), "CXADC_%dCARD", dst->index);
-        dst->type = DEVICE_TYPE_CXADC;
-        app->device_count++;
     }
 
     // Always add simulated device at the end
@@ -1585,12 +1608,13 @@ int gui_app_start_capture(gui_app_t *app) {
         int cxadc_cards = dev->index;
         if (cxadc_cards < 1) cxadc_cards = 1;
         if (cxadc_cards > 2) cxadc_cards = 2;
+        bool cxadc_misrc_clockgen_mode = gui_capture_device_is_misrc_clockgen(dev);
         // gui_cxadc_start() launches extraction internally; set runtime
         // capability flags first so extraction selects the correct A/B path.
         app->capture_backend_upstream = false;
         app->capture_has_channel_b = (cxadc_cards > 1);
         gui_capture_apply_cxadc_profile(app, cxadc_cards);
-        int cxadc_rc = gui_cxadc_start(app, cxadc_cards);
+        int cxadc_rc = gui_cxadc_start(app, cxadc_cards, cxadc_misrc_clockgen_mode);
         if (cxadc_rc == 0) {
             bool prev_runtime_mode = app->capture_mode_runtime_misrc;
             app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;

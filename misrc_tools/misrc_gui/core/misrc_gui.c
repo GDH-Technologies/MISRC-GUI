@@ -206,6 +206,19 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
             if (target->name[0] && strcmp(dev->name, target->name) == 0) {
                 return i;
             }
+        } else if (target->type == DEVICE_TYPE_CXADC) {
+            // Multiple synthetic CXADC entries can exist (e.g. CXADC Clockgen
+            // and MISRC Clockgen). Match by marker serial/name first so
+            // reconnect preserves the selected variant.
+            if (target->serial[0] && strcmp(dev->serial, target->serial) == 0) {
+                return i;
+            }
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+                return i;
+            }
+            if (target->index >= 0 && dev->index == target->index) {
+                return i;
+            }
         }
 #ifdef ENABLE_DDD
         else if (target->type == DEVICE_TYPE_DDD) {

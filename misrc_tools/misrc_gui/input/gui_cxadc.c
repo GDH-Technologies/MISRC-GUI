@@ -228,13 +228,15 @@ static int cxadc_win_set_tenbit(int card_idx, bool enabled)
 static const PROPERTYKEY s_PKEY_Device_FriendlyName = {
     { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
 };
-// PKEY_Device_InstanceId: returns device instance path like USB\VID_1209&PID_0002&MI_00\...
+// PKEY_Device_InstanceId: returns device instance path like USB\VID_1209&PID_0001&MI_00\...
 static const PROPERTYKEY s_PKEY_Device_InstanceId = {
     { 0x78c34fc8, 0x104a, 0x4aca, { 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0xfc } }, 42
 };
-// cxadc-win clockgen USB identifiers (Raspberry Pi Pico + Si5351 clockgen mod).
-#define CXADC_CLOCKGEN_USB_VID_W L"vid_1209"
-#define CXADC_CLOCKGEN_USB_PID_W L"pid_0002"
+// MISRC Clockgen USB identifiers (Raspberry Pi Pico + Si5351 clockgen mod).
+// Keep both PID values to support mixed firmware generations.
+#define MISRC_CLOCKGEN_USB_VID_W L"vid_1209"
+#define MISRC_CLOCKGEN_USB_PID_PRIMARY_W L"pid_0002"
+#define MISRC_CLOCKGEN_USB_PID_ALT_W L"pid_0001"
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -270,6 +272,7 @@ typedef struct {
     thrd_t audio_thread;
     bool audio_thread_started;
     int card_count;
+    bool misrc_clockgen_mode;
     bool tenbit_mode[CXADC_MAX_CARDS];
     uint32_t card_sample_rate_hz[CXADC_MAX_CARDS];
     uint32_t rf_sample_rate_hz;
@@ -700,12 +703,37 @@ static bool cxadc_str_contains_nocase(const char *haystack, const char *needle)
     return false;
 }
 
-static bool cxadc_alsa_card_name_matches_clockgen(const char *name, const char *longname)
+static bool cxadc_alsa_card_name_matches_cxadc_clockgen(const char *name, const char *longname)
 {
     return cxadc_str_contains_nocase(name, "cxadc") ||
            cxadc_str_contains_nocase(name, "clockgen") ||
            cxadc_str_contains_nocase(longname, "cxadc") ||
            cxadc_str_contains_nocase(longname, "clockgen");
+}
+
+static bool cxadc_alsa_card_name_matches_misrc_clockgen(const char *name, const char *longname)
+{
+    bool name_has_misrc = cxadc_str_contains_nocase(name, "misrc") ||
+                          cxadc_str_contains_nocase(longname, "misrc");
+    bool name_has_clockgen = cxadc_str_contains_nocase(name, "clockgen") ||
+                             cxadc_str_contains_nocase(longname, "clockgen");
+    bool name_has_pcm1802 = cxadc_str_contains_nocase(name, "pcm1802") ||
+                            cxadc_str_contains_nocase(longname, "pcm1802");
+    return name_has_misrc && (name_has_clockgen || name_has_pcm1802);
+}
+
+static bool cxadc_alsa_card_name_matches_target(const cxadc_ctx_t *ctx,
+                                                 const char *name,
+                                                 const char *longname)
+{
+    if (ctx && ctx->misrc_clockgen_mode) {
+        if (cxadc_alsa_card_name_matches_misrc_clockgen(name, longname)) {
+            return true;
+        }
+        // Fallback so MISRC mode still works with legacy/unbranded card names.
+        return cxadc_alsa_card_name_matches_cxadc_clockgen(name, longname);
+    }
+    return cxadc_alsa_card_name_matches_cxadc_clockgen(name, longname);
 }
 
 static int cxadc_configure_audio_pcm(snd_pcm_t *pcm,
@@ -785,7 +813,7 @@ static int cxadc_probe_alsa_cards_for_audio(cxadc_ctx_t *ctx)
         (void)snd_card_get_name(card, &name);
         (void)snd_card_get_longname(card, &longname);
 
-        bool likely_clockgen = cxadc_alsa_card_name_matches_clockgen(name, longname);
+        bool likely_clockgen = cxadc_alsa_card_name_matches_target(ctx, name, longname);
         if (likely_clockgen) {
             matched_named_clockgen_card = true;
             char usbstream_dev[32];
@@ -846,9 +874,21 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
     //   alsamixer -D usbstream:CARD=CXADCADCClockGe
     // and make sure "USB Stream Output" is enabled/unmuted.
 
-    const char *env_device = getenv("MISRC_CXADC_ALSA_DEVICE");
-    const char *candidates[] = {
-        env_device,
+    const char *env_device = ctx->misrc_clockgen_mode
+        ? getenv("MISRC_CLOCKGEN_ALSA_DEVICE")
+        : getenv("MISRC_CXADC_ALSA_DEVICE");
+    if ((!env_device || !env_device[0]) && ctx->misrc_clockgen_mode) {
+        // Backward-compatible override name.
+        env_device = getenv("MISRC_CXADC_ALSA_DEVICE");
+    }
+
+    if (env_device && env_device[0]) {
+        if (cxadc_try_open_audio_device(ctx, env_device) == 0) {
+            return 0;
+        }
+    }
+
+    static const char *cxadc_candidates[] = {
         "usbstream:CARD=CXADCADCClockGe",
         "usbstream:CARD=CXADCADCClockGen",
         "usbstream:CARD=CXADCClockGen",
@@ -863,7 +903,27 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
         "plughw:CARD=CXADCClockGe",
         NULL
     };
+    static const char *misrc_candidates[] = {
+        "usbstream:CARD=MISRCClockgen",
+        "usbstream:CARD=MISRCClockGe",
+        "usbstream:CARD=MISRCClock",
+        "hw:CARD=MISRCClockgen",
+        "hw:CARD=MISRCClockGe",
+        "hw:CARD=MISRCClock",
+        "plughw:CARD=MISRCClockgen",
+        "plughw:CARD=MISRCClockGe",
+        "plughw:CARD=MISRCClock",
+        "usbstream:CARD=PCM1802",
+        "hw:CARD=PCM1802",
+        "plughw:CARD=PCM1802",
+        "usbstream:CARD=CXADCADCClockGe",
+        "usbstream:CARD=CXADCADCClockGen",
+        "hw:CARD=CXADCADCClockGe",
+        "hw:CARD=CXADCADCClockGen",
+        NULL
+    };
 
+    const char *const *candidates = ctx->misrc_clockgen_mode ? misrc_candidates : cxadc_candidates;
     for (size_t i = 0; candidates[i]; i++) {
         if (cxadc_try_open_audio_device(ctx, candidates[i]) == 0) {
             return 0;
@@ -965,12 +1025,43 @@ static int cxadc_wasapi_parse_format(const WAVEFORMATEX *wfx, cxadc_ctx_t *ctx)
     return 0;
 }
 
-// Match a WASAPI capture endpoint against the cxadc-win clockgen.
-// Checks (a) explicit env override, (b) USB instance path VID/PID, (c) friendly name.
-static bool cxadc_wasapi_device_matches(const wchar_t *friendly_name,
-                                        const wchar_t *instance_id)
+static bool cxadc_wasapi_wstr_contains_nocase(const wchar_t *haystack, const wchar_t *needle)
 {
-    const char *env_device = getenv("MISRC_CXADC_WASAPI_DEVICE");
+    if (!haystack || !needle || !needle[0]) return false;
+
+    wchar_t haystack_lower[512];
+    wcsncpy(haystack_lower, haystack, 511);
+    haystack_lower[511] = L'\0';
+    _wcslwr(haystack_lower);
+
+    wchar_t needle_lower[128];
+    wcsncpy(needle_lower, needle, 127);
+    needle_lower[127] = L'\0';
+    _wcslwr(needle_lower);
+
+    return wcsstr(haystack_lower, needle_lower) != NULL;
+}
+
+static bool cxadc_wasapi_instance_matches_misrc_clockgen(const wchar_t *instance_id)
+{
+    if (!instance_id) return false;
+
+    wchar_t id_lower[512];
+    wcsncpy(id_lower, instance_id, 511);
+    id_lower[511] = L'\0';
+    _wcslwr(id_lower);
+    if (!wcsstr(id_lower, MISRC_CLOCKGEN_USB_VID_W)) {
+        return false;
+    }
+    return (wcsstr(id_lower, MISRC_CLOCKGEN_USB_PID_PRIMARY_W) != NULL) ||
+           (wcsstr(id_lower, MISRC_CLOCKGEN_USB_PID_ALT_W) != NULL);
+}
+
+static bool cxadc_wasapi_device_matches_env_override(const char *env_name,
+                                                     const wchar_t *friendly_name,
+                                                     const wchar_t *instance_id)
+{
+    const char *env_device = getenv(env_name);
     if (env_device && env_device[0]) {
         wchar_t env_w[256];
         int len = MultiByteToWideChar(CP_UTF8, 0, env_device, -1, env_w, 256);
@@ -980,18 +1071,46 @@ static bool cxadc_wasapi_device_matches(const wchar_t *friendly_name,
             if (instance_id && wcsstr(instance_id, env_w) != NULL) return true;
         }
     }
-    // Clockgen mod is USB VID 1209 PID 0002 (Raspberry Pi Pico + Si5351).
-    if (instance_id) {
-        wchar_t id_lower[512];
-        wcsncpy(id_lower, instance_id, 511);
-        id_lower[511] = L'\0';
-        _wcslwr(id_lower);
-        if (wcsstr(id_lower, CXADC_CLOCKGEN_USB_VID_W) &&
-            wcsstr(id_lower, CXADC_CLOCKGEN_USB_PID_W)) {
+    return false;
+}
+
+// Match a WASAPI capture endpoint against the selected clockgen variant.
+// Checks: explicit env override, USB instance VID/PID, and friendly-name fallbacks.
+static bool cxadc_wasapi_device_matches(const cxadc_ctx_t *ctx,
+                                        const wchar_t *friendly_name,
+                                        const wchar_t *instance_id)
+{
+    if (ctx && ctx->misrc_clockgen_mode) {
+        if (cxadc_wasapi_device_matches_env_override("MISRC_CLOCKGEN_WASAPI_DEVICE",
+                                                     friendly_name,
+                                                     instance_id)) {
             return true;
         }
+        if (cxadc_wasapi_device_matches_env_override("MISRC_CXADC_WASAPI_DEVICE",
+                                                     friendly_name,
+                                                     instance_id)) {
+            return true;
+        }
+        if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id)) {
+            return true;
+        }
+        if (friendly_name &&
+            (cxadc_wasapi_wstr_contains_nocase(friendly_name, L"misrc clockgen") ||
+             cxadc_wasapi_wstr_contains_nocase(friendly_name, L"pcm1802"))) {
+            return true;
+        }
+        return false;
     }
-    // Fallback: match clockgen identifiers in friendly name.
+
+    if (cxadc_wasapi_device_matches_env_override("MISRC_CXADC_WASAPI_DEVICE",
+                                                 friendly_name,
+                                                 instance_id)) {
+        return true;
+    }
+    // Keep explicit MISRC mode and regular CXADC mode distinct by default.
+    if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id)) {
+        return false;
+    }
     if (friendly_name) {
         const wchar_t *patterns[] = { L"CXADC", L"ClockGen", L"Clockgen", L"clockgen", NULL };
         for (int i = 0; patterns[i]; i++) {
@@ -1066,11 +1185,16 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
             instance_id_w = pv_id.pwszVal;
         }
 
-        if (cxadc_wasapi_device_matches(friendly_name_w, instance_id_w)) {
+        if (cxadc_wasapi_device_matches(ctx, friendly_name_w, instance_id_w)) {
             found = true;
-            const wchar_t *label = friendly_name_w ? friendly_name_w : instance_id_w;
-            snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
-                     "WASAPI:%ls", label ? label : L"clockgen");
+            if (ctx->misrc_clockgen_mode) {
+                snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
+                         "%s", "WASAPI:MISRC Clockgen");
+            } else {
+                const wchar_t *label = friendly_name_w ? friendly_name_w : instance_id_w;
+                snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
+                         "WASAPI:%ls", label ? label : L"clockgen");
+            }
         }
 
         if (pv_name.vt == VT_LPWSTR && pv_name.pwszVal) CoTaskMemFree(pv_name.pwszVal);
@@ -1527,7 +1651,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
     return 0;
 }
 
-int gui_cxadc_start(gui_app_t *app, int card_count)
+int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
     if (atomic_load(&s_cxadc.running)) return 0;
@@ -1538,6 +1662,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     memset(&s_cxadc, 0, sizeof(s_cxadc));
     s_cxadc.app = app;
     s_cxadc.card_count = card_count;
+    s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
         bool mode = app->settings.cxadc_tenbit_mode_card[i];
         if (i >= card_count) {
@@ -1618,7 +1743,8 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
 #endif
     } else {
 #if defined(_WIN32) || LIBASOUND_ENABLED
-        fprintf(stderr, "[CXADC] clockgen audio device not available; continuing RF-only\n");
+        fprintf(stderr, "[CXADC] %s audio device not available; continuing RF-only\n",
+                s_cxadc.misrc_clockgen_mode ? "MISRC clockgen" : "clockgen");
 #if !defined(_WIN32) && LIBASOUND_ENABLED
         fprintf(stderr, "[CXADC] support note: for ClockGen Lite feed, check alsamixer card "
                         "\"CXADC+ADC-ClockGen\" (e.g. -D usbstream:CARD=CXADCADCClockGe) "
@@ -1677,7 +1803,13 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
         }
     }
 
-    gui_app_set_status(app, (card_count > 1) ? "CXADC Clockgen capture running" : "CXADC capture running");
+    if (card_count > 1) {
+        gui_app_set_status(app, s_cxadc.misrc_clockgen_mode
+            ? "MISRC Clockgen capture running"
+            : "CXADC Clockgen capture running");
+    } else {
+        gui_app_set_status(app, "CXADC capture running");
+    }
     return 0;
 }
 
@@ -1690,6 +1822,8 @@ void gui_cxadc_stop(gui_app_t *app)
     if (!app) {
         app = s_cxadc.app;
     }
+    bool was_clockgen_mode = (s_cxadc.card_count > 1);
+    bool was_misrc_clockgen_mode = s_cxadc.misrc_clockgen_mode;
 
     if (app) {
         app->is_capturing = false;
@@ -1720,7 +1854,13 @@ void gui_cxadc_stop(gui_app_t *app)
         atomic_store(&app->stream_synced, false);
         atomic_store(&app->dropout_stop_requested, false);
         atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
-        gui_app_set_status(app, "CXADC capture stopped");
+        if (was_clockgen_mode) {
+            gui_app_set_status(app, was_misrc_clockgen_mode
+                ? "MISRC Clockgen capture stopped"
+                : "CXADC Clockgen capture stopped");
+        } else {
+            gui_app_set_status(app, "CXADC capture stopped");
+        }
     }
 
     memset(&s_cxadc, 0, sizeof(s_cxadc));

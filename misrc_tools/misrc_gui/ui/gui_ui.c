@@ -92,6 +92,16 @@ static bool gui_ui_selected_device_is_cxadc(const gui_app_t *app, bool *clockgen
     return true;
 }
 
+static bool gui_ui_selected_device_is_cxadc_misrc_clockgen(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+
+    const device_info_t *dev = &app->devices[app->selected_device];
+    if (dev->type != DEVICE_TYPE_CXADC) return false;
+    return strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0;
+}
+
 static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 {
     if (!app) return 40000.0f;
@@ -3722,6 +3732,7 @@ static void render_toolbar(gui_app_t *app) {
                                                         device_dropdown_max_width);
     bool cxadc_clockgen_mode = false;
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_mode);
+    bool cxadc_misrc_clockgen_mode = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
 #ifdef ENABLE_FX3
     bool fx3_mode = gui_ui_selected_device_is_fx3(app);
 #else
@@ -3751,7 +3762,11 @@ static void render_toolbar(gui_app_t *app) {
     Color mode_fg = mode_change_allowed ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
     const char *mode_label = NULL;
     if (cxadc_mode) {
-        mode_label = cxadc_clockgen_mode ? "Mode: CXADC Clockgen" : "Mode: CXADC";
+        if (cxadc_clockgen_mode) {
+            mode_label = cxadc_misrc_clockgen_mode ? "Mode: MISRC Clockgen" : "Mode: CXADC Clockgen";
+        } else {
+            mode_label = "Mode: CXADC";
+        }
     } else if (fx3_mode) {
         mode_label = "Mode: FX3ADC";
     } else if (ddd_mode) {
@@ -3761,7 +3776,9 @@ static void render_toolbar(gui_app_t *app) {
     }
     if (toolbar_tiny) {
         if (cxadc_mode) {
-            mode_label = cxadc_clockgen_mode ? "CxC" : "CXA";
+            mode_label = cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MiCg" : "CxCg")
+                : "CXA";
         } else if (fx3_mode) {
             mode_label = "FX3ADC";
         } else if (ddd_mode) {
@@ -3771,7 +3788,9 @@ static void render_toolbar(gui_app_t *app) {
         }
     } else if (toolbar_very_narrow) {
         if (cxadc_mode) {
-            mode_label = cxadc_clockgen_mode ? "CxClk" : "CXADC";
+            mode_label = cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MisClk" : "CxClk")
+                : "CXADC";
         } else if (fx3_mode) {
             mode_label = "FX3ADC";
         } else if (ddd_mode) {
@@ -5779,6 +5798,7 @@ void gui_handle_interactions(gui_app_t *app) {
         bool mode_toggle_hit = Clay_PointerOver(CLAY_ID("CaptureModeToggle"));
         bool mode_toggle_cxadc_clockgen = false;
         bool mode_toggle_is_cxadc = gui_ui_selected_device_is_cxadc(app, &mode_toggle_cxadc_clockgen);
+        bool mode_toggle_is_cxadc_misrc_clockgen = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
 #ifdef ENABLE_FX3
         bool mode_toggle_is_fx3 = gui_ui_selected_device_is_fx3(app);
 #else
@@ -5847,9 +5867,13 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         if (mode_toggle_hit) {
             if (mode_toggle_is_cxadc) {
-                gui_app_set_status(app, mode_toggle_cxadc_clockgen
-                    ? "CXADC Clockgen mode is fixed by detected card count"
-                    : "CXADC mode is fixed by detected card count");
+                if (mode_toggle_cxadc_clockgen) {
+                    gui_app_set_status(app, mode_toggle_is_cxadc_misrc_clockgen
+                        ? "MISRC Clockgen mode is selected from the device list"
+                        : "CXADC Clockgen mode is selected from the device list");
+                } else {
+                    gui_app_set_status(app, "CXADC mode is selected from the device list");
+                }
             } else if (mode_toggle_is_fx3) {
                 gui_app_set_status(app, "FX3ADC backend selected; MISRC/HSDAOH mode not applicable");
             } else if (mode_toggle_is_ddd) {
