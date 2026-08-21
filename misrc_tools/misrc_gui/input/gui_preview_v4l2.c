@@ -9,7 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__linux__)
+/* Android is __linux__ too, but has no V4L2 access, no posix_spawn/environ
+ * ffmpeg subprocess and no writable /dev/video* -- and upstream now builds
+ * this same source list into its Android target. Route Android to the
+ * non-Linux stubs below instead of compiling this in. */
+#if defined(__linux__) && !defined(__ANDROID__)
 
 #include <errno.h>
 #include <fcntl.h>

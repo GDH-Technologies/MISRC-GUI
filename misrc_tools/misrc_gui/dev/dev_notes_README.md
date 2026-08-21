@@ -14,6 +14,48 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
 
+## 2026-08-21 Windows WASAPI audio capture: use device format, not system mix format (cxadc-win capture-server pattern)
+
+- Problem: clockgen audio (PCM1802 2ch + headswitch CH3) captured via WASAPI shared mode was distorted on Windows, and Ch3/Ch4 showed red/clipping. Recorded audio was unusable.
+- Root cause: `cxadc_open_audio_capture()` used `IAudioClient::GetMixFormat()` to discover the audio format. GetMixFormat returns the *system mix format* (typically 48000 Hz), NOT the device's actual hardware format. In shared mode Windows silently resamples the device's real stream (e.g. 46875 Hz) up to the system mix rate, corrupting the headswitch signal — a fast binary control signal that resampling destroys.
+- Fix (ported from the proven `cxadc-win` capture-server `src/capture-server/audio_wasapi.c`):
+  - `misrc_tools/misrc_gui/input/gui_cxadc.c` (`cxadc_open_audio_capture`)
+    - Read `PKEY_AudioEngine_DeviceFormat` (the device's actual hardware format, a `WAVEFORMATEXTENSIBLE` blob) from the endpoint's property store instead of `GetMixFormat`.
+    - Validate the device format with `IAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, ...)` BEFORE `Initialize`.
+    - If supported, `Initialize` in **exclusive mode** with the device's native format — no Windows resampling, clean data on all 3 channels. Buffer-size alignment retry: if `Initialize` returns `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`, recalculate the duration from `GetBufferSize` + the device sample rate and retry once (mirrors capture-server).
+    - If exclusive is not supported, fall back to shared mode with `GetMixFormat` + a clear warning that Windows may resample.
+  - Added `s_PKEY_AudioEngine_DeviceFormat` PROPERTYKEY + `REFTIMES_PER_SEC` define locally (MinGW headers don't provide them).
+- Why this works: exclusive mode at the device's real format forces Windows to clock the USB audio device at that rate with no resampling engine in the path. The headswitch CH3 comes through clean. This is the same approach the cxadc-win capture-server uses for its working Windows audio capture.
+- Validated locally: `misrc_gui.exe` builds clean, `--smoke-test` passes. Runtime exclusive-mode success + clean Ch3/Ch4 still pending real-hardware confirmation.
+- Key constraint: do NOT revert to `GetMixFormat`-only shared mode — that is the bug that corrupts the headswitch. The device-format + exclusive path must stay.
+
+## 2026-08-21 Vendored deps caching + CI parity (any terminal just works)
+
+- Problem: building the Windows exe locally snagged because `.deps/install` (compiled hsdaoh + libuvc + raylib) never existed locally. CI rebuilt these from scratch every run with no cache, and the local scripts bailed at the deps gate pointing at a Linux-only script. The dev notes only covered the Meson PATH snag, not the deps-build step.
+- Root cause: hsdaoh/libuvc/raylib are not system packages; they must be compiled from `third_party/hsdaoh` + upstream clones into `.deps/install`. This is what CI does every run (`windows-exe` job, `.github/workflows/build.yml`), but it was never scripted or documented for local Windows use.
+- Fix: `scripts/build-deps-windows.sh` mirrors the CI `windows-exe` deps block (static libuvc v0.0.7 + vendored hsdaoh + vendored raylib with internal GLFW) into `.deps/install`. It is stamp-gated: a content-addressed hash of the hsdaoh source + raylib tag + libuvc ref + pacman dep versions skips the rebuild when unchanged. `scripts/build-local.ps1` auto-invokes it via MSYS2 MINGW64 on first run or when inputs change — one command builds everything, no manual deps step, no shell restart.
+- Cross-platform parity: `scripts/build-deps-unix.sh` mirrors the `linux-appimage`/`macos` CI deps blocks with the same stamp gate. `scripts/build-local.sh` auto-invokes it.
+- CI caching: `actions/cache@v4` on `.deps/install` (keyed on `hashFiles(third_party/hsdaoh/**)` + raylib/libuvc versions) added to all four build jobs, with a cache-hit guard that skips the rebuild when the install is already present.
+- Prebuilt publishing: `scripts/publish-deps-cache.sh <platform> <arch>` packages `.deps/install` into a tar.xz + sha256 for upload to `harrypm/MISRC-ci-cache` (same flow as libFLAC 1.5.0). Not auto-uploaded; prints the `gh release upload` command for manual review.
+- Local CI/dev guard: `python misrc_tools/test/ci_guard_tests.py --static-only` now checks the deps scripts exist, the stamp gate is present, `build-local.ps1` invokes the deps script (not bails), and docs snippets exist — so the local==CI path can't be silently removed.
+- Validated locally: `misrc_gui.exe` (10.7 MB) builds clean, `--smoke-test` exits 0, deps stamp cache skips on second run.
+
+## 2026-08-21 Windows local build bootstrap note (Meson PATH snag)
+
+- Symptom:
+  - `meson: The term 'meson' is not recognized...` in PowerShell.
+- Root cause:
+  - Local shell does not have Meson/Ninja on `PATH`, even when Python is installed.
+- Standard recovery (now the expected flow):
+  - Bootstrap and verify build-tool connection:
+    - `pwsh -File scripts/build-local.ps1 -BootstrapOnly`
+  - Build locally:
+    - `pwsh -File scripts/build-local.ps1`
+- Why this avoids repeat breakage:
+  - `scripts/build-local.ps1` auto-installs user-level `meson` + `ninja` when missing and adds the Python user `Scripts` directory to session `PATH` before invoking Meson.
+- Local CI/dev guard:
+  - `python misrc_tools/test/ci_guard_tests.py --static-only` now checks this contract (script + note snippets), so future edits don’t accidentally remove the bootstrap path.
+
 ## 2026-04-16 capture/runtime snapshot
 
 - Timestamp (UTC): `2026-04-16T03:38:18Z`
@@ -91,3 +133,67 @@ Recent capture regressions showed that small callback-gating changes can silentl
 - Root cause: MISRC shared parser (`misrc_tools/common/frame_parser.c`) diverged from upstream hsdaoh CRC behavior by masking trailer/stream-id high nibbles before `crc16_ccitt(...)`.
 - Upstream reference (`.deps-gha-local/hsdaoh/src/libhsdaoh.c`) computes CRC over raw line bytes without this masking.
 - Corrective direction: compute CRC on raw line bytes in shared parser to align verifier input with upstream transport format, then revalidate mismatch rate with `MISRC_DEBUG=1` capture runs.
+
+## 2026-08-13 Android arm64-v8a APK support (android-support branch)
+
+- Target: basic, launchable Android 11+ (API 30) `arm64-v8a` APK via NativeActivity + raylib `rcore_android.c`, cross-compiled with NDK r25c on an x86_64 Linux host. Full plan in `android/ANDROID_SUPPORT_PLAN.md`.
+- Toolchain: Android SDK cmdline-tools + build-tools;34.0.0 + platforms;android-30/34 + NDK 25.2.9519653 installed to `~/Android/Sdk`; `ANDROID_HOME`/`ANDROID_NDK_HOME`/`NDK_HOME` persisted to `~/.bashrc`.
+- Build flow (all reproducible via scripts under `android/`):
+  1. `android/build-deps-android.sh` cross-builds 7 static deps into `.deps/install-android-arm64` (libFLAC 1.5.0, FFTW 3.3.10 fftw3f, libsoxr 0.1.3, libusb 1.0.27, libuvc, vendored hsdaoh, raylib 5.5 PLATFORM=Android GLES 3.0). Versions + SHAs recorded in `android/deps-versions.txt`.
+  2. `android/gen-cross-file.sh` emits the Meson cross-file `android/aarch64-linux-android.ini` from `$ANDROID_NDK_HOME` + `$DEPS_PREFIX`; `android/android-pkg-config` is a self-contained cross pkg-config wrapper (DEPS_PREFIX-only, no host .pc leak).
+  3. `PKG_CONFIG=android/android-pkg-config meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release build-android misrc_tools` then `meson compile -C build-android misrc_gui` produces `build-android/libmisrc_gui.so`.
+  4. `android/build-apk.sh` packages `libmisrc_gui.so` + `libhsdaoh.so` + manifest + icon into a debug-signed, zipaligned APK at `.ci-artifacts/android-apk/`.
+- Code changes (see `git show` on the android-support commit for the full diff):
+  - `misrc_tools/meson.build`: `android` host branch — GUI built as `shared_library('misrc_gui')` (NativeActivity loads .so), CLI executables gated off, link `-lEGL -lGLESv2 -lGLESv3 -landroid -llog -lOpenSLES -lm -ldl` (no -lpthread/-lX11/-lGL), `-DGRAPHICS_API_OPENGL_ES3` added to cflags.
+  - `misrc_tools/misrc_capture/simple_capture/simple_capture.h` + new `simple_capture_android.c`: `__ANDROID__` branch checked BEFORE `__linux__` (NDK clang defines both) + no-device `sc_*` stub (CXADC/V4L2 out of scope for basic release).
+  - `misrc_tools/misrc_gui/core/gui_settings.c`: `__ANDROID__` storage paths -> `/sdcard/Android/data/dev.misrc.gui/files/` (no HOME/Desktop on Android).
+  - `misrc_tools/common/shm_anon.h`: `__ANDROID__` branch uses bionic's native `memfd_create` (API 30), not the glibc syscall shim.
+  - `misrc_tools/common/flac_writer.c`: FLAC thread-affinity block gated to `__linux__ && !__ANDROID__` (bionic lacks `pthread_setaffinity_np`).
+  - `.github/workflows/build.yml` + `misrc_tools/test/ci_guard_tests.py`: `android-apk` CI job + Android packaging-mirror guard.
+- Entry-point contract (risk #2 resolved by reading `rcore_android.c:269-279`): raylib 5.5 defines `android_main()` which calls the app's standard `main()` — the existing `misrc_gui.c` main() is reused UNCHANGED. Do NOT add an `android_main` shim (would collide with raylib's).
+- Bugs found & fixed during the cross-build (all verified against hard data, not assumed):
+  - raylib 5.5 `rlgl.h:1908-1909` has inverted ES3/non-ES3 branches in `rlActiveDrawBuffers()`: under `GRAPHICS_API_OPENGL_ES3` it called `glDrawBuffersEXT` (an ES2 extension symbol absent on GLES3) instead of `glDrawBuffers` (GLES3 core). Patched via sed in `build-deps-android.sh` to use `glDrawBuffers`. Upstream raylib bug.
+  - raylib CMake install emits a Desktop-style `raylib.pc` with `Requires.private: glfw3` (wrong for PLATFORM=Android — rcore_android.c uses EGL/ANativeWindow, no glfw). With the cross pkg-config wrapper forcing `--static`, this made `pkg-config --static raylib` fail and Meson fell back to CMake, picking up a HOST x86_64 `/usr/local/lib/libraylib.a` (arch-mismatch leak). Fixed by dropping the glfw3 require + setting Android `Libs.private` in the deps script.
+  - hsdaoh hard-requires libuvc (`CMakeLists.txt:132` FATAL_ERROR) — libuvc was not in the original plan's 6 deps. Added a libuvc cross-build block.
+  - hsdaoh `src/CMakeLists.txt:143` links `hsdaoh_test` with `-lrt`, which does not exist on Android (clock_gettime is in libc, like macOS). sed-patched the build copy to add `ANDROID` to the no-rt branch.
+  - Meson 0.61.2 reads machine info from `[host_machine]`, NOT `[properties]` — the cross-file must set `system = 'android'` under `[host_machine]` or `host_system` is misreported as `linux` and the linux branch adds `simple_capture_v4l2.c` (no V4L2 headers on Android -> compile cascade failure).
+  - Cross pkg-config wrapper must be self-contained (derive `DEPS_PREFIX` from its own location): Meson invokes the binary without the shell env, so requiring `DEPS_PREFIX` as an env var broke dep resolution.
+- Verification (hard data):
+  - `build-android/libmisrc_gui.so`: 16.2 MB, ELF 64-bit ARM aarch64 shared object.
+  - `llvm-nm -D`: `ANativeActivity_onCreate` exported (T) — NativeActivity entry; `android_main` + `main` both exported.
+  - `llvm-readelf -d` NEEDED: libEGL.so, libGLESv2.so, libGLESv3.so, libandroid.so, liblog.so, libm.so, libdl.so, libhsdaoh.so, libc.so — all Android sysroot. Zero host x86_64 lib leaks (`/usr/lib/x86_64`/`/usr/local/lib` grep count = 0).
+  - APK `misrc_gui-v1.0.7-3-gaf76387-dirty-android-arm64.apk` (17 MB): `lib/arm64-v8a/libmisrc_gui.so` + `libhsdaoh.so` at correct path, both ARM aarch64; `aapt2 dump badging` -> `sdkVersion:'30'`, `targetSdkVersion:'34'`, `package: name='dev.misrc.gui'`; `apksigner verify` v3 scheme TRUE.
+  - All 7 cross deps verified ARM aarch64 via `file` on extracted `.o` objects from each static archive.
+  - `python3 misrc_tools/test/ci_guard_tests.py --static-only`: 22/22 PASS (including new Android packaging assertions).
+- NOT yet validated (separate milestones, per plan out-of-scope):
+  - Real-device install + GUI render + simulated-device selection (needs a physical Android 11+ arm64 device; cannot verify on this host).
+  - USB host capture (hsdaoh/FX3/DdD) on Android — risk #1; libusb Android backend needs root or a JNI USB-Host bridge. Connect path is runtime-gated off in the basic release.
+- Key constraints to preserve when touching Android build paths:
+  - Keep `[host_machine] system = 'android'` in the cross-file; do not move it to `[properties]` (Meson 0.61.x ignores it there and misreports host_system as linux).
+  - Keep the `__ANDROID__` branch in `simple_capture.h` BEFORE `__linux__` (NDK defines both).
+  - Keep `-DGRAPHICS_API_OPENGL_ES3` in the android cflags — it must match the raylib cross-build's GRAPHICS or `rlActiveDrawBuffers` re-introduces the `glDrawBuffersEXT` link error.
+  - Do not add `-lpthread` to android link flags (bionic pthread is in libc; -lpthread fails to link).
+  - Keep the raylib.pc + rlgl.h sed-patches in `build-deps-android.sh` (run unconditionally so reruns stay correct).
+
+## 2026-08-18 FLAC encode failure on clipped/resampled signal (issue #1)
+
+- Issue: https://github.com/harrypm/MISRC-GUI/issues/1 ("Clipped, resampled signal causes FLAC encode to fail")
+- Symptom: when capturing and downsampling on the fly (e.g. 40 MHz -> 20 MHz), clipped input lets the soxr resampler overshoot the source 12-bit range, and the FLAC encoder aborts with:
+  - `FLAC process error: FLAC__STREAM_ENCODER_CLIENT_ERROR`
+  - `FLAC encoder error on channel A` (or B)
+- Root cause: `convert_i16_to_flac_i32()` in `misrc_tools/misrc_gui/output/gui_record.c` (at the function referenced in the issue) clamped the 8-bit path via `gui_record_sample_12bit_to_i8()`, but the 12-bit and 16-bit paths did not clamp:
+  - 12-bit path: `dst[i] = (int32_t)src[i];` could write values outside the signed 12-bit range `[-2048, 2047]` declared to the FLAC encoder.
+  - 16-bit path: `dst[i] = (int32_t)src[i] << 4;` could shift an overshooting 12-bit value outside the signed 16-bit range `[-32768, 32767]` declared to the FLAC encoder.
+  - Out-of-range samples violate the declared bits-per-sample and trigger `FLAC__STREAM_ENCODER_CLIENT_ERROR`.
+- Fix: clamp both unclamped paths to their declared bit-depth range, mirroring the existing 8-bit clamp:
+  - 12-bit: clamp to `[-2048, 2047]`.
+  - 16-bit: clamp the post-`<<4` value to `[-32768, 32767]`.
+  - RAW 16-bit path was already safe (writes `int16_t` directly, inherently bounded).
+- Files changed:
+  - `misrc_tools/misrc_gui/output/gui_record.c` (`convert_i16_to_flac_i32`).
+- Base commit: `1f6c54c` (prior to this fix).
+- Validation (local, Linux Mint):
+  - `meson compile -C build-local2 misrc_gui` -> builds clean (only pre-existing warnings).
+  - `build-local2/misrc_gui --smoke-test` -> passes.
+- Not yet validated: real on-the-fly resample capture (40 MHz -> 20 MHz) with clipped input against live hardware; confirm no `FLAC__STREAM_ENCODER_CLIENT_ERROR` under sustained clipped+resampled capture before shipping a release.
+- Restore point: zip of the patched `gui_record.c` + this note preserved on the host at `~/MISRC-GUI-restore-points/fix-issue-1-flac-resample-clamp/`.

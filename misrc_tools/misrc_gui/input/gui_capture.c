@@ -30,6 +30,7 @@
 #endif
 #ifdef ENABLE_DDD
 #include "gui_ddd.h"
+#include "gui_ddd_clockgen.h"
 #endif
 #include "../visualization/gui_panel.h"
 #include "../visualization/panel_interface.h"
@@ -517,17 +518,42 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
     if (card_count > 2) card_count = 2;
 
     bool changed = false;
+    const bool tenbit_mode_a = app->settings.cxadc_tenbit_mode_card[0];
+    const bool tenbit_mode_b = app->settings.cxadc_tenbit_mode_card[(card_count > 1) ? 1 : 0];
+    const uint8_t cxadc_rf_bits_a = tenbit_mode_a ? 16 : 8;
+    const uint8_t cxadc_rf_bits_b = tenbit_mode_b ? 16 : 8;
+    const float cxadc_base_rate_a_khz = tenbit_mode_a ? 20000.0f : 40000.0f;
+    const float cxadc_base_rate_b_khz = tenbit_mode_b ? 20000.0f : 40000.0f;
 
-    // Fixed RF assumptions for CXADC mode.
-    if (app->settings.rf_bits_a != 8) {
-        app->settings.rf_bits_a = 8;
+    // Fixed RF assumptions for CXADC mode depend on driver tenbit mode.
+    if (app->settings.rf_bits_a != cxadc_rf_bits_a) {
+        app->settings.rf_bits_a = cxadc_rf_bits_a;
         changed = true;
     }
-    if (app->settings.rf_bits_b != 8) {
-        app->settings.rf_bits_b = 8;
+    if (app->settings.rf_bits_b != cxadc_rf_bits_b) {
+        app->settings.rf_bits_b = cxadc_rf_bits_b;
         changed = true;
     }
-    // Keep user-selected resample modes/rates and RF A toggle in CXADC mode.
+    if (!app->settings.enable_resample_a) {
+        if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
+            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+            changed = true;
+        }
+    } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
+        app->settings.resample_rate_a = cxadc_base_rate_a_khz;
+        changed = true;
+    }
+    if (!app->settings.enable_resample_b) {
+        if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
+            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+            changed = true;
+        }
+    } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
+        app->settings.resample_rate_b = cxadc_base_rate_b_khz;
+        changed = true;
+    }
+
+    // Keep user-selected RF A toggle in CXADC mode.
     // Only clamp RF-B capture when there is no second CXADC card source.
     if (card_count < 2 && app->settings.capture_b) {
         app->settings.capture_b = false;
@@ -582,6 +608,84 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
         }
     }
 
+    if (changed) {
+        gui_settings_save(&app->settings);
+    }
+}
+
+static bool gui_capture_device_is_misrc_clockgen(const device_info_t *dev)
+{
+    // MISRC Clockgen is its own device type. Also accept the legacy CXADC-typed
+    // marker serial for backward compatibility with older saved selections.
+    if (!dev) return false;
+    if (dev->type == DEVICE_TYPE_MISRC_CLOCKGEN) return true;
+    if (dev->type == DEVICE_TYPE_CXADC &&
+        strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0) {
+        return true;
+    }
+    return false;
+}
+
+// Apply the MISRC Clockgen capture profile. Unlike the CXADC profile this does
+// NOT touch CXADC PCI-card concepts (tenbit, 40 MSPS RF base rate, DC offset,
+// card_count clamping) — the MISRC v1.5 clockgen is a pure USB-audio device and
+// the clockgen audio feed (2ch + headswitch) is the sole source. Only the
+// 3-channel clockgen audio mapping/labels are set, mirroring the clockgen
+// audio layout shared with CXADC Clockgen.
+static void gui_capture_apply_misrc_clockgen_profile(gui_app_t *app)
+{
+    if (!app) return;
+    bool changed = false;
+
+    // 3-channel clockgen mapping: CH1/CH2 = audio pair, CH3 = headswitch.
+    static const char *audio_labels[4] = { "audio1", "audio2", "headswitch", "" };
+    for (int i = 0; i < 4; i++) {
+        if (strcmp(app->settings.audio_1ch_labels[i], audio_labels[i]) != 0) {
+            snprintf(app->settings.audio_1ch_labels[i],
+                     sizeof(app->settings.audio_1ch_labels[i]),
+                     "%s", audio_labels[i]);
+            changed = true;
+        }
+    }
+    if (!app->settings.audio_output_tags[1][0]) {
+        snprintf(app->settings.audio_output_tags[1],
+                 sizeof(app->settings.audio_output_tags[1]), "%s", "audio12");
+        changed = true;
+    }
+    if (!app->settings.audio_output_tags[2][0]) {
+        snprintf(app->settings.audio_output_tags[2],
+                 sizeof(app->settings.audio_output_tags[2]), "%s", "headswitch");
+        changed = true;
+    }
+    // Clockgen exposes the audio pair (CH1/2) + headswitch (CH3).
+    if (!app->settings.enable_audio_2ch_12) {
+        app->settings.enable_audio_2ch_12 = true;
+        changed = true;
+    }
+    if (!app->settings.enable_audio_1ch[2]) {
+        app->settings.enable_audio_1ch[2] = true;
+        changed = true;
+    }
+    // RF A+B comes from the hsdaoh device (raw-parser backend), so keep channel
+    // B capture enabled (do NOT force it off — that was the audio-only model).
+    if (!app->settings.capture_a) {
+        app->settings.capture_a = true;
+        changed = true;
+    }
+    if (!app->settings.capture_b) {
+        app->settings.capture_b = true;
+        changed = true;
+    }
+    // MISRC mode is not the hsdaoh A/B swap concept; leave it off so the
+    // capture mode toggle does not fight the clockgen audio mapping.
+    if (app->user_capture_mode_misrc) {
+        app->user_capture_mode_misrc = false;
+        changed = true;
+    }
+    if (!app->is_recording && app->capture_mode_runtime_misrc) {
+        app->capture_mode_runtime_misrc = false;
+        changed = true;
+    }
     if (changed) {
         gui_settings_save(&app->settings);
     }
@@ -1019,7 +1123,7 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->trigger_b.display_width, DISPLAY_BUFFER_SIZE);  // Will be updated by renderer
     app->trigger_b.scope_mode = SCOPE_MODE_PHOSPHOR;  // Phosphor mode by default
     app->trigger_b.trigger_mode = TRIGGER_MODE_RISING;  // Rising edge by default
-    app->trigger_b.trigger_source = TRIGGER_SOURCE_CH1;
+    app->trigger_b.trigger_source = TRIGGER_SOURCE_CH2;
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
@@ -1157,6 +1261,11 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         return;
     }
 
+#ifdef ENABLE_DDD
+    bool ddd_device_added = false;
+    int first_ddd_src_index = -1;
+#endif
+
     // Copy devices to GUI format
     for (size_t i = 0; i < devices.count && app->device_count < MAX_DEVICES; i++) {
         misrc_device_info_t *src = &devices.devices[i];
@@ -1189,9 +1298,27 @@ void gui_app_enumerate_devices(gui_app_t *app) {
             dst->type = DEVICE_TYPE_DDD;
             dst->index = src->index;
             snprintf(dst->serial, sizeof(dst->serial), "%s", src->device_id);
+            // Remember the first DdD device so the synthetic "[DdD] Clockgen"
+            // entry below can target the same physical device for its RF path.
+            if (!ddd_device_added) {
+                ddd_device_added = true;
+                first_ddd_src_index = src->index;
+            }
         }
 #endif
         else {
+#if defined(__ANDROID__)
+            /* The patched Android hsdaoh_get_device_count() unconditionally
+             * reports 1 device (rootless libusb cannot enumerate
+             * /dev/bus/usb), which put a phantom "MS2130" in the list even
+             * with nothing plugged in — shifting selection and breaking the
+             * Test Signal device. Only list the hsdaoh entry when Java
+             * reports a capture candidate is physically attached. */
+            extern int android_usb_device_present(void);
+            if (!android_usb_device_present()) {
+                continue;
+            }
+#endif
             snprintf(dst->name, sizeof(dst->name), "%s", src->name);
             dst->type = DEVICE_TYPE_HSDAOH;
             dst->index = src->index;
@@ -1203,23 +1330,62 @@ void gui_app_enumerate_devices(gui_app_t *app) {
 
     misrc_device_list_free(&devices);
 
-    // Add CXADC mode option if cards are detected on host.
-    int cxadc_cards = gui_cxadc_detect_cards();
-    if (cxadc_cards > 0 && app->device_count < MAX_DEVICES) {
+    int cxadc_card_count = gui_cxadc_detect_cards();
+
+#ifdef ENABLE_DDD
+    // Add the synthetic "[DdD] Clockgen" entry when a DdD device is present,
+    // a Clockgen Lite audio device is detected, and no CXADC RF cards are
+    // found (CXADC already has its own Clockgen mode). Reuses DEVICE_TYPE_DDD
+    // for the RF path; the marker serial distinguishes it from the plain DdD
+    // entry so the start/stop/reconnect/label paths can detect it.
+    if (ddd_device_added && cxadc_card_count == 0 &&
+        gui_ddd_clockgen_detect() && app->device_count < MAX_DEVICES) {
         device_info_t *dst = &app->devices[app->device_count];
-        if (cxadc_cards > 1) {
+        snprintf(dst->name, sizeof(dst->name), "[DdD] Clockgen");
+        snprintf(dst->serial, sizeof(dst->serial), "%s", DDD_CLOCKGEN_MARKER_SERIAL);
+        dst->type = DEVICE_TYPE_DDD;
+        dst->index = first_ddd_src_index;
+        app->device_count++;
+    }
+#endif
+
+    // Add CXADC / MISRC Clockgen mode options.
+    // CXADC mode requires cxadcN RF card nodes. MISRC Clockgen is a first-class
+    // device type (pure USB-audio clockgen; MISRC v1.5 + shared-clock clockgen)
+    // surfaced when its USB-audio capture endpoint is detected, independent of
+    // CXADC cards. On two-CXADC-card hosts both the CXADC Clockgen and the
+    // MISRC Clockgen entries are offered (the clockgen drives either backend).
+    bool misrc_clockgen_audio_present = gui_cxadc_detect_misrc_clockgen_audio();
+
+    if (cxadc_card_count > 1) {
+        if (app->device_count < MAX_DEVICES) {
+            device_info_t *dst = &app->devices[app->device_count];
             snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC Clockgen");
+            snprintf(dst->serial, sizeof(dst->serial), "%s", CXADC_MARKER_SERIAL_2CARD_CX_CLOCKGEN);
+            dst->type = DEVICE_TYPE_CXADC;
             dst->index = 2;
-        } else {
-            snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC");
-            dst->index = 1;
+            app->device_count++;
         }
-        snprintf(dst->serial, sizeof(dst->serial), "CXADC_%dCARD", dst->index);
+    } else if (cxadc_card_count == 1 && app->device_count < MAX_DEVICES) {
+        device_info_t *dst = &app->devices[app->device_count];
+        snprintf(dst->name, sizeof(dst->name), "[CXADC] CXADC");
+        snprintf(dst->serial, sizeof(dst->serial), "%s", CXADC_MARKER_SERIAL_1CARD);
         dst->type = DEVICE_TYPE_CXADC;
+        dst->index = 1;
         app->device_count++;
     }
 
-    // Always add simulated device at the end
+    // MISRC Clockgen entry: own device type, own marker serial. Offered whenever
+    // the MISRC clockgen USB-audio endpoint is present (audio-only rigs have 0
+    // CXADC cards; two-card rigs also offer it alongside CXADC Clockgen).
+    if (misrc_clockgen_audio_present && app->device_count < MAX_DEVICES) {
+        device_info_t *dst = &app->devices[app->device_count];
+        snprintf(dst->name, sizeof(dst->name), "[MISRC] Clockgen");
+        snprintf(dst->serial, sizeof(dst->serial), "%s", MISRC_CLOCKGEN_MARKER_SERIAL);
+        dst->type = DEVICE_TYPE_MISRC_CLOCKGEN;
+        dst->index = 0;  // 0 RF cards; clockgen USB-audio feed is the sole source
+        app->device_count++;
+    }
     if (app->device_count < MAX_DEVICES) {
         device_info_t *dst = &app->devices[app->device_count];
         snprintf(dst->name, sizeof(dst->name), "[Simulated] Test Signal");
@@ -1537,6 +1703,35 @@ int gui_app_start_capture(gui_app_t *app) {
     bool use_upstream_backend = (dev->type == DEVICE_TYPE_HSDAOH) && (!app->user_capture_mode_misrc);
     fprintf(stderr, "[GUI] Selected device: %s (type %d, index %d)\n", dev->name, dev->type, dev->index);
 
+    // MISRC Clockgen combines the hsdaoh raw-parser RF feed (A+B from the MISRC
+    // v1.5a) with the clockgen USB-audio feed (2ch + headswitch). It falls
+    // through to the hsdaoh open path below for RF, using the hsdaoh device's
+    // index (not the synthetic MISRC Clockgen entry's index), then starts the
+    // clockgen audio thread in parallel after the hsdaoh stream is up.
+    int hsdaoh_open_index = dev->index;
+    bool is_misrc_clockgen_mode = (dev->type == DEVICE_TYPE_MISRC_CLOCKGEN);
+    if (is_misrc_clockgen_mode) {
+        // Locate the hsdaoh device (MISRC v1.5a) to open for the A+B RF feed.
+        int hs_idx = -1;
+        for (int i = 0; i < app->device_count; i++) {
+            if (app->devices[i].type == DEVICE_TYPE_HSDAOH) {
+                hs_idx = i;
+                break;
+            }
+        }
+        if (hs_idx < 0) {
+            fprintf(stderr, "[GUI] MISRC Clockgen: no hsdaoh (MISRC v1.5a) device found for RF feed\n");
+            gui_app_set_status(app, "MISRC Clockgen needs a connected MISRC v1.5a device");
+            return -1;
+        }
+        hsdaoh_open_index = app->devices[hs_idx].index;
+        gui_capture_apply_misrc_clockgen_profile(app);
+        // RF A+B comes from the hsdaoh device (raw-parser); clockgen provides audio.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = true;
+        // Do NOT return: fall through to the common init + hsdaoh open path.
+    }
+
     // Handle simulated device separately
     if (dev->type == DEVICE_TYPE_SIMULATED) {
         int sim_rc = gui_simulated_start(app);
@@ -1565,11 +1760,13 @@ int gui_app_start_capture(gui_app_t *app) {
         int cxadc_cards = dev->index;
         if (cxadc_cards < 1) cxadc_cards = 1;
         if (cxadc_cards > 2) cxadc_cards = 2;
+        // gui_cxadc_start() launches extraction internally; set runtime
+        // capability flags first so extraction selects the correct A/B path.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = (cxadc_cards > 1);
         gui_capture_apply_cxadc_profile(app, cxadc_cards);
-        int cxadc_rc = gui_cxadc_start(app, cxadc_cards);
+        int cxadc_rc = gui_cxadc_start(app, cxadc_cards, false);
         if (cxadc_rc == 0) {
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = (cxadc_cards > 1);
             bool prev_runtime_mode = app->capture_mode_runtime_misrc;
             app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
             TraceLog(LOG_INFO,
@@ -1606,10 +1803,14 @@ int gui_app_start_capture(gui_app_t *app) {
     if (dev->type == DEVICE_TYPE_FX3) {
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+        // gui_fx3_start() launches extraction internally; declare A-only mode
+        // before startup so channel mapping is correct from first frame.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = false;
         // Open FX3 device first
         int r = gui_fx3_open(app, dev->index);
         if (r < 0) {
-            gui_app_set_status(app, "Failed to open FX3 device");
+            gui_app_set_status(app, "Failed to open FX3ADC device");
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
@@ -1624,8 +1825,6 @@ int gui_app_start_capture(gui_app_t *app) {
             app->capture_start_time = GetTime();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // fx3usbadc is single-channel (ADC A only)
             {
                 time_t t = time(NULL);
                 struct tm tmv;
@@ -1651,6 +1850,10 @@ int gui_app_start_capture(gui_app_t *app) {
     if (dev->type == DEVICE_TYPE_DDD) {
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+        // gui_ddd_start() launches extraction internally; declare A-only mode
+        // before startup so channel mapping is correct from first frame.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = false;
         // Open DdD device first
         int r = gui_ddd_open(app, dev->index);
         if (r < 0) {
@@ -1666,8 +1869,6 @@ int gui_app_start_capture(gui_app_t *app) {
             app->capture_start_time = GetTime();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // DdD is single-channel (ADC A only)
             {
                 time_t t = time(NULL);
                 struct tm tmv;
@@ -1681,6 +1882,25 @@ int gui_app_start_capture(gui_app_t *app) {
                          (tmv.tm_hour), (tmv.tm_min), (tmv.tm_sec));
             }
             gui_capture_hold_power_assertions();
+
+            // If this is the "[DdD] Clockgen" variant, start the Clockgen Lite
+            // audio capture in parallel with the DdD RF capture (the in-process
+            // equivalent of ddd-capture-toolkit's simultaneous
+            // DomesdayDuplicator + sox|flac start). Both threads feed the GUI
+            // record pipeline so RF and audio are captured in sync. On audio
+            // open failure, continue RF-only with a warning.
+            if (gui_ddd_clockgen_device_mode(dev)) {
+                int cg_rc = gui_ddd_clockgen_start(app);
+                if (cg_rc == 0) {
+                    (void)gui_audio_start(app, &app->buffers);
+                    gui_app_set_status(app, "DdD Clockgen capture running");
+                } else {
+                    gui_record_log_capture_event(app, "WARN",
+                        "DdD Clockgen audio device unavailable; continuing RF-only",
+                        GUI_ERROR_CLASS_NONE, 0);
+                    gui_app_set_status(app, "DdD capture running (clockgen audio unavailable)");
+                }
+            }
         } else {
             proc_set_priority(PROC_PRIORITY_NORMAL);
         }
@@ -1771,17 +1991,61 @@ int gui_app_start_capture(gui_app_t *app) {
     } else {
         fprintf(stderr, "[GUI] Opening hsdaoh device (backend=%s)...\n",
                 use_upstream_backend ? "upstream" : "raw-parser");
+#if !defined(__ANDROID__)
+        /* Desktop: elevate process/thread priority for low-latency capture.
+         * On Android, proc_set_priority() iterates /proc/self/task and calls
+         * setpriority() on EVERY thread (including the render thread), and
+         * thrd_set_priority(CRITICAL) attempts SCHED_FIFO realtime scheduling.
+         * Android's watchdog can ANR/kill apps that abuse realtime scheduling
+         * or process-wide nice changes, which looks like a UI lockup. The OS
+         * already drives USB callbacks with appropriate priority on Android, so
+         * skip the desktop priority elevation here. */
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
-        r = hsdaoh_open(&app->hs_dev, dev->index);
+#endif
+#if defined(__ANDROID__)
+        /* Android: libusb cannot open /dev/bus/usb/* without root. The USB
+         * Host permission dialog + fd handoff is driven ASYNCHRONOUSLY by the
+         * render thread (android_request_usb_permission_async + per-frame
+         * poll in gui_handle_interactions) so the render loop never blocks
+         * across the system dialog Activity transition (which would kill EGL
+         * on resume). By the time we get here, the fd must already be granted;
+         * if not, the async connect flow hasn't completed — bail and let it
+         * finish on a future frame. */
+        extern int android_usb_has_fd(void);
+        extern void android_usb_clear_fd(void);
+        if (!android_usb_has_fd()) {
+            fprintf(stderr, "[GUI] Android connect: no USB fd yet (permission pending)\n");
+            gui_app_set_status(app, "Waiting for USB permission...");
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+            return -3;
+        }
+#endif
+        // MISRC Clockgen overrides the hsdaoh open index to the MISRC v1.5a
+        // device (found above), since the selected entry is the synthetic
+        // MISRC Clockgen entry, not the hsdaoh device itself.
+        r = hsdaoh_open(&app->hs_dev, hsdaoh_open_index);
         if (r < 0 || !app->hs_dev) {
             fprintf(stderr, "[GUI] hsdaoh_open failed: %d\n", r);
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             if (r == -3) {
+#if defined(__ANDROID__)
+                gui_app_set_status(app, "USB permission denied or device not granted");
+#else
                 gui_app_set_status(app, "Permission denied opening MS2130 via libusb; run misrc_gui with sudo");
+#endif
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 return -3;
             } else {
+#if defined(__ANDROID__)
+                char usb_open_msg[96];
+                snprintf(usb_open_msg, sizeof(usb_open_msg), "USB open failed (code %d)", r);
+                gui_app_set_status(app, usb_open_msg);
+#else
                 gui_app_set_status(app, "Failed to open device");
+#endif
             }
             app->hs_dev = NULL;
             proc_set_priority(PROC_PRIORITY_NORMAL);
@@ -1805,6 +2069,9 @@ int gui_app_start_capture(gui_app_t *app) {
             gui_app_set_status(app, "Failed to start stream");
             hsdaoh_close(app->hs_dev);
             app->hs_dev = NULL;
+#if defined(__ANDROID__)
+            android_usb_clear_fd();
+#endif
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
@@ -1906,10 +2173,104 @@ int gui_app_start_capture(gui_app_t *app) {
     macos_promote_all_task_threads();
 #endif
 
-    gui_app_set_status(app, "Capturing...");
+    // MISRC Clockgen: the hsdaoh RF feed (A+B) is now running via the path
+    // above. Start the clockgen USB-audio thread in parallel for the 2ch +
+    // headswitch feed (BUF_CAPTURE_AUDIO). gui_audio_start (the monitor/writer
+    // thread) was already started above and consumes BUF_CAPTURE_AUDIO. On
+    // audio open failure, continue RF-only with a warning (mirrors DdD
+    // Clockgen behavior).
+    if (is_misrc_clockgen_mode) {
+        int cg_rc = gui_cxadc_start_clockgen_audio(app, true);
+        if (cg_rc == 0) {
+            gui_app_set_status(app, "MISRC Clockgen capture running");
+        } else {
+            fprintf(stderr, "[GUI] MISRC Clockgen audio unavailable; continuing RF-only\n");
+            gui_app_set_status(app, "MISRC capture running (clockgen audio unavailable)");
+        }
+    } else {
+        gui_app_set_status(app, "Capturing...");
+    }
 
     return 0;
 }
+
+#if defined(__ANDROID__)
+/* Offload gui_app_start_capture() to a worker thread so the render loop stays
+ * responsive. hsdaoh_open + start_stream + extraction/display thread spawns can
+ * be slow or stall on the Android fd-wrap path; running them on the render
+ * thread freezes the UI (the "connect locks up" symptom). The worker sets
+ * app->is_capturing / status; the render thread just observes. */
+#include <pthread.h>
+static atomic_int s_capture_starting = 0;
+static atomic_int s_capture_stopping = 0;
+static void *capture_start_thread(void *arg)
+{
+    gui_app_t *app = (gui_app_t *)arg;
+    int rc = gui_app_start_capture(app);
+    if (rc != 0) {
+        fprintf(stderr, "[GUI] Android async capture start failed: rc=%d\n", rc);
+    }
+    atomic_store(&s_capture_starting, 0);
+    return NULL;
+}
+void gui_app_start_capture_async(gui_app_t *app)
+{
+    if (!app) return;
+    if (atomic_load(&s_capture_stopping)) {
+        /* stop still in flight; don't start on top of it */
+        return;
+    }
+    if (atomic_exchange(&s_capture_starting, 1) != 0) {
+        /* a start is already in flight; ignore */
+        return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, capture_start_thread, app) != 0) {
+        atomic_store(&s_capture_starting, 0);
+        /* fallback: run synchronously (may briefly stall UI) */
+        (void)gui_app_start_capture(app);
+    } else {
+        pthread_detach(t);
+        gui_app_set_status(app, "Starting capture...");
+    }
+}
+
+/* Offload gui_app_stop_capture() as well: hsdaoh_stop_stream/hsdaoh_close on
+ * the wrapped Android fd join libusb/libuvc transfer threads and can hang for
+ * seconds (or indefinitely) if the device never delivered data. Running stop
+ * on the render thread is what froze the app AFTER connect: the watchdog
+ * detected "no data for 2s" and called stop_capture synchronously. */
+static void *capture_stop_thread(void *arg)
+{
+    gui_app_t *app = (gui_app_t *)arg;
+    gui_app_stop_capture(app);
+    atomic_store(&s_capture_stopping, 0);
+    return NULL;
+}
+void gui_app_stop_capture_async(gui_app_t *app)
+{
+    if (!app) return;
+    if (atomic_load(&s_capture_starting)) {
+        /* start still in flight; let it finish first (watchdog will retry) */
+        return;
+    }
+    if (atomic_exchange(&s_capture_stopping, 1) != 0) {
+        return;  /* stop already in flight */
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, capture_stop_thread, app) != 0) {
+        atomic_store(&s_capture_stopping, 0);
+        gui_app_stop_capture(app);  /* fallback: sync */
+    } else {
+        pthread_detach(t);
+        gui_app_set_status(app, "Stopping capture...");
+    }
+}
+int gui_app_capture_busy(void)
+{
+    return atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping);
+}
+#endif
 
 // Stop capture
 void gui_app_stop_capture(gui_app_t *app) {
@@ -1937,6 +2298,12 @@ void gui_app_stop_capture(gui_app_t *app) {
         gui_app_clear_display(app);
         return;
     }
+    if (dev->type == DEVICE_TYPE_MISRC_CLOCKGEN) {
+        // Stop the clockgen audio thread + close the audio device first. The
+        // hsdaoh RF stream + shared extraction/display/audio-monitor threads
+        // are stopped by the common path below (do NOT return early).
+        gui_cxadc_stop_clockgen_audio();
+    }
     if (dev->type == DEVICE_TYPE_CXADC) {
         gui_cxadc_stop(app);
         app->capture_timestamp[0] = '\0';
@@ -1952,7 +2319,18 @@ void gui_app_stop_capture(gui_app_t *app) {
 #endif
 #ifdef ENABLE_DDD
     if (dev->type == DEVICE_TYPE_DDD) {
+        bool was_clockgen = gui_ddd_clockgen_device_mode(dev);
         gui_ddd_stop(app);
+        if (was_clockgen) {
+            // Stop the Clockgen Lite audio capture that ran in parallel with
+            // the DdD RF capture. gui_ddd_stop already set is_capturing=false,
+            // so the audio thread's loop has exited; join + close ALSA here.
+            gui_ddd_clockgen_stop(app);
+            // The DdD RF stop path (gui_ddd_stop) does not call gui_audio_stop
+            // (the generic stop below is unreachable due to this early return),
+            // so stop the audio monitor/writer thread here for the clockgen variant.
+            gui_audio_stop(app);
+        }
         gui_app_clear_display(app);
         return;
     }
@@ -1978,6 +2356,12 @@ void gui_app_stop_capture(gui_app_t *app) {
         hsdaoh_stop_stream(app->hs_dev);
         hsdaoh_close(app->hs_dev);
         app->hs_dev = NULL;
+#if defined(__ANDROID__)
+        {
+            extern void android_usb_clear_fd(void);
+            android_usb_clear_fd();
+        }
+#endif
     }
     if (app->sc_dev) {
         sc_stop_capture(app->sc_dev);

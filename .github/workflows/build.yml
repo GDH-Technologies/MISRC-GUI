@@ -94,23 +94,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Cache vendored deps (.deps/install)
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/install
+          key: deps-linux-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-flac1.5.0-${{ hashFiles('third_party/hsdaoh/**') }}
+
       - name: Resolve build version
         id: version
         run: |
           set -eux
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
-            VERSION="${{ github.event.inputs.release_tag }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event_inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event_inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA::7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
@@ -146,6 +150,17 @@ jobs:
           set -eux
           DEPS_PREFIX="$PWD/.deps/install"
           mkdir -p .deps
+
+          # Cache hit guard: if .deps/install was restored from actions/cache
+          # (key includes hashFiles(third_party/hsdaoh/**) + raylib/libuvc/flac
+          # versions), skip the FLAC/hsdaoh/raylib rebuild entirely. A source
+          # change invalidates the cache key and forces a clean rebuild.
+          if [[ -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
+            echo "deps cache hit - skipping hsdaoh/raylib/flac rebuild"
+            PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:${DEPS_PREFIX}/lib64/pkgconfig" \
+              pkg-config --modversion flac
+            exit 0
+          fi
 
           # libFLAC 1.5.0 is required by misrc_tools/meson.build for the
           # multithreaded encoder (FLAC__stream_encoder_set_num_threads, libFLAC
@@ -429,6 +444,98 @@ jobs:
           path: linux_MISRC_*_${{ matrix.artifact_suffix }}.zip
           if-no-files-found: error
 
+  android-apk:
+    name: Android APK build (arm64-v8a)
+    runs-on: ubuntu-22.04
+    needs:
+      - preflight-guard-tests
+      - preflight-cross-platform-guards
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK + NDK
+        run: |
+          set -eux
+          export ANDROID_HOME="$HOME/Android/Sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/android-cmdtools
+          mv /tmp/android-cmdtools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          rm /tmp/cmdtools.zip
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true
+          yes 2>/dev/null | sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-30" "platforms;android-34" "ndk;25.2.9519653" >/dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y cmake meson ninja-build nasm pkg-config curl zip unzip
+
+      - name: Cross-build Android deps
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/build-deps-android.sh
+
+      - name: Generate Meson cross-file
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/gen-cross-file.sh
+
+      - name: Cross-compile misrc_gui (libmisrc_gui.so)
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          export PKG_CONFIG="$PWD/android/android-pkg-config"
+          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release build-android misrc_tools
+          meson compile -C build-android misrc_gui
+          test -f build-android/libmisrc_gui.so
+
+      - name: Build + sign APK
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          export BUILD_DIR="$PWD/build-android"
+          bash android/build-apk.sh
+
+      - name: Verify APK
+        run: |
+          set -eux
+          APK=$(ls -t .ci-artifacts/android-apk/*.apk | head -1)
+          test -f "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify "$APK"
+          BADGING="$("$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$APK")"
+          echo "$BADGING" | grep -q "sdkVersion:'30'"
+          echo "$BADGING" | grep -q "targetSdkVersion:'34'"
+          echo "$BADGING" | grep -q "package: name='dev.misrc.gui'"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libmisrc_gui.so"
+          unzip -p "$APK" lib/arm64-v8a/libmisrc_gui.so | file - | grep -q "ARM aarch64"
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "${NDK_TOOLCHAIN}/llvm-readelf" -d build-android/libmisrc_gui.so | grep NEEDED | grep -iE "/usr/lib/x86_64|/usr/local/lib" && {
+            echo "ERROR: host x86_64 lib leaked into arm64 cross build"; exit 1; } || true
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk-arm64
+          path: .ci-artifacts/android-apk/*.apk
+          if-no-files-found: error
+
   windows-exe:
     name: Windows EXE build (x86_64)
     runs-on: windows-2022
@@ -438,6 +545,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Cache vendored deps (.deps/install)
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/install
+          key: deps-windows-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
 
       - name: Setup MSYS2 (cached)
         id: setup_msys2_cached
@@ -492,14 +606,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA:0:7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE
@@ -511,7 +622,10 @@ jobs:
           DEPS_PREFIX="$PWD/.deps/install"
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${MINGW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          git clone --depth 1 https://github.com/libuvc/libuvc.git .deps/libuvc
+          # Cache hit guard: skip libuvc/hsdaoh/raylib rebuild if .deps/install
+          # was restored from actions/cache (key includes hashFiles(hsdaoh/**)).
+          if [[ ! -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
+          git clone --depth 1 --branch v0.0.7 https://github.com/libuvc/libuvc.git .deps/libuvc
           sed -i 's/^if (MSVC OR MINGW)$/if (MSVC)/' .deps/libuvc/cmake/FindLibUSB.cmake
           cmake -S .deps/libuvc -B .deps/libuvc/build -G Ninja \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -564,6 +678,9 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
+          else
+            echo "deps cache hit - skipping libuvc/hsdaoh/raylib rebuild"
+          fi
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
@@ -645,6 +762,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Cache vendored deps (.deps/install)
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/install
+          key: deps-windows-arm64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
+
       - name: Setup MSYS2 (cached)
         id: setup_msys2_cached
         continue-on-error: true
@@ -696,14 +820,11 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA:0:7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE (ARM64)
@@ -715,7 +836,10 @@ jobs:
           DEPS_PREFIX="$PWD/.deps/install"
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${MINGW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          git clone --depth 1 https://github.com/libuvc/libuvc.git .deps/libuvc
+          # Cache hit guard: skip libuvc/hsdaoh/raylib rebuild if .deps/install
+          # was restored from actions/cache (key includes hashFiles(hsdaoh/**)).
+          if [[ ! -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
+          git clone --depth 1 --branch v0.0.7 https://github.com/libuvc/libuvc.git .deps/libuvc
           sed -i 's/^if (MSVC OR MINGW)$/if (MSVC)/' .deps/libuvc/cmake/FindLibUSB.cmake
           cmake -S .deps/libuvc -B .deps/libuvc/build -G Ninja \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -768,6 +892,9 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
+          else
+            echo "deps cache hit - skipping libuvc/hsdaoh/raylib rebuild"
+          fi
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
@@ -847,6 +974,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Cache vendored deps (.deps/install)
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/install
+          key: deps-macos-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
+
       - name: Resolve build version
         id: version
         run: |
@@ -856,17 +990,21 @@ jobs:
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
             VERSION="${{ github.event.inputs.release_tag }}"
           else
-            VERSION="$(git describe --tags --dirty --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)"
+            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="dev-${GITHUB_SHA::7}"
+              VERSION="v1.1.4-dev"
             fi
           fi
-          case "$VERSION" in
-            misrc_tools-*) VERSION="${VERSION#misrc_tools-}" ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
+        env:
+          # GitHub-hosted macOS runners ship a recently-updated Homebrew, so
+          # skip the slow `brew update` (which also triggers re-linking that
+          # emits the 'files were overwritten during the brew link step'
+          # annotation). Only install formulas that are not already present.
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
           set -eux
           for tap_dir in \
@@ -878,7 +1016,6 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          brew update
           for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
@@ -901,6 +1038,9 @@ jobs:
           export LDFLAGS="-arch ${MACOS_ARCH} ${LDFLAGS:-}"
           mkdir -p .deps
 
+          # Cache hit guard: skip hsdaoh/raylib rebuild if .deps/install was
+          # restored from actions/cache (key includes hashFiles(hsdaoh/**)).
+          if [[ ! -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
           rm -rf .deps/hsdaoh
           cp -R third_party/hsdaoh .deps/hsdaoh
           git clone --depth 1 --branch 5.5 https://github.com/raysan5/raylib.git .deps/raylib
@@ -926,6 +1066,9 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
+          else
+            echo "deps cache hit - skipping hsdaoh/raylib rebuild"
+          fi
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
@@ -1208,6 +1351,7 @@ jobs:
       - windows-exe
       - windows-exe-arm64
       - macos-app-universal
+      - android-apk
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
     permissions:
       contents: write
@@ -1266,19 +1410,67 @@ jobs:
           if [[ "$(tail -1 "$BODY_FILE")" == '## Highlights' ]]; then
             printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
           fi
+          # Contributors as GitHub @handles (de-duplicated). Handles are
+          # derived from commit author emails: noreply github emails resolve
+          # automatically (<handle>@users.noreply.github.com or
+          # <id>+<handle>@users.noreply.github.com), and an explicit
+          # email=handle map covers non-noreply emails. Commits whose email
+          # can't be resolved are skipped (their work is still credited via
+          # Highlights + GitHub's auto-generated What's Changed). No author
+          # emails or raw names are published.
+          CONTRIBUTOR_HANDLE_MAP="
+            harry@opcomedia.com=harrypm
+          "
+          github_handle_for_email() {
+            local email="$1"
+            while IFS='=' read -r map_email map_handle; do
+              map_email="${map_email// /}"; map_handle="${map_handle// /}"
+              [[ -z "$map_email" ]] && continue
+              if [[ "${email,,}" == "${map_email,,}" ]]; then
+                printf '%s' "$map_handle"
+                return 0
+              fi
+            done <<< "$CONTRIBUTOR_HANDLE_MAP"
+            case "$email" in
+              *"+*"@users.noreply.github.com) printf '%s' "${email%%+*}"; return 0 ;;
+              *@users.noreply.github.com)     printf '%s' "${email%@users.noreply.github.com}"; return 0 ;;
+            esac
+            return 1
+          }
+          printf '\n%s\n' '' '## Contributors' '' >> "$BODY_FILE"
+          CONTRIB_HANDLES="$(git log --pretty=format:'%ae' --no-merges "$LOG_RANGE" 2>/dev/null | sort -u | while IFS= read -r email; do
+            handle="$(github_handle_for_email "$email")" && printf '%s\n' "@$handle"
+          done | sort -u)"
+          if [[ -n "$CONTRIB_HANDLES" ]]; then
+            while IFS= read -r h; do
+              [[ -n "$h" ]] || continue
+              printf -- '- %s\n' "$h" >> "$BODY_FILE"
+            done <<< "$CONTRIB_HANDLES"
+          else
+            printf '%s\n' "- (no contributors found in range ${LOG_RANGE})" >> "$BODY_FILE"
+          fi
           printf '\n%s\n' '' '## Downloads' '' >> "$BODY_FILE"
-          printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) |\n' >> "$BODY_FILE"
-          printf '|---|---|---|\n' >> "$BODY_FILE"
+          printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
+          printf '|---|---|---|---|\n' >> "$BODY_FILE"
           DL_BASE="https://github.com/harrypm/MISRC-GUI/releases/download/${TAG}"
           WIN_X86="windows_MISRC_${TAG}_x86.zip"
           WIN_ARM="windows_MISRC_${TAG}_arm64.zip"
           MAC_DMG="macos_MISRC_${TAG}_universal.dmg"
           LIN_X86="linux_MISRC_${TAG}_x86.zip"
           LIN_ARM="linux_MISRC_${TAG}_arm64.zip"
-          printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
-          printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
-          printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
-          printf '\n%s\n' '> [!NOTE]' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
+          APK_ARM64="android_MISRC_${TAG}_arm64.apk"
+          printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
+          printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
+          printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
+          printf '| Android 11+ | - | - | [%s](%s/%s) |\n' "$APK_ARM64" "$DL_BASE" "$APK_ARM64" >> "$BODY_FILE"
+          # GitHub admonition: the > [!NOTE] line MUST be immediately followed
+          # by the > content lines with NO blank line between them, or GitHub
+          # renders it as plain quoted text instead of a note box. Do NOT use
+          # printf '\n%s\n' with multiple args here — printf reuses the format
+          # per arg, which inserts a blank line after [!NOTE] and breaks the box.
+          printf '\n%s\n' '> [!NOTE]' >> "$BODY_FILE"
+          printf '%s\n' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
+          printf '%s\n' '> Android support is very alpha and experimental.' >> "$BODY_FILE"
           # Write multi-line output to GITHUB_OUTPUT.
           {
             echo "body<<BODY_EOF"
@@ -1299,3 +1491,4 @@ jobs:
             release-assets/**/windows_MISRC_*_x86.zip
             release-assets/**/windows_MISRC_*_arm64.zip
             release-assets/**/macos_MISRC_*_universal.dmg
+            release-assets/**/android_MISRC_*_arm64.apk

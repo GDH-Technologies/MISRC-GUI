@@ -1,7 +1,7 @@
 # Build options for MISRC.
 #
 # Named meson_options.txt rather than meson.options: the latter is only read by
-# meson >= 1.1, and this project still declares a much lower floor.
+# meson >= 1.1, and meson.build declares meson_version '>=0.57'.
 #
 # Every dependency in meson.build is `required: false`, which means a missing
 # package silently drops a feature instead of failing configure. That is fine

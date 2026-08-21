@@ -15,9 +15,194 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 
 #ifndef LIBASOUND_ENABLED
 #define LIBASOUND_ENABLED 0
+#endif
+#if defined(_WIN32)
+static int cxadc_win_card_path(int card_idx, char *path_out, size_t path_out_len)
+{
+    if (!path_out || path_out_len == 0) return -1;
+    if (card_idx < 0 || card_idx >= 2) return -1;
+    int n = snprintf(path_out, path_out_len, "\\\\.\\cxadc%d", card_idx);
+    if (n <= 0 || (size_t)n >= path_out_len) return -1;
+    return 0;
+}
+
+static void cxadc_win_trim(char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+}
+
+static int cxadc_win_run_ps_readline(const char *script, char *line_out, size_t line_out_len)
+{
+    if (!script || !line_out || line_out_len == 0) return -1;
+    line_out[0] = '\0';
+
+    char command[2048];
+    int n = snprintf(command,
+                     sizeof(command),
+                     "powershell -NoProfile -ExecutionPolicy Bypass -Command \"%s\"",
+                     script);
+    if (n <= 0 || (size_t)n >= sizeof(command)) return -1;
+
+    FILE *pipe = _popen(command, "r");
+    if (!pipe) return -1;
+
+    bool got_line = false;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        cxadc_win_trim(buf);
+        if (buf[0] == '\0') continue;
+        snprintf(line_out, line_out_len, "%s", buf);
+        got_line = true;
+        break;
+    }
+
+    int rc = _pclose(pipe);
+    if (rc != 0 || !got_line) return -1;
+    return 0;
+}
+static bool cxadc_win_ieq(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+static int cxadc_win_parse_bool(const char *value, bool *out_bool)
+{
+    if (!value || !out_bool) return -1;
+    if (cxadc_win_ieq(value, "true") || strcmp(value, "1") == 0) {
+        *out_bool = true;
+        return 0;
+    }
+    if (cxadc_win_ieq(value, "false") || strcmp(value, "0") == 0) {
+        *out_bool = false;
+        return 0;
+    }
+    return -1;
+}
+
+static int cxadc_win_get_center_offset(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1024];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
+                     card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(line, &endptr, 10);
+    if (errno != 0 || endptr == line) return -1;
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) return -1;
+    *value_out = (int)parsed;
+    return 0;
+}
+
+static int cxadc_win_set_center_offset(int card_idx, int value)
+{
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1400];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "Set-CxadcWinConfig -Path '%s' -CenterOffset %d | Out-Null; "
+                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
+                     card_path, value, card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(line, &endptr, 10);
+    if (errno != 0 || endptr == line) return -1;
+    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') return -1;
+    if ((int)parsed != value) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_get_tenbit(int card_idx, bool *enabled_out)
+{
+    if (!enabled_out) return -1;
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+
+    char script[1024];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
+                     card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+    return cxadc_win_parse_bool(line, enabled_out);
+}
+
+static int cxadc_win_set_tenbit(int card_idx, bool enabled)
+{
+    char card_path[64];
+    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
+    const char *enabled_ps = enabled ? "$true" : "$false";
+
+    char script[1400];
+    int n = snprintf(script,
+                     sizeof(script),
+                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
+                     "Set-CxadcWinConfig -Path '%s' -EnableTenbit %s | Out-Null; "
+                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
+                     card_path, enabled_ps, card_path);
+    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
+
+    char line[128];
+    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
+    bool readback = false;
+    if (cxadc_win_parse_bool(line, &readback) != 0) return -1;
+    if (readback != enabled) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
 #endif
 
 #if defined(_WIN32)
@@ -43,13 +228,15 @@
 static const PROPERTYKEY s_PKEY_Device_FriendlyName = {
     { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
 };
-// PKEY_Device_InstanceId: returns device instance path like USB\VID_1209&PID_0002&MI_00\...
+// PKEY_Device_InstanceId: returns device instance path like USB\VID_1209&PID_0001&MI_00\...
 static const PROPERTYKEY s_PKEY_Device_InstanceId = {
     { 0x78c34fc8, 0x104a, 0x4aca, { 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0xfc } }, 42
 };
-// cxadc-win clockgen USB identifiers (Raspberry Pi Pico + Si5351 clockgen mod).
-#define CXADC_CLOCKGEN_USB_VID_W L"vid_1209"
-#define CXADC_CLOCKGEN_USB_PID_W L"pid_0002"
+// MISRC Clockgen USB identifiers (Raspberry Pi Pico + Si5351 clockgen mod).
+// Keep both PID values to support mixed firmware generations.
+#define MISRC_CLOCKGEN_USB_VID_W L"vid_1209"
+#define MISRC_CLOCKGEN_USB_PID_PRIMARY_W L"pid_0002"
+#define MISRC_CLOCKGEN_USB_PID_ALT_W L"pid_0001"
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -61,7 +248,8 @@ static const PROPERTYKEY s_PKEY_Device_InstanceId = {
 extern volatile atomic_int do_exit;
 
 #define CXADC_MAX_CARDS 2
-#define CXADC_SAMPLE_RATE_HZ 40000000U
+#define CXADC_SAMPLE_RATE_8BIT_HZ 40000000U
+#define CXADC_SAMPLE_RATE_TENBIT_HZ 20000000U
 #define CXADC_READ_CHUNK_BYTES 65536
 #define CXADC_AUDIO_SAMPLE_RATE_HZ 46875U
 #define CXADC_AUDIO_CHANNEL_COUNT 3
@@ -84,6 +272,10 @@ typedef struct {
     thrd_t audio_thread;
     bool audio_thread_started;
     int card_count;
+    bool misrc_clockgen_mode;
+    bool tenbit_mode[CXADC_MAX_CARDS];
+    uint32_t card_sample_rate_hz[CXADC_MAX_CARDS];
+    uint32_t rf_sample_rate_hz;
     // Audio format (shared across platforms)
     cxadc_audio_format_t audio_format;
     size_t audio_sample_bytes;
@@ -107,6 +299,253 @@ typedef struct {
 
 static cxadc_ctx_t s_cxadc = {0};
 
+#if !defined(_WIN32)
+#define CXADC_SYSFS_CARD_MAX 255
+#define CXADC_SYSFS_CENTER_OFFSET_MIN 0
+#define CXADC_SYSFS_CENTER_OFFSET_MAX 255
+
+static int cxadc_sysfs_build_param_path(int card_idx,
+                                        const char *param_name,
+                                        char *path_out,
+                                        size_t path_out_len)
+{
+    if (!param_name || !param_name[0] || !path_out || path_out_len == 0) {
+        return -1;
+    }
+    if (card_idx < 0 || card_idx > CXADC_SYSFS_CARD_MAX) {
+        return -1;
+    }
+    int n = snprintf(path_out, path_out_len,
+                     "/sys/class/cxadc/cxadc%d/device/parameters/%s",
+                     card_idx, param_name);
+    if (n <= 0 || (size_t)n >= path_out_len) {
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_sysfs_read_int_param(int card_idx,
+                                      const char *param_name,
+                                      int *value_out)
+{
+    if (!value_out) return -1;
+
+    char path[160];
+    if (cxadc_sysfs_build_param_path(card_idx, param_name, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+
+    char buf[64];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    errno = 0;
+    char *endptr = NULL;
+    long parsed = strtol(buf, &endptr, 10);
+    if (errno != 0 || endptr == buf) {
+        return -1;
+    }
+    while (*endptr && isspace((unsigned char)*endptr)) {
+        endptr++;
+    }
+    if (*endptr != '\0') {
+        return -1;
+    }
+    if (parsed < INT_MIN || parsed > INT_MAX) {
+        return -1;
+    }
+
+    *value_out = (int)parsed;
+    return 0;
+}
+
+static int cxadc_sysfs_write_int_param(int card_idx,
+                                       const char *param_name,
+                                       int value)
+{
+    char path[160];
+    if (cxadc_sysfs_build_param_path(card_idx, param_name, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+
+    int wrote = fprintf(f, "%d\n", value);
+    int close_rc = fclose(f);
+    if (wrote <= 0 || close_rc != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* The cxadc driver's _store() handlers return count unconditionally and never
+ * range-check what they were given, so an out-of-range write is accepted
+ * silently and can leave the register holding something other than what was
+ * asked for. Read the value back so the UI never reports a setting the
+ * hardware does not actually have. */
+static int cxadc_sysfs_write_int_param_verified(int card_idx,
+                                                const char *param_name,
+                                                int value)
+{
+    if (cxadc_sysfs_write_int_param(card_idx, param_name, value) != 0) {
+        return -1;
+    }
+
+    int readback = 0;
+    if (cxadc_sysfs_read_int_param(card_idx, param_name, &readback) != 0) {
+        return -1;
+    }
+    if (readback != value) {
+        errno = ERANGE;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+int gui_cxadc_get_center_offset(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+#if defined(_WIN32)
+    return cxadc_win_get_center_offset(card_idx, value_out);
+#else
+    return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
+#endif
+}
+
+int gui_cxadc_set_center_offset(int card_idx, int value)
+{
+#if defined(_WIN32)
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    return cxadc_win_set_center_offset(card_idx, value);
+#else
+    if (value < CXADC_SYSFS_CENTER_OFFSET_MIN) value = CXADC_SYSFS_CENTER_OFFSET_MIN;
+    if (value > CXADC_SYSFS_CENTER_OFFSET_MAX) value = CXADC_SYSFS_CENTER_OFFSET_MAX;
+    return cxadc_sysfs_write_int_param_verified(card_idx, "center_offset", value);
+#endif
+}
+
+int gui_cxadc_adjust_center_offset(int card_idx, int delta, int *new_value_out)
+{
+    int current = 0;
+    if (gui_cxadc_get_center_offset(card_idx, &current) != 0) {
+        return -1;
+    }
+    int next = current + delta;
+    if (next < 0) next = 0;
+    if (next > 255) next = 255;
+    if (gui_cxadc_set_center_offset(card_idx, next) != 0) {
+        return -1;
+    }
+    if (new_value_out) {
+        *new_value_out = next;
+    }
+    return 0;
+}
+
+int gui_cxadc_get_level(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+#if defined(_WIN32)
+    (void)card_idx;
+    errno = ENOTSUP;
+    return -1;
+#else
+    return cxadc_sysfs_read_int_param(card_idx, "level", value_out);
+#endif
+}
+
+int gui_cxadc_set_level(int card_idx, int value)
+{
+#if defined(_WIN32)
+    (void)card_idx;
+    (void)value;
+    errno = ENOTSUP;
+    return -1;
+#else
+    if (value < CXADC_SYSFS_LEVEL_MIN) value = CXADC_SYSFS_LEVEL_MIN;
+    if (value > CXADC_SYSFS_LEVEL_MAX) value = CXADC_SYSFS_LEVEL_MAX;
+    return cxadc_sysfs_write_int_param_verified(card_idx, "level", value);
+#endif
+}
+
+int gui_cxadc_adjust_level(int card_idx, int delta, int *new_value_out)
+{
+    int current = 0;
+    if (gui_cxadc_get_level(card_idx, &current) != 0) {
+        return -1;
+    }
+    int next = current + delta;
+    if (next < CXADC_SYSFS_LEVEL_MIN) next = CXADC_SYSFS_LEVEL_MIN;
+    if (next > CXADC_SYSFS_LEVEL_MAX) next = CXADC_SYSFS_LEVEL_MAX;
+    if (gui_cxadc_set_level(card_idx, next) != 0) {
+        return -1;
+    }
+    if (new_value_out) {
+        *new_value_out = next;
+    }
+    return 0;
+}
+
+int gui_cxadc_get_tenbit(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+#if defined(_WIN32)
+    bool enabled = false;
+    if (cxadc_win_get_tenbit(card_idx, &enabled) != 0) return -1;
+    *value_out = enabled ? 1 : 0;
+    return 0;
+#else
+    int raw = 0;
+    if (cxadc_sysfs_read_int_param(card_idx, "tenbit", &raw) != 0) {
+        return -1;
+    }
+    *value_out = (raw != 0) ? 1 : 0;
+    return 0;
+#endif
+}
+
+int gui_cxadc_set_tenbit(int card_idx, bool enabled)
+{
+#if defined(_WIN32)
+    return cxadc_win_set_tenbit(card_idx, enabled);
+#else
+    return cxadc_sysfs_write_int_param(card_idx, "tenbit", enabled ? 1 : 0);
+#endif
+}
+
+static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
+{
+    if (card_count < 1) card_count = 1;
+    if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
+    for (int i = 0; i < card_count; i++) {
+        bool mode = (enabled != NULL) ? enabled[i] : false;
+        if (gui_cxadc_set_tenbit(i, mode) != 0) {
+            return -1;
+        }
+        int readback = -1;
+        if (gui_cxadc_get_tenbit(i, &readback) != 0) {
+            return -1;
+        }
+        if (((readback != 0) ? true : false) != mode) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return 0;
+}
 static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_b)
 {
     if (sample_a > 2047) sample_a = 2047;
@@ -118,10 +557,23 @@ static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_
     uint32_t ch_b = (uint32_t)((2047 - sample_b) & 0xFFF);
     return ch_a | (ch_b << 20);
 }
+static inline int16_t cxadc_decode_sample_8bit(uint8_t sample)
+{
+    return (int16_t)(((int)sample - 128) << 4);
+}
 
-static void cxadc_reset_stats(gui_app_t *app)
+static inline int16_t cxadc_decode_sample_tenbit(uint8_t lo, uint8_t hi)
+{
+    uint16_t raw = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    return (int16_t)(((int)raw - 32768) >> 4);
+}
+
+static void cxadc_reset_stats(gui_app_t *app, uint32_t rf_sample_rate_hz)
 {
     if (!app) return;
+    if (rf_sample_rate_hz == 0) {
+        rf_sample_rate_hz = CXADC_SAMPLE_RATE_8BIT_HZ;
+    }
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
 
     atomic_store(&app->total_samples, 0);
@@ -141,7 +593,7 @@ static void cxadc_reset_stats(gui_app_t *app)
     atomic_store(&app->rb_wait_count, 0);
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
-    atomic_store(&app->sample_rate, CXADC_SAMPLE_RATE_HZ);
+    atomic_store(&app->sample_rate, rf_sample_rate_hz);
     atomic_store(&app->audio_sample_rate, CXADC_AUDIO_SAMPLE_RATE_HZ);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     atomic_store(&app->dropout_stop_requested, false);
@@ -319,12 +771,37 @@ static bool cxadc_str_contains_nocase(const char *haystack, const char *needle)
     return false;
 }
 
-static bool cxadc_alsa_card_name_matches_clockgen(const char *name, const char *longname)
+static bool cxadc_alsa_card_name_matches_cxadc_clockgen(const char *name, const char *longname)
 {
     return cxadc_str_contains_nocase(name, "cxadc") ||
            cxadc_str_contains_nocase(name, "clockgen") ||
            cxadc_str_contains_nocase(longname, "cxadc") ||
            cxadc_str_contains_nocase(longname, "clockgen");
+}
+
+static bool cxadc_alsa_card_name_matches_misrc_clockgen(const char *name, const char *longname)
+{
+    bool name_has_misrc = cxadc_str_contains_nocase(name, "misrc") ||
+                          cxadc_str_contains_nocase(longname, "misrc");
+    bool name_has_clockgen = cxadc_str_contains_nocase(name, "clockgen") ||
+                             cxadc_str_contains_nocase(longname, "clockgen");
+    bool name_has_pcm1802 = cxadc_str_contains_nocase(name, "pcm1802") ||
+                            cxadc_str_contains_nocase(longname, "pcm1802");
+    return name_has_misrc && (name_has_clockgen || name_has_pcm1802);
+}
+
+static bool cxadc_alsa_card_name_matches_target(const cxadc_ctx_t *ctx,
+                                                 const char *name,
+                                                 const char *longname)
+{
+    if (ctx && ctx->misrc_clockgen_mode) {
+        if (cxadc_alsa_card_name_matches_misrc_clockgen(name, longname)) {
+            return true;
+        }
+        // Fallback so MISRC mode still works with legacy/unbranded card names.
+        return cxadc_alsa_card_name_matches_cxadc_clockgen(name, longname);
+    }
+    return cxadc_alsa_card_name_matches_cxadc_clockgen(name, longname);
 }
 
 static int cxadc_configure_audio_pcm(snd_pcm_t *pcm,
@@ -404,7 +881,7 @@ static int cxadc_probe_alsa_cards_for_audio(cxadc_ctx_t *ctx)
         (void)snd_card_get_name(card, &name);
         (void)snd_card_get_longname(card, &longname);
 
-        bool likely_clockgen = cxadc_alsa_card_name_matches_clockgen(name, longname);
+        bool likely_clockgen = cxadc_alsa_card_name_matches_target(ctx, name, longname);
         if (likely_clockgen) {
             matched_named_clockgen_card = true;
             char usbstream_dev[32];
@@ -465,9 +942,21 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
     //   alsamixer -D usbstream:CARD=CXADCADCClockGe
     // and make sure "USB Stream Output" is enabled/unmuted.
 
-    const char *env_device = getenv("MISRC_CXADC_ALSA_DEVICE");
-    const char *candidates[] = {
-        env_device,
+    const char *env_device = ctx->misrc_clockgen_mode
+        ? getenv("MISRC_CLOCKGEN_ALSA_DEVICE")
+        : getenv("MISRC_CXADC_ALSA_DEVICE");
+    if ((!env_device || !env_device[0]) && ctx->misrc_clockgen_mode) {
+        // Backward-compatible override name.
+        env_device = getenv("MISRC_CXADC_ALSA_DEVICE");
+    }
+
+    if (env_device && env_device[0]) {
+        if (cxadc_try_open_audio_device(ctx, env_device) == 0) {
+            return 0;
+        }
+    }
+
+    static const char *cxadc_candidates[] = {
         "usbstream:CARD=CXADCADCClockGe",
         "usbstream:CARD=CXADCADCClockGen",
         "usbstream:CARD=CXADCClockGen",
@@ -482,7 +971,27 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
         "plughw:CARD=CXADCClockGe",
         NULL
     };
+    static const char *misrc_candidates[] = {
+        "usbstream:CARD=MISRCClockgen",
+        "usbstream:CARD=MISRCClockGe",
+        "usbstream:CARD=MISRCClock",
+        "hw:CARD=MISRCClockgen",
+        "hw:CARD=MISRCClockGe",
+        "hw:CARD=MISRCClock",
+        "plughw:CARD=MISRCClockgen",
+        "plughw:CARD=MISRCClockGe",
+        "plughw:CARD=MISRCClock",
+        "usbstream:CARD=PCM1802",
+        "hw:CARD=PCM1802",
+        "plughw:CARD=PCM1802",
+        "usbstream:CARD=CXADCADCClockGe",
+        "usbstream:CARD=CXADCADCClockGen",
+        "hw:CARD=CXADCADCClockGe",
+        "hw:CARD=CXADCADCClockGen",
+        NULL
+    };
 
+    const char *const *candidates = ctx->misrc_clockgen_mode ? misrc_candidates : cxadc_candidates;
     for (size_t i = 0; candidates[i]; i++) {
         if (cxadc_try_open_audio_device(ctx, candidates[i]) == 0) {
             return 0;
@@ -584,12 +1093,43 @@ static int cxadc_wasapi_parse_format(const WAVEFORMATEX *wfx, cxadc_ctx_t *ctx)
     return 0;
 }
 
-// Match a WASAPI capture endpoint against the cxadc-win clockgen.
-// Checks (a) explicit env override, (b) USB instance path VID/PID, (c) friendly name.
-static bool cxadc_wasapi_device_matches(const wchar_t *friendly_name,
-                                        const wchar_t *instance_id)
+static bool cxadc_wasapi_wstr_contains_nocase(const wchar_t *haystack, const wchar_t *needle)
 {
-    const char *env_device = getenv("MISRC_CXADC_WASAPI_DEVICE");
+    if (!haystack || !needle || !needle[0]) return false;
+
+    wchar_t haystack_lower[512];
+    wcsncpy(haystack_lower, haystack, 511);
+    haystack_lower[511] = L'\0';
+    _wcslwr(haystack_lower);
+
+    wchar_t needle_lower[128];
+    wcsncpy(needle_lower, needle, 127);
+    needle_lower[127] = L'\0';
+    _wcslwr(needle_lower);
+
+    return wcsstr(haystack_lower, needle_lower) != NULL;
+}
+
+static bool cxadc_wasapi_instance_matches_misrc_clockgen(const wchar_t *instance_id)
+{
+    if (!instance_id) return false;
+
+    wchar_t id_lower[512];
+    wcsncpy(id_lower, instance_id, 511);
+    id_lower[511] = L'\0';
+    _wcslwr(id_lower);
+    if (!wcsstr(id_lower, MISRC_CLOCKGEN_USB_VID_W)) {
+        return false;
+    }
+    return (wcsstr(id_lower, MISRC_CLOCKGEN_USB_PID_PRIMARY_W) != NULL) ||
+           (wcsstr(id_lower, MISRC_CLOCKGEN_USB_PID_ALT_W) != NULL);
+}
+
+static bool cxadc_wasapi_device_matches_env_override(const char *env_name,
+                                                     const wchar_t *friendly_name,
+                                                     const wchar_t *instance_id)
+{
+    const char *env_device = getenv(env_name);
     if (env_device && env_device[0]) {
         wchar_t env_w[256];
         int len = MultiByteToWideChar(CP_UTF8, 0, env_device, -1, env_w, 256);
@@ -599,18 +1139,46 @@ static bool cxadc_wasapi_device_matches(const wchar_t *friendly_name,
             if (instance_id && wcsstr(instance_id, env_w) != NULL) return true;
         }
     }
-    // Clockgen mod is USB VID 1209 PID 0002 (Raspberry Pi Pico + Si5351).
-    if (instance_id) {
-        wchar_t id_lower[512];
-        wcsncpy(id_lower, instance_id, 511);
-        id_lower[511] = L'\0';
-        _wcslwr(id_lower);
-        if (wcsstr(id_lower, CXADC_CLOCKGEN_USB_VID_W) &&
-            wcsstr(id_lower, CXADC_CLOCKGEN_USB_PID_W)) {
+    return false;
+}
+
+// Match a WASAPI capture endpoint against the selected clockgen variant.
+// Checks: explicit env override, USB instance VID/PID, and friendly-name fallbacks.
+static bool cxadc_wasapi_device_matches(const cxadc_ctx_t *ctx,
+                                        const wchar_t *friendly_name,
+                                        const wchar_t *instance_id)
+{
+    if (ctx && ctx->misrc_clockgen_mode) {
+        if (cxadc_wasapi_device_matches_env_override("MISRC_CLOCKGEN_WASAPI_DEVICE",
+                                                     friendly_name,
+                                                     instance_id)) {
             return true;
         }
+        if (cxadc_wasapi_device_matches_env_override("MISRC_CXADC_WASAPI_DEVICE",
+                                                     friendly_name,
+                                                     instance_id)) {
+            return true;
+        }
+        if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id)) {
+            return true;
+        }
+        if (friendly_name &&
+            (cxadc_wasapi_wstr_contains_nocase(friendly_name, L"misrc clockgen") ||
+             cxadc_wasapi_wstr_contains_nocase(friendly_name, L"pcm1802"))) {
+            return true;
+        }
+        return false;
     }
-    // Fallback: match clockgen identifiers in friendly name.
+
+    if (cxadc_wasapi_device_matches_env_override("MISRC_CXADC_WASAPI_DEVICE",
+                                                 friendly_name,
+                                                 instance_id)) {
+        return true;
+    }
+    // Keep explicit MISRC mode and regular CXADC mode distinct by default.
+    if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id)) {
+        return false;
+    }
     if (friendly_name) {
         const wchar_t *patterns[] = { L"CXADC", L"ClockGen", L"Clockgen", L"clockgen", NULL };
         for (int i = 0; patterns[i]; i++) {
@@ -685,11 +1253,16 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
             instance_id_w = pv_id.pwszVal;
         }
 
-        if (cxadc_wasapi_device_matches(friendly_name_w, instance_id_w)) {
+        if (cxadc_wasapi_device_matches(ctx, friendly_name_w, instance_id_w)) {
             found = true;
-            const wchar_t *label = friendly_name_w ? friendly_name_w : instance_id_w;
-            snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
-                     "WASAPI:%ls", label ? label : L"clockgen");
+            if (ctx->misrc_clockgen_mode) {
+                snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
+                         "%s", "WASAPI:MISRC Clockgen");
+            } else {
+                const wchar_t *label = friendly_name_w ? friendly_name_w : instance_id_w;
+                snprintf(ctx->audio_device_name, sizeof(ctx->audio_device_name),
+                         "WASAPI:%ls", label ? label : L"clockgen");
+            }
         }
 
         if (pv_name.vt == VT_LPWSTR && pv_name.pwszVal) CoTaskMemFree(pv_name.pwszVal);
@@ -904,6 +1477,10 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                                 dst[0] = dst[1] = dst[2] = 0;
                             }
                         }
+                        // CH4: the clockgen device is 3-channel (CH1/CH2 + headswitch
+                        // CH3). There is no CH4 input — always leave it zero. Do
+                        // NOT mirror CH3 into CH4 (the clockgen has no CH3/4
+                        // pair control path on any platform).
                         dst_frame[9] = 0;
                         dst_frame[10] = 0;
                         dst_frame[11] = 0;
@@ -1028,9 +1605,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
         gui_app_set_status(app, "CXADC: failed to allocate capture buffers");
         return -1;
     }
+    const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
+    const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
 
     atomic_store(&app->stream_synced, true);
-    atomic_store(&app->sample_rate, CXADC_SAMPLE_RATE_HZ);
+    atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
 
     while (atomic_load(&ctx->running) && app->is_capturing && !atomic_load(&do_exit)) {
 #if defined(_WIN32)
@@ -1047,7 +1626,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
             continue;
         }
 
-        int output_samples = read_a;
+        int output_samples = read_a / input_bytes_per_sample_a;
+        if (output_samples <= 0) {
+            thrd_sleep_ms(1);
+            continue;
+        }
         if (ctx->card_count > 1) {
 #if defined(_WIN32)
             int read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
@@ -1062,8 +1645,9 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 thrd_sleep_ms(1);
                 continue;
             }
-            if (read_b < output_samples) {
-                output_samples = read_b;
+            int output_samples_b = read_b / input_bytes_per_sample_b;
+            if (output_samples_b < output_samples) {
+                output_samples = output_samples_b;
             }
         }
 
@@ -1080,10 +1664,21 @@ static int cxadc_capture_thread(void *ctx_ptr)
         }
 
         for (int i = 0; i < output_samples; i++) {
-            int16_t sample_a = (int16_t)(((int)card_buf_a[i] - 128) << 4);
+            int16_t sample_a = 0;
+            if (ctx->tenbit_mode[0]) {
+                int idx = i * 2;
+                sample_a = cxadc_decode_sample_tenbit(card_buf_a[idx], card_buf_a[idx + 1]);
+            } else {
+                sample_a = cxadc_decode_sample_8bit(card_buf_a[i]);
+            }
             int16_t sample_b = 0;
             if (ctx->card_count > 1) {
-                sample_b = (int16_t)(((int)card_buf_b[i] - 128) << 4);
+                if (ctx->tenbit_mode[1]) {
+                    int idx = i * 2;
+                    sample_b = cxadc_decode_sample_tenbit(card_buf_b[idx], card_buf_b[idx + 1]);
+                } else {
+                    sample_b = cxadc_decode_sample_8bit(card_buf_b[i]);
+                }
             }
             raw_out[i] = cxadc_encode_raw_sample(sample_a, sample_b);
         }
@@ -1100,17 +1695,113 @@ static int cxadc_capture_thread(void *ctx_ptr)
     return 0;
 }
 
-int gui_cxadc_start(gui_app_t *app, int card_count)
+bool gui_cxadc_detect_misrc_clockgen_audio(void)
+{
+#if defined(_WIN32)
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
+    bool com_initialized = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator *pEnum = NULL;
+    hr = CoCreateInstance(&s_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &s_IID_IMMDeviceEnumerator, (void **)&pEnum);
+    if (FAILED(hr)) { if (com_initialized) CoUninitialize(); return false; }
+
+    IMMDeviceCollection *pCollection = NULL;
+    hr = pEnum->lpVtbl->EnumAudioEndpoints(pEnum, eCapture, DEVICE_STATE_ACTIVE, &pCollection);
+    if (FAILED(hr)) {
+        pEnum->lpVtbl->Release(pEnum);
+        if (com_initialized) CoUninitialize();
+        return false;
+    }
+
+    UINT count = 0;
+    pCollection->lpVtbl->GetCount(pCollection, &count);
+    bool found = false;
+    for (UINT i = 0; i < count && !found; i++) {
+        IMMDevice *pDevice = NULL;
+        hr = pCollection->lpVtbl->Item(pCollection, i, &pDevice);
+        if (FAILED(hr)) continue;
+        IPropertyStore *pProps = NULL;
+        hr = pDevice->lpVtbl->OpenPropertyStore(pDevice, STGM_READ, &pProps);
+        if (SUCCEEDED(hr)) {
+            wchar_t *friendly_name_w = NULL;
+            PROPVARIANT pv_name;
+            memset(&pv_name, 0, sizeof(pv_name));
+            hr = pProps->lpVtbl->GetValue(pProps, &s_PKEY_Device_FriendlyName, &pv_name);
+            if (SUCCEEDED(hr) && pv_name.vt == VT_LPWSTR && pv_name.pwszVal) {
+                friendly_name_w = pv_name.pwszVal;
+            }
+            wchar_t *instance_id_w = NULL;
+            PROPVARIANT pv_id;
+            memset(&pv_id, 0, sizeof(pv_id));
+            hr = pProps->lpVtbl->GetValue(pProps, &s_PKEY_Device_InstanceId, &pv_id);
+            if (SUCCEEDED(hr) && pv_id.vt == VT_LPWSTR && pv_id.pwszVal) {
+                instance_id_w = pv_id.pwszVal;
+            }
+            // Reuse the MISRC matchers (USB instance VID/PID + friendly name).
+            if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id_w) ||
+                (friendly_name_w &&
+                 (cxadc_wasapi_wstr_contains_nocase(friendly_name_w, L"misrc clockgen") ||
+                  cxadc_wasapi_wstr_contains_nocase(friendly_name_w, L"pcm1802")))) {
+                found = true;
+            }
+            if (pv_name.vt == VT_LPWSTR && pv_name.pwszVal) CoTaskMemFree(pv_name.pwszVal);
+            if (pv_id.vt == VT_LPWSTR && pv_id.pwszVal) CoTaskMemFree(pv_id.pwszVal);
+            pProps->lpVtbl->Release(pProps);
+        }
+        pDevice->lpVtbl->Release(pDevice);
+    }
+    pCollection->lpVtbl->Release(pCollection);
+    pEnum->lpVtbl->Release(pEnum);
+    if (com_initialized) CoUninitialize();
+    return found;
+#elif !defined(_WIN32) && LIBASOUND_ENABLED
+    int card = -1;
+    if (snd_card_next(&card) < 0) return false;
+    while (card >= 0) {
+        char *name = NULL;
+        char *longname = NULL;
+        (void)snd_card_get_name(card, &name);
+        (void)snd_card_get_longname(card, &longname);
+        bool match = cxadc_alsa_card_name_matches_misrc_clockgen(name, longname);
+        if (name) free(name);
+        if (longname) free(longname);
+        if (match) return true;
+        if (snd_card_next(&card) < 0) break;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
     if (atomic_load(&s_cxadc.running)) return 0;
 
-    if (card_count < 1) card_count = 1;
+    // card_count == 0 is valid for the audio-only MISRC Clockgen path (no
+    // cxadcN RF card nodes; the clockgen USB-audio feed is the sole source).
+    // Clamp negatives to 0; cap at CXADC_MAX_CARDS.
+    if (card_count < 0) card_count = 0;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
 
     memset(&s_cxadc, 0, sizeof(s_cxadc));
     s_cxadc.app = app;
     s_cxadc.card_count = card_count;
+    s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        bool mode = app->settings.cxadc_tenbit_mode_card[i];
+        if (i >= card_count) {
+            mode = false;
+        }
+        s_cxadc.tenbit_mode[i] = mode;
+        s_cxadc.card_sample_rate_hz[i] = mode
+            ? CXADC_SAMPLE_RATE_TENBIT_HZ
+            : CXADC_SAMPLE_RATE_8BIT_HZ;
+    }
+    s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
 #if defined(_WIN32)
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
         s_cxadc.card_handles[i] = INVALID_HANDLE_VALUE;
@@ -1135,10 +1826,26 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     s_cxadc.audio_device_name[0] = '\0';
 
     gui_headswitch_lock_reset();
+    // Skip CXADC card programming/open when there are no RF cards (audio-only
+    // MISRC Clockgen). tenbit/center-offset sysfs writes would fail and abort.
+    if (card_count > 0) {
+        if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+#if !defined(_WIN32)
+            if (errno == EACCES || errno == EPERM) {
+                gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+            } else {
+                gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+            }
+#else
+            gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+#endif
+            return -1;
+        }
 
-    if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
-        gui_app_set_status(app, "CXADC: failed to open card device(s)");
-        return -1;
+        if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
+            gui_app_set_status(app, "CXADC: failed to open card device(s)");
+            return -1;
+        }
     }
 
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF) != 0) {
@@ -1152,7 +1859,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
         return -1;
     }
 
-    cxadc_reset_stats(app);
+    cxadc_reset_stats(app, s_cxadc.rf_sample_rate_hz);
 
     bool audio_capture_available = false;
     if (cxadc_open_audio_capture(&s_cxadc) == 0) {
@@ -1168,7 +1875,8 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
 #endif
     } else {
 #if defined(_WIN32) || LIBASOUND_ENABLED
-        fprintf(stderr, "[CXADC] clockgen audio device not available; continuing RF-only\n");
+        fprintf(stderr, "[CXADC] %s audio device not available; continuing RF-only\n",
+                s_cxadc.misrc_clockgen_mode ? "MISRC clockgen" : "clockgen");
 #if !defined(_WIN32) && LIBASOUND_ENABLED
         fprintf(stderr, "[CXADC] support note: for ClockGen Lite feed, check alsamixer card "
                         "\"CXADC+ADC-ClockGen\" (e.g. -D usbstream:CARD=CXADCADCClockGe) "
@@ -1197,23 +1905,28 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
     (void)gui_audio_start(app, &app->buffers);
 
     atomic_store(&s_cxadc.running, true);
-    if (thrd_create_with_priority(&s_cxadc.rf_thread,
-                                  cxadc_capture_thread,
-                                  &s_cxadc,
-                                  THRD_PRIORITY_CRITICAL) != thrd_success) {
-        gui_app_set_status(app, "CXADC: failed to start RF capture thread");
-        atomic_store(&s_cxadc.running, false);
-        gui_audio_stop(app);
-        if (app->display_thread) {
-            gui_display_thread_stop(app->display_thread);
+    // The RF card-reading thread only applies when there are cxadcN cards.
+    // In audio-only MISRC Clockgen mode (card_count == 0) the clockgen USB-audio
+    // feed is the sole source, so skip the RF thread and run audio-only.
+    if (card_count > 0) {
+        if (thrd_create_with_priority(&s_cxadc.rf_thread,
+                                      cxadc_capture_thread,
+                                      &s_cxadc,
+                                      THRD_PRIORITY_CRITICAL) != thrd_success) {
+            gui_app_set_status(app, "CXADC: failed to start RF capture thread");
+            atomic_store(&s_cxadc.running, false);
+            gui_audio_stop(app);
+            if (app->display_thread) {
+                gui_display_thread_stop(app->display_thread);
+            }
+            gui_extract_stop();
+            app->is_capturing = false;
+            cxadc_close_audio_capture(&s_cxadc);
+            cxadc_close_cards(&s_cxadc);
+            return -1;
         }
-        gui_extract_stop();
-        app->is_capturing = false;
-        cxadc_close_audio_capture(&s_cxadc);
-        cxadc_close_cards(&s_cxadc);
-        return -1;
+        s_cxadc.rf_thread_started = true;
     }
-    s_cxadc.rf_thread_started = true;
 
     if (audio_capture_available) {
         if (thrd_create_with_priority(&s_cxadc.audio_thread,
@@ -1227,7 +1940,15 @@ int gui_cxadc_start(gui_app_t *app, int card_count)
         }
     }
 
-    gui_app_set_status(app, (card_count > 1) ? "CXADC Clockgen capture running" : "CXADC capture running");
+    // Status is mode-aware: MISRC Clockgen is reported regardless of card_count
+    // (audio-only rigs have 0 cards); CXADC Clockgen only applies with >1 card.
+    if (s_cxadc.misrc_clockgen_mode) {
+        gui_app_set_status(app, "MISRC Clockgen capture running");
+    } else if (card_count > 1) {
+        gui_app_set_status(app, "CXADC Clockgen capture running");
+    } else {
+        gui_app_set_status(app, "CXADC capture running");
+    }
     return 0;
 }
 
@@ -1240,6 +1961,9 @@ void gui_cxadc_stop(gui_app_t *app)
     if (!app) {
         app = s_cxadc.app;
     }
+    // MISRC Clockgen is a clockgen variant even with 0 RF cards (audio-only).
+    bool was_clockgen_mode = (s_cxadc.card_count > 1) || s_cxadc.misrc_clockgen_mode;
+    bool was_misrc_clockgen_mode = s_cxadc.misrc_clockgen_mode;
 
     if (app) {
         app->is_capturing = false;
@@ -1270,7 +1994,13 @@ void gui_cxadc_stop(gui_app_t *app)
         atomic_store(&app->stream_synced, false);
         atomic_store(&app->dropout_stop_requested, false);
         atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
-        gui_app_set_status(app, "CXADC capture stopped");
+        if (was_clockgen_mode) {
+            gui_app_set_status(app, was_misrc_clockgen_mode
+                ? "MISRC Clockgen capture stopped"
+                : "CXADC Clockgen capture stopped");
+        } else {
+            gui_app_set_status(app, "CXADC capture stopped");
+        }
     }
 
     memset(&s_cxadc, 0, sizeof(s_cxadc));
@@ -1279,4 +2009,100 @@ void gui_cxadc_stop(gui_app_t *app)
 bool gui_cxadc_is_running(void)
 {
     return atomic_load(&s_cxadc.running);
+}
+
+int gui_cxadc_start_clockgen_audio(gui_app_t *app, bool misrc_clockgen_mode)
+{
+    // Audio-only subset of gui_cxadc_start: opens the clockgen USB-audio capture
+    // device (WASAPI/ALSA) and starts the cxadc audio thread feeding
+    // BUF_CAPTURE_AUDIO + headswitch ingest. Does NOT open CXADC RF cards, start
+    // the RF thread, or own extraction/display/audio-monitor threads (the caller's
+    // RF path owns those). Used by MISRC Clockgen, which runs the hsdaoh raw-
+    // parser RF feed (A+B) in parallel and shares one set of extraction/display/
+    // audio-monitor threads.
+    if (!app) return -1;
+    if (atomic_load(&s_cxadc.running)) return 0;
+
+    memset(&s_cxadc, 0, sizeof(s_cxadc));
+    s_cxadc.app = app;
+    s_cxadc.card_count = 0;  // audio-only; no CXADC RF cards
+    s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
+#if defined(_WIN32)
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        s_cxadc.card_handles[i] = INVALID_HANDLE_VALUE;
+    }
+    s_cxadc.audio_endpoint = NULL;
+    s_cxadc.audio_client = NULL;
+    s_cxadc.audio_capture = NULL;
+    s_cxadc.audio_com_initialized = false;
+#else
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        s_cxadc.card_fds[i] = -1;
+    }
+#if LIBASOUND_ENABLED
+    s_cxadc.audio_pcm = NULL;
+#endif
+#endif
+    s_cxadc.audio_format = CXADC_AUDIO_FMT_NONE;
+    s_cxadc.audio_sample_bytes = 0;
+    s_cxadc.audio_sample_rate_hz = 0;
+    s_cxadc.audio_channels = 0;
+    s_cxadc.audio_device_name[0] = '\0';
+
+    if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO) != 0) {
+        gui_app_set_status(app, "MISRC Clockgen: failed to initialize audio buffer");
+        return -1;
+    }
+
+    gui_headswitch_lock_reset();
+
+    if (cxadc_open_audio_capture(&s_cxadc) != 0) {
+#if defined(_WIN32) || LIBASOUND_ENABLED
+        fprintf(stderr, "[CXADC] %s audio device not available; continuing RF-only\n",
+                s_cxadc.misrc_clockgen_mode ? "MISRC clockgen" : "clockgen");
+#endif
+        return -1;
+    }
+
+    if (s_cxadc.audio_sample_rate_hz > 0) {
+        atomic_store(&app->audio_sample_rate, s_cxadc.audio_sample_rate_hz);
+    }
+#if defined(_WIN32) || LIBASOUND_ENABLED
+    fprintf(stderr, "[CXADC] audio capture device: %s (%u Hz, %d ch)\n",
+            s_cxadc.audio_device_name,
+            s_cxadc.audio_sample_rate_hz,
+            s_cxadc.audio_channels);
+#endif
+
+    atomic_store(&s_cxadc.running, true);
+    if (thrd_create_with_priority(&s_cxadc.audio_thread,
+                                  cxadc_audio_capture_thread,
+                                  &s_cxadc,
+                                  THRD_PRIORITY_ABOVE) != thrd_success) {
+        fprintf(stderr, "[CXADC] Failed to start clockgen audio thread; continuing RF-only\n");
+        cxadc_close_audio_capture(&s_cxadc);
+        atomic_store(&s_cxadc.running, false);
+        return -1;
+    }
+    s_cxadc.audio_thread_started = true;
+    return 0;
+}
+
+void gui_cxadc_stop_clockgen_audio(void)
+{
+    // Audio-only subset of gui_cxadc_stop: stops/joins the cxadc audio thread
+    // and closes the audio device. Does NOT stop extraction/display/audio-
+    // monitor/cards (owned by the caller's RF path).
+    if (!atomic_load(&s_cxadc.running) && !s_cxadc.audio_thread_started) {
+        return;
+    }
+    atomic_store(&s_cxadc.running, false);
+    cxadc_abort_audio_capture(&s_cxadc);
+    if (s_cxadc.audio_thread_started) {
+        thrd_join(s_cxadc.audio_thread, NULL);
+        s_cxadc.audio_thread_started = false;
+    }
+    cxadc_close_audio_capture(&s_cxadc);
+    gui_headswitch_lock_reset();
+    memset(&s_cxadc, 0, sizeof(s_cxadc));
 }

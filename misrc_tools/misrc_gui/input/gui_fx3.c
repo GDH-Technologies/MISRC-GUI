@@ -56,15 +56,18 @@
 #define FX3_TRANSFER_TIMEOUT 1000                    // 1 second timeout
 #define FX3_CTRL_TIMEOUT     1000                    // Control transfer timeout (ms) — must be >=1s for fx3usbadc 0x91 start
 
-// fx3usbadc command defaults (verified against fx3usbadc firmware README + live 100 MSPS test):
+// fx3usbadc start command (0x91):
 // wValue = gain control word [0:HighGain(1):GainCode(7)], default 0x94.
-// wIndex = [bit15 sample16][bit14 external_clock][bits7:0 clkConfig]:
-//   0xC010 = 16-bit + external NB3N3020 clock + config 16 => 100 MSPS.
-//   (Previous 0x800C was 64 MHz internal clock — wrong for the fx3usbadc board.)
+// wIndex = [bit15 sample16][bit14 external_clock][bits7:0 clkConfig].
+// Use discrete external-clock clkConfig settings and keep auto-fallback
+// with no user-side mode control.
 #define FX3USBADC_CMD_START                  0x91
 #define FX3USBADC_DEFAULT_GAIN_CONTROL_WORD  ((uint16_t)0x94)
-#define FX3USBADC_DEFAULT_START_WINDEX       ((uint16_t)0xC010)
-#define FX3USBADC_SAMPLE_RATE_HZ             (100000000u)
+#define FX3USBADC_START_WINDEX_BASE          ((uint16_t)0xC000)  // 16-bit sample + external clock
+#define FX3USBADC_START_WINDEX_FROM_CLKCFG(c) ((uint16_t)(FX3USBADC_START_WINDEX_BASE | ((uint16_t)(c) & 0x00FF)))
+#define FX3USBADC_DEFAULT_CLK_CONFIG         ((uint8_t)16)       // 100 MHz
+// DdD-compatible single-channel 12-bit pack (channel A in bits 11:0, AUX/B zero).
+#define FX3_DDD_PACK_12BIT(sample10_u) ((uint32_t)(4095u - ((((uint32_t)(sample10_u)) & 0x03FFu) << 2)))
 
 //-----------------------------------------------------------------------------
 // Platform-specific USB abstraction
@@ -114,6 +117,66 @@ typedef enum {
 static fx3_protocol_t s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
 static uint8_t s_fx3_bulk_ep = FX3_EP_BULK_IN;
 
+typedef struct {
+    uint8_t clk_config;
+    uint16_t start_windex;
+    uint32_t nominal_sample_rate_hz; // 0 means firmware mapping is undefined (e.g. clkConfig 5/12)
+} fx3usbadc_mode_t;
+
+static const fx3usbadc_mode_t s_fx3usbadc_modes[] = {
+    {  1, FX3USBADC_START_WINDEX_FROM_CLKCFG(1),   25000000u },
+    {  2, FX3USBADC_START_WINDEX_FROM_CLKCFG(2),   33333333u },
+    {  3, FX3USBADC_START_WINDEX_FROM_CLKCFG(3),   37500000u },
+    {  4, FX3USBADC_START_WINDEX_FROM_CLKCFG(4),   40000000u },
+    {  5, FX3USBADC_START_WINDEX_FROM_CLKCFG(5),          0u },
+    {  6, FX3USBADC_START_WINDEX_FROM_CLKCFG(6),   50000000u },
+    {  7, FX3USBADC_START_WINDEX_FROM_CLKCFG(7),   58333333u },
+    {  8, FX3USBADC_START_WINDEX_FROM_CLKCFG(8),   60000000u },
+    {  9, FX3USBADC_START_WINDEX_FROM_CLKCFG(9),   62500000u },
+    { 10, FX3USBADC_START_WINDEX_FROM_CLKCFG(10),  66666667u },
+    { 11, FX3USBADC_START_WINDEX_FROM_CLKCFG(11),  75000000u },
+    { 12, FX3USBADC_START_WINDEX_FROM_CLKCFG(12),         0u },
+    { 13, FX3USBADC_START_WINDEX_FROM_CLKCFG(13),  80000000u },
+    { 14, FX3USBADC_START_WINDEX_FROM_CLKCFG(14),  83333333u },
+    { 15, FX3USBADC_START_WINDEX_FROM_CLKCFG(15),  93750000u },
+    { 16, FX3USBADC_START_WINDEX_FROM_CLKCFG(16), 100000000u },
+    { 17, FX3USBADC_START_WINDEX_FROM_CLKCFG(17), 125000000u },
+    { 18, FX3USBADC_START_WINDEX_FROM_CLKCFG(18), 150000000u },
+    { 19, FX3USBADC_START_WINDEX_FROM_CLKCFG(19), 156250000u },
+    { 20, FX3USBADC_START_WINDEX_FROM_CLKCFG(20), 158333333u },
+};
+static size_t s_fx3usbadc_active_mode_index = 0;
+
+static size_t fx3usbadc_mode_count(void)
+{
+    return sizeof(s_fx3usbadc_modes) / sizeof(s_fx3usbadc_modes[0]);
+}
+static size_t fx3usbadc_default_mode_index(void)
+{
+    const size_t mode_count = fx3usbadc_mode_count();
+    for (size_t i = 0; i < mode_count; i++) {
+        if (s_fx3usbadc_modes[i].clk_config == FX3USBADC_DEFAULT_CLK_CONFIG) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static const fx3usbadc_mode_t *fx3usbadc_active_mode(void)
+{
+    size_t mode_count = fx3usbadc_mode_count();
+    if (mode_count == 0) return NULL;
+    if (s_fx3usbadc_active_mode_index >= mode_count) {
+        s_fx3usbadc_active_mode_index = fx3usbadc_default_mode_index();
+    }
+    return &s_fx3usbadc_modes[s_fx3usbadc_active_mode_index];
+}
+
+static void fx3usbadc_reset_mode(void)
+{
+    s_fx3usbadc_active_mode_index = fx3usbadc_default_mode_index();
+}
+
 static fx3_protocol_t fx3_protocol_from_pid(uint16_t pid)
 {
     if (pid == FX3_PID_FX3USBADC) {
@@ -137,7 +200,11 @@ static const char *fx3_protocol_name(fx3_protocol_t protocol)
 static uint32_t fx3_protocol_sample_rate_hz(fx3_protocol_t protocol)
 {
     if (protocol == FX3_PROTOCOL_FX3USBADC) {
-        return FX3USBADC_SAMPLE_RATE_HZ;
+        const fx3usbadc_mode_t *mode = fx3usbadc_active_mode();
+        if (mode && mode->nominal_sample_rate_hz > 0) {
+            return mode->nominal_sample_rate_hz;
+        }
+        return FX3_SAMPLE_RATE;
     }
     return FX3_SAMPLE_RATE;
 }
@@ -150,13 +217,13 @@ static uint32_t fx3_active_sample_rate_hz(void)
 static uint32_t fx3usbadc_pack_signed10_from_sample16(int16_t sample16)
 {
     // fx3usbadc 16-bit mode packs signed 10-bit samples left-shifted by 6.
-    // Convert to 10-bit unsigned and then polarity-compensate into MISRC's
-    // 12-bit slot so extract-pad reproduces the original signed sample scale.
+    // Convert to 10-bit unsigned, then apply the exact same polarity-
+    // compensated 12-bit mapping used by DdD.
     int32_t sample10 = ((int32_t)sample16) >> 6;
     if (sample10 < -512) sample10 = -512;
     if (sample10 > 511) sample10 = 511;
     uint32_t u10 = (uint32_t)(sample10 + 512);
-    return (uint32_t)(4095u - (u10 << 2));
+    return FX3_DDD_PACK_12BIT(u10);
 }
 
 //-----------------------------------------------------------------------------
@@ -226,22 +293,60 @@ static int fx3_cmd_start_acquisition_fx3usbadc(void)
 {
     if (!s_fx3_handle) return -1;
 
-    int ret = libusb_control_transfer(s_fx3_handle,
-        LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
-        FX3USBADC_CMD_START,
-        FX3USBADC_DEFAULT_GAIN_CONTROL_WORD,
-        FX3USBADC_DEFAULT_START_WINDEX,
-        NULL, 0,
-        FX3_CTRL_TIMEOUT);
-
-    if (ret < 0) {
-        fprintf(stderr, "[FX3] fx3usbadc start command failed: %s%c",
-                libusb_error_name(ret), 10);
-        return -1;
+    const size_t mode_count = fx3usbadc_mode_count();
+    if (mode_count == 0) return -1;
+    if (s_fx3usbadc_active_mode_index >= mode_count) {
+        s_fx3usbadc_active_mode_index = fx3usbadc_default_mode_index();
     }
-    fprintf(stderr, "[FX3] fx3usbadc start command sent (wValue=0x%04X, wIndex=0x%04X)%c",
-            FX3USBADC_DEFAULT_GAIN_CONTROL_WORD, FX3USBADC_DEFAULT_START_WINDEX, 10);
-    return 0;
+
+    int last_error = 0;
+    for (size_t i = 0; i < mode_count; i++) {
+        const size_t mode_index = (s_fx3usbadc_active_mode_index + i) % mode_count;
+        const fx3usbadc_mode_t *mode = &s_fx3usbadc_modes[mode_index];
+
+        int ret = libusb_control_transfer(s_fx3_handle,
+            LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
+            FX3USBADC_CMD_START,
+            FX3USBADC_DEFAULT_GAIN_CONTROL_WORD,
+            mode->start_windex,
+            NULL, 0,
+            FX3_CTRL_TIMEOUT);
+
+        if (ret >= 0) {
+            s_fx3usbadc_active_mode_index = mode_index;
+            if (mode->nominal_sample_rate_hz > 0) {
+                fprintf(stderr,
+                        "[FX3] fx3usbadc start command sent (clk=%u, wValue=0x%04X, wIndex=0x%04X, sample_rate=%u)%c",
+                        (unsigned int)mode->clk_config,
+                        FX3USBADC_DEFAULT_GAIN_CONTROL_WORD,
+                        mode->start_windex,
+                        mode->nominal_sample_rate_hz,
+                        10);
+            } else {
+                fprintf(stderr,
+                        "[FX3] fx3usbadc start command sent (clk=%u, wValue=0x%04X, wIndex=0x%04X, sample_rate=unknown)%c",
+                        (unsigned int)mode->clk_config,
+                        FX3USBADC_DEFAULT_GAIN_CONTROL_WORD,
+                        mode->start_windex,
+                        10);
+            }
+            return 0;
+        }
+
+        last_error = ret;
+        fprintf(stderr,
+                "[FX3] fx3usbadc start attempt failed (clk=%u, wIndex=0x%04X): %s%c",
+                (unsigned int)mode->clk_config,
+                mode->start_windex,
+                libusb_error_name(ret),
+                10);
+    }
+
+    fprintf(stderr,
+            "[FX3] fx3usbadc start command failed for all auto modes (clk=1..20): %s%c",
+            libusb_error_name(last_error),
+            10);
+    return -1;
 }
 
 // Send the active protocol's start-acquisition command.
@@ -540,6 +645,7 @@ static int fx3_open_linux_runtime_candidate(const fx3_linux_runtime_candidate_t 
 
 int gui_fx3_open(gui_app_t *app, int device_index) {
     (void)app;
+    fx3usbadc_reset_mode();
 
 #ifdef __linux__
     int num_devices = cyusb_open();
@@ -964,6 +1070,7 @@ void gui_fx3_close(gui_app_t *app) {
     }
     s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
     s_fx3_bulk_ep = FX3_EP_BULK_IN;
+    fx3usbadc_reset_mode();
 }
 
 //-----------------------------------------------------------------------------
@@ -1227,7 +1334,7 @@ int gui_fx3_start(gui_app_t *app) {
     if (fx3_start_before_thread) {
         if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
             fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
+            gui_app_set_status(app, "FX3ADC: Failed to start acquisition");
             gui_extract_stop();
             if (app->display_thread) {
                 gui_display_thread_stop(app->display_thread);
@@ -1236,6 +1343,8 @@ int gui_fx3_start(gui_app_t *app) {
             app->is_capturing = false;
             return -1;
         }
+        // Start command may auto-fallback to a different firmware mode.
+        atomic_store(&app->sample_rate, fx3_active_sample_rate_hz());
     }
 
     atomic_store(&s_fx3_transfer_ready, false);
@@ -1273,7 +1382,7 @@ int gui_fx3_start(gui_app_t *app) {
         fprintf(stderr, "[FX3] Waited additional 100ms for bulk transfer to be pending\n");
         if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
             fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
+            gui_app_set_status(app, "FX3ADC: Failed to start acquisition");
             atomic_store(&app->fx3_running, false);
             thrd_join(thread, NULL);
             app->fx3_thread = NULL;
@@ -1286,7 +1395,7 @@ int gui_fx3_start(gui_app_t *app) {
         }
     }
 
-    gui_app_set_status(app, "FX3 capture running");
+    gui_app_set_status(app, "FX3ADC capture running");
     return 0;
 }
 
@@ -1323,7 +1432,7 @@ void gui_fx3_stop(gui_app_t *app) {
 
     atomic_store(&app->stream_synced, false);
 
-    gui_app_set_status(app, "FX3 capture stopped");
+    gui_app_set_status(app, "FX3ADC capture stopped");
 }
 
 bool gui_fx3_is_running(gui_app_t *app) {

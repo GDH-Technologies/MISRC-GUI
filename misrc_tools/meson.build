@@ -325,25 +325,43 @@ if host_system == 'windows' or host_system == 'cygwin'
 elif host_system == 'linux'
   sources_capture += 'misrc_capture/simple_capture/simple_capture_v4l2.c'
   ldflags_capture += [ '-lm' ]
+elif host_system == 'android'
+  # No V4L2 on Android; simple_capture_android.c is a no-device stub (CXADC
+  # capture is out of scope for the basic Android release).
+  sources_capture += 'misrc_capture/simple_capture/simple_capture_android.c'
+  ldflags_capture += [ '-lm' ]
 elif host_system == 'darwin'
   add_languages('objc', native: false)
   ldflags_capture += ['-Wl,-framework,Cocoa', '-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,CoreVideo', '-Wl,-framework,IOKit', '-Wl,-framework,CoreFoundation', '-Wl,-framework,Security']
   sources_capture += 'misrc_capture/simple_capture/simple_capture_avfoundation.m'
 endif
 
-executable('misrc_extract',
-              sources_extract,
-              dependencies: [],
-              link_args: ldflags,
-              c_args: cflags,
-              install: true)
+if host_system == 'android'
+  # raylib was cross-built with GRAPHICS_API_OPENGL_ES3 (rcore_android.c +
+  # rlgl ES3 paths). GUI sources that include rlgl.h must match, else
+  # rlActiveDrawBuffers references the glDrawBuffersEXT extension symbol
+  # which is absent on Android GLES and fails at link time.
+  cflags += ['-DGRAPHICS_API_OPENGL_ES3']
+endif
 
-executable('misrc_capture',
-              sources_capture,
-              dependencies: deps,
-              link_args: ldflags + ldflags_capture,
-              c_args: cflags,
-              install: true)
+# The CLI tools (misrc_extract, misrc_capture) are not built for Android: an
+# APK has no terminal to run them, and they would only add cross-link risk.
+# The Android build target is the libmisrc_gui.so NativeActivity library below.
+if host_system != 'android'
+  executable('misrc_extract',
+                sources_extract,
+                dependencies: [],
+                link_args: ldflags,
+                c_args: cflags,
+                install: true)
+
+  executable('misrc_capture',
+                sources_capture,
+                dependencies: deps,
+                link_args: ldflags + ldflags_capture,
+                c_args: cflags,
+                install: true)
+endif
 
 # GUI application (requires raylib)
 # `required:` takes the feature object directly, so -Dmisrc_gui=enabled turns a
@@ -362,7 +380,6 @@ if raylib_dep.found()
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
-    'misrc_gui/input/gui_cxadc_params.c',
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
     'misrc_gui/input/gui_preview_v4l2.c',
@@ -418,6 +435,7 @@ if raylib_dep.found()
   # Add DdD support to GUI if available
   if ddd_enabled
     sources_gui += 'misrc_gui/input/gui_ddd.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
 
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
@@ -442,6 +460,19 @@ if raylib_dep.found()
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_v4l2.c'
+  elif host_system == 'android'
+    # NativeActivity + raylib rcore_android.c use EGL + GLES. raylib 5.5 links
+    # GLESv2 (see cmake/LibraryConfigurations.cmake); we also link GLESv3
+    # because the cross raylib was built with GRAPHICS_API_OPENGL_ES3 so rlgl
+    # uses ES3 entry points. -landroid/-llog for ANativeActivity/android_log.
+    # No -lX11/-lGL on Android (ANativeWindow replaces X11).
+    # NOTE: no -lpthread on Android — bionic's libc provides pthread (there is
+    # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
+    gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
+    sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
+    # JNI bridge: MainActivity.nativeSetUsbFd -> android_usb_get_fd() so the
+    # hsdaoh capture path can wrap the Java-granted USB fd with uvc_wrap().
+    sources_gui += 'misrc_gui/input/android_usb_jni.c'
   elif host_system == 'darwin'
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
     gui_ldflags += ['-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,Security']
@@ -459,14 +490,52 @@ if raylib_dep.found()
     gui_win_resources = windows_mod.compile_resources('misrc_gui/assets/misrc_gui.rc')
   endif
 
-  executable('misrc_gui',
-              sources_gui + gui_win_resources,
-              dependencies: gui_deps,
-              include_directories: gui_includes,
-              link_args: gui_ldflags,
-              c_args: gui_cflags,
-              win_subsystem: gui_win_subsystem,
-              install: true)
+  # Headless CLI capture mode: compile misrc_capture.c into the GUI binary
+  # (non-Android only) with main renamed to misrc_capture_main, so the GUI
+  # binary can run as the full misrc_capture CLI when capture args are passed.
+  # The static lib's extern symbols (usage/list_devices/audio_file_writer/etc.)
+  # are unique to this TU and don't collide with the GUI's; common symbols are
+  # resolved from the GUI's own common/ objects at link time.
+  # version_target is listed so the generated version.h is built before this TU
+  # compiles (misrc_capture.c does #include "../version.h") and the build root
+  # is on its include path -- without it, a fresh parallel build can compile
+  # this TU before version.h exists (the standalone misrc_capture gets this via
+  # version_target in sources_capture).
+  gui_extra_link_with = []
+  if host_system != 'android'
+    misrc_capture_cli_lib = static_library('misrc_capture_cli',
+                'misrc_capture/misrc_capture.c',
+                version_target,
+                include_directories: include_directories('misrc_capture'),
+                dependencies: deps,
+                c_args: cflags + ['-Dmain=misrc_capture_main'])
+    gui_extra_link_with += [ misrc_capture_cli_lib ]
+  endif
+
+  if host_system == 'android'
+    # NativeActivity loads a shared library libmisrc_gui.so that exports
+    # ANativeActivity_onCreate (pulled from raylib.a by the -u link flag in the
+    # cross-file). raylib's rcore_android.c defines android_main() which calls
+    # the app's main(), so the existing misrc_gui.c main() is reused unchanged.
+    # shared_library gives the lib* prefix + .so suffix on unix automatically.
+    shared_library('misrc_gui',
+                sources_gui + gui_win_resources,
+                dependencies: gui_deps,
+                include_directories: gui_includes,
+                link_args: gui_ldflags,
+                c_args: gui_cflags,
+                install: true)
+  else
+    executable('misrc_gui',
+                sources_gui + gui_win_resources,
+                dependencies: gui_deps,
+                include_directories: gui_includes,
+                link_args: gui_ldflags,
+                link_with: gui_extra_link_with,
+                c_args: gui_cflags,
+                win_subsystem: gui_win_subsystem,
+                install: true)
+  endif
 
   message('raylib found, building GUI application')
 else

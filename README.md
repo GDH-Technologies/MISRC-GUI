@@ -4,7 +4,7 @@
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
 
-A universal cross platform GUI tool for interfacing with and visualising monitoring and control of FM RF archival focused, capture device workflows.
+A universal cross platform GUI tool for interfacing with and visualizing monitoring and control of FM RF archival focused, capture device workflows.
 
 ### Current Supported Hardware
 
@@ -15,6 +15,24 @@ A universal cross platform GUI tool for interfacing with and visualising monitor
 - DdD (DomesDay Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
+### Linux setup note (CXADC DC controls)
+
+For CXADC `DC` up/down controls to work without root, the sysfs parameter files must be writable by the `video` group.
+
+One-time fix for the current boot:
+
+```bash
+sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*
+```
+
+Verify:
+
+```bash
+ls -l /sys/class/cxadc/cxadc*/device/parameters/center_offset
+```
+
+Expected group is `video` (e.g. `root video`).
+
 
 ## Downloads
 
@@ -23,8 +41,11 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 - Windows
 - MacOS
 - Linux
+- Android (arm64 APK, very alpha)
 
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
+
+Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
 
 ## Building from source on Fedora
@@ -43,12 +64,18 @@ sudo dnf install -y gcc meson ninja-build cmake pkgconf-pkg-config git nasm \
 Then build:
 
 ```sh
-./scripts/build-fedora.sh
+./scripts/build-local.sh
 ```
 
-Binaries land in `build-fedora/`. The script builds the vendored `third_party/hsdaoh` into
-`.deps/install` first (no distro packages it, and the API used here is the MISRC fork rather
-than upstream), then configures Meson against system libraries.
+Binaries land in `build-local/`. The script calls `scripts/build-deps-unix.sh`, which builds
+the vendored `third_party/hsdaoh` into `.deps/install` first (no distro packages it, and the
+API used here is the MISRC fork rather than upstream), then configures Meson against system
+libraries and runs a smoke test.
+
+> The Fedora-specific `scripts/build-fedora.sh` was removed once upstream's `build-local.sh`
+> gained the same coverage. Fedora support now lives in `build-deps-unix.sh` directly: dnf
+> package names in its dependency check, and `-DCMAKE_INSTALL_LIBDIR=lib` so the vendored
+> hsdaoh install and its `.pc` agree on a multilib distro.
 
 Notes on the Fedora-specific pieces:
 
@@ -65,7 +92,7 @@ Notes on the Fedora-specific pieces:
 
 By default a missing optional dependency silently drops a feature. Pass
 `-Dmisrc_gui=enabled`, `-Dfx3=enabled` or `-Dddd=enabled` to turn that into a configure
-error instead; `build-fedora.sh` already sets the first of these.
+error instead; `build-local.sh` already sets the first of these.
 
 
 ## Visual Overview & Use
@@ -108,7 +135,7 @@ Record button is clear when not in use.
 
 Record button is RED when capturing is in use.
 
-The record button will turn orange and state finalising when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
+The record button will turn orange and state finalizing when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
 
 Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
 
@@ -305,4 +332,4 @@ Log Example:
 - April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
-- August 13th 20206 - Official release!
+- August 13th 2026 - Official release!

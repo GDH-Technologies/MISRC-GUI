@@ -87,7 +87,21 @@ static const char* get_settings_file_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
+        // MainActivity.onCreate calls nativeSetStoragePath(getExternalFilesDir)
+        // before main() runs, so android_get_storage_path() returns the real,
+        // scoped-storage-exempt, writable app-external files dir. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(settings_path, sizeof(settings_path),
+                    "%s/misrc_gui_settings.json", ext);
+        } else {
+            strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
+        }
+#elif defined(__APPLE__)
         // Use ~/Library/Preferences on macOS
         const char* home = getenv("HOME");
         if (home) {
@@ -141,7 +155,19 @@ const char* gui_settings_get_desktop_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android 11+: use the scoped-storage-exempt external files dir handed
+        // in from Java (getExternalFilesDir), so native fopen() can write
+        // capture logs/FLAC here and the user can adb pull them. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(desktop_path, sizeof(desktop_path), "%s", ext);
+        } else {
+            strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+        }
+#elif defined(__APPLE__)
         const char* home = getenv("HOME");
         if (home) {
             snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
@@ -365,6 +391,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // RF bit depth defaults (per-channel)
     settings->rf_bits_a = 16;
     settings->rf_bits_b = 16;
+    settings->cxadc_tenbit_mode_card[0] = false;
+    settings->cxadc_tenbit_mode_card[1] = false;
     
     // Individual channel filenames
     for (int i = 0; i < 4; i++) {
@@ -462,6 +490,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
     // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
     settings->memory_budget_gb = 4;
+    settings->update_last_check_unix_s = 0;
+    settings->update_last_release_tag[0] = '\0';
+    settings->update_available_cached = false;
 
     // Keep derived filenames coherent with default auto-naming state.
     gui_settings_refresh_auto_names(settings);
@@ -489,6 +520,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
     fprintf(f, "  \"rf_bits_a\": %u,\n", (unsigned)settings->rf_bits_a);
     fprintf(f, "  \"rf_bits_b\": %u,\n", (unsigned)settings->rf_bits_b);
+    fprintf(f, "  \"cxadc_tenbit_mode_a\": %s,\n", settings->cxadc_tenbit_mode_card[0] ? "true" : "false");
+    fprintf(f, "  \"cxadc_tenbit_mode_b\": %s,\n", settings->cxadc_tenbit_mode_card[1] ? "true" : "false");
     fprintf(f, "  \"rf_tag_a\": \"%s\",\n", settings->rf_channel_tags[0]);
     fprintf(f, "  \"rf_tag_b\": \"%s\",\n", settings->rf_channel_tags[1]);
     fprintf(f, "  \"output_filename_a\": \"%s\",\n", settings->output_filename_a);
@@ -583,6 +616,9 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
     fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
+    fprintf(f, "  \"update_last_check_unix_s\": %llu,\n", (unsigned long long)settings->update_last_check_unix_s);
+    fprintf(f, "  \"update_last_release_tag\": \"%s\",\n", settings->update_last_release_tag);
+    fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -670,14 +706,21 @@ static void strip_timestamp_prefix_inplace(char *s) {
     }
 }
 
-// macOS folder picker using osascript. Returns true if output_path changed.
+// Output-folder picker. Returns true if output_path changed.
+// NOTE: On Android this is no longer called — the settings click handler in
+// gui_ui.c launches the async SAF picker (android_pick_output_folder_async)
+// and applies the result via the per-frame poll, so the render thread never
+// blocks across the picker Activity transition. This sync path remains for
+// desktop platforms.
 bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     if (!settings) return false;
     char picked[512] = {0};
-
-#ifdef __APPLE__
+#if defined(__ANDROID__)
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
+#elif defined(__APPLE__)
     // Use AppleScript choose folder dialog and return POSIX path.
-    // Note: This will prompt the user and block until a selection is made.
     const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -687,7 +730,7 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker - uses GUI subsystem without console or powershell
+    // Native Win32 folder picker.
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     BROWSEINFOA bi = {0};
     bi.lpszTitle = "Select output folder for MISRC captures";
@@ -715,20 +758,17 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #endif
-
     trim_newlines(picked);
     if (picked[0] == '\0') return false;
 
-    // Remove trailing slash/backslash
     size_t len = strlen(picked);
     while (len > 1 && (picked[len - 1] == '/' || picked[len - 1] == '\\')) {
         picked[--len] = '\0';
     }
 
     if (strncmp(settings->output_path, picked, MAX_FILENAME_LEN) == 0) {
-        return false; // no change
+        return false;
     }
-
     strncpy(settings->output_path, picked, MAX_FILENAME_LEN - 1);
     settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
     return true;
@@ -740,8 +780,11 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
     if (channel != 0 && channel != 1) return false;
 
     char picked[512] = {0};
-
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+    /* Not reached on Android (async path in gui_ui.c handles it). */
+    (void)picked;
+    return false;
+#elif defined(__APPLE__)
     // choose file, return POSIX path
     const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
     FILE *fp = popen(cmd, "r");
@@ -796,12 +839,10 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
 #endif
 
     if (picked[0] == '\0') return false;
-
     char *dst = (channel == 0) ? settings->playback_file_a : settings->playback_file_b;
     if (strncmp(dst, picked, MAX_FILENAME_LEN) == 0) {
         return false;
     }
-
     strncpy(dst, picked, MAX_FILENAME_LEN - 1);
     dst[MAX_FILENAME_LEN - 1] = '\0';
     return true;
@@ -869,6 +910,25 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "rf_bits_b")) != NULL) {
         settings->rf_bits_b = (uint8_t)atoi(value);
+    }
+    bool cxadc_mode_legacy_loaded = false;
+    if ((value = find_value(content, "cxadc_tenbit_mode")) != NULL) {
+        bool mode = (strcmp(value, "true") == 0);
+        settings->cxadc_tenbit_mode_card[0] = mode;
+        settings->cxadc_tenbit_mode_card[1] = mode;
+        cxadc_mode_legacy_loaded = true;
+    }
+    if ((value = find_value(content, "cxadc_tenbit_mode_a")) != NULL) {
+        settings->cxadc_tenbit_mode_card[0] = (strcmp(value, "true") == 0);
+        cxadc_mode_legacy_loaded = true;
+    }
+    if ((value = find_value(content, "cxadc_tenbit_mode_b")) != NULL) {
+        settings->cxadc_tenbit_mode_card[1] = (strcmp(value, "true") == 0);
+        cxadc_mode_legacy_loaded = true;
+    }
+    if (!cxadc_mode_legacy_loaded) {
+        settings->cxadc_tenbit_mode_card[0] = false;
+        settings->cxadc_tenbit_mode_card[1] = false;
     }
     if ((value = find_value(content, "rf_tag_a")) != NULL) {
         strncpy(settings->rf_channel_tags[0], value, sizeof(settings->rf_channel_tags[0]) - 1);
@@ -982,6 +1042,16 @@ void gui_settings_load(gui_settings_t *settings) {
         if (gb < 1) gb = 4;
         if (gb > 16) gb = 16;
         settings->memory_budget_gb = (uint32_t)gb;
+    }
+    if ((value = find_value(content, "update_last_check_unix_s")) != NULL) {
+        settings->update_last_check_unix_s = (uint64_t)strtoull(value, NULL, 10);
+    }
+    if ((value = find_value(content, "update_last_release_tag")) != NULL) {
+        strncpy(settings->update_last_release_tag, value, sizeof(settings->update_last_release_tag) - 1);
+        settings->update_last_release_tag[sizeof(settings->update_last_release_tag) - 1] = '\0';
+    }
+    if ((value = find_value(content, "update_available_cached")) != NULL) {
+        settings->update_available_cached = (strcmp(value, "true") == 0);
     }
 
     if ((value = find_value(content, "reduce_8bit_a")) != NULL) {

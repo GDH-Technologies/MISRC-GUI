@@ -109,6 +109,7 @@ static bool handle_device_dropdown(gui_app_t *app) {
                         gui_app_stop_capture(app);
                     }
                     app->selected_device = i;
+                    gui_ui_sync_capture_mode_state(app);
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
                     if (was_capturing) {

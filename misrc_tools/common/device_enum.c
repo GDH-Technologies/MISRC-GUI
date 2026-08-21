@@ -278,7 +278,7 @@ int misrc_device_enumerate_fx3(misrc_device_list_t *list, bool include_hsdaoh,
 
                 const char *fx3_name = "Cypress FX3";
                 if (desc.idProduct == FX3_PID_FX3USBADC) {
-                    fx3_name = "Fx3ADC";
+                    fx3_name = "FX3ADC";
                 } else if (desc.idProduct == FX3_PID_BOOTLOADER) {
                     fx3_name = "FX3 Bootloader";
                 }
