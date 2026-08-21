@@ -145,7 +145,11 @@ static bool gui_audio_selected_device_is_cxadc(const gui_app_t *app)
 {
     if (!app) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
-    return app->devices[app->selected_device].type == DEVICE_TYPE_CXADC;
+    // MISRC Clockgen is a clockgen-family device for audio purposes: it uses
+    // the same 3-channel clockgen audio layout (CH1/2 + headswitch CH3) and the
+    // same CH3 dual-mono monitor path as CXADC Clockgen.
+    device_type_t t = app->devices[app->selected_device].type;
+    return t == DEVICE_TYPE_CXADC || t == DEVICE_TYPE_MISRC_CLOCKGEN;
 }
 
 static uint32_t gui_audio_capture_rate_hz(const gui_app_t *app)

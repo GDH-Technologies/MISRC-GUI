@@ -207,9 +207,9 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
                 return i;
             }
         } else if (target->type == DEVICE_TYPE_CXADC) {
-            // Multiple synthetic CXADC entries can exist (e.g. CXADC Clockgen
-            // and MISRC Clockgen). Match by marker serial/name first so
-            // reconnect preserves the selected variant.
+            // Multiple synthetic CXADC entries can exist (e.g. CXADC Clockgen).
+            // Match by marker serial/name first so reconnect preserves the
+            // selected variant. (MISRC Clockgen now has its own device type.)
             if (target->serial[0] && strcmp(dev->serial, target->serial) == 0) {
                 return i;
             }
@@ -217,6 +217,15 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
                 return i;
             }
             if (target->index >= 0 && dev->index == target->index) {
+                return i;
+            }
+        } else if (target->type == DEVICE_TYPE_MISRC_CLOCKGEN) {
+            // MISRC Clockgen is a single synthetic entry; match by marker
+            // serial/name so reconnect stays on it across re-enumeration.
+            if (target->serial[0] && strcmp(dev->serial, target->serial) == 0) {
+                return i;
+            }
+            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
                 return i;
             }
         }
@@ -528,9 +537,14 @@ int main(int argc, char **argv) {
         if (hs_idx >= 0) {
             app.selected_device = hs_idx;
         } else {
-            int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
-            if (cxadc_idx >= 0) {
-                app.selected_device = cxadc_idx;
+            int misrc_cg_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_MISRC_CLOCKGEN);
+            if (misrc_cg_idx >= 0) {
+                app.selected_device = misrc_cg_idx;
+            } else {
+                int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
+                if (cxadc_idx >= 0) {
+                    app.selected_device = cxadc_idx;
+                }
             }
         }
     }
@@ -547,19 +561,26 @@ int main(int argc, char **argv) {
             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
             gui_app_set_status(&app, "Ready. Click Connect to start capture.");
         } else {
-            int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
-            if (cxadc_idx >= 0) {
-                app.selected_device = cxadc_idx;
+            int misrc_cg_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_MISRC_CLOCKGEN);
+            if (misrc_cg_idx >= 0) {
+                app.selected_device = misrc_cg_idx;
                 gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                 gui_app_set_status(&app, "Ready. Click Connect to start capture.");
             } else {
-                int sc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_SIMPLE_CAPTURE);
-                if (sc_idx >= 0) {
-                    app.selected_device = sc_idx;
+                int cxadc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_CXADC);
+                if (cxadc_idx >= 0) {
+                    app.selected_device = cxadc_idx;
                     gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                     gui_app_set_status(&app, "Ready. Click Connect to start capture.");
                 } else {
-                    gui_app_set_status(&app, "No hsdaoh/CXADC devices found. Select device and click Connect.");
+                    int sc_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_SIMPLE_CAPTURE);
+                    if (sc_idx >= 0) {
+                        app.selected_device = sc_idx;
+                        gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+                        gui_app_set_status(&app, "Ready. Click Connect to start capture.");
+                    } else {
+                        gui_app_set_status(&app, "No hsdaoh/CXADC devices found. Select device and click Connect.");
+                    }
                 }
             }
         }

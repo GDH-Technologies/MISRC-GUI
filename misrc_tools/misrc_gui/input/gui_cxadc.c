@@ -1651,12 +1651,96 @@ static int cxadc_capture_thread(void *ctx_ptr)
     return 0;
 }
 
+bool gui_cxadc_detect_misrc_clockgen_audio(void)
+{
+#if defined(_WIN32)
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
+    bool com_initialized = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator *pEnum = NULL;
+    hr = CoCreateInstance(&s_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &s_IID_IMMDeviceEnumerator, (void **)&pEnum);
+    if (FAILED(hr)) { if (com_initialized) CoUninitialize(); return false; }
+
+    IMMDeviceCollection *pCollection = NULL;
+    hr = pEnum->lpVtbl->EnumAudioEndpoints(pEnum, eCapture, DEVICE_STATE_ACTIVE, &pCollection);
+    if (FAILED(hr)) {
+        pEnum->lpVtbl->Release(pEnum);
+        if (com_initialized) CoUninitialize();
+        return false;
+    }
+
+    UINT count = 0;
+    pCollection->lpVtbl->GetCount(pCollection, &count);
+    bool found = false;
+    for (UINT i = 0; i < count && !found; i++) {
+        IMMDevice *pDevice = NULL;
+        hr = pCollection->lpVtbl->Item(pCollection, i, &pDevice);
+        if (FAILED(hr)) continue;
+        IPropertyStore *pProps = NULL;
+        hr = pDevice->lpVtbl->OpenPropertyStore(pDevice, STGM_READ, &pProps);
+        if (SUCCEEDED(hr)) {
+            wchar_t *friendly_name_w = NULL;
+            PROPVARIANT pv_name;
+            memset(&pv_name, 0, sizeof(pv_name));
+            hr = pProps->lpVtbl->GetValue(pProps, &s_PKEY_Device_FriendlyName, &pv_name);
+            if (SUCCEEDED(hr) && pv_name.vt == VT_LPWSTR && pv_name.pwszVal) {
+                friendly_name_w = pv_name.pwszVal;
+            }
+            wchar_t *instance_id_w = NULL;
+            PROPVARIANT pv_id;
+            memset(&pv_id, 0, sizeof(pv_id));
+            hr = pProps->lpVtbl->GetValue(pProps, &s_PKEY_Device_InstanceId, &pv_id);
+            if (SUCCEEDED(hr) && pv_id.vt == VT_LPWSTR && pv_id.pwszVal) {
+                instance_id_w = pv_id.pwszVal;
+            }
+            // Reuse the MISRC matchers (USB instance VID/PID + friendly name).
+            if (cxadc_wasapi_instance_matches_misrc_clockgen(instance_id_w) ||
+                (friendly_name_w &&
+                 (cxadc_wasapi_wstr_contains_nocase(friendly_name_w, L"misrc clockgen") ||
+                  cxadc_wasapi_wstr_contains_nocase(friendly_name_w, L"pcm1802")))) {
+                found = true;
+            }
+            if (pv_name.vt == VT_LPWSTR && pv_name.pwszVal) CoTaskMemFree(pv_name.pwszVal);
+            if (pv_id.vt == VT_LPWSTR && pv_id.pwszVal) CoTaskMemFree(pv_id.pwszVal);
+            pProps->lpVtbl->Release(pProps);
+        }
+        pDevice->lpVtbl->Release(pDevice);
+    }
+    pCollection->lpVtbl->Release(pCollection);
+    pEnum->lpVtbl->Release(pEnum);
+    if (com_initialized) CoUninitialize();
+    return found;
+#elif !defined(_WIN32) && LIBASOUND_ENABLED
+    int card = -1;
+    if (snd_card_next(&card) < 0) return false;
+    while (card >= 0) {
+        char *name = NULL;
+        char *longname = NULL;
+        (void)snd_card_get_name(card, &name);
+        (void)snd_card_get_longname(card, &longname);
+        bool match = cxadc_alsa_card_name_matches_misrc_clockgen(name, longname);
+        if (name) free(name);
+        if (longname) free(longname);
+        if (match) return true;
+        if (snd_card_next(&card) < 0) break;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
     if (atomic_load(&s_cxadc.running)) return 0;
 
-    if (card_count < 1) card_count = 1;
+    // card_count == 0 is valid for the audio-only MISRC Clockgen path (no
+    // cxadcN RF card nodes; the clockgen USB-audio feed is the sole source).
+    // Clamp negatives to 0; cap at CXADC_MAX_CARDS.
+    if (card_count < 0) card_count = 0;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
 
     memset(&s_cxadc, 0, sizeof(s_cxadc));
@@ -1698,22 +1782,26 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     s_cxadc.audio_device_name[0] = '\0';
 
     gui_headswitch_lock_reset();
-    if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+    // Skip CXADC card programming/open when there are no RF cards (audio-only
+    // MISRC Clockgen). tenbit/center-offset sysfs writes would fail and abort.
+    if (card_count > 0) {
+        if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
 #if !defined(_WIN32)
-        if (errno == EACCES || errno == EPERM) {
-            gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
-        } else {
-            gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
-        }
+            if (errno == EACCES || errno == EPERM) {
+                gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+            } else {
+                gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+            }
 #else
-        gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+            gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
 #endif
-        return -1;
-    }
+            return -1;
+        }
 
-    if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
-        gui_app_set_status(app, "CXADC: failed to open card device(s)");
-        return -1;
+        if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
+            gui_app_set_status(app, "CXADC: failed to open card device(s)");
+            return -1;
+        }
     }
 
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF) != 0) {
@@ -1773,23 +1861,28 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     (void)gui_audio_start(app, &app->buffers);
 
     atomic_store(&s_cxadc.running, true);
-    if (thrd_create_with_priority(&s_cxadc.rf_thread,
-                                  cxadc_capture_thread,
-                                  &s_cxadc,
-                                  THRD_PRIORITY_CRITICAL) != thrd_success) {
-        gui_app_set_status(app, "CXADC: failed to start RF capture thread");
-        atomic_store(&s_cxadc.running, false);
-        gui_audio_stop(app);
-        if (app->display_thread) {
-            gui_display_thread_stop(app->display_thread);
+    // The RF card-reading thread only applies when there are cxadcN cards.
+    // In audio-only MISRC Clockgen mode (card_count == 0) the clockgen USB-audio
+    // feed is the sole source, so skip the RF thread and run audio-only.
+    if (card_count > 0) {
+        if (thrd_create_with_priority(&s_cxadc.rf_thread,
+                                      cxadc_capture_thread,
+                                      &s_cxadc,
+                                      THRD_PRIORITY_CRITICAL) != thrd_success) {
+            gui_app_set_status(app, "CXADC: failed to start RF capture thread");
+            atomic_store(&s_cxadc.running, false);
+            gui_audio_stop(app);
+            if (app->display_thread) {
+                gui_display_thread_stop(app->display_thread);
+            }
+            gui_extract_stop();
+            app->is_capturing = false;
+            cxadc_close_audio_capture(&s_cxadc);
+            cxadc_close_cards(&s_cxadc);
+            return -1;
         }
-        gui_extract_stop();
-        app->is_capturing = false;
-        cxadc_close_audio_capture(&s_cxadc);
-        cxadc_close_cards(&s_cxadc);
-        return -1;
+        s_cxadc.rf_thread_started = true;
     }
-    s_cxadc.rf_thread_started = true;
 
     if (audio_capture_available) {
         if (thrd_create_with_priority(&s_cxadc.audio_thread,
@@ -1803,10 +1896,12 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
         }
     }
 
-    if (card_count > 1) {
-        gui_app_set_status(app, s_cxadc.misrc_clockgen_mode
-            ? "MISRC Clockgen capture running"
-            : "CXADC Clockgen capture running");
+    // Status is mode-aware: MISRC Clockgen is reported regardless of card_count
+    // (audio-only rigs have 0 cards); CXADC Clockgen only applies with >1 card.
+    if (s_cxadc.misrc_clockgen_mode) {
+        gui_app_set_status(app, "MISRC Clockgen capture running");
+    } else if (card_count > 1) {
+        gui_app_set_status(app, "CXADC Clockgen capture running");
     } else {
         gui_app_set_status(app, "CXADC capture running");
     }
@@ -1822,7 +1917,8 @@ void gui_cxadc_stop(gui_app_t *app)
     if (!app) {
         app = s_cxadc.app;
     }
-    bool was_clockgen_mode = (s_cxadc.card_count > 1);
+    // MISRC Clockgen is a clockgen variant even with 0 RF cards (audio-only).
+    bool was_clockgen_mode = (s_cxadc.card_count > 1) || s_cxadc.misrc_clockgen_mode;
     bool was_misrc_clockgen_mode = s_cxadc.misrc_clockgen_mode;
 
     if (app) {
@@ -1869,4 +1965,100 @@ void gui_cxadc_stop(gui_app_t *app)
 bool gui_cxadc_is_running(void)
 {
     return atomic_load(&s_cxadc.running);
+}
+
+int gui_cxadc_start_clockgen_audio(gui_app_t *app, bool misrc_clockgen_mode)
+{
+    // Audio-only subset of gui_cxadc_start: opens the clockgen USB-audio capture
+    // device (WASAPI/ALSA) and starts the cxadc audio thread feeding
+    // BUF_CAPTURE_AUDIO + headswitch ingest. Does NOT open CXADC RF cards, start
+    // the RF thread, or own extraction/display/audio-monitor threads (the caller's
+    // RF path owns those). Used by MISRC Clockgen, which runs the hsdaoh raw-
+    // parser RF feed (A+B) in parallel and shares one set of extraction/display/
+    // audio-monitor threads.
+    if (!app) return -1;
+    if (atomic_load(&s_cxadc.running)) return 0;
+
+    memset(&s_cxadc, 0, sizeof(s_cxadc));
+    s_cxadc.app = app;
+    s_cxadc.card_count = 0;  // audio-only; no CXADC RF cards
+    s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
+#if defined(_WIN32)
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        s_cxadc.card_handles[i] = INVALID_HANDLE_VALUE;
+    }
+    s_cxadc.audio_endpoint = NULL;
+    s_cxadc.audio_client = NULL;
+    s_cxadc.audio_capture = NULL;
+    s_cxadc.audio_com_initialized = false;
+#else
+    for (int i = 0; i < CXADC_MAX_CARDS; i++) {
+        s_cxadc.card_fds[i] = -1;
+    }
+#if LIBASOUND_ENABLED
+    s_cxadc.audio_pcm = NULL;
+#endif
+#endif
+    s_cxadc.audio_format = CXADC_AUDIO_FMT_NONE;
+    s_cxadc.audio_sample_bytes = 0;
+    s_cxadc.audio_sample_rate_hz = 0;
+    s_cxadc.audio_channels = 0;
+    s_cxadc.audio_device_name[0] = '\0';
+
+    if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO) != 0) {
+        gui_app_set_status(app, "MISRC Clockgen: failed to initialize audio buffer");
+        return -1;
+    }
+
+    gui_headswitch_lock_reset();
+
+    if (cxadc_open_audio_capture(&s_cxadc) != 0) {
+#if defined(_WIN32) || LIBASOUND_ENABLED
+        fprintf(stderr, "[CXADC] %s audio device not available; continuing RF-only\n",
+                s_cxadc.misrc_clockgen_mode ? "MISRC clockgen" : "clockgen");
+#endif
+        return -1;
+    }
+
+    if (s_cxadc.audio_sample_rate_hz > 0) {
+        atomic_store(&app->audio_sample_rate, s_cxadc.audio_sample_rate_hz);
+    }
+#if defined(_WIN32) || LIBASOUND_ENABLED
+    fprintf(stderr, "[CXADC] audio capture device: %s (%u Hz, %d ch)\n",
+            s_cxadc.audio_device_name,
+            s_cxadc.audio_sample_rate_hz,
+            s_cxadc.audio_channels);
+#endif
+
+    atomic_store(&s_cxadc.running, true);
+    if (thrd_create_with_priority(&s_cxadc.audio_thread,
+                                  cxadc_audio_capture_thread,
+                                  &s_cxadc,
+                                  THRD_PRIORITY_ABOVE) != thrd_success) {
+        fprintf(stderr, "[CXADC] Failed to start clockgen audio thread; continuing RF-only\n");
+        cxadc_close_audio_capture(&s_cxadc);
+        atomic_store(&s_cxadc.running, false);
+        return -1;
+    }
+    s_cxadc.audio_thread_started = true;
+    return 0;
+}
+
+void gui_cxadc_stop_clockgen_audio(void)
+{
+    // Audio-only subset of gui_cxadc_stop: stops/joins the cxadc audio thread
+    // and closes the audio device. Does NOT stop extraction/display/audio-
+    // monitor/cards (owned by the caller's RF path).
+    if (!atomic_load(&s_cxadc.running) && !s_cxadc.audio_thread_started) {
+        return;
+    }
+    atomic_store(&s_cxadc.running, false);
+    cxadc_abort_audio_capture(&s_cxadc);
+    if (s_cxadc.audio_thread_started) {
+        thrd_join(s_cxadc.audio_thread, NULL);
+        s_cxadc.audio_thread_started = false;
+    }
+    cxadc_close_audio_capture(&s_cxadc);
+    gui_headswitch_lock_reset();
+    memset(&s_cxadc, 0, sizeof(s_cxadc));
 }

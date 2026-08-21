@@ -134,16 +134,20 @@ typedef struct {
 // Device info for enumeration
 // Device type enumeration
 typedef enum {
-    DEVICE_TYPE_HSDAOH,         // Hardware device via hsdaoh
-    DEVICE_TYPE_SIMPLE_CAPTURE, // OS video capture
-    DEVICE_TYPE_CXADC,          // CXADC RF capture card(s)
-    DEVICE_TYPE_SIMULATED,      // Simulated device for testing
-    DEVICE_TYPE_PLAYBACK,       // Playback from recorded FLAC files
+    DEVICE_TYPE_HSDAOH,                  // Hardware device via hsdaoh
+    DEVICE_TYPE_SIMPLE_CAPTURE,           // OS video capture
+    DEVICE_TYPE_CXADC,                   // CXADC RF capture card(s)
+    DEVICE_TYPE_MISRC_CLOCKGEN,          // MISRC Clockgen: pure USB-audio clockgen
+                                         // (MISRC v1.5 + shared-clock clockgen),
+                                         // distinct from CXADC (no PCI RF cards,
+                                         // no DC-offset/tenbit profile)
+    DEVICE_TYPE_SIMULATED,               // Simulated device for testing
+    DEVICE_TYPE_PLAYBACK,                // Playback from recorded FLAC files
 #ifdef ENABLE_FX3
-    DEVICE_TYPE_FX3,            // Cypress FX3 USB device
+    DEVICE_TYPE_FX3,                     // Cypress FX3 USB device
 #endif
 #ifdef ENABLE_DDD
-    DEVICE_TYPE_DDD,            // DomesdayDuplicator USB device
+    DEVICE_TYPE_DDD,                     // DomesdayDuplicator USB device
 #endif
 } device_type_t;
 

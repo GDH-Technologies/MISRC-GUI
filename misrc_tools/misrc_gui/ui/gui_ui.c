@@ -94,12 +94,26 @@ static bool gui_ui_selected_device_is_cxadc(const gui_app_t *app, bool *clockgen
 
 static bool gui_ui_selected_device_is_cxadc_misrc_clockgen(const gui_app_t *app)
 {
+    // MISRC Clockgen is now its own device type (DEVICE_TYPE_MISRC_CLOCKGEN).
+    // Also accept the legacy CXADC-typed marker serial for older saved selections.
     if (!app) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
 
     const device_info_t *dev = &app->devices[app->selected_device];
-    if (dev->type != DEVICE_TYPE_CXADC) return false;
-    return strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0;
+    if (dev->type == DEVICE_TYPE_MISRC_CLOCKGEN) return true;
+    if (dev->type == DEVICE_TYPE_CXADC &&
+        strcmp(dev->serial, CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN) == 0) {
+        return true;
+    }
+    return false;
+}
+
+// True iff the selected device is the first-class MISRC Clockgen entry.
+static bool gui_ui_selected_device_is_misrc_clockgen(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_MISRC_CLOCKGEN;
 }
 
 static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
@@ -5799,6 +5813,7 @@ void gui_handle_interactions(gui_app_t *app) {
         bool mode_toggle_cxadc_clockgen = false;
         bool mode_toggle_is_cxadc = gui_ui_selected_device_is_cxadc(app, &mode_toggle_cxadc_clockgen);
         bool mode_toggle_is_cxadc_misrc_clockgen = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
+        bool mode_toggle_is_misrc_clockgen = gui_ui_selected_device_is_misrc_clockgen(app);
 #ifdef ENABLE_FX3
         bool mode_toggle_is_fx3 = gui_ui_selected_device_is_fx3(app);
 #else
@@ -5866,7 +5881,9 @@ void gui_handle_interactions(gui_app_t *app) {
             }
         }
         if (mode_toggle_hit) {
-            if (mode_toggle_is_cxadc) {
+            if (mode_toggle_is_misrc_clockgen) {
+                gui_app_set_status(app, "MISRC Clockgen mode is selected from the device list");
+            } else if (mode_toggle_is_cxadc) {
                 if (mode_toggle_cxadc_clockgen) {
                     gui_app_set_status(app, mode_toggle_is_cxadc_misrc_clockgen
                         ? "MISRC Clockgen mode is selected from the device list"

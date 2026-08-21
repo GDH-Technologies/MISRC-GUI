@@ -9,10 +9,22 @@ typedef struct gui_app gui_app_t;
 #define CXADC_MARKER_SERIAL_2CARD "CXADC_2CARD"
 #define CXADC_MARKER_SERIAL_2CARD_CX_CLOCKGEN "CXADC_2CARD_CX_CLOCKGEN"
 #define CXADC_MARKER_SERIAL_2CARD_MISRC_CLOCKGEN "CXADC_2CARD_MISRC_CLOCKGEN"
+// MISRC Clockgen is a first-class device type (DEVICE_TYPE_MISRC_CLOCKGEN),
+// not a CXADC variant. This marker serial identifies its synthetic entry so
+// reconnect/selection can match it by name/serial.
+#define MISRC_CLOCKGEN_MARKER_SERIAL "MISRC_CLOCKGEN"
 
 // Detect available CXADC RF cards.
 // Returns number of cards detected (0..2).
 int gui_cxadc_detect_cards(void);
+
+// Detect whether a MISRC Clockgen USB-audio capture endpoint is present on the
+// host (WASAPI on Windows, ALSA on Linux), independent of CXADC RF cards. Used
+// to surface the "[CXADC] MISRC Clockgen" entry on rigs that have the clockgen
+// audio device but no cxadcN card nodes (the MISRC v1.5 presents purely as a
+// USB audio-class device).
+// Returns true if a matching endpoint is found.
+bool gui_cxadc_detect_misrc_clockgen_audio(void);
 // Read per-card CXADC center offset (driver DC offset).
 // card_idx is zero-based (cxadc0, cxadc1, ...).
 // Returns 0 on success, -1 on error.
@@ -44,5 +56,16 @@ void gui_cxadc_stop(gui_app_t *app);
 
 // Check whether CXADC capture mode is currently running.
 bool gui_cxadc_is_running(void);
+
+// Start ONLY the clockgen audio capture thread (WASAPI/ALSA) feeding
+// BUF_CAPTURE_AUDIO + headswitch ingest, with no CXADC RF cards and no
+// extraction/display/audio-monitor thread ownership. Used by MISRC Clockgen
+// mode, which owns its RF feed separately (hsdaoh raw-parser) and shares one
+// set of extraction/display/audio-monitor threads. Returns 0 on success.
+int gui_cxadc_start_clockgen_audio(gui_app_t *app, bool misrc_clockgen_mode);
+
+// Stop/join the clockgen audio thread and close the audio device. Does NOT
+// touch extraction/display/audio-monitor/cards (owned by the caller's RF path).
+void gui_cxadc_stop_clockgen_audio(void);
 
 #endif // GUI_CXADC_H
