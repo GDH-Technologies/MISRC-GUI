@@ -366,6 +366,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_fft.c',
     'misrc_gui/visualization/gui_panel.c',
     'misrc_gui/visualization/gui_histogram_panel.c',
+    'misrc_gui/visualization/gui_spectrogram.c',
     'misrc_gui/visualization/gui_text.c',
     'misrc_gui/visualization/gui_vu_meter.c',
     'misrc_gui/visualization/panel_registry.c',
@@ -417,7 +418,9 @@ if raylib_dep.found()
   gui_ldflags = ldflags
 
   if host_system == 'windows' or host_system == 'cygwin'
-    gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
+    # raylib's static lib was built against glfw as a DLL (references __imp_glfw*),
+    # so link the glfw import library (libglfw3.dll.a) rather than the static lib.
+    gui_ldflags += ['-l:libglfw3.dll.a', '-lopengl32', '-lgdi32', '-lwinmm']
     # Need mincore for VirtualAlloc2/MapViewOfFile3 used by ringbuffer
     gui_ldflags += ['-lmincore']
     # simple_capture for device enumeration

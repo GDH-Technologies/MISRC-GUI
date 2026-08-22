@@ -33,6 +33,7 @@
 #include "../visualization/gui_panel.h"
 #include "../visualization/panel_interface.h"
 #include "../visualization/gui_histogram_panel.h"
+#include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
@@ -993,6 +994,8 @@ void gui_app_init(gui_app_t *app) {
     gui_fft_panel_register();
     gui_cvbs_panel_register();
     gui_histogram_panel_register();
+    gui_waterfall_panel_register();
+    gui_spectrograph_panel_register();
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
