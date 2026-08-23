@@ -268,6 +268,35 @@ else
   message('libusb-1.0 not found, building without DdD support')
 endif
 
+# RTL-SDR support (optional, librtlsdr + libusb-1.0 on all platforms).
+# The RTL-SDR raw I/Q backend (gui_rtlsdr.c) is only compiled when librtlsdr
+# is found; the device-agnostic Demod panel (gui_demod.c) is always compiled.
+rtlsdr_enabled = false
+rtlsdr_pc = dependency('librtlsdr', required : false, static: windows_static_deps)
+if rtlsdr_pc.found()
+  if not libusb_common_dep_added
+    # librtlsdr needs libusb-1.0 at link time on Windows static builds.
+    deps += [ libusb_common_dep ]
+    libusb_common_dep_added = true
+  endif
+  if windows_static_deps
+    # MSYS2's rtl-sdr package names its static archive librtlsdr_static.a
+    # (there is no librtlsdr.a), and the .pc Libs ("-lrtlsdr") resolves to the
+    # DLL import lib. With the global -static ldflag, carry over only the
+    # compile-side (include dirs) of the pkg-config dependency and link the
+    # static archive explicitly by filename in the GUI link step below.
+    rtlsdr_dep = rtlsdr_pc.partial_dependency(compile_args: true, includes: true)
+  else
+    rtlsdr_dep = rtlsdr_pc
+  endif
+  deps += [ rtlsdr_dep ]
+  cflags += ['-DENABLE_RTLSDR=1']
+  rtlsdr_enabled = true
+  message('librtlsdr found, building with RTL-SDR support')
+else
+  message('librtlsdr not found, building without RTL-SDR support (Demod panel still built)')
+endif
+
 
 if host_system == 'windows' or host_system == 'cygwin'
   if meson.get_compiler('c').get_id() != 'gcc' and meson.get_compiler('c').get_id() != 'clang'
@@ -360,6 +389,7 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_histogram.c',
+    'misrc_gui/signal/gui_demod.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',
     'misrc_gui/visualization/gui_phosphor_rt.c',
@@ -405,6 +435,11 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
 
+  # Add RTL-SDR support to GUI if available
+  if rtlsdr_enabled
+    sources_gui += 'misrc_gui/input/gui_rtlsdr.c'
+  endif
+
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
 
   gui_cflags = cflags + [
@@ -421,6 +456,11 @@ if raylib_dep.found()
     # raylib's static lib was built against glfw as a DLL (references __imp_glfw*),
     # so link the glfw import library (libglfw3.dll.a) rather than the static lib.
     gui_ldflags += ['-l:libglfw3.dll.a', '-lopengl32', '-lgdi32', '-lwinmm']
+    # RTL-SDR: link the static archive by filename (MSYS2 names it librtlsdr_static.a;
+    # the .pc -lrtlsdr resolves to the DLL import lib which -static rejects).
+    if rtlsdr_enabled
+      gui_ldflags += ['-l:librtlsdr_static.a']
+    endif
     # Need mincore for VirtualAlloc2/MapViewOfFile3 used by ringbuffer
     gui_ldflags += ['-lmincore']
     # simple_capture for device enumeration
