@@ -453,9 +453,13 @@ if raylib_dep.found()
   gui_ldflags = ldflags
 
   if host_system == 'windows' or host_system == 'cygwin'
-    # raylib's static lib was built against glfw as a DLL (references __imp_glfw*),
-    # so link the glfw import library (libglfw3.dll.a) rather than the static lib.
-    gui_ldflags += ['-l:libglfw3.dll.a', '-lopengl32', '-lgdi32', '-lwinmm']
+    # raylib 5.5 is built from source with its bundled GLFW (USE_EXTERNAL_GLFW
+    # defaults to OFF), so the GLFW objects are compiled into libraylib.a and
+    # no separate glfw link is needed. Do NOT add -l:libglfw3.dll.a here: that
+    # import library is only shipped by MSYS2's mingw glfw package, which the CI
+    # MSYS2 install list does not include, so the flag breaks the link with
+    # "cannot find -l:libglfw3.dll.a". OpenGL/GDI/winmm are still required.
+    gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
     # RTL-SDR: link the static archive by filename (MSYS2 names it librtlsdr_static.a;
     # the .pc -lrtlsdr resolves to the DLL import lib which -static rejects).
     if rtlsdr_enabled

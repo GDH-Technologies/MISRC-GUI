@@ -55,15 +55,15 @@ typedef struct {
     float agc_peak;                     // AM AGC running peak
     int   sb_phase;                     // sideband fs/4 oscillator phase index (USB/LSB)
 
-    // soxr: capture rate -> 48k, int16 mono -> int16 mono
-#if LIBSOXR_ENABLED
-    void  *soxr;                      // soxr_t
+    // soxr: capture rate -> 48k, int16 mono -> int16 mono.
+    // The scratch buffers are always present so the Demod panel builds and runs
+    // even when libsoxr is unavailable (no-resample pass-through at capture rate).
+    void  *soxr;                      // soxr_t (only used when LIBSOXR_ENABLED)
     uint32_t soxr_in_rate;             // configured input rate (0 = not created)
     int16_t *soxr_in_buf;             // input scratch (capture-rate mono samples)
     size_t  soxr_in_cap;
     int16_t *soxr_out_buf;            // output scratch (48k mono samples)
     size_t  soxr_out_cap;
-#endif
 
     int16_t *audio_out;               // 48k stereo buffer pushed to monitor
     size_t  audio_out_cap;
@@ -208,8 +208,10 @@ static void demod_process_frame(demod_state_t *s, gui_app_t *app,
 
 #if LIBSOXR_ENABLED
     if (!demod_soxr_ensure(s, fs)) return;
-    if (count > s->soxr_in_cap) count = s->soxr_in_cap;
 #endif
+    // Cap to the input scratch capacity (allocated in create() / grown by
+    // demod_soxr_ensure). Applies to both the soxr and no-soxr pass-through paths.
+    if (count > s->soxr_in_cap) count = s->soxr_in_cap;
 
     int16_t *scratch_in = s->soxr_in_buf;
     size_t n = 0;
@@ -365,7 +367,8 @@ static void *demod_vtable_create(void) {
     s->mode = DEMOD_MODE_WFM;
     s->last_consumed_frame = 0;
     s->wave_pos = 0;
-#if LIBSOXR_ENABLED
+    // Scratch buffers are always allocated so demod_process_frame can fill the
+    // pre-resample mono buffer on the no-soxr pass-through path too.
     s->soxr_in_cap = 65536;
     s->soxr_in_buf = (int16_t *)malloc(s->soxr_in_cap * sizeof(int16_t));
     s->soxr_out_cap = 4096;
@@ -374,7 +377,6 @@ static void *demod_vtable_create(void) {
         free(s->soxr_in_buf); free(s->soxr_out_buf); free(s);
         return NULL;
     }
-#endif
     s->audio_out_cap = 4096 * 2;
     s->audio_out = (int16_t *)malloc(s->audio_out_cap * sizeof(int16_t));
     if (!s->audio_out) {
