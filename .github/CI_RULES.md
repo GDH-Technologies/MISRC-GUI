@@ -95,23 +95,59 @@ MUST resolve through `misrc_tools/git-version.sh`. Do not re-implement
 
 ## Artifact naming convention
 
-Every release artifact filename MUST follow `<platform>_MISRC_<version>_<arch>.<ext>`:
+Every release artifact filename MUST follow `<Platform>_MISRC_<version>_<arch>.<ext>`
+with the platform name capitalized (Linux, Windows, macOS, Android):
 
 | Artifact | Pattern |
 |---|---|
-| Linux AppImage/zip | `linux_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
-| Windows zip | `windows_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
-| macOS DMG | `macos_MISRC_${VERSION}_universal.dmg` |
-| Android APK | `android_MISRC_${VERSION}_arm64.apk` |
+| Linux AppImage/zip | `Linux_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
+| Windows zip | `Windows_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
+| macOS DMG | `macOS_MISRC_${VERSION}_universal.dmg` |
+| Android APK | `Android_MISRC_${VERSION}_arm64.apk` |
 
 Rules:
 - Do NOT use the legacy `misrc_gui-<version>-<platform>-<arch>.<ext>` shape for
   any platform. `ci_guard_tests.py` forbids those patterns.
+- Do NOT use lowercase platform prefixes (`linux_`, `windows_`, `macos_`,
+  `android_`) on release artifacts. `ci_guard_tests.py
+  check_release_artifact_naming_contract` forbids the lowercase forms so the
+  v1.1.7 malform (lowercase + dev-named Linux/Android assets shipped under a
+  tag) cannot regress.
 - The version segment is the full `git-version.sh` output. For tagged releases
-  it is the clean tag (e.g. `v1.1.5`); for dev builds it includes the SHA. A
+  it is the clean tag (e.g. `v1.1.7`); for dev builds it includes the SHA. A
   clean checkout must NOT append `-dirty` — if `-dirty` appears on CI, a
   generated/machine-specific file is being rewritten mid-build (see the
   generated-file rule above).
+
+## Release version resolution
+
+CI build jobs resolve the version through `misrc_tools/ci-resolve-version.sh`
+(the shared release/version resolver), NOT inline `git describe` logic. The
+resolver is the single source of truth for whether a run is a release context:
+
+- Tag push (`GITHUB_REF=refs/tags/v*`): version = the tag.
+- `workflow_dispatch` with `create_release=true`: version = the `release_tag`
+  input. If `create_release=true` but `release_tag` is empty, the resolver
+  hard-fails (re-dispatch with `release_tag=vX.Y.Z`).
+- Non-release (PR / dev dispatch / non-release push): version =
+  `git-version.sh` (date-stamped `dev-YYYY-MM-DD-<sha>`).
+
+Hard guard: if a release-context run resolves a `dev-*` version, the resolver
+exits 1 — a release must never ship a dev-named artifact under the tag.
+Every build job (linux, windows-x86, windows-arm64, macos, android) calls the
+resolver and exports `MISRC_TOOLS_VERSION_OVERRIDE` from its output. The
+android-apk job MUST export the override because `android/build-apk.sh` calls
+`git-version.sh` directly (no inline version step); without the override it
+always yields `dev-...` (versionCode 1) on the `--no-tags --depth=1` shallow
+checkout — the v1.1.7 APK regression.
+
+Last line of defense: the `release` job has a pre-upload assertion that scans
+`release-assets/` and fails if any `*_MISRC_*` artifact is dev-named or does
+not contain the resolved tag, so no future build-job misbehavior can leak a
+dev-named artifact into a published release. `ci_guard_tests.py
+check_release_version_resolution_contract` asserts the resolver, its
+hard-fails, its use by all 5 build jobs, the Android override wiring, and the
+release-job pre-upload assertion.
 
 ## Release notes structure
 

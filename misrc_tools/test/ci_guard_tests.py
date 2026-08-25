@@ -391,6 +391,7 @@ def check_dev_version_naming(repo_root: Path, meson_path: Path, workflow_path: P
         meson_path,
         workflow_path,
         repo_root / "misrc_tools" / "git-version.sh",
+        repo_root / "misrc_tools" / "ci-resolve-version.sh",
         repo_root / "android" / "build-apk.sh",
         repo_root / "scripts" / "build-appimage-local.sh",
         repo_root / "VERSION",
@@ -901,7 +902,7 @@ def check_windows_packaging_assertions(workflow_path: Path) -> int:
         "test \"$(objdump -p dist/MISRC.exe | awk '/^Subsystem[[:space:]]/ {print $2; exit}')\" = \"00000002\"",
         "assert_no_nonsystem_dlls()",
         "assert_no_nonsystem_dlls \"dist/MISRC.exe\"",
-        "$ZipPath = \"windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
         "Compress-Archive -Path @(\"dist/MISRC.exe\")",
         "if ($zip.Entries.Count -ne 1)",
         "$entry.FullName.Contains('/') -or $entry.FullName.Contains('\\')",
@@ -946,30 +947,42 @@ def check_android_packaging_assertions(workflow_path: Path) -> int:
             return fail(f"Workflow is missing required Android packaging assertion: {snippet}")
     return 0
 
-def check_release_artifact_naming_contract(workflow_path: Path) -> int:
+def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert every release artifact filename follows
+    <Platform>_MISRC_<version>_<arch>.<ext> with the platform name capitalized
+    (Linux, Windows, macOS, Android), and that the lowercase v1.1.7 malform
+    cannot regress.
+
+    Regression (v1.1.7): Linux + Android release assets shipped as
+    linux_MISRC_dev-..._arm64.zip / android_MISRC_dev-..._arm64.apk under tag
+    v1.1.7 (lowercase prefix AND dev-named). This guard forbids the lowercase
+    platform prefixes on release artifacts so the naming half of the malform is
+    caught; check_release_version_resolution_contract covers the dev-name half.
+    """
     workflow_text = read_text(workflow_path)
     required_snippets = [
         "workflow_dispatch:",
         "artifact_suffix: x86",
         "artifact_suffix: arm64",
-        "APPIMAGE_NAME=\"linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
-        "ZIP_NAME=\"linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
-        "path: linux_MISRC_*_${{ matrix.artifact_suffix }}.zip",
-        "$ZipPath = \"windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
-        "path: windows_MISRC_*_x86.zip",
-        "DMG_NAME=\"macos_MISRC_${BUILD_VERSION}_universal.dmg\"",
-        "path: macos_MISRC_*_universal.dmg",
-        "release-assets/**/linux_MISRC_*_x86.zip",
-        "release-assets/**/linux_MISRC_*_arm64.zip",
-        "release-assets/**/windows_MISRC_*_x86.zip",
-        "release-assets/**/macos_MISRC_*_universal.dmg",
-        "APK_ARM64=\"android_MISRC_${TAG}_arm64.apk\"",
-        "release-assets/**/android_MISRC_*_arm64.apk",
+        "APPIMAGE_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
+        "ZIP_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
+        "path: Linux_MISRC_*_${{ matrix.artifact_suffix }}.zip",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
+        "path: Windows_MISRC_*_x86.zip",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip\"",
+        "path: Windows_MISRC_*_arm64.zip",
+        "DMG_NAME=\"macOS_MISRC_${BUILD_VERSION}_universal.dmg\"",
+        "path: macOS_MISRC_*_universal.dmg",
+        "release-assets/**/Linux_MISRC_*_x86.zip",
+        "release-assets/**/Linux_MISRC_*_arm64.zip",
+        "release-assets/**/Windows_MISRC_*_x86.zip",
+        "release-assets/**/Windows_MISRC_*_arm64.zip",
+        "release-assets/**/macOS_MISRC_*_universal.dmg",
+        "APK_ARM64=\"Android_MISRC_${TAG}_arm64.apk\"",
+        "release-assets/**/Android_MISRC_*_arm64.apk",
     ]
     forbidden_snippets = [
-        # Legacy Android APK naming (pre-convention-alignment). The APK must
-        # follow <platform>_MISRC_<version>_<arch>.<ext> like the other
-        # platforms, not misrc_gui-<version>-android-arm64.apk.
+        # Legacy pre-convention APK/shapes.
         "misrc_gui-${TAG}-android-arm64.apk",
         "release-assets/**/misrc_gui-*-android-arm64.apk",
         "misrc_gui-*-windows-x86_64.zip",
@@ -986,14 +999,120 @@ def check_release_artifact_naming_contract(workflow_path: Path) -> int:
         "release-assets/**/MISRC_*_linux_arm64.zip",
         "release-assets/**/MISRC_*_windows_x86.zip",
         "release-assets/**/MISRC_*_macos_universal.dmg",
+        # Lowercase platform prefixes on release artifacts (v1.1.7 malform).
+        "linux_MISRC_${BUILD_VERSION}",
+        "windows_MISRC_${{ steps.version.outputs.version }}",
+        "macos_MISRC_${BUILD_VERSION}",
+        "android_MISRC_${TAG}",
+        "release-assets/**/linux_MISRC_*_x86.zip",
+        "release-assets/**/linux_MISRC_*_arm64.zip",
+        "release-assets/**/windows_MISRC_*_x86.zip",
+        "release-assets/**/windows_MISRC_*_arm64.zip",
+        "release-assets/**/macos_MISRC_*_universal.dmg",
+        "release-assets/**/android_MISRC_*_arm64.apk",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
             return fail(f"Workflow is missing required release artifact naming snippet: {snippet}")
     for snippet in forbidden_snippets:
         if snippet in workflow_text:
-            return fail(f"Workflow still contains legacy release artifact naming snippet: {snippet}")
+            return fail(f"Workflow still contains forbidden release artifact naming snippet: {snippet}")
+    # The Android APK filename is produced by android/build-apk.sh (not the
+    # workflow), so assert the capitalized convention there too.
+    apk_script = repo_root / "android" / "build-apk.sh"
+    if not apk_script.exists():
+        return fail(f"android/build-apk.sh is missing: {apk_script}")
+    apk_text = read_text(apk_script)
+    if "Android_MISRC_${VERSION}_arm64.apk" not in apk_text:
+        return fail(
+            "android/build-apk.sh must name the APK Android_MISRC_${VERSION}_arm64.apk "
+            "(capitalized platform prefix, matching the release convention)."
+        )
+    if "android_MISRC_${VERSION}_arm64.apk" in apk_text:
+        return fail(
+            "android/build-apk.sh still uses the lowercase android_MISRC_ prefix "
+            "(v1.1.7 malform); use Android_MISRC_."
+        )
     return 0
+
+
+def check_release_version_resolution_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert release-context CI runs resolve the tag (never a dev string) and
+    that a release can never ship a dev-named artifact under the tag.
+
+    Regression (v1.1.7): the Linux job received an empty release_tag input and
+    silently fell through to git-version.sh on a --no-tags --depth=1 shallow
+    clone (-> dev-2026-08-25-c991f39), and the android-apk job had no
+    version-resolution step and never passed MISRC_TOOLS_VERSION_OVERRIDE to
+    build-apk.sh (which calls git-version.sh directly -> always dev-...,
+    versionCode 1). Both shipped dev-named assets under tag v1.1.7.
+
+    Requires:
+      - misrc_tools/ci-resolve-version.sh exists, is executable, and contains
+        the empty-release_tag hard-fail + the release+dev hard-fail.
+      - every build job (linux, windows-x86, windows-arm64, macos, android)
+        calls the shared resolver.
+      - every build job exports MISRC_TOOLS_VERSION_OVERRIDE from the version
+        step (Android especially: build-apk.sh reads it via git-version.sh).
+      - the release job has the pre-upload 'no dev leak / tag-named' assertion.
+    """
+    resolver = repo_root / "misrc_tools" / "ci-resolve-version.sh"
+    if not resolver.exists():
+        return fail(f"Missing shared release/version resolver: {resolver}")
+    if not os.access(resolver, os.X_OK):
+        return fail("misrc_tools/ci-resolve-version.sh must be executable (chmod +x)")
+    rv = read_text(resolver)
+    for snippet in [
+        "refs/tags/",
+        "workflow_dispatch",
+        "CI_CREATE_RELEASE",
+        "CI_RELEASE_TAG",
+        "release_tag input is empty",
+        "release run resolved a dev version",
+    ]:
+        if snippet not in rv:
+            return fail(f"misrc_tools/ci-resolve-version.sh is missing required snippet: {snippet}")
+
+    wf = read_text(workflow_path)
+    for snippet in [
+        "CI_EVENT_NAME: ${{ github.event_name }}",
+        "CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}",
+        "CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}",
+    ]:
+        if snippet not in wf:
+            return fail(f"Workflow is missing release-version-resolution env snippet: {snippet}")
+
+    # The resolver must be invoked by all 5 build jobs (linux, windows-x86,
+    # windows-arm64, macos, android).
+    call_count = wf.count("misrc_tools/ci-resolve-version.sh")
+    if call_count < 5:
+        return fail(
+            f"ci-resolve-version.sh must be called by all 5 build jobs (linux, "
+            f"windows-x86, windows-arm64, macos, android); found {call_count} call(s)."
+        )
+
+    # All 5 build jobs must export MISRC_TOOLS_VERSION_OVERRIDE from the version
+    # step. Android is the critical one: build-apk.sh calls git-version.sh
+    # directly, so without the override it always yields dev-... on the shallow
+    # clone (the v1.1.7 APK regression).
+    override_count = wf.count("MISRC_TOOLS_VERSION_OVERRIDE: ${{ steps.version.outputs.version }}")
+    if override_count < 5:
+        return fail(
+            f"All 5 build jobs must export MISRC_TOOLS_VERSION_OVERRIDE from the "
+            f"version step (Android was missing this in the v1.1.7 regression); "
+            f"found {override_count}."
+        )
+
+    # The release job must have the pre-upload assertion.
+    if "Assert release assets are tag-named" not in wf:
+        return fail(
+            "Release job is missing the pre-upload 'Assert release assets are "
+            "tag-named (no dev leak)' step."
+        )
+    if "*_MISRC_dev-*" not in wf:
+        return fail("Release pre-upload assertion must match '*_MISRC_dev-*' dev-named artifacts.")
+    return 0
+
 
 def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
     if not build_workflow_path.exists():
@@ -1279,7 +1398,8 @@ def main() -> int:
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
-        ("release artifact naming contract", lambda: check_release_artifact_naming_contract(workflow_path)),
+        ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
+        ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
