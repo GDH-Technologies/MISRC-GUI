@@ -31,9 +31,14 @@ fi
 
 # Append -dirty for a modified tree. Tagged releases stay as the bare tag;
 # dev builds already include the SHA so only -dirty is appended when needed.
+# --ignore-cr-at-eol: on Windows, actions/checkout (System git, autocrlf=true)
+# checks out CRLF while MSYS2 git (autocrlf=false) compares raw bytes, so a
+# fresh checkout would otherwise phantom-dirty as CRLF-vs-LF. Ignoring CR at
+# EOL makes the dirty check see real content changes only; it is a no-op on
+# Linux/macOS (LF endings, no CR to ignore).
 case "$V" in
 	dev-*)
-		if git diff --quiet --ignore-submodules -- 2>/dev/null; then
+		if git diff --quiet --ignore-submodules --ignore-cr-at-eol -- 2>/dev/null; then
 			:
 		else
 			V="${V}-dirty"
@@ -45,7 +50,7 @@ case "$V" in
 	*)
 		# Any other override string: append SHA + dirty so it stays traceable.
 		DIRTY=""
-		if git diff --quiet --ignore-submodules -- 2>/dev/null; then :; else DIRTY="-dirty"; fi
+		if git diff --quiet --ignore-submodules --ignore-cr-at-eol -- 2>/dev/null; then :; else DIRTY="-dirty"; fi
 		V="${V}-${SHA}${DIRTY}"
 		;;
 esac

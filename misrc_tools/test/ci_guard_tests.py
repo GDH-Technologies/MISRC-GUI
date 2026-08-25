@@ -415,6 +415,49 @@ def check_dev_version_naming(repo_root: Path, meson_path: Path, workflow_path: P
                 "misrc_tools/git-version.sh must derive the untagged dev version "
                 "from `date -u` with a `dev-` prefix (date-stamped scheme)."
             )
+        if "--ignore-cr-at-eol" not in gv_text:
+            return fail(
+                "misrc_tools/git-version.sh dirty check must use --ignore-cr-at-eol "
+                "so a fresh Windows checkout (CRLF) does not phantom-tag -dirty "
+                "under MSYS2 git (autocrlf=false). It is a no-op on Linux/macOS."
+            )
+    return 0
+
+
+def check_no_tracked_generated_dirty_sources(repo_root: Path) -> int:
+    """Generated, machine-specific files that `git-version.sh`'s dirty check
+    would see MUST be gitignored (untracked), not committed. Regression:
+    android/deps-versions.txt was tracked and overwritten by
+    build-deps-android.sh with a build timestamp + host NDK path, so every
+    Android CI build dirty-tagged the version. Same class as the gitignored
+    android/aarch64-linux-android.ini cross-file. Asserts both stay untracked."""
+    targets = [
+        repo_root / "android" / "deps-versions.txt",
+        repo_root / "android" / "aarch64-linux-android.ini",
+    ]
+    for path in targets:
+        if not path.exists():
+            continue
+        rel = path.relative_to(repo_root)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(path)],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if tracked.returncode == 0:
+            return fail(
+                f"{rel} is tracked but is a generated, machine-specific file. "
+                "It dirty-tags the version string on any host/CI that regenerates "
+                "it. Add it to .gitignore and `git rm --cached` it."
+            )
+        ign = subprocess.run(
+            ["git", "check-ignore", str(path)],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if ign.returncode != 0:
+            return fail(
+                f"{rel} is untracked but NOT gitignored; add it to .gitignore so "
+                "regenerating it cannot dirty the tree."
+            )
     return 0
 
 
@@ -1227,6 +1270,7 @@ def main() -> int:
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
         ("dev version naming", lambda: check_dev_version_naming(repo_root, meson_path, workflow_path)),
+        ("no tracked generated dirty sources", lambda: check_no_tracked_generated_dirty_sources(repo_root)),
         ("Windows GUI link no DLL import libs", lambda: check_windows_gui_link_no_dll_import_libs(meson_path)),
         ("optional-dep guard consistency", lambda: check_optional_dep_guard_consistency(repo_root)),
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),
