@@ -464,14 +464,56 @@ static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     for (int i = 0; i < card_count; i++) {
         bool mode = (enabled != NULL) ? enabled[i] : false;
+
+        // Read the card's current tenbit setting first. The cxadc driver
+        // defaults to 8-bit (tenbit=0), so when the user wants 8-bit (the
+        // common case) and the card is already in 8-bit, skip the sysfs write
+        // entirely. This restores the pre-v1.1.6 behaviour where a plain
+        // 8-bit capture start needed no sysfs write permission at all: the
+        // /sys/class/cxadc/cxadcN/device/parameters/* files are root:root
+        // 0644 by default and need a one-time `chgrp video` (+ group memship)
+        // to be writable by non-root users. Writing tenbit=0 on every start
+        // regressed that by requiring write access for an 8-bit capture.
+        int current = -1;
+        bool have_current = (gui_cxadc_get_tenbit(i, &current) == 0);
+        if (have_current && (((current != 0) ? true : false) == mode)) {
+            continue;  // already in the requested mode; no sysfs write needed
+        }
+
         if (gui_cxadc_set_tenbit(i, mode) != 0) {
+#if !defined(_WIN32)
+            int saved_errno = errno;
+            fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
+                    i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
+            // If the write was denied for permissions AND the requested mode
+            // is 8-bit (the driver default), don't abort the whole capture:
+            // the card is already in 8-bit (we either read it above or can't
+            // read it, in which case read-only capture is still better than
+            // refusing to start). Only abort when the user explicitly asked
+            // for 10-bit and we can't set it (sample rate/format would be
+            // wrong, so capture would be silently misconfigured).
+            if ((saved_errno == EACCES || saved_errno == EPERM) && !mode) {
+                fprintf(stderr, "[CXADC] 8-bit mode requested, sysfs write denied; "
+                                "continuing with card default (no chgrp setup needed for 8-bit)\n");
+                continue;
+            }
+#else
+            fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed\n",
+                    i, mode ? "10-bit" : "8-bit");
+#endif
             return -1;
         }
         int readback = -1;
         if (gui_cxadc_get_tenbit(i, &readback) != 0) {
+#if !defined(_WIN32)
+            fprintf(stderr, "[CXADC] tenbit readback failed on card %d: %s (errno %d)\n",
+                    i, strerror(errno), errno);
+#endif
             return -1;
         }
         if (((readback != 0) ? true : false) != mode) {
+            fprintf(stderr, "[CXADC] tenbit readback mismatch on card %d: expected %s got %s\n",
+                    i, mode ? "10-bit" : "8-bit", readback ? "10-bit" : "8-bit");
             errno = EIO;
             return -1;
         }
@@ -743,24 +785,56 @@ static int cxadc_configure_audio_pcm(snd_pcm_t *pcm,
     snd_pcm_hw_params_t *params = NULL;
     snd_pcm_hw_params_alloca(&params);
 
-    if (snd_pcm_hw_params_any(pcm, params) < 0) return -1;
-    if (snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED) < 0) return -1;
-    if (snd_pcm_hw_params_set_format(pcm, params, format) < 0) return -1;
-    if (snd_pcm_hw_params_set_channels(pcm, params, CXADC_AUDIO_CHANNEL_COUNT) < 0) return -1;
+    int r;
+    if ((r = snd_pcm_hw_params_any(pcm, params)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA hw_params_any failed: %s\n", snd_strerror(r));
+        return -1;
+    }
+    if ((r = snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA set_access(RW_INTERLEAVED) failed: %s\n", snd_strerror(r));
+        return -1;
+    }
+    if ((r = snd_pcm_hw_params_set_format(pcm, params, format)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA set_format(%s) failed: %s\n",
+                snd_pcm_format_name(format), snd_strerror(r));
+        return -1;
+    }
+    if ((r = snd_pcm_hw_params_set_channels(pcm, params, CXADC_AUDIO_CHANNEL_COUNT)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA set_channels(%d) failed: %s "
+                        "(clockgen may not expose %d channels via this device id)\n",
+                CXADC_AUDIO_CHANNEL_COUNT, snd_strerror(r), CXADC_AUDIO_CHANNEL_COUNT);
+        return -1;
+    }
 
     unsigned int rate_hz = CXADC_AUDIO_SAMPLE_RATE_HZ;
     int dir = 0;
-    if (snd_pcm_hw_params_set_rate_near(pcm, params, &rate_hz, &dir) < 0) return -1;
-    if (rate_hz < 46000 || rate_hz > 48000) return -1;
+    if ((r = snd_pcm_hw_params_set_rate_near(pcm, params, &rate_hz, &dir)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA set_rate_near(%u) failed: %s\n",
+                CXADC_AUDIO_SAMPLE_RATE_HZ, snd_strerror(r));
+        return -1;
+    }
+    if (rate_hz < 46000 || rate_hz > 48000) {
+        fprintf(stderr, "[CXADC] ALSA rate %u Hz out of range (need 46000-48000)\n", rate_hz);
+        return -1;
+    }
 
     snd_pcm_uframes_t period_frames = CXADC_AUDIO_READ_FRAMES;
     snd_pcm_uframes_t buffer_frames = CXADC_AUDIO_READ_FRAMES * 8;
     (void)snd_pcm_hw_params_set_period_size_near(pcm, params, &period_frames, &dir);
     (void)snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer_frames);
 
-    if (snd_pcm_hw_params(pcm, params) < 0) return -1;
-    if (snd_pcm_prepare(pcm) < 0) return -1;
-    if (snd_pcm_nonblock(pcm, 1) < 0) return -1;
+    if ((r = snd_pcm_hw_params(pcm, params)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA hw_params apply failed: %s\n", snd_strerror(r));
+        return -1;
+    }
+    if ((r = snd_pcm_prepare(pcm)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA prepare failed: %s\n", snd_strerror(r));
+        return -1;
+    }
+    if ((r = snd_pcm_nonblock(pcm, 1)) < 0) {
+        fprintf(stderr, "[CXADC] ALSA nonblock failed: %s\n", snd_strerror(r));
+        return -1;
+    }
 
     if (out_rate_hz) {
         *out_rate_hz = rate_hz;
@@ -773,7 +847,10 @@ static int cxadc_try_open_audio_device(cxadc_ctx_t *ctx, const char *device_name
     if (!ctx || !device_name || !device_name[0]) return -1;
 
     snd_pcm_t *pcm = NULL;
-    if (snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0) < 0) {
+    int open_rc = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0);
+    if (open_rc < 0) {
+        fprintf(stderr, "[CXADC] ALSA snd_pcm_open('%s', CAPTURE) failed: %s\n",
+                device_name, snd_strerror(open_rc));
         return -1;
     }
 
@@ -1462,14 +1539,22 @@ cxadc_wasapi_done:
             continue;
         }
         if (frames == -EPIPE) {
+            fprintf(stderr, "[CXADC] ALSA underrun (EPIPE) on %s, preparing\n",
+                    ctx->audio_device_name);
             (void)snd_pcm_prepare(ctx->audio_pcm);
             continue;
         }
         if (frames < 0) {
+            fprintf(stderr, "[CXADC] ALSA readi error on %s: %s (errno %d)\n",
+                    ctx->audio_device_name, snd_strerror((int)frames), (int)frames);
             int rec = snd_pcm_recover(ctx->audio_pcm, (int)frames, 1);
+            if (rec < 0) {
+                fprintf(stderr, "[CXADC] ALSA recover failed: %s\n", snd_strerror(rec));
+            }
             if (rec >= 0) {
                 continue;
             }
+            fprintf(stderr, "[CXADC] ALSA audio thread exiting after unrecoverable read error\n");
             gui_app_set_status(app, "CXADC ALSA audio read error");
             break;
         }
@@ -1763,29 +1848,46 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     if (card_count > 0) {
         if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
 #if !defined(_WIN32)
-            if (errno == EACCES || errno == EPERM) {
+            int saved_errno = errno;
+            fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s): %s (errno %d)\n",
+                    card_count, strerror(saved_errno), saved_errno);
+            if (saved_errno == EACCES || saved_errno == EPERM) {
+                fprintf(stderr, "[CXADC] sysfs write denied. For 10-bit mode you need one-time setup:\n"
+                                "          sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*\n"
+                                "          sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
+                                "          sudo usermod -aG video $USER   (then log out/in)\n");
                 gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
             } else {
                 gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
             }
 #else
+            fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s)\n", card_count);
             gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
 #endif
             return -1;
         }
 
         if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
+#if !defined(_WIN32)
+            fprintf(stderr, "[CXADC] failed to open /dev/cxadc0..%d: %s (errno %d)\n",
+                    card_count - 1, strerror(errno), errno);
+            fprintf(stderr, "[CXADC] check the cxadc driver is loaded and /dev/cxadcN exists (ls -l /dev/cxadc*)\n");
+#else
+            fprintf(stderr, "[CXADC] failed to open card device(s)\\n");
+#endif
             gui_app_set_status(app, "CXADC: failed to open card device(s)");
             return -1;
         }
     }
 
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF) != 0) {
+        fprintf(stderr, "[CXADC] failed to initialize RF ringbuffer\n");
         gui_app_set_status(app, "CXADC: failed to initialize RF buffer");
         cxadc_close_cards(&s_cxadc);
         return -1;
     }
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO) != 0) {
+        fprintf(stderr, "[CXADC] failed to initialize audio ringbuffer\n");
         gui_app_set_status(app, "CXADC: failed to initialize audio buffer");
         cxadc_close_cards(&s_cxadc);
         return -1;
@@ -1820,6 +1922,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     app->is_capturing = true;
     int r = gui_extract_start(app);
     if (r < 0) {
+        fprintf(stderr, "[CXADC] failed to start extraction thread\n");
         gui_app_set_status(app, "CXADC: failed to start extraction thread");
         app->is_capturing = false;
         cxadc_close_audio_capture(&s_cxadc);
@@ -1845,6 +1948,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
                                       cxadc_capture_thread,
                                       &s_cxadc,
                                       THRD_PRIORITY_CRITICAL) != thrd_success) {
+            fprintf(stderr, "[CXADC] failed to create RF capture thread\n");
             gui_app_set_status(app, "CXADC: failed to start RF capture thread");
             atomic_store(&s_cxadc.running, false);
             gui_audio_stop(app);

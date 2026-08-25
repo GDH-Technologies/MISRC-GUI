@@ -4741,9 +4741,29 @@ static void render_status_bar(gui_app_t *app) {
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
     bool show_status_message = !status_tiny && !status_quarter_scale;
-    /* Keep free-space visible during normal startup/layout sizes; only hide on
-     * very tiny widths where preserving right-side counters takes priority. */
-    bool show_free_space = !status_tiny;
+    // Detect an error/denied/failed status message so the status bar can
+    // yield space to it: when an error is being shown, hide the free-space
+    // readout (and widen the message budget) so the actual error text isn't
+    // truncated behind the free-space label. This is what makes CXADC/USB
+    // permission failures readable in the bottom bar instead of "CXADC permi...".
+    const char *raw_status_gate = (app->status_message[0] != '\0') ? app->status_message : NULL;
+    bool status_is_error = false;
+    if (raw_status_gate) {
+        status_is_error =
+            strstr(raw_status_gate, "denied") != NULL ||
+            strstr(raw_status_gate, "Denied") != NULL ||
+            strstr(raw_status_gate, "error") != NULL ||
+            strstr(raw_status_gate, "Error") != NULL ||
+            strstr(raw_status_gate, "failed") != NULL ||
+            strstr(raw_status_gate, "Failed") != NULL ||
+            strstr(raw_status_gate, "not granted") != NULL ||
+            strstr(raw_status_gate, "timed out") != NULL;
+    }
+    /* Keep free-space visible during normal startup/layout sizes; hide it when
+     * an error/denied status is active so the error text gets the left-side
+     * space, and on very tiny widths where preserving right-side counters
+     * takes priority. */
+    bool show_free_space = !status_tiny && !status_is_error;
     int sample_rate_value_width = status_narrow ? 68 : 80;
     int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
     int frames_value_width = 50;
@@ -4752,7 +4772,11 @@ static void render_status_bar(gui_app_t *app) {
     int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
     int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
     int status_left_gap = show_status_message ? (status_tiny ? 4 : 8) : 0;
-    int status_message_max_chars = status_narrow ? 16 : (status_compact ? 22 : 30);
+    // Widen the message budget when free-space is hidden (error case) so the
+    // full error reason fits instead of being ellipsised at the normal width.
+    int status_message_max_chars = status_is_error
+        ? (status_narrow ? 48 : 64)
+        : (status_narrow ? 16 : (status_compact ? 22 : 30));
     int status_font_size = FONT_SIZE_STATUS - 1;
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
