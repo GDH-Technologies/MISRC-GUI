@@ -1,0 +1,59 @@
+name: Verify Windows dirty (diagnostic)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows-dirty:
+    name: Inspect git diff bytes on a fresh Windows checkout
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup MSYS2 (mirrors the build's msys2 shell)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          cache: false
+          install: >-
+            git
+
+      - name: Dump git diff diagnostics (MSYS2 git, raw bytes)
+        shell: msys2 {0}
+        run: |
+          set -u
+          echo "===== which git / version (MSYS2) ====="
+          which git
+          git --version
+          echo
+          echo "===== System git version (for comparison) ====="
+          "/c/Program Files/Git/bin/git.exe" --version 2>/dev/null || true
+          echo
+          echo "===== git config (autocrlf / eol) ====="
+          git config --list | grep -Ei "autocrlf|eol|safecrlf" || echo "(no autocrlf/eol config)"
+          echo
+          echo "===== git status --porcelain (MSYS2 git, raw) ====="
+          git status --porcelain || true
+          echo "(blank = clean)"
+          echo
+          echo "===== git diff --stat (MSYS2 git, RAW bytes — CRLF shows as a diff) ====="
+          git diff --stat -- 2>/dev/null || true
+          echo
+          echo "===== git diff --stat --ignore-cr-at-eol (should be EMPTY if diff is purely CRLF) ====="
+          git diff --stat --ignore-cr-at-eol -- 2>/dev/null || true
+          echo "(blank = no diff once CR ignored)"
+          echo
+          echo "===== git diff raw bytes via cat -v (^M = carriage return / CR) ====="
+          git diff -- 2>/dev/null | cat -v | head -40 || true
+          echo
+          echo "===== exit codes ====="
+          git diff --quiet -- 2>/dev/null; echo "raw      git diff --quiet rc=$?"
+          git diff --quiet --ignore-cr-at-eol -- 2>/dev/null; echo "igncr    git diff --quiet --ignore-cr-at-eol rc=$?"
+          echo
+          echo "===== misrc_tools/git-version.sh output (should be clean: dev-YYYY-MM-DD-<sha>, no -dirty) ====="
+          sh misrc_tools/git-version.sh
