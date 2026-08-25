@@ -58,8 +58,15 @@ All version strings (CI, AppImage script, Android APK script, GUI About box)
 MUST resolve through `misrc_tools/git-version.sh`. Do not re-implement
 `git describe` inline in a job/script.
 
-- `git-version.sh` prefers an exact-tag describe, then the top-level `VERSION`
-  file, then `v1.1.4-dev`, appending SHA+dirty only for `-dev`/untagged builds.
+- `git-version.sh` resolves an explicit override (`MISRC_TOOLS_VERSION_OVERRIDE`,
+  set by CI release runs to the tag), then an exact tag at HEAD, then a
+  date-stamped dev string `dev-YYYY-MM-DD-<sha>` (UTC date + short commit SHA,
+  with `-dirty` if the working tree has tracked changes). Tagged releases keep
+  the bare tag (e.g. `v1.1.6`); dev builds are NEVER a hardcoded `vX.Y.Z-dev`
+  literal, so they cannot go stale as releases advance. There is no `VERSION`
+  file — it was removed because its `vX.Y.Z-dev` content was the stale-string
+  vector. `ci_guard_tests.py check_dev_version_naming` forbids reintroducing a
+  stale `vX.Y.Z-dev` literal anywhere in the version-resolution path.
 - The Android APK injects `versionCode` (semver triplet -> MAJOR*1e6 +
   MINOR*1e3 + PATCH) and `versionName` (full resolved string) at `aapt2 link`
   via `--version-code`/`--version-name`/`--replace-version`. The manifest must

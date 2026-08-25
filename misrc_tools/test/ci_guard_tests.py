@@ -376,6 +376,48 @@ def check_windows_meson_subsystem_contract(meson_path: Path) -> int:
     return 0
 
 
+def check_dev_version_naming(repo_root: Path, meson_path: Path, workflow_path: Path) -> int:
+    """Dev/untagged builds MUST use a date-stamped version (dev-YYYY-MM-DD-<sha>)
+    derived by misrc_tools/git-version.sh, not a hardcoded "vX.Y.Z-dev" literal.
+    Regression: the repo carried a hardcoded vN.N.N-dev literal in git-version.sh
+    + 4 CI fallbacks and another in the VERSION file while the current release
+    had advanced past it, so dev builds reported a version behind the last
+    release. This guard forbids stale vX.Y.Z-dev literals across the
+    version-resolution path and requires git-version.sh to derive the dev string
+    from the current UTC date.
+    ci_guard_tests.py check_dev_version_naming."""
+    stale_re = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+-dev")
+    targets = [
+        meson_path,
+        workflow_path,
+        repo_root / "misrc_tools" / "git-version.sh",
+        repo_root / "android" / "build-apk.sh",
+        repo_root / "scripts" / "build-appimage-local.sh",
+        repo_root / "VERSION",
+    ]
+    for path in targets:
+        if not path.exists():
+            continue
+        m = stale_re.search(read_text(path))
+        if m:
+            rel = path.relative_to(repo_root)
+            return fail(
+                f"{rel} contains a stale hardcoded dev-version literal ({m.group(0)}). "
+                "Dev versions must be date-stamped (dev-YYYY-MM-DD-<sha>) via "
+                "misrc_tools/git-version.sh, not a vX.Y.Z-dev string that goes "
+                "stale as releases advance."
+            )
+    gv = repo_root / "misrc_tools" / "git-version.sh"
+    if gv.exists():
+        gv_text = read_text(gv)
+        if "date -u" not in gv_text or "dev-" not in gv_text:
+            return fail(
+                "misrc_tools/git-version.sh must derive the untagged dev version "
+                "from `date -u` with a `dev-` prefix (date-stamped scheme)."
+            )
+    return 0
+
+
 # Optional-dependency feature macros defined by misrc_tools/meson.build. A
 # struct member declared inside an enabled #if <MACRO> branch must not be
 # referenced (->name / .name) outside that branch, or the build breaks when
@@ -1184,6 +1226,7 @@ def main() -> int:
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
+        ("dev version naming", lambda: check_dev_version_naming(repo_root, meson_path, workflow_path)),
         ("Windows GUI link no DLL import libs", lambda: check_windows_gui_link_no_dll_import_libs(meson_path)),
         ("optional-dep guard consistency", lambda: check_optional_dep_guard_consistency(repo_root)),
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),

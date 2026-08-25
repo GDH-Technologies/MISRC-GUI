@@ -2,49 +2,53 @@
 set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-VERSION_FILE="$REPO_ROOT/VERSION"
 
+# Single source of truth for the MISRC version string. Resolution order:
+#   1. MISRC_TOOLS_VERSION_OVERRIDE / MISRC_TOOLS_VERSION env (CI release runs
+#      set this to the tag).
+#   2. An exact tag at HEAD (a checked-out release tag, e.g. v1.1.6).
+#   3. A date-stamped dev version: dev-YYYY-MM-DD-<sha> (UTC date + short commit
+#      SHA), with -dirty appended if the working tree has tracked changes.
+#
+# Dev builds MUST NOT use a hardcoded "vX.Y.Z-dev" literal. Such a string goes
+# stale the moment a release advances past it (the repo previously carried a
+# hardcoded vX.Y.Z-dev literal in this script and the VERSION file while the
+# current release had advanced past it, so dev builds reported a version
+# behind the last release). The date-stamped scheme is always current and the
+# SHA pins the exact commit. Tagged releases keep the bare tag name.
 V="${MISRC_TOOLS_VERSION_OVERRIDE:-${MISRC_TOOLS_VERSION:-}}"
 
 if [ -z "$V" ]; then
 	V=$(git describe --tags --exact-match --match 'v*' --match 'misrc_tools-*' 2>/dev/null || true)
 fi
 
-if [ -z "$V" ]; then
-	if [ -f "$VERSION_FILE" ]; then
-		V=$(sed -n '1s/[[:space:]]*$//;1p' "$VERSION_FILE")
-	fi
-fi
+SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "nogit")
 
 if [ -z "$V" ]; then
-	V="v1.1.4-dev"
+	DATE=$(date -u +%Y-%m-%d)
+	V="dev-${DATE}-${SHA}"
 fi
 
-if [ -n "$V" ]; then
-	SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "nogit")
-	DIRTY=""
-	if git diff --quiet --ignore-submodules -- 2>/dev/null; then
-		:
-	else
-		DIRTY="-dirty"
-	fi
-	case "$V" in
-		*v[0-9]*.[0-9]*.[0-9]*-dev*)
-			V="${V}-${SHA}${DIRTY}"
-			;;
-		*)
-			# Exact tag builds should stay as tag names.
-			case "$V" in
-				v*|misrc_tools-*)
-					:
-					;;
-				*)
-					V="${V}-${SHA}${DIRTY}"
-					;;
-			esac
-			;;
-	esac
-fi
+# Append -dirty for a modified tree. Tagged releases stay as the bare tag;
+# dev builds already include the SHA so only -dirty is appended when needed.
+case "$V" in
+	dev-*)
+		if git diff --quiet --ignore-submodules -- 2>/dev/null; then
+			:
+		else
+			V="${V}-dirty"
+		fi
+		;;
+	v*|misrc_tools-*)
+		: # exact tag — keep as-is
+		;;
+	*)
+		# Any other override string: append SHA + dirty so it stays traceable.
+		DIRTY=""
+		if git diff --quiet --ignore-submodules -- 2>/dev/null; then :; else DIRTY="-dirty"; fi
+		V="${V}-${SHA}${DIRTY}"
+		;;
+esac
 
 case "$V" in
 	misrc_tools-*)

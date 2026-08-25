@@ -112,7 +112,7 @@ jobs:
           else
             VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
+              VERSION="dev-$(date -u +%Y-%m-%d)-nogit"
             fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -608,7 +608,7 @@ jobs:
           else
             VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
+              VERSION="dev-$(date -u +%Y-%m-%d)-nogit"
             fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -822,7 +822,7 @@ jobs:
           else
             VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
+              VERSION="dev-$(date -u +%Y-%m-%d)-nogit"
             fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -992,7 +992,7 @@ jobs:
           else
             VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
             if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
+              VERSION="dev-$(date -u +%Y-%m-%d)-nogit"
             fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
