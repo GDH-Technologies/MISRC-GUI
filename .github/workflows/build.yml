@@ -96,7 +96,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-linux-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-flac1.5.0-${{ hashFiles('third_party/hsdaoh/**') }}
@@ -548,7 +548,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-windows-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
@@ -764,7 +764,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-windows-arm64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
@@ -976,7 +976,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-macos-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}

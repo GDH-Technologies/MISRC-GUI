@@ -18,6 +18,7 @@ Current pinned versions (verify before bumping):
 | actions/setup-java | v5 | Bumped from v4 (v4 targets Node 20 and is deprecated). |
 | actions/upload-artifact | v7 | |
 | actions/download-artifact | v8 | |
+| actions/cache | v6 | Bumped from v4 (v4 targets Node 20; every deps-cache step emitted a `Node.js 20 is deprecated` warning annotation per build job). v5 and v6 both run on node24; v6 is the current major. |
 | msys2/setup-msys2 | v2 | |
 | softprops/action-gh-release | v3 | |
 
@@ -128,11 +129,53 @@ A clean run should produce zero annotations. Known sources and fixes:
 - `Node.js 20 is deprecated ... actions/X@vN` → bump that action to a major
   that targets Node 24.
 - `setup-java v4 is deprecated` → use `actions/setup-java@v5`.
+- `actions/cache@v4 is deprecated` / `Node.js 20 is deprecated ... actions/cache@v4`
+  → use `actions/cache@v6` (v5 and v6 both run on node24; v6 is current). This
+  was emitted once per deps-cache step (Linux x86/arm64, Windows x86/arm64,
+  macOS arm64/x86 = 6 annotations/run) because every build job caches
+  `.deps/install`. Fixed by bumping all 4 `actions/cache@v4` uses to `@v6`.
 - `These files were overwritten during the brew link step` (macOS) → do not run
   `brew update` on GitHub macOS runners (they are already current); set
   `HOMEBREW_NO_AUTO_UPDATE=1` and install only missing formulas.
 - Any `deprecation of Node 20` or `vN is deprecated` annotation is actionable;
   do not ignore it across runs.
+
+The `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` workflow env var (set in `build.yml`)
+  force-runs JavaScript actions on Node 24 instead of their declared Node 20,
+  which *prevents the hard Node-16-style failures* but GitHub still *posts a
+  warning annotation* naming the action. The real fix is bumping the action
+  major, not relying on the env var to silence it.
+
+`ci_guard_tests.py` `check_actions_runtime_policy` forbids the deprecated
+action pins (checkout@v4, setup-python@v5, upload-artifact@v4,
+download-artifact@v4, cache@v4) and requires the current node24 majors, so a
+local `python3 misrc_tools/test/ci_guard_tests.py --static-only` run before
+pushing catches a stale action pin before it can annotate a CI run.
+
+### How to find annotation warnings for a run
+
+Annotation warnings are NOT in the step logs as `::warning`/`##[warning]`
+commands (those are a different, step-emitted kind). GitHub auto-posts the
+deprecation annotations to the run's check-suites, and they only show in the
+Actions UI "Annotations" panel. To list them from the CLI for a completed run
+(head SHA `<sha>`):
+
+```
+gh api --paginate repos/harrypm/MISRC-GUI/commits/<sha>/check-suites \
+  --jq '.check_suites[].id' | \
+  while read sid; do
+    gh api --paginate repos/harrypm/MISRC-GUI/check-suites/$sid/check-runs \
+      --jq '.check_runs[] | .id' | \
+      while read cid; do
+        gh api repos/harrypm/MISRC-GUI/check-runs/$cid/annotations \
+          --jq '.[] | "\(.annotation_level): \(.message)"'
+      done
+  done
+```
+
+A clean run prints nothing. Run this after any `workflow_dispatch` that touches
+workflow/action versions, and record the result (zero annotations) in the
+prompt log before declaring the change done.
 
 ## Pre-commit CI check (manual)
 

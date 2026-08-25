@@ -98,6 +98,7 @@ def check_actions_runtime_policy(workflow_path: Path) -> int:
         "actions/setup-python@v5",
         "actions/upload-artifact@v4",
         "actions/download-artifact@v4",
+        "actions/cache@v4",
     ]
     for pin in forbidden_action_pins:
         if pin in workflow_text:
@@ -108,6 +109,7 @@ def check_actions_runtime_policy(workflow_path: Path) -> int:
         "actions/setup-python@v6",
         "actions/upload-artifact@v7",
         "actions/download-artifact@v8",
+        "actions/cache@v6",
     ]
     for pin in required_action_pins:
         if pin not in workflow_text:
@@ -1047,8 +1049,8 @@ def check_local_deps_cache_contract(repo_root: Path,
         return fail("build-local.sh must reference build-deps-unix.sh")
 
     workflow_text = read_text(workflow_path)
-    if "actions/cache@v4" not in workflow_text:
-        return fail("build.yml is missing actions/cache@v4 for deps caching")
+    if "actions/cache@v6" not in workflow_text:
+        return fail("build.yml is missing actions/cache@v6 for deps caching")
     if "deps cache hit" not in workflow_text:
         return fail("build.yml is missing the deps cache-hit guard ('deps cache hit')")
     if "v0.0.7" not in workflow_text:
