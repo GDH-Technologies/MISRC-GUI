@@ -355,6 +355,7 @@ static bool s_android_keyboard_visible = false;
 // Update checker (GitHub release tag lookup).
 #define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
 #define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
+#define GUI_UI_RELEASES_DOWNLOAD_BASE_URL "https://github.com/harrypm/MISRC-GUI/releases/download"
 
 typedef struct {
     bool manual;
@@ -450,6 +451,19 @@ static bool gui_ui_parse_semver_triplet(const char *version, int *major_out, int
     return true;
 }
 
+static bool gui_ui_is_release_tag_safe(const char *tag)
+{
+    if (!tag || !tag[0]) return false;
+    const unsigned char *p = (const unsigned char *)tag;
+    while (*p) {
+        if (!(isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) {
+            return false;
+        }
+        p++;
+    }
+    return true;
+}
+
 static int gui_ui_compare_versions(const char *current_version, const char *latest_version)
 {
     int cmaj = 0, cmin = 0, cpat = 0;
@@ -516,6 +530,97 @@ static bool gui_ui_fetch_latest_release_tag(char *tag_out, size_t tag_out_len, c
 
     if (!gui_ui_extract_release_tag_from_url(location, tag_out, tag_out_len)) {
         snprintf(error_out, error_out_len, "unable to parse release tag");
+        return false;
+    }
+    return true;
+}
+
+static bool gui_ui_build_release_asset_filename_for_platform(const char *release_tag,
+                                                             char *filename_out,
+                                                             size_t filename_out_len)
+{
+    if (!release_tag || !filename_out || filename_out_len == 0) return false;
+    filename_out[0] = '\0';
+    if (!gui_ui_is_release_tag_safe(release_tag)) return false;
+
+#if defined(__ANDROID__)
+    const char *pattern = "Android_MISRC_%s_arm64.apk";
+#elif defined(__APPLE__)
+    const char *pattern = "macOS_MISRC_%s_universal.dmg";
+#elif defined(_WIN32)
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
+    const char *pattern = "Windows_MISRC_%s_arm64.zip";
+#else
+    const char *pattern = "Windows_MISRC_%s_x86.zip";
+#endif
+#elif defined(__linux__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *pattern = "Linux_MISRC_%s_arm64.zip";
+#else
+    const char *pattern = "Linux_MISRC_%s_x86.zip";
+#endif
+#else
+    return false;
+#endif
+
+    int written = snprintf(filename_out, filename_out_len, pattern, release_tag);
+    return (written > 0) && ((size_t)written < filename_out_len);
+}
+
+static bool gui_ui_build_release_asset_url_for_platform(const char *release_tag,
+                                                        char *url_out,
+                                                        size_t url_out_len,
+                                                        char *asset_out,
+                                                        size_t asset_out_len)
+{
+    if (!url_out || url_out_len == 0) return false;
+    url_out[0] = '\0';
+    if (asset_out && asset_out_len > 0) asset_out[0] = '\0';
+
+    char asset[160];
+    if (!gui_ui_build_release_asset_filename_for_platform(release_tag, asset, sizeof(asset))) {
+        return false;
+    }
+    int written = snprintf(url_out,
+                           url_out_len,
+                           GUI_UI_RELEASES_DOWNLOAD_BASE_URL "/%s/%s",
+                           release_tag,
+                           asset);
+    if (written <= 0 || (size_t)written >= url_out_len) {
+        return false;
+    }
+    if (asset_out && asset_out_len > 0) {
+        snprintf(asset_out, asset_out_len, "%s", asset);
+    }
+    return true;
+}
+
+static bool gui_ui_open_url_external(const char *url, char *error_out, size_t error_out_len)
+{
+    if (!url || !url[0] || !error_out || error_out_len == 0) return false;
+    error_out[0] = '\0';
+
+    char cmd[1024];
+    int written = 0;
+#if defined(_WIN32)
+    written = snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+#elif defined(__APPLE__)
+    written = snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
+#elif defined(__ANDROID__)
+    written = snprintf(cmd, sizeof(cmd), "am start -a android.intent.action.VIEW -d \"%s\"", url);
+#elif defined(__linux__)
+    written = snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
+#else
+    snprintf(error_out, error_out_len, "unsupported platform");
+    return false;
+#endif
+    if (written <= 0 || (size_t)written >= sizeof(cmd)) {
+        snprintf(error_out, error_out_len, "download command too long");
+        return false;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        snprintf(error_out, error_out_len, "failed to open download URL");
         return false;
     }
     return true;
@@ -3064,8 +3169,9 @@ static void render_version_info_window(gui_app_t *app)
         snprintf(vi_rate, sizeof(vi_rate), "%u Hz", sr);
     }
 
+    bool update_check_running = atomic_load_explicit(&s_update_check_running, memory_order_acquire);
     Color update_status_color = COLOR_TEXT_DIM;
-    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+    if (update_check_running) {
         snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
     } else if (app->settings.update_last_release_tag[0]) {
         int update_cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
@@ -3081,6 +3187,10 @@ static void render_version_info_window(gui_app_t *app)
     } else {
         snprintf(vi_update_status, sizeof(vi_update_status), "Not checked yet");
     }
+    Color update_download_btn_bg = update_check_running ? ui_disabled_color(COLOR_BUTTON)
+                                                        : COLOR_BUTTON;
+    Color update_download_btn_fg = update_check_running ? ui_disabled_color(COLOR_TEXT)
+                                                        : COLOR_TEXT;
     bool ab_swap_cxadc = gui_ui_selected_device_is_cxadc(app, NULL);
 #ifdef ENABLE_FX3
     bool ab_swap_fx3 = gui_ui_selected_device_is_fx3(app);
@@ -3180,14 +3290,34 @@ static void render_version_info_window(gui_app_t *app)
         }
 
         CLAY(CLAY_ID("VersionInfoUpdateRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 10
+            }
         }) {
             CLAY(CLAY_ID("VersionInfoUpdateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
                 CLAY_TEXT(CLAY_STRING("Update:"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
-            CLAY_TEXT(make_string(vi_update_status),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
+            CLAY(CLAY_ID("VersionInfoUpdateStatus"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) } }
+            }) {
+                CLAY_TEXT(make_string(vi_update_status),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
+            }
+            CLAY(CLAY_ID("VersionInfoDownloadButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(24) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(update_download_btn_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("Download Latest"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_download_btn_fg) }));
+            }
         }
 
         // Capture state row
@@ -5488,6 +5618,83 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_app_set_status(app, "Checking for updates...");
                 } else {
                     gui_app_set_status(app, "Unable to start update check");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoDownloadButton"))) {
+                gui_ui_process_update_check_result(app);
+                if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+                    gui_app_set_status(app, "Please wait for update check to finish");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char latest_tag[64] = {0};
+                char lookup_error[160] = {0};
+                bool used_cached_tag = false;
+                bool have_latest_tag = gui_ui_fetch_latest_release_tag(latest_tag,
+                                                                       sizeof(latest_tag),
+                                                                       lookup_error,
+                                                                       sizeof(lookup_error));
+                if (have_latest_tag) {
+                    snprintf(app->settings.update_last_release_tag,
+                             sizeof(app->settings.update_last_release_tag),
+                             "%s",
+                             latest_tag);
+                    app->settings.update_last_check_unix_s = (uint64_t)time(NULL);
+                    int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
+                    app->settings.update_available_cached = (cmp < 0);
+                    gui_settings_save(&app->settings);
+                } else if (gui_ui_is_release_tag_safe(app->settings.update_last_release_tag)) {
+                    snprintf(latest_tag, sizeof(latest_tag), "%s", app->settings.update_last_release_tag);
+                    used_cached_tag = true;
+                    have_latest_tag = true;
+                }
+
+                if (!have_latest_tag) {
+                    char msg[220];
+                    snprintf(msg,
+                             sizeof(msg),
+                             "Unable to resolve latest release: %s",
+                             lookup_error[0] ? lookup_error : "unknown error");
+                    gui_app_set_status(app, msg);
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char download_url[512] = {0};
+                char asset_name[160] = {0};
+                if (!gui_ui_build_release_asset_url_for_platform(latest_tag,
+                                                                 download_url,
+                                                                 sizeof(download_url),
+                                                                 asset_name,
+                                                                 sizeof(asset_name))) {
+                    gui_app_set_status(app, "No direct download mapping for this platform");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char open_error[160] = {0};
+                if (!gui_ui_open_url_external(download_url, open_error, sizeof(open_error))) {
+                    char msg[240];
+                    snprintf(msg,
+                             sizeof(msg),
+                             "Failed to open download URL: %s",
+                             open_error[0] ? open_error : "unknown error");
+                    gui_app_set_status(app, msg);
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                if (used_cached_tag) {
+                    char msg[220];
+                    snprintf(msg, sizeof(msg), "Opening cached download: %s", asset_name);
+                    gui_app_set_status(app, msg);
+                } else {
+                    char msg[220];
+                    snprintf(msg, sizeof(msg), "Opening latest download: %s", asset_name);
+                    gui_app_set_status(app, msg);
                 }
                 gui_ui_set_click_consumed();
                 return;
