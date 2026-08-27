@@ -1,5 +1,6 @@
 # MISRC GUI
 
+
 <img width="150" height="150" alt="GUI_Icon" src="assets/Icons/MISRC_Icon.png" />
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
@@ -8,7 +9,7 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 ### Current Supported Hardware
 
-- MISRC (v1.0-v1.5a / native v2.5)
+- [MISRC](www.misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
@@ -81,8 +82,7 @@ Expected group is `video` (e.g. `root video`).
 
 The MISRC GUI, the layout is a simplified command and control system, designed for a single 9-24” monitor both touch & non-touch compatible, with a two layer only rule of design meaning there is no more than one sub menu per button press or drop down selection.
 
-
-<img width="1427" height="752" alt="image" src="https://github.com/user-attachments/assets/7a715ce0-872b-4b38-ab31-e668505b8dc6" />
+<img width="1427" height="752" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Main_Current.png" />
 
 The main GUI window from beginning from the top row
 
@@ -97,9 +97,11 @@ The main GUI window from beginning from the top row
 
 The record timer system is self fail proof, you cannot set a time lower than your current duration and instantly stop capture by accident, it will count the total timer with a discount of the current duration passed, and has to be armed with a manual button click.
 
+
 ## Information Page 
 
-<img width="473" height="388" alt="image" src="https://github.com/user-attachments/assets/83cfc78d-757c-467f-a74a-5755167ae5d5" />
+
+<img width="473" height="388" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Info_Current.png" />
 
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
@@ -112,7 +114,7 @@ The GUI is built with several layers of fallback and prevention measures to stop
 ## Record & Audio Monitoring
 
 
-<img width="617" height="46" alt="image" src="https://github.com/user-attachments/assets/af6ad652-ca67-4f5d-bf35-7635d62dd187" />
+<img width="617" height="46" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Mon_&_Control_Current.png" />
 
 Record button is clear when not in use.
 
@@ -122,17 +124,21 @@ The record button will turn orange and state finalizing when a file is still bei
 
 Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
 
+
 ## Timer and Level Auto Stop
 
-<img width="436" height="340" alt="image" src="https://github.com/user-attachments/assets/d5a7ea02-b2dc-41f6-a2db-d24783cde1c9" />
 
-Timer mode allows for HH:MM:SS timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
+<img width="436" height="340" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Record_Auto_Control_Current.png" />
+
+Timer mode allows for `HH:MM:SS` timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
 
 Level Autostop, this allows for you to set a overall % level alongside a timer to automatically stop captures when a tape is clearly reached its end and no active signal is being captured thus presenting a drastically lower level, users should be careful with this to prevent re-runs if tapes have spaced recordings.
 
+
 ## Settings Page
 
-<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="https://github.com/user-attachments/assets/db2d99a8-a712-4e24-9d6d-e2fdb2886428" />
+
+<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Settings_Current.png" />
 
 - Auto File Naming
 - Auto File Date Stamping
@@ -140,7 +146,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Base Name and Output
 - A/B RF Capture On/Off
 - FLAC/RAW PCM Encoding Control
-- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC is assumed 8-bit)
+- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC)
 - FLAC Level & Threads Control
 - Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
@@ -158,14 +164,16 @@ Included currently are the following viewer modes.
 - FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (Basic composite video decoder Luma B/W only currently)
 
-<img width="140" height="132" alt="image" src="https://github.com/user-attachments/assets/8a3d0632-5e9b-4c15-985e-73805c62f0e5" />
+<img width="140" height="132" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
 
 Experimental support for [Tape-Decode](https://github.com/harrypm/tape-decode-rust) (A Rust re-write of vhs-decode) is also a working progress, this plugin hopes to allow for a quick is this working inspection and in the future potentially direct to file decoding however currently this does have massive limitation implications and performance cost implications, so it's not a high priority over the stability of the core feature of seeing there is something and getting it safely captured to file. 
 
 There is plans for a basic quality hi-fi audio decoder mode based off of the GNU radio script, allowing for directional test point finding and quick testing of sanity of if there is a HiFi FM signal present.
 
+
 ## During Capture Readout 
+
 
 Statistics per channel will be available on the right hand side. 
 
@@ -180,7 +188,7 @@ Statistics per channel will be available on the right hand side.
 - Encoded FLAC file size
 - Compression Ratio (I.g 8.7x)
 
-<img width="191" height="547" alt="image" src="https://github.com/user-attachments/assets/790a4ca2-51ed-409a-833b-bdde6c248c06" />
+<img width="191" height="547" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Capture_Readout_Current.png" />
 
 After a capture is finished these values will be persistent until a new capture starts or the application is closed.
 
@@ -207,7 +215,7 @@ There are two visualization modes currently implemented.
 - Waveform Line
 - Waveform Phosphor
 
-<img width="154" height="86" alt="image" src="https://github.com/user-attachments/assets/dcb5f58c-f91f-4ff8-b67f-c0a47a9e1ff1" />
+<img width="154" height="86" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Scope_Settings_Current.png" />
 
 On the zero line that is your DC offset position your signal should be level with this position to begin with irrespective of your gain level of the signal of input.
 
@@ -215,7 +223,7 @@ Ideal saturation range at 8-bit is typically within the plus +0.5 and -0.5 range
 
 Trigger modes like an oscilloscope can be done in the simple following. 
 
-<img width="144" height="215" alt="image" src="https://github.com/user-attachments/assets/8ca5cc52-282b-4481-bb73-524bcbeb3cfd" />
+<img width="144" height="215" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Trigger_Settings_Current.png" />
 
 Each channel can be triggered by any other channel by selecting the channel trigger mode. 
 
@@ -232,13 +240,15 @@ Modes:
 - Sync
 - CVBS
 
-There are plans to expand upon these to cover a full range of trigger modes you would typically see inside of an Sigilent/Rigol oscilloscope.
+There are plans to expand upon these to cover a full range of trigger modes you would typically see inside of an Siglent/Rigol oscilloscope.
+
 
 ## Capture Ingest Metadata
 
+
 The Text Icon opens the metadata tab for logging information about your capture.
 
-<img width="665" height="486" alt="image" src="https://github.com/user-attachments/assets/9102a6cb-23c1-4cc7-8349-df923283bc57" />
+<img width="665" height="486" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
 
 
 ## Logging 
