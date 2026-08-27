@@ -138,7 +138,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 ## Settings Page
 
 
-<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="assets/images/MISRC_GUI_Window_Settings_Current.png" />
+<img width="763" height="647" alt="image" src="assets/images/MISRC_GUI_Window_Settings_Current.png" />
 
 - Auto File Naming
 - Auto File Date Stamping
