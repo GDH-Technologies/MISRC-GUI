@@ -82,7 +82,7 @@ Expected group is `video` (e.g. `root video`).
 
 The MISRC GUI, the layout is a simplified command and control system, designed for a single 9-24” monitor both touch & non-touch compatible, with a two layer only rule of design meaning there is no more than one sub menu per button press or drop down selection.
 
-<img width="1427" height="752" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Main_Current.png" />
+<img width="1427" height="752" alt="image" src="assets/images/MISRC_GUI_Window_Main_Current.png" />
 
 The main GUI window from beginning from the top row
 
@@ -101,7 +101,7 @@ The record timer system is self fail proof, you cannot set a time lower than you
 ## Information Page 
 
 
-<img width="473" height="388" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Info_Current.png" />
+<img width="473" height="388" alt="image" src="assets/images/MISRC_GUI_Window_Info_Current.png" />
 
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
@@ -114,7 +114,7 @@ The GUI is built with several layers of fallback and prevention measures to stop
 ## Record & Audio Monitoring
 
 
-<img width="617" height="46" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Mon_&_Control_Current.png" />
+<img width="617" height="46" alt="image" src="assets/images/MISRC_GUI_Window_Mon_&_Control_Current.png" />
 
 Record button is clear when not in use.
 
@@ -128,7 +128,7 @@ Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators 
 ## Timer and Level Auto Stop
 
 
-<img width="436" height="340" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Record_Auto_Control_Current.png" />
+<img width="436" height="340" alt="image" src="assets/images/MISRC_GUI_Window_Record_Auto_Control_Current.png" />
 
 Timer mode allows for `HH:MM:SS` timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
 
@@ -138,7 +138,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 ## Settings Page
 
 
-<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Settings_Current.png" />
+<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="assets/images/MISRC_GUI_Window_Settings_Current.png" />
 
 - Auto File Naming
 - Auto File Date Stamping
@@ -164,7 +164,7 @@ Included currently are the following viewer modes.
 - FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (Basic composite video decoder Luma B/W only currently)
 
-<img width="140" height="132" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
+<img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
 
 Experimental support for [Tape-Decode](https://github.com/harrypm/tape-decode-rust) (A Rust re-write of vhs-decode) is also a working progress, this plugin hopes to allow for a quick is this working inspection and in the future potentially direct to file decoding however currently this does have massive limitation implications and performance cost implications, so it's not a high priority over the stability of the core feature of seeing there is something and getting it safely captured to file. 
@@ -188,7 +188,7 @@ Statistics per channel will be available on the right hand side.
 - Encoded FLAC file size
 - Compression Ratio (I.g 8.7x)
 
-<img width="191" height="547" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Capture_Readout_Current.png" />
+<img width="191" height="547" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Readout_Current.png" />
 
 After a capture is finished these values will be persistent until a new capture starts or the application is closed.
 
@@ -215,7 +215,7 @@ There are two visualization modes currently implemented.
 - Waveform Line
 - Waveform Phosphor
 
-<img width="154" height="86" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Scope_Settings_Current.png" />
+<img width="154" height="86" alt="image" src="assets/images/MISRC_GUI_Window_Scope_Settings_Current.png" />
 
 On the zero line that is your DC offset position your signal should be level with this position to begin with irrespective of your gain level of the signal of input.
 
@@ -223,7 +223,7 @@ Ideal saturation range at 8-bit is typically within the plus +0.5 and -0.5 range
 
 Trigger modes like an oscilloscope can be done in the simple following. 
 
-<img width="144" height="215" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Trigger_Settings_Current.png" />
+<img width="144" height="215" alt="image" src="assets/images/MISRC_GUI_Window_Trigger_Settings_Current.png" />
 
 Each channel can be triggered by any other channel by selecting the channel trigger mode. 
 
@@ -248,7 +248,7 @@ There are plans to expand upon these to cover a full range of trigger modes you 
 
 The Text Icon opens the metadata tab for logging information about your capture.
 
-<img width="665" height="486" alt="image" src="https://github.com/harrypm/MISRC-GUI/assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
+<img width="665" height="486" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
 
 
 ## Logging 
