@@ -15,7 +15,47 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 - DdD (DomesDay Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
-### Linux setup note (CXADC DC controls)
+## Downloads
+
+
+Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-GUI/releases).
+- Windows
+- MacOS
+- Linux
+- Android (arm64 APK, very alpha)
+
+x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
+
+Building from source? See [INSTALLATION.md](INSTALLATION.md).
+
+
+## Setup With Devices
+
+
+<details closed>
+<summary>Install Windows</summary>
+<br>
+
+For `misrc_capture` to be able to access the MS2130 or MS2131 capture device, you need to install a generic driver:
+
+Firstly download [Zadig](https://zadig.akeo.ie/)
+
+Force the installation of `WinUSB (v6.1.7600.16385)` or `libusb-win32 (v1.2.6.0)` driver on your MS2130/MS2131 adapter, on `interface 0` leave `interface 4` alone. 
+
+```
+Interface 0 - USB Video
+Interface 4 - HIDDevice
+```
+
+</details>
+
+</details>
+
+<details closed>
+<summary>Linux CXADC/Clockgen Setup</summary>
+<br>
+
+Linux setup note (CXADC DC controls)
 
 For CXADC `DC` up/down controls to work without root, the sysfs parameter files must be writable by the `video` group.
 
@@ -33,19 +73,7 @@ ls -l /sys/class/cxadc/cxadc*/device/parameters/center_offset
 
 Expected group is `video` (e.g. `root video`).
 
-
-## Downloads
-
-
-Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-GUI/releases).
-- Windows
-- MacOS
-- Linux
-- Android (arm64 APK, very alpha)
-
-x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
-
-Building from source? See [INSTALLATION.md](INSTALLATION.md).
+</details>
 
 
 ## Visual Overview & Use
@@ -80,7 +108,9 @@ The record timer system is self fail proof, you cannot set a time lower than you
 
 The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
 
+
 ## Record & Audio Monitoring
+
 
 <img width="617" height="46" alt="image" src="https://github.com/user-attachments/assets/af6ad652-ca67-4f5d-bf35-7635d62dd187" />
 
@@ -116,14 +146,16 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
 - Playback Input Files
 
+
 ## Scopes & Plugins
+
 
 There is a unified plugin system for deploying decoders.
 
 Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
-- FTT (visualises peaks of signals carriers i.g video/hifi or your local FM radio)
+- FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (Basic composite video decoder Luma B/W only currently)
 
 <img width="140" height="132" alt="image" src="https://github.com/user-attachments/assets/8a3d0632-5e9b-4c15-985e-73805c62f0e5" />
@@ -154,7 +186,9 @@ After a capture is finished these values will be persistent until a new capture 
 
 Persistence config, once you have configured your settings a global configuration file will be saved and this will carry forward onto new versions or older test builds, this allows you to quickly change between builds to test things or to just instantaneously update to the latest version.
 
+
 ## General Monitoring 
+
 
 - Sync Status  - confirms the current state of connectivity. 
 - XXX MSPS     - shows your current rate of the hardware capture device I.g 40msps or 100msps
@@ -167,7 +201,7 @@ Persistence config, once you have configured your settings a global configuratio
 
 Understanding the waveform scale. 
 
-There are two visualisation modes currently implemented. 
+There are two visualization modes currently implemented. 
 
 - Level Bar (vertical colour indicator)
 - Waveform Line
@@ -206,7 +240,9 @@ The Text Icon opens the metadata tab for logging information about your capture.
 
 <img width="665" height="486" alt="image" src="https://github.com/user-attachments/assets/9102a6cb-23c1-4cc7-8349-df923283bc57" />
 
+
 ## Logging 
+
 
 MISRC GUI has a perpetual logging system, as record button has is pressed your exact system and record config is saved to your log file along with any metadata saved in the fields provided under the metadata window, and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
 
@@ -278,6 +314,7 @@ Log Example:
 [2026-07-31 03:00:32] [INFO] Session complete
 ```````
 
+
 ## History
 
 - December 2025 - Initial version presented by AlessandroAU (back and forth tinkering begins)
@@ -286,3 +323,4 @@ Log Example:
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
 - August 13th 2026 - Official release!
+- August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
