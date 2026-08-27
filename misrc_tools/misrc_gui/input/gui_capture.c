@@ -402,6 +402,26 @@ static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t 
     atomic_store(&app->dropout_stop_requested, true);
 }
 
+// Generic SDR live-retune dispatch. Device-agnostic: callers (Demod panel,
+// Settings UI) call this without knowing which SDR backend is active.
+// Dispatches to the active SDR backend's set-frequency and persists the value.
+// Returns 0 on success, -1 if no SDR backend is active/not capturing-relevant.
+int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz)
+{
+    if (!app || hz == 0) return -1;
+#ifdef ENABLE_RTLSDR
+    // Today the only SDR backend is RTL-SDR. When a second SDR backend is
+    // added, dispatch on the selected device type here (and move the settings
+    // field to a generic sdr_freq_hz if appropriate).
+    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR) {
+        return gui_rtlsdr_set_frequency(app, hz);
+    }
+#endif
+    (void)hz;
+    return -1;
+}
+
 static inline void gui_capture_promote_callback_priority_once(void)
 {
     static MISRC_THREAD_LOCAL bool s_capture_callback_thread_priority_set = false;

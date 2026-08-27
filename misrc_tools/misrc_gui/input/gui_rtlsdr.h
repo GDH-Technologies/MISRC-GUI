@@ -58,6 +58,10 @@ void gui_rtlsdr_stop(gui_app_t *app);
 // True while the RTL-SDR capture thread is running.
 bool gui_rtlsdr_is_running(gui_app_t *app);
 
+// Live-retune the open RTL-SDR to hz (also updates settings.rtlsdr_freq_hz).
+// Safe to call whether or not capture is running; returns 0 on success.
+int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz);
+
 #endif // ENABLE_RTLSDR
 
 #endif // GUI_RTLSDR_H

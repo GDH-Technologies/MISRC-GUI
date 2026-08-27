@@ -340,4 +340,22 @@ bool gui_rtlsdr_is_running(gui_app_t *app) {
     return atomic_load(&s_rtlsdr_running);
 }
 
+int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
+    if (!app) return -1;
+    // Persist so the next capture start uses the new frequency even if not live.
+    app->settings.rtlsdr_freq_hz = hz;
+    gui_settings_save(&app->settings);
+    // Live retune only if the device is open and capture is running.
+    if (s_rtlsdr_dev && atomic_load(&s_rtlsdr_running)) {
+        int r = rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)hz);
+        if (r < 0) {
+            fprintf(stderr, "[RTL-SDR] live retune to %llu Hz failed (err %d)\n",
+                    (unsigned long long)hz, r);
+            return -1;
+        }
+        fprintf(stderr, "[RTL-SDR] live retune to %llu Hz\n", (unsigned long long)hz);
+    }
+    return 0;
+}
+
 #endif // ENABLE_RTLSDR
