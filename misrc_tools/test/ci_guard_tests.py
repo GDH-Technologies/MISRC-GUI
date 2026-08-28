@@ -1394,7 +1394,10 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     gui_app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
     gui_ui_h = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h")
     gui_ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    popup_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_popup.c")
     renderer_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/clay_renderer_raylib.c")
+    oscilloscope_c = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_oscilloscope.c")
+    fft_c = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_fft.c")
     phosphor_h = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_phosphor_rt.h")
     phosphor_c = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_phosphor_rt.c")
     meson = read_text(meson_path)
@@ -1404,14 +1407,29 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
         (settings_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
         (settings_c, '\\"ui_scale_percent\\": %d', "settings save key"),
         (settings_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (meson, "'misrc_gui/ui/gui_ui_scale.c'", "UI scale policy product source"),
         (gui_c, "gui_ui_zoom_process(&ui_zoom_state", "single wheel routing policy"),
         (gui_c, "IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)", "100% reset shortcut"),
+        (gui_c, "IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)", "keyboard zoom-in shortcut"),
+        (gui_c, "IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)", "keyboard zoom-out shortcut"),
+        (gui_c, "gui_ui_scale_step_percent(app.settings.ui_scale_percent", "shared keyboard zoom-step policy"),
+        (gui_c, "ui_zoom_result.step_attempted || keyboard_zoom_pressed", "zoom HUD attempt feedback"),
+        (gui_c, "gui_ui_show_scale_hud(ui_zoom_result.percent);", "zoom HUD trigger"),
         (gui_c, "ui_zoom_result.passthrough_x * 20.0f", "Clay horizontal wheel routing"),
         (gui_c, "ui_zoom_result.passthrough_y * 20.0f", "Clay vertical wheel routing"),
-        (gui_c, "fabsf(ui_zoom_result.passthrough_x)", "panel horizontal wheel routing"),
-        (gui_c, "fabsf(ui_zoom_result.passthrough_y)", "panel vertical wheel routing"),
         (gui_ui_h, "Vector2 gui_ui_get_mouse_position(void);", "logical pointer API"),
         (gui_ui_c, "position.x /= scale;", "pointer inverse transform"),
+        (gui_ui_c, "CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH", "pointer-transparent zoom HUD"),
+        (gui_ui_c, "gui_ui_scale_hud_opacity(remaining_s)", "zoom HUD fade policy"),
+        (gui_ui_c, "render_ui_scale_hud();", "zoom HUD render integration"),
+        (gui_ui_c, "Cmd+0 to reset to 100%", "macOS zoom reset hint"),
+        (gui_ui_c, "Ctrl+0 to reset to 100%", "desktop zoom reset hint"),
+        (gui_ui_c, "gui_ui_toolbar_uses_two_rows(toolbar_width,", "content-aware toolbar policy"),
+        (gui_ui_c, "gui_ui_get_status_layout_mode(status_width, status_height,", "responsive status policy"),
+        (gui_ui_c, 'strstr(raw_status_gate, "Capture stopped:")', "critical stop reason priority"),
+        (gui_ui_c, "gui_ui_modal_max_extent(gui_ui_get_layout_width()", "viewport-clamped modals"),
+        (popup_c, "gui_ui_modal_max_extent(gui_ui_get_layout_width()", "viewport-clamped generic popup"),
+        (popup_c, 'CLAY_ID("PopupContentScroll")', "scrollable popup content"),
         (renderer_c, "Matrix outer_modelview = rlGetMatrixModelview();", "outer render transform capture"),
         (renderer_c, "rlScalef(ui_scale, ui_scale, 1.0f);", "global render transform"),
         (renderer_c, "box.x * ui_scale", "scaled scissor transform"),
@@ -1419,7 +1437,10 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
         (phosphor_h, "Matrix outer_modelview;", "saved phosphor model-view"),
         (phosphor_c, "rlGetMatrixModelview()", "phosphor transform capture"),
         (phosphor_c, "rlSetMatrixModelview", "phosphor transform restore"),
-        (meson, "'misrc_gui/ui/gui_ui_scale.c'", "UI scale policy product source"),
+        (phosphor_c, "DrawTexturePro", "logical-size phosphor composite"),
+        (gui_ui_h, "Vector2 gui_ui_get_render_scale(void);", "framebuffer-density API"),
+        (oscilloscope_c, "gui_ui_get_render_scale();", "scale-aware waveform texture"),
+        (fft_c, "gui_ui_get_render_scale();", "scale-aware FFT texture"),
     ]
     for source, snippet, label in required_snippets:
         if snippet not in source:

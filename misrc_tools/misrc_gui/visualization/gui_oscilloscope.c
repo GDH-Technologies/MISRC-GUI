@@ -525,7 +525,9 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     phosphor_rt_t *prt = state->phosphor;
     if (prt) {
         // Initialize/resize phosphor if needed
-        phosphor_rt_init(prt, buf_width, buf_height);
+        Vector2 render_scale = gui_ui_get_render_scale();
+        phosphor_rt_init(prt, buf_width, buf_height,
+                         render_scale.x, render_scale.y);
 
         // Update phosphor
         phosphor_rt_begin_frame(prt);

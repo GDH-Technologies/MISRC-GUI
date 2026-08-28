@@ -52,8 +52,11 @@ void gui_ui_sync_android_keyboard_state(void);
 // Application-controlled UI zoom. Layout and pointer coordinates remain in
 // logical units while the renderer scales them into the window framebuffer.
 void gui_ui_set_scale_percent(int percent);
-int gui_ui_get_scale_percent(void);
 float gui_ui_get_scale_factor(void);
+// Physical framebuffer pixels per logical UI unit. This includes both the
+// application zoom and any OS backing scale such as macOS Retina.
+Vector2 gui_ui_get_render_scale(void);
+void gui_ui_show_scale_hud(int percent);
 int gui_ui_get_layout_width(void);
 int gui_ui_get_layout_height(void);
 Vector2 gui_ui_get_mouse_position(void);

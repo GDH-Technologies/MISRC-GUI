@@ -635,7 +635,9 @@ void gui_fft_render(fft_state_t *state, float x, float y,
     int rt_height = (int)height;
 
     // Ensure we have phosphor render textures of the right size
-    if (!phosphor_rt_init(&state->phosphor, rt_width, rt_height)) {
+    Vector2 render_scale = gui_ui_get_render_scale();
+    if (!phosphor_rt_init(&state->phosphor, rt_width, rt_height,
+                          render_scale.x, render_scale.y)) {
         // Fallback: just draw background
         DrawRectangle((int)x, (int)y, rt_width, rt_height, COLOR_METER_BG);
         fft_draw_text(fonts, "FFT: GPU init failed", x + 10, y + 10, FONT_SIZE_OSC_SCALE, (Color){255, 80, 80, 255});

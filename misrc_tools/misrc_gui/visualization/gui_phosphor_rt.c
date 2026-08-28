@@ -6,6 +6,7 @@
 
 #include "gui_phosphor_rt.h"
 #include "rlgl.h"
+#include <math.h>
 #include <stdlib.h>
 
 //-----------------------------------------------------------------------------
@@ -262,15 +263,27 @@ void phosphor_rt_cleanup_shaders(void) {
 // Render Texture Lifecycle
 //-----------------------------------------------------------------------------
 
-bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height) {
+bool phosphor_rt_init(phosphor_rt_t *prt, int logical_width,
+                      int logical_height, float render_scale_x,
+                      float render_scale_y) {
     if (!prt) return false;
 
-    // Clamp dimensions
+    // Clamp dimensions and derive display-pixel-sized render textures. Keeping
+    // this buffer at physical density avoids blurring at >100% and needless
+    // over-allocation at <100% while the rest of the UI remains logical.
+    if (logical_width < 1) logical_width = 1;
+    if (logical_height < 1) logical_height = 1;
+    if (!isfinite(render_scale_x) || render_scale_x <= 0.0f) render_scale_x = 1.0f;
+    if (!isfinite(render_scale_y) || render_scale_y <= 0.0f) render_scale_y = 1.0f;
+    int width = (int)lroundf((float)logical_width * render_scale_x);
+    int height = (int)lroundf((float)logical_height * render_scale_y);
     if (width < 1) width = 1;
     if (height < 1) height = 1;
 
     // Check if resize needed
-    if (prt->valid && prt->width == width && prt->height == height) {
+    if (prt->valid && prt->width == width && prt->height == height &&
+        prt->logical_width == logical_width &&
+        prt->logical_height == logical_height) {
         return true;  // Already correct size
     }
 
@@ -312,6 +325,8 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height) {
 
     prt->width = width;
     prt->height = height;
+    prt->logical_width = logical_width;
+    prt->logical_height = logical_height;
     prt->rt_index = 0;
     prt->valid = true;
 
@@ -326,7 +341,9 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height) {
         prt->config.bloom_intensity = PHOSPHOR_DEFAULT_BLOOM;
     }
 
-    TraceLog(LOG_INFO, "PHOSPHOR_RT: Initialized %dx%d render textures", width, height);
+    TraceLog(LOG_INFO,
+             "PHOSPHOR_RT: Initialized %dx%d render textures for %dx%d logical pixels",
+             width, height, logical_width, logical_height);
     return true;
 }
 
@@ -349,6 +366,8 @@ void phosphor_rt_cleanup(phosphor_rt_t *prt) {
     }
     prt->width = 0;
     prt->height = 0;
+    prt->logical_width = 0;
+    prt->logical_height = 0;
     prt->rt_index = 0;
     prt->outer_modelview_saved = false;
 }
@@ -407,6 +426,9 @@ void phosphor_rt_begin_frame(phosphor_rt_t *prt) {
 
     // Now ready for drawing new primitives with additive blending
     BeginBlendMode(BLEND_ADDITIVE);
+    rlScalef((float)prt->width / (float)prt->logical_width,
+             (float)prt->height / (float)prt->logical_height,
+             1.0f);
 }
 
 void phosphor_rt_end_frame(phosphor_rt_t *prt) {
@@ -436,9 +458,12 @@ void phosphor_rt_render(phosphor_rt_t *prt, float x, float y, bool use_alpha_ble
     }
 
     BeginShaderMode(s_composite_shader);
-    DrawTextureRec(prt->rt[prt->rt_index].texture,
+    DrawTexturePro(prt->rt[prt->rt_index].texture,
                    (Rectangle){0, 0, (float)prt->width, -(float)prt->height},
-                   (Vector2){x, y}, WHITE);
+                   (Rectangle){x, y,
+                               (float)prt->logical_width,
+                               (float)prt->logical_height},
+                   (Vector2){0, 0}, 0.0f, WHITE);
     EndShaderMode();
 
     if (use_alpha_blend) {
@@ -456,9 +481,12 @@ void phosphor_rt_render_opacity(phosphor_rt_t *prt, float x, float y) {
     SetShaderValue(s_opacity_shader, s_opacity_bloomIntensity_loc, &bloom, SHADER_UNIFORM_FLOAT);
 
     BeginShaderMode(s_opacity_shader);
-    DrawTextureRec(prt->rt[prt->rt_index].texture,
+    DrawTexturePro(prt->rt[prt->rt_index].texture,
                    (Rectangle){0, 0, (float)prt->width, -(float)prt->height},
-                   (Vector2){x, y}, WHITE);
+                   (Rectangle){x, y,
+                               (float)prt->logical_width,
+                               (float)prt->logical_height},
+                   (Vector2){0, 0}, 0.0f, WHITE);
     EndShaderMode();
 }
 
@@ -484,7 +512,7 @@ void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
                                float amplitude_scale) {
     if (!prt || !prt->valid || !samples || sample_count < 2) return;
 
-    int buf_height = prt->height;
+    int buf_height = prt->logical_height;
 
     // Scale factor: half height = full amplitude
     float scale = amplitude_scale * 0.5f;

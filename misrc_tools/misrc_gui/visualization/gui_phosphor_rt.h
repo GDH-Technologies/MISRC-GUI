@@ -48,8 +48,10 @@ typedef struct phosphor_rt_config {
 typedef struct phosphor_rt {
     RenderTexture2D rt[2];    // Ping-pong render textures
     int rt_index;             // Current render texture index (0 or 1)
-    int width;                // Render texture width
-    int height;               // Render texture height
+    int width;                // Physical render texture width
+    int height;               // Physical render texture height
+    int logical_width;        // Destination width before global UI scaling
+    int logical_height;       // Destination height before global UI scaling
     bool valid;               // True if render textures are initialized
     Matrix outer_modelview;   // UI transform saved across Begin/EndTextureMode
     bool outer_modelview_saved;
@@ -71,9 +73,12 @@ void phosphor_rt_cleanup_shaders(void);
 // Render Texture Lifecycle
 //-----------------------------------------------------------------------------
 
-// Initialize or resize a phosphor render texture pair
+// Initialize or resize a phosphor render texture pair. Dimensions are logical
+// UI pixels; render scales keep the off-screen texture at framebuffer density.
 // Returns true on success, false on allocation failure
-bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height);
+bool phosphor_rt_init(phosphor_rt_t *prt, int logical_width,
+                      int logical_height, float render_scale_x,
+                      float render_scale_y);
 
 // Clear render textures (reset to black)
 void phosphor_rt_clear(phosphor_rt_t *prt);

@@ -118,6 +118,13 @@ void gui_popup_render(void)
         return;
     }
 
+    int popup_max_width =
+        gui_ui_modal_max_extent(gui_ui_get_layout_width(), 548);
+    int popup_max_height =
+        gui_ui_modal_max_extent(gui_ui_get_layout_height(), 600);
+    int popup_min_width = popup_max_width < 320 ? popup_max_width : 320;
+    int popup_min_height = popup_max_height < 156 ? popup_max_height : 156;
+
     // Full-screen dimming overlay
     CLAY(CLAY_ID("PopupOverlay"), {
         .layout = {
@@ -133,7 +140,12 @@ void gui_popup_render(void)
         // Dialog box
         CLAY(CLAY_ID("PopupDialog"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIT(.min = 320), CLAY_SIZING_FIT(0) },
+                .sizing = {
+                    CLAY_SIZING_FIT(.min = popup_min_width,
+                                    .max = popup_max_width),
+                    CLAY_SIZING_FIT(.min = popup_min_height,
+                                    .max = popup_max_height)
+                },
                 .padding = { 24, 24, 20, 20 },
                 .childGap = 16,
                 .layoutDirection = CLAY_TOP_TO_BOTTOM
@@ -145,31 +157,47 @@ void gui_popup_render(void)
                 .color = to_clay_color(COLOR_POPUP_BORDER)
             }
         }) {
-            // Title
-            CLAY(CLAY_ID("PopupTitle"), {
+            // Keep the decision buttons fixed and let the title/message share
+            // the only scroll container. This keeps Overwrite/Cancel reachable
+            // even at the 320x180 logical minimum used by 200% zoom.
+            CLAY(CLAY_ID("PopupContentScroll"), {
                 .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .childGap = 16
+                },
+                .clip = {
+                    .horizontal = true,
+                    .vertical = true,
+                    .childOffset = Clay_GetScrollOffset()
                 }
             }) {
-                CLAY_TEXT(make_string(s_popup.title),
-                    CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_HEADING,
-                        .textColor = to_clay_color(COLOR_POPUP_TITLE)
-                    }));
-            }
+                // Title
+                CLAY(CLAY_ID("PopupTitle"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }
+                    }
+                }) {
+                    CLAY_TEXT(make_string(s_popup.title),
+                        CLAY_TEXT_CONFIG({
+                            .fontSize = FONT_SIZE_HEADING,
+                            .textColor = to_clay_color(COLOR_POPUP_TITLE)
+                        }));
+                }
 
-            // Message
-            CLAY(CLAY_ID("PopupMessage"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(.max = 500), CLAY_SIZING_FIT(0) },
-                    .padding = { 0, 0, 8, 8 }
+                // Message
+                CLAY(CLAY_ID("PopupMessage"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(.max = 500), CLAY_SIZING_FIT(0) },
+                        .padding = { 0, 0, 8, 8 }
+                    }
+                }) {
+                    CLAY_TEXT(make_string(s_popup.message),
+                        CLAY_TEXT_CONFIG({
+                            .fontSize = FONT_SIZE_NORMAL,
+                            .textColor = to_clay_color(COLOR_POPUP_TEXT)
+                        }));
                 }
-            }) {
-                CLAY_TEXT(make_string(s_popup.message),
-                    CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_NORMAL,
-                        .textColor = to_clay_color(COLOR_POPUP_TEXT)
-                    }));
             }
 
             // Button row

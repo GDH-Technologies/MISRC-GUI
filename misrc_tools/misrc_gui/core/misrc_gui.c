@@ -443,7 +443,6 @@ int main(int argc, char **argv) {
     // Load persistent settings (includes desktop path defaults)
     gui_settings_load(&app.settings);
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
-    app.settings.ui_scale_percent = gui_ui_get_scale_percent();
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;
@@ -615,14 +614,31 @@ int main(int argc, char **argv) {
                                 wheel_delta.x,
                                 wheel_delta.y);
 
-        if (primary_modifier_down &&
-            (IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0))) {
+        bool zoom_reset_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0));
+        bool zoom_in_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD));
+        bool zoom_out_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT));
+        bool keyboard_step_pressed = zoom_in_pressed != zoom_out_pressed;
+        bool keyboard_zoom_pressed = zoom_reset_pressed || keyboard_step_pressed;
+        bool show_ui_scale_hud =
+            ui_zoom_result.step_attempted || keyboard_zoom_pressed;
+
+        if (keyboard_zoom_pressed) {
             ui_zoom_state.wheel_remainder = 0.0f;
-            if (ui_zoom_result.percent != GUI_UI_SCALE_DEFAULT_PERCENT) {
+            if (zoom_reset_pressed) {
                 ui_zoom_result.percent = GUI_UI_SCALE_DEFAULT_PERCENT;
-                ui_zoom_result.changed = true;
+            } else {
+                int direction = zoom_in_pressed ? 1 : -1;
+                ui_zoom_result.percent =
+                    gui_ui_scale_step_percent(app.settings.ui_scale_percent,
+                                              direction);
             }
         }
+
+        ui_zoom_result.changed =
+            ui_zoom_result.percent != app.settings.ui_scale_percent;
 
         if (ui_zoom_result.changed) {
             app.settings.ui_scale_percent = ui_zoom_result.percent;
@@ -631,6 +647,10 @@ int main(int argc, char **argv) {
             last_layout_height = -1;
             ui_scale_save_pending = true;
             ui_scale_save_deadline = GetTime() + 0.4;
+        }
+
+        if (show_ui_scale_hud) {
+            gui_ui_show_scale_hud(ui_zoom_result.percent);
         }
 
         if (ui_scale_save_pending && GetTime() >= ui_scale_save_deadline) {
