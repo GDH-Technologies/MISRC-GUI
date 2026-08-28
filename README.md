@@ -1,5 +1,6 @@
 # MISRC GUI
 
+
 <img width="150" height="150" alt="GUI_Icon" src="assets/Icons/MISRC_Icon.png" />
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
@@ -8,14 +9,54 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 ### Current Supported Hardware
 
-- MISRC (v1.0-v1.5a / native v2.5)
+- [MISRC](www.misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
 - DdD (DomesDay Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
-### Linux setup note (CXADC DC controls)
+## Downloads
+
+
+Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-GUI/releases).
+- Windows
+- MacOS
+- Linux
+- Android (arm64 APK, very alpha)
+
+x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
+
+Building from source? See [INSTALLATION.md](INSTALLATION.md).
+
+
+## Setup With Devices
+
+
+<details closed>
+<summary>Install Windows</summary>
+<br>
+
+For `misrc_capture` to be able to access the MS2130 or MS2131 capture device, you need to install a generic driver:
+
+Firstly download [Zadig](https://zadig.akeo.ie/)
+
+Force the installation of `WinUSB (v6.1.7600.16385)` or `libusb-win32 (v1.2.6.0)` driver on your MS2130/MS2131 adapter, on `interface 0` leave `interface 4` alone. 
+
+```
+Interface 0 - USB Video
+Interface 4 - HIDDevice
+```
+
+</details>
+
+</details>
+
+<details closed>
+<summary>Linux CXADC/Clockgen Setup</summary>
+<br>
+
+Linux setup note (CXADC DC controls)
 
 For CXADC `DC` up/down controls to work without root, the sysfs parameter files must be writable by the `video` group.
 
@@ -33,19 +74,7 @@ ls -l /sys/class/cxadc/cxadc*/device/parameters/center_offset
 
 Expected group is `video` (e.g. `root video`).
 
-
-## Downloads
-
-
-Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-GUI/releases).
-- Windows
-- MacOS
-- Linux
-- Android (arm64 APK, very alpha)
-
-x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
-
-Building from source? See [INSTALLATION.md](INSTALLATION.md).
+</details>
 
 
 ## Building from source on Fedora
@@ -100,8 +129,7 @@ error instead; `build-local.sh` already sets the first of these.
 
 The MISRC GUI, the layout is a simplified command and control system, designed for a single 9-24” monitor both touch & non-touch compatible, with a two layer only rule of design meaning there is no more than one sub menu per button press or drop down selection.
 
-
-<img width="1427" height="752" alt="image" src="https://github.com/user-attachments/assets/7a715ce0-872b-4b38-ab31-e668505b8dc6" />
+<img width="1427" height="752" alt="image" src="assets/images/MISRC_GUI_Window_Main_Current.png" />
 
 The main GUI window from beginning from the top row
 
@@ -116,9 +144,11 @@ The main GUI window from beginning from the top row
 
 The record timer system is self fail proof, you cannot set a time lower than your current duration and instantly stop capture by accident, it will count the total timer with a discount of the current duration passed, and has to be armed with a manual button click.
 
+
 ## Information Page 
 
-<img width="473" height="388" alt="image" src="https://github.com/user-attachments/assets/83cfc78d-757c-467f-a74a-5755167ae5d5" />
+
+<img width="473" height="388" alt="image" src="assets/images/MISRC_GUI_Window_Info_Current.png" />
 
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
@@ -127,9 +157,11 @@ The record timer system is self fail proof, you cannot set a time lower than you
 
 The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
 
+
 ## Record & Audio Monitoring
 
-<img width="617" height="46" alt="image" src="https://github.com/user-attachments/assets/af6ad652-ca67-4f5d-bf35-7635d62dd187" />
+
+<img width="617" height="46" alt="image" src="assets/images/MISRC_GUI_Window_Mon_&_Control_Current.png" />
 
 Record button is clear when not in use.
 
@@ -139,17 +171,21 @@ The record button will turn orange and state finalizing when a file is still bei
 
 Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
 
+
 ## Timer and Level Auto Stop
 
-<img width="436" height="340" alt="image" src="https://github.com/user-attachments/assets/d5a7ea02-b2dc-41f6-a2db-d24783cde1c9" />
 
-Timer mode allows for HH:MM:SS timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
+<img width="436" height="340" alt="image" src="assets/images/MISRC_GUI_Window_Record_Auto_Control_Current.png" />
+
+Timer mode allows for `HH:MM:SS` timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
 
 Level Autostop, this allows for you to set a overall % level alongside a timer to automatically stop captures when a tape is clearly reached its end and no active signal is being captured thus presenting a drastically lower level, users should be careful with this to prevent re-runs if tapes have spaced recordings.
 
+
 ## Settings Page
 
-<img width="763" height="647" alt="Screenshot from 2026-08-10 16-58-26" src="https://github.com/user-attachments/assets/db2d99a8-a712-4e24-9d6d-e2fdb2886428" />
+
+<img width="763" height="647" alt="image" src="assets/images/MISRC_GUI_Window_Settings_Current.png" />
 
 - Auto File Naming
 - Auto File Date Stamping
@@ -157,30 +193,34 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Base Name and Output
 - A/B RF Capture On/Off
 - FLAC/RAW PCM Encoding Control
-- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC is assumed 8-bit)
+- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC)
 - FLAC Level & Threads Control
 - Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
 - Playback Input Files
 
+
 ## Scopes & Plugins
+
 
 There is a unified plugin system for deploying decoders.
 
 Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
-- FTT (visualises peaks of signals carriers i.g video/hifi or your local FM radio)
+- FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (Basic composite video decoder Luma B/W only currently)
 
-<img width="140" height="132" alt="image" src="https://github.com/user-attachments/assets/8a3d0632-5e9b-4c15-985e-73805c62f0e5" />
+<img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
 
 Experimental support for [Tape-Decode](https://github.com/harrypm/tape-decode-rust) (A Rust re-write of vhs-decode) is also a working progress, this plugin hopes to allow for a quick is this working inspection and in the future potentially direct to file decoding however currently this does have massive limitation implications and performance cost implications, so it's not a high priority over the stability of the core feature of seeing there is something and getting it safely captured to file. 
 
 There is plans for a basic quality hi-fi audio decoder mode based off of the GNU radio script, allowing for directional test point finding and quick testing of sanity of if there is a HiFi FM signal present.
 
+
 ## During Capture Readout 
+
 
 Statistics per channel will be available on the right hand side. 
 
@@ -195,13 +235,15 @@ Statistics per channel will be available on the right hand side.
 - Encoded FLAC file size
 - Compression Ratio (I.g 8.7x)
 
-<img width="191" height="547" alt="image" src="https://github.com/user-attachments/assets/790a4ca2-51ed-409a-833b-bdde6c248c06" />
+<img width="191" height="547" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Readout_Current.png" />
 
 After a capture is finished these values will be persistent until a new capture starts or the application is closed.
 
 Persistence config, once you have configured your settings a global configuration file will be saved and this will carry forward onto new versions or older test builds, this allows you to quickly change between builds to test things or to just instantaneously update to the latest version.
 
+
 ## General Monitoring 
+
 
 - Sync Status  - confirms the current state of connectivity. 
 - XXX MSPS     - shows your current rate of the hardware capture device I.g 40msps or 100msps
@@ -214,13 +256,13 @@ Persistence config, once you have configured your settings a global configuratio
 
 Understanding the waveform scale. 
 
-There are two visualisation modes currently implemented. 
+There are two visualization modes currently implemented. 
 
 - Level Bar (vertical colour indicator)
 - Waveform Line
 - Waveform Phosphor
 
-<img width="154" height="86" alt="image" src="https://github.com/user-attachments/assets/dcb5f58c-f91f-4ff8-b67f-c0a47a9e1ff1" />
+<img width="154" height="86" alt="image" src="assets/images/MISRC_GUI_Window_Scope_Settings_Current.png" />
 
 On the zero line that is your DC offset position your signal should be level with this position to begin with irrespective of your gain level of the signal of input.
 
@@ -228,7 +270,7 @@ Ideal saturation range at 8-bit is typically within the plus +0.5 and -0.5 range
 
 Trigger modes like an oscilloscope can be done in the simple following. 
 
-<img width="144" height="215" alt="image" src="https://github.com/user-attachments/assets/8ca5cc52-282b-4481-bb73-524bcbeb3cfd" />
+<img width="144" height="215" alt="image" src="assets/images/MISRC_GUI_Window_Trigger_Settings_Current.png" />
 
 Each channel can be triggered by any other channel by selecting the channel trigger mode. 
 
@@ -245,15 +287,19 @@ Modes:
 - Sync
 - CVBS
 
-There are plans to expand upon these to cover a full range of trigger modes you would typically see inside of an Sigilent/Rigol oscilloscope.
+There are plans to expand upon these to cover a full range of trigger modes you would typically see inside of an Siglent/Rigol oscilloscope.
+
 
 ## Capture Ingest Metadata
 
+
 The Text Icon opens the metadata tab for logging information about your capture.
 
-<img width="665" height="486" alt="image" src="https://github.com/user-attachments/assets/9102a6cb-23c1-4cc7-8349-df923283bc57" />
+<img width="665" height="486" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
+
 
 ## Logging 
+
 
 MISRC GUI has a perpetual logging system, as record button has is pressed your exact system and record config is saved to your log file along with any metadata saved in the fields provided under the metadata window, and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
 
@@ -325,6 +371,7 @@ Log Example:
 [2026-07-31 03:00:32] [INFO] Session complete
 ```````
 
+
 ## History
 
 - December 2025 - Initial version presented by AlessandroAU (back and forth tinkering begins)
@@ -333,3 +380,4 @@ Log Example:
 - June 3rd 2026  - V1.0.7 Release first overall stable production release
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
 - August 13th 2026 - Official release!
+- August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 

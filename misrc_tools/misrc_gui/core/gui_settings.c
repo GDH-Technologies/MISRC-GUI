@@ -494,8 +494,20 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->update_last_release_tag[0] = '\0';
     settings->update_available_cached = false;
 
-    // Keep derived filenames coherent with default auto-naming state.
-    gui_settings_refresh_auto_names(settings);
+    // RTL-SDR defaults (only relevant when an RTL-SDR device is selected)
+    settings->rtlsdr_freq_hz = 100000000ULL;   // 100.0 MHz (FM broadcast band)
+    settings->rtlsdr_gain_mode = 0;             // 0 = auto, 1 = manual
+    settings->rtlsdr_gain_tenths_db = 0;        // manual gain (tenths dB); unused in auto mode
+    settings->rtlsdr_sample_rate_hz = 2400000U;  // 2.4 MSPS (highest widely-stable)
+    settings->rtlsdr_agc = true;                // RTL2832 AGC on
+    settings->rtlsdr_offset_corr = false;       // RTL offset tuning correction off
+
+    // Demod view defaults (device-agnostic; apply to the Demod panel)
+    settings->demod_mode = 0;                   // 0=WFM,1=NFM,2=AM,3=USB,4=LSB
+    settings->demod_bandwidth_hz = 0;           // 0 = use mode default bandwidth
+    settings->demod_squelch = 0.0f;             // 0.0 = squelch open
+    settings->demod_volume = 1.0f;              // 1.0 = unity gain
+    settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
 }
 
 // Simple JSON-like format for settings
@@ -619,6 +631,17 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"update_last_check_unix_s\": %llu,\n", (unsigned long long)settings->update_last_check_unix_s);
     fprintf(f, "  \"update_last_release_tag\": \"%s\",\n", settings->update_last_release_tag);
     fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
+    fprintf(f, "  \"rtlsdr_freq_hz\": %llu,\n", (unsigned long long)settings->rtlsdr_freq_hz);
+    fprintf(f, "  \"rtlsdr_gain_mode\": %d,\n", settings->rtlsdr_gain_mode);
+    fprintf(f, "  \"rtlsdr_gain_tenths_db\": %d,\n", settings->rtlsdr_gain_tenths_db);
+    fprintf(f, "  \"rtlsdr_sample_rate_hz\": %u,\n", (unsigned)settings->rtlsdr_sample_rate_hz);
+    fprintf(f, "  \"rtlsdr_agc\": %s,\n", settings->rtlsdr_agc ? "true" : "false");
+    fprintf(f, "  \"rtlsdr_offset_corr\": %s,\n", settings->rtlsdr_offset_corr ? "true" : "false");
+    fprintf(f, "  \"demod_mode\": %d,\n", settings->demod_mode);
+    fprintf(f, "  \"demod_bandwidth_hz\": %d,\n", settings->demod_bandwidth_hz);
+    fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
+    fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
+    fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -1233,6 +1256,42 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "playback_file_b")) != NULL) {
         strncpy(settings->playback_file_b, value, MAX_FILENAME_LEN - 1);
         settings->playback_file_b[MAX_FILENAME_LEN - 1] = '\0';
+    }
+
+    // RTL-SDR settings
+    if ((value = find_value(content, "rtlsdr_freq_hz")) != NULL) {
+        settings->rtlsdr_freq_hz = (uint64_t)strtoull(value, NULL, 10);
+    }
+    if ((value = find_value(content, "rtlsdr_gain_mode")) != NULL) {
+        settings->rtlsdr_gain_mode = atoi(value);
+    }
+    if ((value = find_value(content, "rtlsdr_gain_tenths_db")) != NULL) {
+        settings->rtlsdr_gain_tenths_db = atoi(value);
+    }
+    if ((value = find_value(content, "rtlsdr_sample_rate_hz")) != NULL) {
+        settings->rtlsdr_sample_rate_hz = (uint32_t)strtoul(value, NULL, 10);
+    }
+    if ((value = find_value(content, "rtlsdr_agc")) != NULL) {
+        settings->rtlsdr_agc = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "rtlsdr_offset_corr")) != NULL) {
+        settings->rtlsdr_offset_corr = (strcmp(value, "true") == 0);
+    }
+    // Demod view settings
+    if ((value = find_value(content, "demod_mode")) != NULL) {
+        settings->demod_mode = atoi(value);
+    }
+    if ((value = find_value(content, "demod_bandwidth_hz")) != NULL) {
+        settings->demod_bandwidth_hz = atoi(value);
+    }
+    if ((value = find_value(content, "demod_squelch")) != NULL) {
+        settings->demod_squelch = (float)atof(value);
+    }
+    if ((value = find_value(content, "demod_volume")) != NULL) {
+        settings->demod_volume = (float)atof(value);
+    }
+    if ((value = find_value(content, "demod_output_pair")) != NULL) {
+        settings->demod_output_pair = atoi(value);
     }
 
     // Backward-compat migration:

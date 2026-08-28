@@ -111,6 +111,15 @@ static void play_q_push_samples(const int16_t *samples, size_t count) {
     atomic_store(&s_play_q_tail, t + count);
 }
 
+// Public wrapper used by the Demod panel to feed the live monitor queue with
+// 48 k stereo int16 audio. Does not auto-enable monitoring (the user enables
+// Audio Mon, mirroring device-audio monitoring).
+void gui_audio_push_demod(const int16_t *stereo_48k, size_t frames) {
+    if (!stereo_48k || frames == 0) return;
+    play_q_ensure_alloc();
+    play_q_push_samples(stereo_48k, frames * 2);
+}
+
 static size_t play_q_pop_samples(int16_t *out, size_t max_count) {
     if (!s_play_q || max_count == 0) return 0;
     size_t used = play_q_used_samples();

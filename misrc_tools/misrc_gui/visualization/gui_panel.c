@@ -12,6 +12,8 @@
 #include "../core/gui_app.h"
 #include "gui_oscilloscope.h"
 #include "gui_fft.h"
+#include "gui_spectrogram.h"
+#include "../signal/gui_demod.h"
 #include "../ui/gui_ui.h"
 #include <stdio.h>
 
@@ -24,6 +26,9 @@ static const char* s_view_names[] = {
     [PANEL_VIEW_FFT] = "FFT",
     [PANEL_VIEW_CVBS] = "Video",
     [PANEL_VIEW_HISTOGRAM] = "Histogram",
+    [PANEL_VIEW_WATERFALL] = "Waterfall",
+    [PANEL_VIEW_SPECTROGRAPH] = "Spectro",
+    [PANEL_VIEW_DEMOD] = "Demod",
     [PANEL_VIEW_PREVIEW] = "Preview",
 };
 
@@ -57,6 +62,11 @@ bool panel_view_type_available(panel_view_type_t type) {
             return true;
         case PANEL_VIEW_FFT:
             return gui_fft_available();
+        case PANEL_VIEW_WATERFALL:
+        case PANEL_VIEW_SPECTROGRAPH:
+            return gui_spectrogram_available();
+        case PANEL_VIEW_DEMOD:
+            return gui_demod_available();
         case PANEL_VIEW_PREVIEW:
             return gui_preview_supported();
         default:

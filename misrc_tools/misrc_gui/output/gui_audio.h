@@ -21,4 +21,9 @@ void gui_audio_set_playback_enabled(gui_app_t *app, bool enabled);
 // Pump audio playback (call from main thread once per frame).
 void gui_audio_update_playback(gui_app_t *app);
 
+// Push demodulated audio (stereo int16 @ 48k) into the live monitor queue so
+// the "Audio Mon" button plays it. Safe to call from the render thread.
+// The user must enable Audio Mon to hear it (mirrors device-audio monitoring).
+void gui_audio_push_demod(const int16_t *stereo_48k, size_t frames);
+
 #endif // GUI_AUDIO_H

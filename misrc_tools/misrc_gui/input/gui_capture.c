@@ -35,7 +35,12 @@
 #include "../visualization/gui_panel.h"
 #include "../visualization/panel_interface.h"
 #include "../visualization/gui_histogram_panel.h"
+#include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"
+#include "../signal/gui_demod.h"
+#ifdef ENABLE_RTLSDR
+#include "gui_rtlsdr.h"
+#endif
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
 #include <hsdaoh.h>
@@ -400,6 +405,26 @@ static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t 
     if (!app) return;
     atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
     atomic_store(&app->dropout_stop_requested, true);
+}
+
+// Generic SDR live-retune dispatch. Device-agnostic: callers (Demod panel,
+// Settings UI) call this without knowing which SDR backend is active.
+// Dispatches to the active SDR backend's set-frequency and persists the value.
+// Returns 0 on success, -1 if no SDR backend is active/not capturing-relevant.
+int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz)
+{
+    if (!app || hz == 0) return -1;
+#ifdef ENABLE_RTLSDR
+    // Today the only SDR backend is RTL-SDR. When a second SDR backend is
+    // added, dispatch on the selected device type here (and move the settings
+    // field to a generic sdr_freq_hz if appropriate).
+    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR) {
+        return gui_rtlsdr_set_frequency(app, hz);
+    }
+#endif
+    (void)hz;
+    return -1;
 }
 
 static inline void gui_capture_promote_callback_priority_once(void)
@@ -1035,6 +1060,9 @@ void gui_app_init(gui_app_t *app) {
     gui_fft_panel_register();
     gui_cvbs_panel_register();
     gui_histogram_panel_register();
+    gui_waterfall_panel_register();
+    gui_spectrograph_panel_register();
+    gui_demod_panel_register();
     gui_preview_panel_register();
 
     // Initialize per-channel display buffers
@@ -1386,6 +1414,22 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         dst->index = 0;  // 0 RF cards; clockgen USB-audio feed is the sole source
         app->device_count++;
     }
+    // Add RTL-SDR devices (only when librtlsdr is compiled in).
+#ifdef ENABLE_RTLSDR
+    {
+        rtlsdr_device_info_t rtls[8];
+        int rtlsdr_count = gui_rtlsdr_enumerate(rtls, 8);
+        for (int i = 0; i < rtlsdr_count && app->device_count < MAX_DEVICES; i++) {
+            device_info_t *dst = &app->devices[app->device_count];
+            snprintf(dst->name, sizeof(dst->name), "[RTL-SDR] %s", rtls[i].name);
+            snprintf(dst->serial, sizeof(dst->serial), "%s", rtls[i].serial);
+            dst->type = DEVICE_TYPE_RTLSDR;
+            dst->index = rtls[i].index;
+            app->device_count++;
+        }
+    }
+#endif
+
     if (app->device_count < MAX_DEVICES) {
         device_info_t *dst = &app->devices[app->device_count];
         snprintf(dst->name, sizeof(dst->name), "[Simulated] Test Signal");
@@ -1842,6 +1886,46 @@ int gui_app_start_capture(gui_app_t *app) {
             proc_set_priority(PROC_PRIORITY_NORMAL);
         }
         return fx3_rc;
+    }
+#endif
+
+#ifdef ENABLE_RTLSDR
+    // Handle RTL-SDR device (raw I/Q packed into the A/B capture pipeline).
+    if (dev->type == DEVICE_TYPE_RTLSDR) {
+        proc_set_priority(PROC_PRIORITY_ABOVE);
+        thrd_set_priority(THRD_PRIORITY_CRITICAL);
+        // I -> channel A, Q -> channel B: both channels active.
+        app->capture_backend_upstream = false;
+        app->capture_has_channel_b = true;
+        // Open + apply settings (freq/gain/rate/agc/offset) first.
+        int r = gui_rtlsdr_open(app, dev->index);
+        if (r < 0) {
+            gui_app_set_status(app, "Failed to open RTL-SDR device");
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+            return -1;
+        }
+        int rtl_rc = gui_rtlsdr_start(app);
+        if (rtl_rc == 0) {
+            app->capture_start_time = GetTime();
+            app->reconnect_pending = false;
+            app->reconnect_attempts = 0;
+            {
+                time_t t = time(NULL);
+                struct tm tmv;
+#if defined(_WIN32) || defined(_WIN64)
+                localtime_s(&tmv, &t);
+#else
+                localtime_r(&t, &tmv);
+#endif
+                snprintf(app->capture_timestamp, sizeof(app->capture_timestamp), "%04d.%02d.%02d_%02d.%02d.%02d",
+                         (tmv.tm_year + 1900), (tmv.tm_mon + 1), (tmv.tm_mday),
+                         (tmv.tm_hour), (tmv.tm_min), (tmv.tm_sec));
+            }
+            gui_capture_hold_power_assertions();
+        } else {
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+        }
+        return rtl_rc;
     }
 #endif
 
@@ -2313,6 +2397,13 @@ void gui_app_stop_capture(gui_app_t *app) {
 #ifdef ENABLE_FX3
     if (dev->type == DEVICE_TYPE_FX3) {
         gui_fx3_stop(app);
+        gui_app_clear_display(app);
+        return;
+    }
+#endif
+#ifdef ENABLE_RTLSDR
+    if (dev->type == DEVICE_TYPE_RTLSDR) {
+        gui_rtlsdr_stop(app);
         gui_app_clear_display(app);
         return;
     }
