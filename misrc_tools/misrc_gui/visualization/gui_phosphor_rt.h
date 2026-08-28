@@ -51,6 +51,8 @@ typedef struct phosphor_rt {
     int width;                // Render texture width
     int height;               // Render texture height
     bool valid;               // True if render textures are initialized
+    Matrix outer_modelview;   // UI transform saved across Begin/EndTextureMode
+    bool outer_modelview_saved;
     phosphor_rt_config_t config;  // Per-instance configuration
 } phosphor_rt_t;
 

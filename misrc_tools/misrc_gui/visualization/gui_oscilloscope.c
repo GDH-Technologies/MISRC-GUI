@@ -965,7 +965,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     float btn_h = 18;
     float btn_y = bounds.y + 8;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
 
     // Button widths
     float trig_btn_w = 98;
@@ -1240,7 +1240,7 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
     if (!state || !app || !state->dragging) return;
 
     if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
-        Vector2 mouse = GetMousePosition();
+        Vector2 mouse = gui_ui_get_mouse_position();
 
         // Calculate trigger level from mouse position
         float center_y = bounds.y + bounds.height / 2.0f;
@@ -1266,7 +1266,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
 
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     if (!CheckCollisionPointRec(mouse, bounds)) return false;
 
     // Smooth zoom: multiply/divide by a factor for each scroll step

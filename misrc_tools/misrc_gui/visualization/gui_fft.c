@@ -810,7 +810,7 @@ void gui_fft_render(fft_state_t *state, float x, float y,
 
     // Peak detection on mouse hover - show closest peak to mouse (with zoom/pan support)
     if (state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
-        Vector2 mouse = GetMousePosition();
+        Vector2 mouse = gui_ui_get_mouse_position();
         Rectangle fft_rect = {x, y, width, height};
 
         if (CheckCollisionPointRec(mouse, fft_rect)) {
@@ -1008,7 +1008,7 @@ static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
     fft_state_t *state = (fft_state_t *)state_ptr;
     if (!state->initialized) return false;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
 
     // Check if mouse is inside bounds
     if (!CheckCollisionPointRec(mouse, bounds)) return false;
@@ -1093,7 +1093,7 @@ static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
 #if LIBFFTW_ENABLED
     if (!state || !state->initialized || !state->dragging) return;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
 
     if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
         // Calculate pan delta based on mouse movement

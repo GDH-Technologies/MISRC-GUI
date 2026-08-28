@@ -301,9 +301,14 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height) {
     SetTextureFilter(prt->rt[0].texture, TEXTURE_FILTER_BILINEAR);
     SetTextureFilter(prt->rt[1].texture, TEXTURE_FILTER_BILINEAR);
 
+    // EndTextureMode() resets raylib's model-view matrix. Preserve an outer UI
+    // camera when initialization happens during a Clay custom render command.
+    Matrix outer_modelview = rlGetMatrixModelview();
+
     // Clear render textures
     BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
     BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    rlSetMatrixModelview(outer_modelview);
 
     prt->width = width;
     prt->height = height;
@@ -328,8 +333,10 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int width, int height) {
 void phosphor_rt_clear(phosphor_rt_t *prt) {
     if (!prt || !prt->valid) return;
 
+    Matrix outer_modelview = rlGetMatrixModelview();
     BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
     BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    rlSetMatrixModelview(outer_modelview);
 }
 
 void phosphor_rt_cleanup(phosphor_rt_t *prt) {
@@ -343,6 +350,7 @@ void phosphor_rt_cleanup(phosphor_rt_t *prt) {
     prt->width = 0;
     prt->height = 0;
     prt->rt_index = 0;
+    prt->outer_modelview_saved = false;
 }
 
 void phosphor_rt_set_config(phosphor_rt_t *prt, const phosphor_rt_config_t *config) {
@@ -383,6 +391,8 @@ void phosphor_rt_begin_frame(phosphor_rt_t *prt) {
     int next = 1 - current;
 
     // Apply decay to previous frame, write to next buffer
+    prt->outer_modelview = rlGetMatrixModelview();
+    prt->outer_modelview_saved = true;
     BeginTextureMode(prt->rt[next]);
     ClearBackground(BLACK);
 
@@ -404,6 +414,10 @@ void phosphor_rt_end_frame(phosphor_rt_t *prt) {
 
     EndBlendMode();
     EndTextureMode();
+    if (prt->outer_modelview_saved) {
+        rlSetMatrixModelview(prt->outer_modelview);
+        prt->outer_modelview_saved = false;
+    }
 
     // Swap buffers
     prt->rt_index = 1 - prt->rt_index;

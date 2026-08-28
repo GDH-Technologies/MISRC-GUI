@@ -3,6 +3,7 @@
 
 #include "../core/gui_app.h"
 #include "clay.h"
+#include "gui_ui_scale.h"
 
 // UI colors
 #define COLOR_BG              (Color){ 30, 30, 35, 255 }
@@ -47,6 +48,15 @@ void gui_handle_interactions(gui_app_t *app);
 // Reconcile mode/device constraints immediately after device selection changes.
 void gui_ui_sync_capture_mode_state(gui_app_t *app);
 void gui_ui_sync_android_keyboard_state(void);
+
+// Application-controlled UI zoom. Layout and pointer coordinates remain in
+// logical units while the renderer scales them into the window framebuffer.
+void gui_ui_set_scale_percent(int percent);
+int gui_ui_get_scale_percent(void);
+float gui_ui_get_scale_factor(void);
+int gui_ui_get_layout_width(void);
+int gui_ui_get_layout_height(void);
+Vector2 gui_ui_get_mouse_position(void);
 
 // Check if UI consumed the current frame's click (prevents click-through to oscilloscope)
 bool gui_ui_click_consumed(void);

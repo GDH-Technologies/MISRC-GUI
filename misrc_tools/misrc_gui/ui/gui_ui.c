@@ -48,6 +48,7 @@ extern const char *android_get_storage_path(void);
 
 // Track if UI consumed the current frame's click (prevents click-through)
 static bool s_ui_consumed_click = false;
+static int s_ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 // Authoritative capture mode selected by user via CaptureModeToggle.
 // Keeping this outside gui_app_t protects mode from unrelated runtime mutations.
 static bool s_capture_mode_state_initialized = false;
@@ -72,6 +73,66 @@ static int s_cxadc_dc_anchor_device_index = -1;
 static bool s_cxadc_dc_anchor_valid[2] = { false, false };
 static int s_cxadc_dc_anchor_raw[2] = { 0, 0 };
 static int s_cxadc_dc_relative[2] = { 0, 0 };
+
+void gui_ui_set_scale_percent(int percent)
+{
+    s_ui_scale_percent = gui_ui_scale_sanitize_percent(percent);
+}
+
+int gui_ui_get_scale_percent(void)
+{
+    return s_ui_scale_percent;
+}
+
+float gui_ui_get_scale_factor(void)
+{
+    return (float)s_ui_scale_percent / 100.0f;
+}
+
+static int gui_ui_get_base_layout_width(void)
+{
+#if defined(__APPLE__)
+    int width = GetScreenWidth();
+#else
+    int width = GetRenderWidth();
+    if (width <= 0) width = GetScreenWidth();
+#endif
+    return (width > 0) ? width : 1;
+}
+
+static int gui_ui_get_base_layout_height(void)
+{
+#if defined(__APPLE__)
+    int height = GetScreenHeight();
+#else
+    int height = GetRenderHeight();
+    if (height <= 0) height = GetScreenHeight();
+#endif
+    return (height > 0) ? height : 1;
+}
+
+int gui_ui_get_layout_width(void)
+{
+    int width = (int)ceilf((float)gui_ui_get_base_layout_width() /
+                           gui_ui_get_scale_factor());
+    return (width > 0) ? width : 1;
+}
+
+int gui_ui_get_layout_height(void)
+{
+    int height = (int)ceilf((float)gui_ui_get_base_layout_height() /
+                            gui_ui_get_scale_factor());
+    return (height > 0) ? height : 1;
+}
+
+Vector2 gui_ui_get_mouse_position(void)
+{
+    Vector2 position = GetMousePosition();
+    float scale = gui_ui_get_scale_factor();
+    position.x /= scale;
+    position.y /= scale;
+    return position;
+}
 
 static const char *gui_ui_capture_mode_name(bool misrc_mode) {
     return misrc_mode ? "MISRC" : "HSDAOH";
@@ -895,7 +956,7 @@ static void record_limit_set_cursor_from_field_click(gui_app_t *app)
         return;
     }
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     float content_left = field.boundingBox.x + (float)RECORD_LIMIT_TIMECODE_BORDER_X;
     float content_width = field.boundingBox.width - (float)(RECORD_LIMIT_TIMECODE_BORDER_X * 2);
     if (content_width < 8.0f) content_width = 8.0f;
@@ -1840,7 +1901,7 @@ static int gui_ui_text_cursor_from_click(gui_app_t *app,
     Clay_ElementData element_data = Clay_GetElementData(element_id);
     if (!element_data.found || len == 0) return (int)len;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     float content_left = element_data.boundingBox.x + left_padding;
     float content_width = element_data.boundingBox.width - (left_padding + right_padding);
     if (content_width < 1.0f) return (int)len;
@@ -3938,7 +3999,7 @@ static void render_toolbar(gui_app_t *app) {
         version_icon_state = GUI_VERSION_ICON_CAPTURING;
     }
     s_version_icon_element.customData.version_icon.state = version_icon_state;
-    int toolbar_width = GetScreenWidth();
+    int toolbar_width = gui_ui_get_layout_width();
     bool toolbar_tiny = toolbar_width < 760;
     bool toolbar_ultra_narrow = toolbar_width < 900;
     bool toolbar_very_narrow = toolbar_width < 1020;
@@ -4388,8 +4449,8 @@ static void render_toolbar(gui_app_t *app) {
 
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
 static void render_channel_stats(gui_app_t *app, int channel) {
-    int screen_w = GetScreenWidth();
-    int screen_h = GetScreenHeight();
+    int screen_w = gui_ui_get_layout_width();
+    int screen_h = gui_ui_get_layout_height();
     bool quarter_scale_layout = (screen_w <= 1000 && screen_h <= 700);
     // Get per-channel stats
     uint32_t clip_pos, clip_neg;
@@ -4777,7 +4838,7 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
     Color timeline_text_color = enabled ? COLOR_TEXT : COLOR_TEXT_DIM;
     Color timeline_track_color = enabled ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = enabled ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM;
-    int screen_width = GetScreenWidth();
+    int screen_width = gui_ui_get_layout_width();
     int left_pad_width = screen_width < 900 ? 60 : 74;
     int label_width = screen_width < 900 ? 120 : 150;
     int right_pad_width = screen_width < 900 ? 0 : 189;
@@ -4884,7 +4945,7 @@ static void render_channels_panel(gui_app_t *app) {
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG)
     }) {
-        int screen_width = GetScreenWidth();
+        int screen_width = gui_ui_get_layout_width();
         int playback_track_width_px = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
         int playback_fill_w_a = 0;
         int playback_fill_w_b = 0;
@@ -4970,8 +5031,8 @@ static void render_channels_panel(gui_app_t *app) {
 
 // Render status bar
 static void render_status_bar(gui_app_t *app) {
-    int status_width = GetScreenWidth();
-    int status_height = GetScreenHeight();
+    int status_width = gui_ui_get_layout_width();
+    int status_height = gui_ui_get_layout_height();
     bool status_quarter_scale = (status_width <= 1000 && status_height <= 700);
     bool status_compact = status_width < 1040;
     bool status_narrow = status_width < 900;
@@ -5393,7 +5454,7 @@ void gui_render_layout(gui_app_t *app) {
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
-        int overlay_screen_width = GetScreenWidth();
+        int overlay_screen_width = gui_ui_get_layout_width();
         bool overlay_toolbar_tiny = overlay_screen_width < 760;
         bool overlay_toolbar_ultra_narrow = overlay_screen_width < 900;
         bool overlay_toolbar_very_narrow = overlay_screen_width < 1020;
@@ -5582,7 +5643,8 @@ void gui_handle_interactions(gui_app_t *app) {
                !s_record_limit_window_open &&
                !s_version_info_window_open &&
                !s_metadata_window_open) {
-        if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+        if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                             gui_ui_get_mouse_position().x)) {
             s_playback_scrub_active = false;
         }
     }
@@ -6128,7 +6190,8 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_selected_device_is_playback(app) &&
             Clay_PointerOver(CLAY_IDI("PlaybackTimelineTrack", 0))) {
             s_playback_scrub_track_index = 0;
-            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                                gui_ui_get_mouse_position().x)) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
@@ -6141,7 +6204,8 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_selected_device_is_playback(app) &&
             Clay_PointerOver(CLAY_IDI("PlaybackTimelineTrack", 1))) {
             s_playback_scrub_track_index = 1;
-            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                                gui_ui_get_mouse_position().x)) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
@@ -6150,7 +6214,7 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_set_click_consumed();
             return;
         }
-        Vector2 click_pos = GetMousePosition();
+        Vector2 click_pos = gui_ui_get_mouse_position();
         bool mode_toggle_hit = Clay_PointerOver(CLAY_ID("CaptureModeToggle"));
         bool mode_toggle_cxadc_clockgen = false;
         bool mode_toggle_is_cxadc = gui_ui_selected_device_is_cxadc(app, &mode_toggle_cxadc_clockgen);

@@ -329,23 +329,23 @@ def check_linux_desktop_metadata(workflow_path: Path) -> int:
     return 0
 
 
-def check_macos_layout_policy(gui_c_path: Path) -> int:
-    source = read_text(gui_c_path)
-    width_body = extract_function_body(source, "static int gui_layout_width(void)")
-    height_body = extract_function_body(source, "static int gui_layout_height(void)")
+def check_macos_layout_policy(gui_ui_c_path: Path) -> int:
+    source = read_text(gui_ui_c_path)
+    width_body = extract_function_body(source, "static int gui_ui_get_base_layout_width(void)")
+    height_body = extract_function_body(source, "static int gui_ui_get_base_layout_height(void)")
 
     if "#if defined(__APPLE__)" not in width_body:
-        return fail("gui_layout_width() is missing __APPLE__ guard")
+        return fail("gui_ui_get_base_layout_width() is missing __APPLE__ guard")
     if "#if defined(__APPLE__)" not in height_body:
-        return fail("gui_layout_height() is missing __APPLE__ guard")
+        return fail("gui_ui_get_base_layout_height() is missing __APPLE__ guard")
     if "GetScreenWidth();" not in width_body:
-        return fail("gui_layout_width() must use GetScreenWidth() on macOS")
+        return fail("gui_ui_get_base_layout_width() must use GetScreenWidth() on macOS")
     if "GetScreenHeight();" not in height_body:
-        return fail("gui_layout_height() must use GetScreenHeight() on macOS")
+        return fail("gui_ui_get_base_layout_height() must use GetScreenHeight() on macOS")
     if "GetRenderWidth();" not in width_body:
-        return fail("gui_layout_width() must use GetRenderWidth() for non-macOS")
+        return fail("gui_ui_get_base_layout_width() must use GetRenderWidth() for non-macOS")
     if "GetRenderHeight();" not in height_body:
-        return fail("gui_layout_height() must use GetRenderHeight() for non-macOS")
+        return fail("gui_ui_get_base_layout_height() must use GetRenderHeight() for non-macOS")
     return 0
 
 def check_macos_admin_elevation_contract(gui_c_path: Path) -> int:
@@ -1342,6 +1342,127 @@ def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_ui_scale_policy_runtime(repo_root: Path) -> int:
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for UI scale policy runtime guard")
+        print("SKIP: UI scale policy runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_ui_scale_harness.c"
+    policy_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui_scale.c"
+    include_dir = repo_root / "misrc_tools/misrc_gui/ui"
+
+    for path, label in [(harness_path, "UI scale harness"),
+                        (policy_path, "UI scale policy")]:
+        if not path.exists():
+            return fail(f"{label} source is missing: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_ui_scale_guard_") as temp_root:
+        exe_name = "gui_ui_scale_guard.exe" if os.name == "nt" else "gui_ui_scale_guard"
+        exe_path = Path(temp_root) / exe_name
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(policy_path),
+            "-lm",
+            "-o",
+            str(exe_path),
+        ]
+        try:
+            run_checked(compile_cmd)
+            run_checked([str(exe_path)])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "UI scale policy runtime guard failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+    return 0
+
+
+def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
+                                        gui_settings_c_path: Path,
+                                        meson_path: Path) -> int:
+    gui_c = read_text(gui_c_path)
+    settings_c = read_text(gui_settings_c_path)
+    gui_app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    gui_ui_h = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h")
+    gui_ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    renderer_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/clay_renderer_raylib.c")
+    phosphor_h = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_phosphor_rt.h")
+    phosphor_c = read_text(repo_root / "misrc_tools/misrc_gui/visualization/gui_phosphor_rt.c")
+    meson = read_text(meson_path)
+
+    required_snippets = [
+        (gui_app_h, "int ui_scale_percent;", "persisted settings field"),
+        (settings_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
+        (settings_c, '\\"ui_scale_percent\\": %d', "settings save key"),
+        (settings_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (gui_c, "gui_ui_zoom_process(&ui_zoom_state", "single wheel routing policy"),
+        (gui_c, "IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)", "100% reset shortcut"),
+        (gui_c, "ui_zoom_result.passthrough_x * 20.0f", "Clay horizontal wheel routing"),
+        (gui_c, "ui_zoom_result.passthrough_y * 20.0f", "Clay vertical wheel routing"),
+        (gui_c, "fabsf(ui_zoom_result.passthrough_x)", "panel horizontal wheel routing"),
+        (gui_c, "fabsf(ui_zoom_result.passthrough_y)", "panel vertical wheel routing"),
+        (gui_ui_h, "Vector2 gui_ui_get_mouse_position(void);", "logical pointer API"),
+        (gui_ui_c, "position.x /= scale;", "pointer inverse transform"),
+        (renderer_c, "Matrix outer_modelview = rlGetMatrixModelview();", "outer render transform capture"),
+        (renderer_c, "rlScalef(ui_scale, ui_scale, 1.0f);", "global render transform"),
+        (renderer_c, "box.x * ui_scale", "scaled scissor transform"),
+        (renderer_c, "rlSetMatrixModelview(outer_modelview);", "balanced render transform"),
+        (phosphor_h, "Matrix outer_modelview;", "saved phosphor model-view"),
+        (phosphor_c, "rlGetMatrixModelview()", "phosphor transform capture"),
+        (phosphor_c, "rlSetMatrixModelview", "phosphor transform restore"),
+        (meson, "'misrc_gui/ui/gui_ui_scale.c'", "UI scale policy product source"),
+    ]
+    for source, snippet, label in required_snippets:
+        if snippet not in source:
+            return fail(f"Missing UI scale integration contract ({label}): {snippet}")
+
+    if gui_c.count("GetMouseWheelMoveV(") != 1:
+        return fail("misrc_gui.c must snapshot GetMouseWheelMoveV() exactly once per frame")
+    if re.search(r"\bGetMouseWheelMove\(", gui_c):
+        return fail("misrc_gui.c must not re-read scalar GetMouseWheelMove()")
+
+    ordered = [
+        gui_c.find("GetMouseWheelMoveV("),
+        gui_c.find("gui_ui_zoom_process(&ui_zoom_state"),
+        gui_c.find("Clay_UpdateScrollContainers"),
+        gui_c.find("panel_handle_all_scrolls"),
+    ]
+    if any(pos < 0 for pos in ordered) or ordered != sorted(ordered):
+        return fail("UI scale wheel routing must occur before Clay and panel consumers")
+
+    modifier_snippets = [
+        "KEY_LEFT_CONTROL", "KEY_RIGHT_CONTROL",
+        "KEY_LEFT_SUPER", "KEY_RIGHT_SUPER",
+    ]
+    for snippet in modifier_snippets:
+        if snippet not in gui_c:
+            return fail(f"UI scale primary modifier mapping is missing {snippet}")
+
+    direct_mouse_calls = []
+    gui_root = repo_root / "misrc_tools/misrc_gui"
+    for source_path in gui_root.rglob("*.c"):
+        source = read_text(source_path)
+        count = source.count("GetMousePosition(")
+        if count:
+            direct_mouse_calls.append((source_path, count))
+    expected_pointer_source = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
+    if direct_mouse_calls != [(expected_pointer_source, 1)]:
+        details = ", ".join(f"{path.relative_to(repo_root)}:{count}"
+                            for path, count in direct_mouse_calls)
+        return fail(f"Raw GetMousePosition() escaped the logical pointer wrapper: {details}")
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -1368,6 +1489,7 @@ def main() -> int:
     legacy_workflow_path = repo_root / ".github/workflows/release-sanity-build.yml"
     gui_c_path = repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"
     gui_settings_c_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings.c"
+    gui_ui_c_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
     flac_writer_c_path = repo_root / "misrc_tools/common/flac_writer.c"
     meson_path = repo_root / "misrc_tools/meson.build"
     tools_readme_path = repo_root / "misrc_tools/README.md"
@@ -1385,7 +1507,7 @@ def main() -> int:
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
         ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path)),
-        ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
+        ("macOS layout policy", lambda: check_macos_layout_policy(gui_ui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
         ("dev version naming", lambda: check_dev_version_naming(repo_root, meson_path, workflow_path)),
@@ -1394,6 +1516,8 @@ def main() -> int:
         ("optional-dep guard consistency", lambda: check_optional_dep_guard_consistency(repo_root)),
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),
         ("settings persistence contract", lambda: check_settings_persistence_contract(gui_settings_c_path)),
+        ("UI scale integration contract", lambda: check_ui_scale_integration_contract(
+            repo_root, gui_c_path, gui_settings_c_path, meson_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
@@ -1409,7 +1533,8 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
-        checks.insert(9, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
+        checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
+        checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
     # that catches vendored-dep shadowing and silent FX3-disable on every build.
