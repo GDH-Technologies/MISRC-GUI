@@ -117,7 +117,7 @@ Add `android/` scaffolding:
 ### 6. CI (preferred build path)
 Add a job to `.github/workflows/build.yml` modeled on `linux-appimage` (`build.yml:75-430`):
 - Runner: `ubuntu-22.04` (x86_64 host cross-compiling to arm64).
-- Steps: install NDK r25c + SDK build-tools + `platforms;android-30`; cross-build deps (step 2) into `.deps/install-android-arm64`; `meson setup --cross-file android/aarch64-linux-android.ini build-android misrc_tools`; `meson compile -C build-android misrc_gui`; run the APK packaging script; upload `android_MISRC_<version>_arm64.apk`.
+- Steps: install NDK r25c + SDK build-tools + `platforms;android-30`; cross-build deps (step 2) into `.deps/install-android-arm64`; `meson setup --cross-file android/aarch64-linux-android.ini build-android misrc_tools`; `meson compile -C build-android misrc_gui`; run the APK packaging script; upload `Android_MISRC_<version>_arm64.apk`.
 - Add an Android packaging-mirror check to `misrc_tools/test/ci_guard_tests.py` consistent with the existing CI mirror rules (assert the APK's `libmisrc_gui.so` links only vendored deps, not system libs).
 
 ## Risks and unknowns (must be validated, not assumed)

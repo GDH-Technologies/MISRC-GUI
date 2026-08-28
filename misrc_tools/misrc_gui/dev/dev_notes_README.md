@@ -14,20 +14,19 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
 
-## 2026-08-21 Windows WASAPI audio capture: use device format, not system mix format (cxadc-win capture-server pattern)
+## 2026-08-21 Windows WASAPI clockgen audio — PARKED (firmware-side issue)
 
-- Problem: clockgen audio (PCM1802 2ch + headswitch CH3) captured via WASAPI shared mode was distorted on Windows, and Ch3/Ch4 showed red/clipping. Recorded audio was unusable.
-- Root cause: `cxadc_open_audio_capture()` used `IAudioClient::GetMixFormat()` to discover the audio format. GetMixFormat returns the *system mix format* (typically 48000 Hz), NOT the device's actual hardware format. In shared mode Windows silently resamples the device's real stream (e.g. 46875 Hz) up to the system mix rate, corrupting the headswitch signal — a fast binary control signal that resampling destroys.
-- Fix (ported from the proven `cxadc-win` capture-server `src/capture-server/audio_wasapi.c`):
-  - `misrc_tools/misrc_gui/input/gui_cxadc.c` (`cxadc_open_audio_capture`)
-    - Read `PKEY_AudioEngine_DeviceFormat` (the device's actual hardware format, a `WAVEFORMATEXTENSIBLE` blob) from the endpoint's property store instead of `GetMixFormat`.
-    - Validate the device format with `IAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, ...)` BEFORE `Initialize`.
-    - If supported, `Initialize` in **exclusive mode** with the device's native format — no Windows resampling, clean data on all 3 channels. Buffer-size alignment retry: if `Initialize` returns `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`, recalculate the duration from `GetBufferSize` + the device sample rate and retry once (mirrors capture-server).
-    - If exclusive is not supported, fall back to shared mode with `GetMixFormat` + a clear warning that Windows may resample.
-  - Added `s_PKEY_AudioEngine_DeviceFormat` PROPERTYKEY + `REFTIMES_PER_SEC` define locally (MinGW headers don't provide them).
-- Why this works: exclusive mode at the device's real format forces Windows to clock the USB audio device at that rate with no resampling engine in the path. The headswitch CH3 comes through clean. This is the same approach the cxadc-win capture-server uses for its working Windows audio capture.
-- Validated locally: `misrc_gui.exe` builds clean, `--smoke-test` passes. Runtime exclusive-mode success + clean Ch3/Ch4 still pending real-hardware confirmation.
-- Key constraint: do NOT revert to `GetMixFormat`-only shared mode — that is the bug that corrupts the headswitch. The device-format + exclusive path must stay.
+- Problem: clockgen audio (PCM1802 2ch + headswitch CH3) captured via WASAPI shared mode is distorted on Windows. Ch3/Ch4 showed red/clipping (now fixed: CH3/Ch4 peaks disabled for MISRC Clockgen, CH4 always zero). Recorded audio is still unusable due to resampling distortion.
+- Root cause: the MISRC Clockgen hardware runs at 46875 Hz (stock crystal rate). Windows WASAPI shared mode resamples the 46875 Hz stream to the system mix rate (48000 Hz), corrupting the headswitch signal. Exclusive mode at 46875 Hz fails with `AUDCLNT_E_UNSUPPORTED_FORMAT` (0x8889000e) — the device does not expose a native format Windows will accept exclusively. Exclusive at 48000 Hz also fails (`AUDCLNT_E_UNSUPPORTED_FORMAT`) because the hardware is not at 48000. The endpoint exposes NO `PKEY_AudioEngine_DeviceFormat` property.
+- What was tried and reverted:
+  - GUI: exclusive mode at 46875 Hz (WAVEFORMATEXTENSIBLE, S24_3LE, 3ch) — failed `AUDCLNT_E_UNSUPPORTED_FORMAT`.
+  - GUI: exclusive mode at 48000 Hz — failed `AUDCLNT_E_UNSUPPORTED_FORMAT`.
+  - GUI: `PKEY_AudioEngine_DeviceFormat` approach (cxadc-win capture-server pattern) — the endpoint has no such property.
+  - Firmware: resample 46875->48000 in `fill_buffer_normal()` with a 128/125 phase accumulator (zero-order hold, per-buffer) — produced a variable/wobbly rate because the USB endpoint pulls at a fixed 48000 Hz and the buffer fill rate doesn't match exactly. Reverted.
+  - Firmware: present 48000 to USB (descriptor + `CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE`) — Windows still reports 48000 shared-mode resampling; the device format isn't exposed so Windows resamples regardless.
+- Conclusion: this is a firmware-side issue that needs a proper approach not yet found. The GUI-side WASAPI path is reverted to the original working shared-mode capture (distorted but functional). The firmware repo is reverted to the working `5f98d2f` baseline. Both repos are clean.
+- Open question for future work: the firmware needs to present the clockgen as a real 48000 Hz device to USB with the PCM1802 data accurately resampled in firmware before USB transmit. The per-buffer 128/125 phase accumulator approach was time-base accurate in theory but the USB endpoint's fixed 64-sample buffer size makes the output rate wobble. A variable-output-rate approach (not fixed 64) or a proper fractional resampler (linear interpolation / windowed sinc) may be needed. This is parked until a correct firmware resample design is worked out.
+- GUI-side fixes that ARE committed and working: CH3/Ch4 peaks disabled for MISRC Clockgen (no red), CH4 always zero (no mirror), audio monitor forced to CH1/2 for MISRC Clockgen. Audio monitoring works (CH1/2, distorted by Windows resampling but functional).
 
 ## 2026-08-21 Vendored deps caching + CI parity (any terminal just works)
 

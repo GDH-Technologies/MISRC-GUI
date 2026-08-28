@@ -223,6 +223,19 @@ static bool gui_ui_selected_device_is_fx3(const gui_app_t *app)
 }
 #endif
 
+#ifdef ENABLE_RTLSDR
+// Generic SDR device check. True for any I/Q-providing SDR backend (today
+// only RTL-SDR; add future SDR backends here so the SDR controls show for
+// them too). This keeps the Settings/Demod SDR controls SDR-generic, not
+// tied to the RTL-SDR backend specifically.
+static bool gui_ui_selected_device_is_sdr(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
+}
+#endif
+
 static void gui_ui_trace_capture_mode_state(gui_app_t *app, const char *source, bool force) {
     if (!app) return;
     bool ui_mode = s_capture_mode_state_misrc;
@@ -320,6 +333,7 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_OPERATOR,
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
+    UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
 } ui_text_field_t;
 
 // Above this the CX front end's own noise starts interfering with the signal,
@@ -358,6 +372,10 @@ static double s_active_text_last_click_time = -1.0;
 static Clay_ElementId s_active_text_last_click_element_id = { 0 };
 static double s_active_text_backspace_repeat_at = 0.0;
 
+// RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
+// Synced in render_settings_panel: format Hz->str when not editing, parse str->Hz when editing.
+static char s_rtlsdr_freq_str[32] = {0};
+
 // Record-limit popup state (toolbar clock button)
 static bool s_record_limit_window_open = false;
 // Version info popup state (toolbar "i" badge button)
@@ -383,6 +401,7 @@ static bool s_android_keyboard_visible = false;
 // Update checker (GitHub release tag lookup).
 #define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
 #define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
+#define GUI_UI_RELEASES_DOWNLOAD_BASE_URL "https://github.com/harrypm/MISRC-GUI/releases/download"
 
 typedef struct {
     bool manual;
@@ -478,6 +497,19 @@ static bool gui_ui_parse_semver_triplet(const char *version, int *major_out, int
     return true;
 }
 
+static bool gui_ui_is_release_tag_safe(const char *tag)
+{
+    if (!tag || !tag[0]) return false;
+    const unsigned char *p = (const unsigned char *)tag;
+    while (*p) {
+        if (!(isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) {
+            return false;
+        }
+        p++;
+    }
+    return true;
+}
+
 static int gui_ui_compare_versions(const char *current_version, const char *latest_version)
 {
     int cmaj = 0, cmin = 0, cpat = 0;
@@ -544,6 +576,97 @@ static bool gui_ui_fetch_latest_release_tag(char *tag_out, size_t tag_out_len, c
 
     if (!gui_ui_extract_release_tag_from_url(location, tag_out, tag_out_len)) {
         snprintf(error_out, error_out_len, "unable to parse release tag");
+        return false;
+    }
+    return true;
+}
+
+static bool gui_ui_build_release_asset_filename_for_platform(const char *release_tag,
+                                                             char *filename_out,
+                                                             size_t filename_out_len)
+{
+    if (!release_tag || !filename_out || filename_out_len == 0) return false;
+    filename_out[0] = '\0';
+    if (!gui_ui_is_release_tag_safe(release_tag)) return false;
+
+#if defined(__ANDROID__)
+    const char *pattern = "Android_MISRC_%s_arm64.apk";
+#elif defined(__APPLE__)
+    const char *pattern = "macOS_MISRC_%s_universal.dmg";
+#elif defined(_WIN32)
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
+    const char *pattern = "Windows_MISRC_%s_arm64.zip";
+#else
+    const char *pattern = "Windows_MISRC_%s_x86.zip";
+#endif
+#elif defined(__linux__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *pattern = "Linux_MISRC_%s_arm64.zip";
+#else
+    const char *pattern = "Linux_MISRC_%s_x86.zip";
+#endif
+#else
+    return false;
+#endif
+
+    int written = snprintf(filename_out, filename_out_len, pattern, release_tag);
+    return (written > 0) && ((size_t)written < filename_out_len);
+}
+
+static bool gui_ui_build_release_asset_url_for_platform(const char *release_tag,
+                                                        char *url_out,
+                                                        size_t url_out_len,
+                                                        char *asset_out,
+                                                        size_t asset_out_len)
+{
+    if (!url_out || url_out_len == 0) return false;
+    url_out[0] = '\0';
+    if (asset_out && asset_out_len > 0) asset_out[0] = '\0';
+
+    char asset[160];
+    if (!gui_ui_build_release_asset_filename_for_platform(release_tag, asset, sizeof(asset))) {
+        return false;
+    }
+    int written = snprintf(url_out,
+                           url_out_len,
+                           GUI_UI_RELEASES_DOWNLOAD_BASE_URL "/%s/%s",
+                           release_tag,
+                           asset);
+    if (written <= 0 || (size_t)written >= url_out_len) {
+        return false;
+    }
+    if (asset_out && asset_out_len > 0) {
+        snprintf(asset_out, asset_out_len, "%s", asset);
+    }
+    return true;
+}
+
+static bool gui_ui_open_url_external(const char *url, char *error_out, size_t error_out_len)
+{
+    if (!url || !url[0] || !error_out || error_out_len == 0) return false;
+    error_out[0] = '\0';
+
+    char cmd[1024];
+    int written = 0;
+#if defined(_WIN32)
+    written = snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+#elif defined(__APPLE__)
+    written = snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
+#elif defined(__ANDROID__)
+    written = snprintf(cmd, sizeof(cmd), "am start -a android.intent.action.VIEW -d \"%s\"", url);
+#elif defined(__linux__)
+    written = snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
+#else
+    snprintf(error_out, error_out_len, "unsupported platform");
+    return false;
+#endif
+    if (written <= 0 || (size_t)written >= sizeof(cmd)) {
+        snprintf(error_out, error_out_len, "download command too long");
+        return false;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        snprintf(error_out, error_out_len, "failed to open download URL");
         return false;
     }
     return true;
@@ -1643,6 +1766,13 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_AUDIO_LABEL_3:
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
             return app->settings.auto_names_enabled;
+        case UI_TEXT_FIELD_RTLSDR_FREQ: {
+#ifdef ENABLE_RTLSDR
+            return gui_ui_selected_device_is_sdr(app);
+#else
+            return false;
+#endif
+        }
         default:
             return false;
     }
@@ -1672,6 +1802,10 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         field == UI_TEXT_FIELD_INGEST_NOTES) {
         // Keep these permissive for ingest entry, but still block JSON-breaking quote chars.
         return (ch >= 32 && ch < 127 && ch != '\"');
+    }
+    if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
+        // Frequency in Hz: digits only (parsed to uint64 on commit).
+        return (ch >= '0' && ch <= '9');
     }
     if (ch < 32 || ch >= 127) {
         return false;
@@ -2081,6 +2215,14 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     gui_ui_text_clamp_state(dst);
 
+    // RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
+    // Sync string -> uint64 here so every gui_settings_save() below commits the
+    // current value (including on Enter/Esc). Non-digits parse to 0 and are ignored.
+    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
+        unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
+        if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
+    }
+
     bool changed = false;
     bool shift_down = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     bool primary_mod_down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
@@ -2439,6 +2581,80 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
                 }) {
                     // helper-like rows
+#ifdef ENABLE_RTLSDR
+                    if (gui_ui_selected_device_is_sdr(app)) {
+                        // Display sync: when not editing, format uint64 -> string.
+                        if (s_active_text_field != UI_TEXT_FIELD_RTLSDR_FREQ) {
+                            snprintf(s_rtlsdr_freq_str, sizeof(s_rtlsdr_freq_str), "%llu",
+                                     (unsigned long long)app->settings.rtlsdr_freq_hz);
+                        }
+
+                        CLAY_TEXT(CLAY_STRING("SDR:"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
+                        // Frequency (Hz) row
+                        CLAY(CLAY_ID("RtlsdrFreqRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY_TEXT(CLAY_STRING("Frequency (Hz):"),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY(CLAY_ID("RtlsdrFreqField"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_RTLSDR_FREQ)) {
+                                    gui_ui_render_active_text(UI_TEXT_FIELD_RTLSDR_FREQ, s_rtlsdr_freq_str, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                                } else {
+                                    CLAY_TEXT(make_string(s_rtlsdr_freq_str), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                }
+                            }
+                            CLAY(CLAY_ID("RtlsdrFreqHint"), { .layout = { .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                                CLAY_TEXT(CLAY_STRING("(click to edit)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            }
+                        }
+
+                        // Sample rate row (cycle box)
+                        CLAY(CLAY_ID("RtlsdrSampleRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY_TEXT(CLAY_STRING("Sample rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            char sr_buf[24];
+                            snprintf(sr_buf, sizeof(sr_buf), "%.2f MSPS", (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
+                            CLAY(CLAY_ID("RtlsdrSampleRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(sr_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                        }
+
+                        // Gain mode toggle row
+                        CLAY(CLAY_ID("RtlsdrGainModeRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color gm_bg = app->settings.rtlsdr_gain_mode ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            CLAY(CLAY_ID("RtlsdrGainModeToggle"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(gm_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.rtlsdr_gain_mode ? CLAY_STRING("Manual") : CLAY_STRING("Auto"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("Gain mode"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+
+                        // Gain stepper row
+                        CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
+                            char gain_buf[24];
+                            snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
+                            CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
+                            CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
+                        }
+
+                        // AGC toggle row
+                        CLAY(CLAY_ID("RtlsdrAgcRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color agc_bg = app->settings.rtlsdr_agc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            CLAY(CLAY_ID("RtlsdrAgcToggle"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(agc_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.rtlsdr_agc ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("AGC"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+
+                        // Offset tuning toggle row
+                        CLAY(CLAY_ID("RtlsdrOffsetRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color off_bg = app->settings.rtlsdr_offset_corr ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            CLAY(CLAY_ID("RtlsdrOffsetToggle"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(off_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.rtlsdr_offset_corr ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("Offset tuning"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                    }
+#endif // ENABLE_RTLSDR
                     CLAY_TEXT(CLAY_STRING("Capture:"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
@@ -3163,8 +3379,9 @@ static void render_version_info_window(gui_app_t *app)
         snprintf(vi_rate, sizeof(vi_rate), "%u Hz", sr);
     }
 
+    bool update_check_running = atomic_load_explicit(&s_update_check_running, memory_order_acquire);
     Color update_status_color = COLOR_TEXT_DIM;
-    if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+    if (update_check_running) {
         snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
     } else if (app->settings.update_last_release_tag[0]) {
         int update_cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
@@ -3180,6 +3397,10 @@ static void render_version_info_window(gui_app_t *app)
     } else {
         snprintf(vi_update_status, sizeof(vi_update_status), "Not checked yet");
     }
+    Color update_download_btn_bg = update_check_running ? ui_disabled_color(COLOR_BUTTON)
+                                                        : COLOR_BUTTON;
+    Color update_download_btn_fg = update_check_running ? ui_disabled_color(COLOR_TEXT)
+                                                        : COLOR_TEXT;
     bool ab_swap_cxadc = gui_ui_selected_device_is_cxadc(app, NULL);
 #ifdef ENABLE_FX3
     bool ab_swap_fx3 = gui_ui_selected_device_is_fx3(app);
@@ -3279,14 +3500,34 @@ static void render_version_info_window(gui_app_t *app)
         }
 
         CLAY(CLAY_ID("VersionInfoUpdateRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 10 }
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 10
+            }
         }) {
             CLAY(CLAY_ID("VersionInfoUpdateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
                 CLAY_TEXT(CLAY_STRING("Update:"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
-            CLAY_TEXT(make_string(vi_update_status),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
+            CLAY(CLAY_ID("VersionInfoUpdateStatus"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) } }
+            }) {
+                CLAY_TEXT(make_string(vi_update_status),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
+            }
+            CLAY(CLAY_ID("VersionInfoDownloadButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(24) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(update_download_btn_bg),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("Download Latest"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_download_btn_fg) }));
+            }
         }
 
         // Capture state row
@@ -5175,9 +5416,29 @@ static void render_status_bar(gui_app_t *app) {
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
     bool show_status_message = !status_tiny && !status_quarter_scale;
-    /* Keep free-space visible during normal startup/layout sizes; only hide on
-     * very tiny widths where preserving right-side counters takes priority. */
-    bool show_free_space = !status_tiny;
+    // Detect an error/denied/failed status message so the status bar can
+    // yield space to it: when an error is being shown, hide the free-space
+    // readout (and widen the message budget) so the actual error text isn't
+    // truncated behind the free-space label. This is what makes CXADC/USB
+    // permission failures readable in the bottom bar instead of "CXADC permi...".
+    const char *raw_status_gate = (app->status_message[0] != '\0') ? app->status_message : NULL;
+    bool status_is_error = false;
+    if (raw_status_gate) {
+        status_is_error =
+            strstr(raw_status_gate, "denied") != NULL ||
+            strstr(raw_status_gate, "Denied") != NULL ||
+            strstr(raw_status_gate, "error") != NULL ||
+            strstr(raw_status_gate, "Error") != NULL ||
+            strstr(raw_status_gate, "failed") != NULL ||
+            strstr(raw_status_gate, "Failed") != NULL ||
+            strstr(raw_status_gate, "not granted") != NULL ||
+            strstr(raw_status_gate, "timed out") != NULL;
+    }
+    /* Keep free-space visible during normal startup/layout sizes; hide it when
+     * an error/denied status is active so the error text gets the left-side
+     * space, and on very tiny widths where preserving right-side counters
+     * takes priority. */
+    bool show_free_space = !status_tiny && !status_is_error;
     int sample_rate_value_width = status_narrow ? 68 : 80;
     int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
     int frames_value_width = 50;
@@ -5186,7 +5447,11 @@ static void render_status_bar(gui_app_t *app) {
     int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
     int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
     int status_left_gap = show_status_message ? (status_tiny ? 4 : 8) : 0;
-    int status_message_max_chars = status_narrow ? 16 : (status_compact ? 22 : 30);
+    // Widen the message budget when free-space is hidden (error case) so the
+    // full error reason fits instead of being ellipsised at the normal width.
+    int status_message_max_chars = status_is_error
+        ? (status_narrow ? 48 : 64)
+        : (status_narrow ? 16 : (status_compact ? 22 : 30));
     int status_font_size = FONT_SIZE_STATUS - 1;
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
@@ -6175,6 +6440,83 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoDownloadButton"))) {
+                gui_ui_process_update_check_result(app);
+                if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+                    gui_app_set_status(app, "Please wait for update check to finish");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char latest_tag[64] = {0};
+                char lookup_error[160] = {0};
+                bool used_cached_tag = false;
+                bool have_latest_tag = gui_ui_fetch_latest_release_tag(latest_tag,
+                                                                       sizeof(latest_tag),
+                                                                       lookup_error,
+                                                                       sizeof(lookup_error));
+                if (have_latest_tag) {
+                    snprintf(app->settings.update_last_release_tag,
+                             sizeof(app->settings.update_last_release_tag),
+                             "%s",
+                             latest_tag);
+                    app->settings.update_last_check_unix_s = (uint64_t)time(NULL);
+                    int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
+                    app->settings.update_available_cached = (cmp < 0);
+                    gui_settings_save(&app->settings);
+                } else if (gui_ui_is_release_tag_safe(app->settings.update_last_release_tag)) {
+                    snprintf(latest_tag, sizeof(latest_tag), "%s", app->settings.update_last_release_tag);
+                    used_cached_tag = true;
+                    have_latest_tag = true;
+                }
+
+                if (!have_latest_tag) {
+                    char msg[220];
+                    snprintf(msg,
+                             sizeof(msg),
+                             "Unable to resolve latest release: %s",
+                             lookup_error[0] ? lookup_error : "unknown error");
+                    gui_app_set_status(app, msg);
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char download_url[512] = {0};
+                char asset_name[160] = {0};
+                if (!gui_ui_build_release_asset_url_for_platform(latest_tag,
+                                                                 download_url,
+                                                                 sizeof(download_url),
+                                                                 asset_name,
+                                                                 sizeof(asset_name))) {
+                    gui_app_set_status(app, "No direct download mapping for this platform");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                char open_error[160] = {0};
+                if (!gui_ui_open_url_external(download_url, open_error, sizeof(open_error))) {
+                    char msg[240];
+                    snprintf(msg,
+                             sizeof(msg),
+                             "Failed to open download URL: %s",
+                             open_error[0] ? open_error : "unknown error");
+                    gui_app_set_status(app, msg);
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+
+                if (used_cached_tag) {
+                    char msg[220];
+                    snprintf(msg, sizeof(msg), "Opening cached download: %s", asset_name);
+                    gui_app_set_status(app, msg);
+                } else {
+                    char msg[220];
+                    snprintf(msg, sizeof(msg), "Opening latest download: %s", asset_name);
+                    gui_app_set_status(app, msg);
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCorePinningToggle"))) {
                 app->settings.show_core_pinning_in_settings = !app->settings.show_core_pinning_in_settings;
                 if (!app->settings.show_core_pinning_in_settings && s_active_text_field == UI_TEXT_FIELD_FLAC_AFFINITY) {
@@ -6945,6 +7287,60 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_settings_save(&app->settings);
                 }
             }
+
+            // SDR controls (shown for any SDR backend; today only RTL-SDR).
+#ifdef ENABLE_RTLSDR
+            if (gui_ui_selected_device_is_sdr(app)) {
+                if (Clay_PointerOver(CLAY_ID("RtlsdrFreqField")) && !gui_ui_click_consumed()) {
+                    gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RTLSDR_FREQ, CLAY_ID("RtlsdrFreqField"), 8.0f, 8.0f);
+                    gui_ui_set_click_consumed();
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrSampleRateBox"))) {
+                    // Cycle through known-stable RTL sample rates (Hz).
+                    static const uint32_t rtlsdr_rates[] = { 250000, 1024000, 1200000, 1536000, 2048000, 2400000 };
+                    static const int n = (int)(sizeof(rtlsdr_rates)/sizeof(rtlsdr_rates[0]));
+                    uint32_t cur = app->settings.rtlsdr_sample_rate_hz;
+                    int idx = 0;
+                    for (int i = 0; i < n; i++) { if (rtlsdr_rates[i] == cur) { idx = i; break; } }
+                    app->settings.rtlsdr_sample_rate_hz = rtlsdr_rates[(idx + 1) % n];
+                    gui_settings_save(&app->settings);
+                    char msg[80];
+                    snprintf(msg, sizeof(msg), "SDR sample rate set to %.2f MSPS (applies on next capture start)",
+                             (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
+                    gui_app_set_status(app, msg);
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrGainModeToggle"))) {
+                    // 0=auto,1=manual
+                    app->settings.rtlsdr_gain_mode = app->settings.rtlsdr_gain_mode ? 0 : 1;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.rtlsdr_gain_mode
+                        ? "SDR gain mode: manual"
+                        : "SDR gain mode: auto");
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrGainMinus"))) {
+                    if (app->settings.rtlsdr_gain_tenths_db > 0) app->settings.rtlsdr_gain_tenths_db -= 10;
+                    gui_settings_save(&app->settings);
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrGainPlus"))) {
+                    if (app->settings.rtlsdr_gain_tenths_db < 600) app->settings.rtlsdr_gain_tenths_db += 10;
+                    gui_settings_save(&app->settings);
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrAgcToggle"))) {
+                    app->settings.rtlsdr_agc = !app->settings.rtlsdr_agc;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.rtlsdr_agc
+                        ? "SDR AGC enabled"
+                        : "SDR AGC disabled");
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrOffsetToggle"))) {
+                    app->settings.rtlsdr_offset_corr = !app->settings.rtlsdr_offset_corr;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.rtlsdr_offset_corr
+                        ? "SDR offset tuning enabled"
+                        : "SDR offset tuning disabled");
+                }
+            }
+#endif // ENABLE_RTLSDR
 
             // Auto naming controls
             if (Clay_PointerOver(CLAY_ID("ToggleAutoNames"))) {

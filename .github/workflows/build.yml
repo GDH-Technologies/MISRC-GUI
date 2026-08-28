@@ -96,25 +96,21 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-linux-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-flac1.5.0-${{ hashFiles('third_party/hsdaoh/**') }}
 
       - name: Resolve build version
         id: version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -eux
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event_inputs.release_tag }}" ]]; then
-            VERSION="${{ github.event_inputs.release_tag }}"
-          else
-            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
-            if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
-            fi
-          fi
+          VERSION="$(misrc_tools/ci-resolve-version.sh)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
@@ -417,7 +413,7 @@ jobs:
             -i AppDir/misrc.png \
             --output appimage
 
-          APPIMAGE_NAME="linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage"
+          APPIMAGE_NAME="Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage"
           mv ./*.AppImage "$APPIMAGE_NAME"
           test -f "$APPIMAGE_NAME"
 
@@ -432,7 +428,7 @@ jobs:
           test "$RC_EXTRACT" -eq 1
           grep -qi "Usage" /tmp/appimage_capture_help.txt
           grep -qi "Usage" /tmp/appimage_extract_help.txt
-          ZIP_NAME="linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
+          ZIP_NAME="Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
           zip -j "$ZIP_NAME" "$APPIMAGE_NAME"
           test -f "$ZIP_NAME"
           test "$(unzip -Z1 "$ZIP_NAME" | wc -l)" -eq 1
@@ -441,7 +437,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: linux-zip-${{ matrix.arch }}
-          path: linux_MISRC_*_${{ matrix.artifact_suffix }}.zip
+          path: Linux_MISRC_*_${{ matrix.artifact_suffix }}.zip
           if-no-files-found: error
 
   android-apk:
@@ -453,6 +449,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Resolve build version
+        id: version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -eux
+          VERSION="$(misrc_tools/ci-resolve-version.sh)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -507,6 +515,8 @@ jobs:
           test -f build-android/libmisrc_gui.so
 
       - name: Build + sign APK
+        env:
+          MISRC_TOOLS_VERSION_OVERRIDE: ${{ steps.version.outputs.version }}
         run: |
           set -eux
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
@@ -548,7 +558,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-windows-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
@@ -598,19 +608,15 @@ jobs:
 
       - name: Resolve build version
         id: version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
-            VERSION="${{ github.event.inputs.release_tag }}"
-          else
-            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
-            if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
-            fi
-          fi
+          VERSION="$(misrc_tools/ci-resolve-version.sh)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE
@@ -729,7 +735,7 @@ jobs:
       - name: Create ZIP artifact
         shell: pwsh
         run: |
-          $ZipPath = "windows_MISRC_${{ steps.version.outputs.version }}_x86.zip"
+          $ZipPath = "Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip"
           Compress-Archive -Path @("dist/MISRC.exe") -DestinationPath $ZipPath -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipPath))
@@ -750,7 +756,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-exe
-          path: windows_MISRC_*_x86.zip
+          path: Windows_MISRC_*_x86.zip
           if-no-files-found: error
   windows-exe-arm64:
     name: Windows EXE build (arm64)
@@ -764,7 +770,7 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-windows-arm64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
@@ -812,19 +818,15 @@ jobs:
 
       - name: Resolve build version
         id: version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
-            VERSION="${{ github.event.inputs.release_tag }}"
-          else
-            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
-            if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
-            fi
-          fi
+          VERSION="$(misrc_tools/ci-resolve-version.sh)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and package EXE (ARM64)
@@ -932,7 +934,7 @@ jobs:
       - name: Create ZIP artifact
         shell: pwsh
         run: |
-          $ZipPath = "windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip"
+          $ZipPath = "Windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip"
           Compress-Archive -Path @("dist/MISRC.exe") -DestinationPath $ZipPath -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipPath))
@@ -953,7 +955,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-exe-arm64
-          path: windows_MISRC_*_arm64.zip
+          path: Windows_MISRC_*_arm64.zip
           if-no-files-found: error
 
   macos-app-build:
@@ -976,25 +978,21 @@ jobs:
 
       - name: Cache vendored deps (.deps/install)
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .deps/install
           key: deps-macos-${{ matrix.arch }}-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
 
       - name: Resolve build version
         id: version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -eux
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
-            VERSION="${{ github.event.inputs.release_tag }}"
-          else
-            VERSION="$(misrc_tools/git-version.sh 2>/dev/null || true)"
-            if [[ -z "$VERSION" ]]; then
-              VERSION="v1.1.4-dev"
-            fi
-          fi
+          VERSION="$(misrc_tools/ci-resolve-version.sh)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
@@ -1327,7 +1325,7 @@ jobs:
           mkdir -p "$DMG_STAGE_DIR"
           cp -R dist/MISRC.app "$DMG_STAGE_DIR/MISRC.app"
           ln -s /Applications "$DMG_STAGE_DIR/Applications"
-          DMG_NAME="macos_MISRC_${BUILD_VERSION}_universal.dmg"
+          DMG_NAME="macOS_MISRC_${BUILD_VERSION}_universal.dmg"
           hdiutil create \
             -volname "MISRC" \
             -srcfolder "$DMG_STAGE_DIR" \
@@ -1340,7 +1338,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: macos-app
-          path: macos_MISRC_*_universal.dmg
+          path: macOS_MISRC_*_universal.dmg
           if-no-files-found: error
 
   release:
@@ -1386,6 +1384,36 @@ jobs:
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Assert release assets are tag-named (no dev leak)
+        run: |
+          set -eu
+          TAG="${{ steps.tag.outputs.tag }}"
+          shopt -s globstar nullglob
+          artifacts=(
+            release-assets/**/*_MISRC_*.zip
+            release-assets/**/*_MISRC_*.dmg
+            release-assets/**/*_MISRC_*.apk
+          )
+          if [[ "${#artifacts[@]}" -eq 0 ]]; then
+            echo "ERROR: no release artifacts found in release-assets/" >&2
+            exit 1
+          fi
+          for f in "${artifacts[@]}"; do
+            base="$(basename "$f")"
+            case "$base" in
+              *_MISRC_dev-*)
+                echo "ERROR: release artifact '$base' is dev-named; refusing to publish under tag $TAG" >&2
+                exit 1
+                ;;
+              *"$TAG"*) : ;;
+              *)
+                echo "ERROR: release artifact '$base' does not contain the release tag $TAG" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "All ${#artifacts[@]} release assets are tag-named ($TAG)."
 
       - name: Build release summary
         id: summary
@@ -1453,12 +1481,12 @@ jobs:
           printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
           printf '|---|---|---|---|\n' >> "$BODY_FILE"
           DL_BASE="https://github.com/harrypm/MISRC-GUI/releases/download/${TAG}"
-          WIN_X86="windows_MISRC_${TAG}_x86.zip"
-          WIN_ARM="windows_MISRC_${TAG}_arm64.zip"
-          MAC_DMG="macos_MISRC_${TAG}_universal.dmg"
-          LIN_X86="linux_MISRC_${TAG}_x86.zip"
-          LIN_ARM="linux_MISRC_${TAG}_arm64.zip"
-          APK_ARM64="android_MISRC_${TAG}_arm64.apk"
+          WIN_X86="Windows_MISRC_${TAG}_x86.zip"
+          WIN_ARM="Windows_MISRC_${TAG}_arm64.zip"
+          MAC_DMG="macOS_MISRC_${TAG}_universal.dmg"
+          LIN_X86="Linux_MISRC_${TAG}_x86.zip"
+          LIN_ARM="Linux_MISRC_${TAG}_arm64.zip"
+          APK_ARM64="Android_MISRC_${TAG}_arm64.apk"
           printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
           printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
           printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
@@ -1486,9 +1514,9 @@ jobs:
           body: ${{ steps.summary.outputs.body }}
           generate_release_notes: true
           files: |
-            release-assets/**/linux_MISRC_*_x86.zip
-            release-assets/**/linux_MISRC_*_arm64.zip
-            release-assets/**/windows_MISRC_*_x86.zip
-            release-assets/**/windows_MISRC_*_arm64.zip
-            release-assets/**/macos_MISRC_*_universal.dmg
-            release-assets/**/android_MISRC_*_arm64.apk
+            release-assets/**/Linux_MISRC_*_x86.zip
+            release-assets/**/Linux_MISRC_*_arm64.zip
+            release-assets/**/Windows_MISRC_*_x86.zip
+            release-assets/**/Windows_MISRC_*_arm64.zip
+            release-assets/**/macOS_MISRC_*_universal.dmg
+            release-assets/**/Android_MISRC_*_arm64.apk

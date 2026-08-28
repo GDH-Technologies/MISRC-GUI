@@ -29,4 +29,12 @@ void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reaso
 // Major HW issues will be obvious
 void gui_capture_poll_hsdaoh_status(gui_app_t *app);
 
+
+// Generic SDR live-retune dispatch. Updates the active SDR backend's center
+// frequency to hz and persists it; live-retunes if capture is running.
+// Device-agnostic: dispatches to whichever SDR backend is active (RTL-SDR
+// today; add a branch here when a second SDR backend is added). Returns 0 on
+// success, -1 if no SDR backend is active.
+int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz);
+
 #endif // GUI_CAPTURE_H

@@ -98,6 +98,7 @@ def check_actions_runtime_policy(workflow_path: Path) -> int:
         "actions/setup-python@v5",
         "actions/upload-artifact@v4",
         "actions/download-artifact@v4",
+        "actions/cache@v4",
     ]
     for pin in forbidden_action_pins:
         if pin in workflow_text:
@@ -108,6 +109,7 @@ def check_actions_runtime_policy(workflow_path: Path) -> int:
         "actions/setup-python@v6",
         "actions/upload-artifact@v7",
         "actions/download-artifact@v8",
+        "actions/cache@v6",
     ]
     for pin in required_action_pins:
         if pin not in workflow_text:
@@ -376,6 +378,335 @@ def check_windows_meson_subsystem_contract(meson_path: Path) -> int:
     return 0
 
 
+def check_dev_version_naming(repo_root: Path, meson_path: Path, workflow_path: Path) -> int:
+    """Dev/untagged builds MUST use a date-stamped version (dev-YYYY-MM-DD-<sha>)
+    derived by misrc_tools/git-version.sh, not a hardcoded "vX.Y.Z-dev" literal.
+    Regression: the repo carried a hardcoded vN.N.N-dev literal in git-version.sh
+    + 4 CI fallbacks and another in the VERSION file while the current release
+    had advanced past it, so dev builds reported a version behind the last
+    release. This guard forbids stale vX.Y.Z-dev literals across the
+    version-resolution path and requires git-version.sh to derive the dev string
+    from the current UTC date.
+    ci_guard_tests.py check_dev_version_naming."""
+    stale_re = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+-dev")
+    targets = [
+        meson_path,
+        workflow_path,
+        repo_root / "misrc_tools" / "git-version.sh",
+        repo_root / "misrc_tools" / "ci-resolve-version.sh",
+        repo_root / "android" / "build-apk.sh",
+        repo_root / "scripts" / "build-appimage-local.sh",
+        repo_root / "VERSION",
+    ]
+    for path in targets:
+        if not path.exists():
+            continue
+        m = stale_re.search(read_text(path))
+        if m:
+            rel = path.relative_to(repo_root)
+            return fail(
+                f"{rel} contains a stale hardcoded dev-version literal ({m.group(0)}). "
+                "Dev versions must be date-stamped (dev-YYYY-MM-DD-<sha>) via "
+                "misrc_tools/git-version.sh, not a vX.Y.Z-dev string that goes "
+                "stale as releases advance."
+            )
+    gv = repo_root / "misrc_tools" / "git-version.sh"
+    if gv.exists():
+        gv_text = read_text(gv)
+        if "date -u" not in gv_text or "dev-" not in gv_text:
+            return fail(
+                "misrc_tools/git-version.sh must derive the untagged dev version "
+                "from `date -u` with a `dev-` prefix (date-stamped scheme)."
+            )
+        if "--ignore-cr-at-eol" not in gv_text:
+            return fail(
+                "misrc_tools/git-version.sh dirty check must use --ignore-cr-at-eol "
+                "so a fresh Windows checkout (CRLF) does not phantom-tag -dirty "
+                "under MSYS2 git (autocrlf=false). It is a no-op on Linux/macOS."
+            )
+    return 0
+
+
+def check_no_tracked_generated_dirty_sources(repo_root: Path) -> int:
+    """Generated, machine-specific files that `git-version.sh`'s dirty check
+    would see MUST be gitignored (untracked), not committed. Regression:
+    android/deps-versions.txt was tracked and overwritten by
+    build-deps-android.sh with a build timestamp + host NDK path, so every
+    Android CI build dirty-tagged the version. Same class as the gitignored
+    android/aarch64-linux-android.ini cross-file. Asserts both stay untracked."""
+    targets = [
+        repo_root / "android" / "deps-versions.txt",
+        repo_root / "android" / "aarch64-linux-android.ini",
+    ]
+    for path in targets:
+        if not path.exists():
+            continue
+        rel = path.relative_to(repo_root)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(path)],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if tracked.returncode == 0:
+            return fail(
+                f"{rel} is tracked but is a generated, machine-specific file. "
+                "It dirty-tags the version string on any host/CI that regenerates "
+                "it. Add it to .gitignore and `git rm --cached` it."
+            )
+        ign = subprocess.run(
+            ["git", "check-ignore", str(path)],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if ign.returncode != 0:
+            return fail(
+                f"{rel} is untracked but NOT gitignored; add it to .gitignore so "
+                "regenerating it cannot dirty the tree."
+            )
+    return 0
+
+
+# Optional-dependency feature macros defined by misrc_tools/meson.build. A
+# struct member declared inside an enabled #if <MACRO> branch must not be
+# referenced (->name / .name) outside that branch, or the build breaks when
+# the dependency is absent. Regression 64b2171: gui_demod.c declared
+# soxr_in_buf/soxr_out_buf inside #if LIBSOXR_ENABLED but referenced them
+# unguarded; Windows arm64 (no mingw-w64-clang-aarch64-libsoxr =>
+# LIBSOXR_ENABLED=0) failed to compile with "no member named 'soxr_in_buf'".
+_OPTIONAL_DEP_MACROS = (
+    "LIBSOXR_ENABLED",
+    "LIBFLAC_ENABLED",
+    "LIBFFTW_ENABLED",
+    "LIBASOUND_ENABLED",
+    "ENABLE_FX3",
+    "ENABLE_DDD",
+    "ENABLE_RTLSDR",
+)
+
+_C_TYPE_KEYWORDS = {
+    "const", "static", "extern", "volatile", "register", "auto",
+    "unsigned", "signed", "short", "long", "int", "char", "float",
+    "double", "void", "bool", "struct", "union", "enum",
+    "size_t", "ssize_t", "ptrdiff_t", "wchar_t",
+    "int8_t", "int16_t", "int32_t", "int64_t",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+}
+
+
+def _make_c_stripper():
+    """Return a stateful function that strips C comments and string/char
+    literals from successive lines, replacing their contents with empty
+    strings so braces/parens inside them do not affect structural parsing."""
+    state = {"in_block_comment": False}
+
+    def strip(line: str) -> str:
+        out: List[str] = []
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+            if state["in_block_comment"]:
+                if ch == "*" and nxt == "/":
+                    state["in_block_comment"] = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                break  # line comment to end of line
+            if ch == "/" and nxt == "*":
+                state["in_block_comment"] = True
+                i += 2
+                continue
+            if ch == '"':
+                out.append('""')
+                i += 1
+                while i < n and line[i] != '"':
+                    if line[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1  # skip closing quote
+                continue
+            if ch == "'":
+                out.append("''")
+                i += 1
+                while i < n and line[i] != "'":
+                    if line[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    return strip
+
+
+def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[int, str]]:
+    """Return [(lineno, member_name), ...] for struct member references
+    (->name / .name) that occur in plain code NOT enclosed by any conditional
+    chain that mentions <macro>, while the member is declared only inside an
+    enabled #if <macro> branch (not outside it, not in a #else branch). Those
+    compile-fail when <macro> is undefined.
+
+    Limitation: to avoid false positives on the legitimate #if/#elif !MACRO/
+    #else idiom (where the final #else is only reached when MACRO is defined),
+    a reference is NOT flagged if any enclosing #if/#elif/#else chain mentions
+    <macro> at all. This means references inside a negated guard (#if !MACRO)
+    are not caught — that rarer pattern would need a real preprocessor to
+    evaluate precisely. The guard still catches the common regression where a
+    guarded-only member is referenced in plain code with no macro conditional
+    around it (regression 64b2171 in gui_demod.c)."""
+    strip = _make_c_stripper()
+    lines = [strip(l) for l in source.splitlines()]
+
+    # pp_stack entries: (macro_or_None, in_else, chain_mentions_macro)
+    pp_stack: List[Tuple[str, bool, bool]] = []
+    in_struct = False
+    struct_depth = 0
+    struct_open_re = re.compile(r"(?:typedef\s+)?struct\s+\w*\s*\{")
+    member_re = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;")
+    ref_re = re.compile(r"(?:->|\.)\s*([A-Za-z_]\w*)")
+    macro_token_re = re.compile(rf"\b{re.escape(macro)}\b")
+
+    # member name -> per-region declared flags
+    members: Dict[str, Dict[str, bool]] = {}
+    # (lineno, name, region, enclosed_by_macro_chain)
+    refs: List[Tuple[int, str, str, bool]] = []
+
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            m = re.match(r"#\s*(\w+)(.*)", stripped)
+            if m:
+                directive, rest = m.group(1), m.group(2).strip()
+                mentions = bool(macro_token_re.search(rest))
+                if directive in ("if", "ifdef"):
+                    negated = bool(re.search(rf"!\s*defined\s*\(\s*{re.escape(macro)}\s*\)", rest)) \
+                        or bool(re.search(rf"!\s*{re.escape(macro)}\b", rest))
+                    positive = mentions and not negated
+                    pp_stack.append((macro if positive else None, False, mentions))
+                elif directive == "ifndef":
+                    # Block runs when <macro> is UNDEFINED; the chain mentions it.
+                    pp_stack.append((None, False, mentions))
+                elif directive == "elif":
+                    if pp_stack:
+                        top_macro, _, top_mentions = pp_stack[-1]
+                        pp_stack[-1] = (top_macro, True, top_mentions or mentions)
+                elif directive == "else":
+                    if pp_stack:
+                        top_macro, _, top_mentions = pp_stack[-1]
+                        pp_stack[-1] = (top_macro, True, top_mentions)
+                elif directive == "endif":
+                    if pp_stack:
+                        pp_stack.pop()
+            continue
+
+        # Region of this line relative to <macro>, and whether any enclosing
+        # conditional chain mentions <macro> at all.
+        region = "outside"
+        enclosed = False
+        for m_macro, m_else, m_mentions in pp_stack:
+            if m_mentions:
+                enclosed = True
+            if m_macro == macro:
+                region = "disabled" if m_else else "enabled"
+
+        if in_struct:
+            for ch in line:
+                if ch == "{":
+                    struct_depth += 1
+                elif ch == "}":
+                    struct_depth -= 1
+            if struct_depth <= 0:
+                in_struct = False
+                continue
+            for m in member_re.finditer(line):
+                name = m.group(1)
+                if name in _C_TYPE_KEYWORDS:
+                    continue
+                rec = members.setdefault(name, {"enabled": False, "disabled": False, "outside": False})
+                rec[region] = True
+            continue
+
+        if struct_open_re.search(line):
+            in_struct = True
+            struct_depth = 0
+            for ch in line:
+                if ch == "{":
+                    struct_depth += 1
+                elif ch == "}":
+                    struct_depth -= 1
+            if struct_depth <= 0:
+                in_struct = False
+            continue
+
+        # Outside any struct body: collect member-style references.
+        for m in ref_re.finditer(line):
+            refs.append((idx, m.group(1), region, enclosed))
+
+    guarded_only = {
+        name for name, rec in members.items()
+        if rec["enabled"] and not rec["outside"] and not rec["disabled"]
+    }
+    return [(lineno, name) for lineno, name, region, enclosed in refs
+            if name in guarded_only and region != "enabled" and not enclosed]
+
+
+def check_windows_gui_link_no_dll_import_libs(meson_path: Path) -> int:
+    """Forbid -l:lib<name>.dll.a DLL import-library references in meson.build.
+    Windows builds are static (-static -static-libgcc); such import libs are
+    only shipped by the matching MSYS2 mingw package, which the CI install
+    list does not necessarily include. Regression 4cb9ced added
+    -l:libglfw3.dll.a, breaking the Windows x86_64 link because raylib 5.5
+    bundles GLFW into libraylib.a (no glfw DLL import lib is installed)."""
+    meson_text = read_text(meson_path)
+    # Strip meson line comments so the explanatory comment that names the
+    # forbidden flag does not trip the check.
+    code = "\n".join(line.split("#", 1)[0] for line in meson_text.splitlines())
+    m = re.search(r"-l:lib\w+\.dll\.a", code)
+    if m:
+        return fail(
+            "meson.build Windows GUI link flags reference a DLL import library ("
+            + m.group(0) + "). Windows builds are static and the CI MSYS2 install "
+            "list does not ship every mingw DLL import lib (regression 4cb9ced: "
+            "-l:libglfw3.dll.a broke the link; raylib 5.5 bundles GLFW into "
+            "libraylib.a). Link the static archive / system lib name instead."
+        )
+    return 0
+
+
+def check_optional_dep_guard_consistency(repo_root: Path) -> int:
+    """For each optional-dependency feature macro, scan the C sources for
+    struct members declared inside an enabled #if <MACRO> branch that are
+    referenced (->name / .name) outside the branch. Those fail to compile
+    when the dependency is absent. Regression 64b2171: gui_demod.c soxr
+    scratch buffers were #if LIBSOXR_ENABLED-guarded but referenced unguarded,
+    breaking the Windows arm64 build (no libsoxr => LIBSOXR_ENABLED=0)."""
+    tools_dir = repo_root / "misrc_tools"
+    sources = sorted(tools_dir.rglob("*.c"))
+    any_problem = False
+    for src_path in sources:
+        text = read_text(src_path)
+        for macro in _OPTIONAL_DEP_MACROS:
+            if macro not in text:
+                continue
+            for lineno, name in _find_unguarded_struct_member_refs(text, macro):
+                any_problem = True
+                rel = src_path.relative_to(repo_root)
+                print(
+                    f"ERROR: {rel}:{lineno}: struct member '{name}' is declared "
+                    f"inside #if {macro} but referenced outside it; the build "
+                    f"breaks when {macro} is undefined (a platform without the "
+                    f"dependency). Move the member outside the guard or guard the "
+                    f"reference.",
+                    file=sys.stderr,
+                )
+    return 1 if any_problem else 0
+
+
 def check_debug_view_contract(gui_c_path: Path) -> int:
     source = read_text(gui_c_path)
     required_snippets = [
@@ -573,7 +904,7 @@ def check_windows_packaging_assertions(workflow_path: Path) -> int:
         "test \"$(objdump -p dist/MISRC.exe | awk '/^Subsystem[[:space:]]/ {print $2; exit}')\" = \"00000002\"",
         "assert_no_nonsystem_dlls()",
         "assert_no_nonsystem_dlls \"dist/MISRC.exe\"",
-        "$ZipPath = \"windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
         "Compress-Archive -Path @(\"dist/MISRC.exe\")",
         "if ($zip.Entries.Count -ne 1)",
         "$entry.FullName.Contains('/') -or $entry.FullName.Contains('\\')",
@@ -618,30 +949,42 @@ def check_android_packaging_assertions(workflow_path: Path) -> int:
             return fail(f"Workflow is missing required Android packaging assertion: {snippet}")
     return 0
 
-def check_release_artifact_naming_contract(workflow_path: Path) -> int:
+def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert every release artifact filename follows
+    <Platform>_MISRC_<version>_<arch>.<ext> with the platform name capitalized
+    (Linux, Windows, macOS, Android), and that the lowercase v1.1.7 malform
+    cannot regress.
+
+    Regression (v1.1.7): Linux + Android release assets shipped as
+    linux_MISRC_dev-..._arm64.zip / android_MISRC_dev-..._arm64.apk under tag
+    v1.1.7 (lowercase prefix AND dev-named). This guard forbids the lowercase
+    platform prefixes on release artifacts so the naming half of the malform is
+    caught; check_release_version_resolution_contract covers the dev-name half.
+    """
     workflow_text = read_text(workflow_path)
     required_snippets = [
         "workflow_dispatch:",
         "artifact_suffix: x86",
         "artifact_suffix: arm64",
-        "APPIMAGE_NAME=\"linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
-        "ZIP_NAME=\"linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
-        "path: linux_MISRC_*_${{ matrix.artifact_suffix }}.zip",
-        "$ZipPath = \"windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
-        "path: windows_MISRC_*_x86.zip",
-        "DMG_NAME=\"macos_MISRC_${BUILD_VERSION}_universal.dmg\"",
-        "path: macos_MISRC_*_universal.dmg",
-        "release-assets/**/linux_MISRC_*_x86.zip",
-        "release-assets/**/linux_MISRC_*_arm64.zip",
-        "release-assets/**/windows_MISRC_*_x86.zip",
-        "release-assets/**/macos_MISRC_*_universal.dmg",
-        "APK_ARM64=\"android_MISRC_${TAG}_arm64.apk\"",
-        "release-assets/**/android_MISRC_*_arm64.apk",
+        "APPIMAGE_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
+        "ZIP_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
+        "path: Linux_MISRC_*_${{ matrix.artifact_suffix }}.zip",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
+        "path: Windows_MISRC_*_x86.zip",
+        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip\"",
+        "path: Windows_MISRC_*_arm64.zip",
+        "DMG_NAME=\"macOS_MISRC_${BUILD_VERSION}_universal.dmg\"",
+        "path: macOS_MISRC_*_universal.dmg",
+        "release-assets/**/Linux_MISRC_*_x86.zip",
+        "release-assets/**/Linux_MISRC_*_arm64.zip",
+        "release-assets/**/Windows_MISRC_*_x86.zip",
+        "release-assets/**/Windows_MISRC_*_arm64.zip",
+        "release-assets/**/macOS_MISRC_*_universal.dmg",
+        "APK_ARM64=\"Android_MISRC_${TAG}_arm64.apk\"",
+        "release-assets/**/Android_MISRC_*_arm64.apk",
     ]
     forbidden_snippets = [
-        # Legacy Android APK naming (pre-convention-alignment). The APK must
-        # follow <platform>_MISRC_<version>_<arch>.<ext> like the other
-        # platforms, not misrc_gui-<version>-android-arm64.apk.
+        # Legacy pre-convention APK/shapes.
         "misrc_gui-${TAG}-android-arm64.apk",
         "release-assets/**/misrc_gui-*-android-arm64.apk",
         "misrc_gui-*-windows-x86_64.zip",
@@ -658,14 +1001,120 @@ def check_release_artifact_naming_contract(workflow_path: Path) -> int:
         "release-assets/**/MISRC_*_linux_arm64.zip",
         "release-assets/**/MISRC_*_windows_x86.zip",
         "release-assets/**/MISRC_*_macos_universal.dmg",
+        # Lowercase platform prefixes on release artifacts (v1.1.7 malform).
+        "linux_MISRC_${BUILD_VERSION}",
+        "windows_MISRC_${{ steps.version.outputs.version }}",
+        "macos_MISRC_${BUILD_VERSION}",
+        "android_MISRC_${TAG}",
+        "release-assets/**/linux_MISRC_*_x86.zip",
+        "release-assets/**/linux_MISRC_*_arm64.zip",
+        "release-assets/**/windows_MISRC_*_x86.zip",
+        "release-assets/**/windows_MISRC_*_arm64.zip",
+        "release-assets/**/macos_MISRC_*_universal.dmg",
+        "release-assets/**/android_MISRC_*_arm64.apk",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
             return fail(f"Workflow is missing required release artifact naming snippet: {snippet}")
     for snippet in forbidden_snippets:
         if snippet in workflow_text:
-            return fail(f"Workflow still contains legacy release artifact naming snippet: {snippet}")
+            return fail(f"Workflow still contains forbidden release artifact naming snippet: {snippet}")
+    # The Android APK filename is produced by android/build-apk.sh (not the
+    # workflow), so assert the capitalized convention there too.
+    apk_script = repo_root / "android" / "build-apk.sh"
+    if not apk_script.exists():
+        return fail(f"android/build-apk.sh is missing: {apk_script}")
+    apk_text = read_text(apk_script)
+    if "Android_MISRC_${VERSION}_arm64.apk" not in apk_text:
+        return fail(
+            "android/build-apk.sh must name the APK Android_MISRC_${VERSION}_arm64.apk "
+            "(capitalized platform prefix, matching the release convention)."
+        )
+    if "android_MISRC_${VERSION}_arm64.apk" in apk_text:
+        return fail(
+            "android/build-apk.sh still uses the lowercase android_MISRC_ prefix "
+            "(v1.1.7 malform); use Android_MISRC_."
+        )
     return 0
+
+
+def check_release_version_resolution_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert release-context CI runs resolve the tag (never a dev string) and
+    that a release can never ship a dev-named artifact under the tag.
+
+    Regression (v1.1.7): the Linux job received an empty release_tag input and
+    silently fell through to git-version.sh on a --no-tags --depth=1 shallow
+    clone (-> dev-2026-08-25-c991f39), and the android-apk job had no
+    version-resolution step and never passed MISRC_TOOLS_VERSION_OVERRIDE to
+    build-apk.sh (which calls git-version.sh directly -> always dev-...,
+    versionCode 1). Both shipped dev-named assets under tag v1.1.7.
+
+    Requires:
+      - misrc_tools/ci-resolve-version.sh exists, is executable, and contains
+        the empty-release_tag hard-fail + the release+dev hard-fail.
+      - every build job (linux, windows-x86, windows-arm64, macos, android)
+        calls the shared resolver.
+      - every build job exports MISRC_TOOLS_VERSION_OVERRIDE from the version
+        step (Android especially: build-apk.sh reads it via git-version.sh).
+      - the release job has the pre-upload 'no dev leak / tag-named' assertion.
+    """
+    resolver = repo_root / "misrc_tools" / "ci-resolve-version.sh"
+    if not resolver.exists():
+        return fail(f"Missing shared release/version resolver: {resolver}")
+    if not os.access(resolver, os.X_OK):
+        return fail("misrc_tools/ci-resolve-version.sh must be executable (chmod +x)")
+    rv = read_text(resolver)
+    for snippet in [
+        "refs/tags/",
+        "workflow_dispatch",
+        "CI_CREATE_RELEASE",
+        "CI_RELEASE_TAG",
+        "release_tag input is empty",
+        "release run resolved a dev version",
+    ]:
+        if snippet not in rv:
+            return fail(f"misrc_tools/ci-resolve-version.sh is missing required snippet: {snippet}")
+
+    wf = read_text(workflow_path)
+    for snippet in [
+        "CI_EVENT_NAME: ${{ github.event_name }}",
+        "CI_CREATE_RELEASE: ${{ github.event.inputs.create_release }}",
+        "CI_RELEASE_TAG: ${{ github.event.inputs.release_tag }}",
+    ]:
+        if snippet not in wf:
+            return fail(f"Workflow is missing release-version-resolution env snippet: {snippet}")
+
+    # The resolver must be invoked by all 5 build jobs (linux, windows-x86,
+    # windows-arm64, macos, android).
+    call_count = wf.count("misrc_tools/ci-resolve-version.sh")
+    if call_count < 5:
+        return fail(
+            f"ci-resolve-version.sh must be called by all 5 build jobs (linux, "
+            f"windows-x86, windows-arm64, macos, android); found {call_count} call(s)."
+        )
+
+    # All 5 build jobs must export MISRC_TOOLS_VERSION_OVERRIDE from the version
+    # step. Android is the critical one: build-apk.sh calls git-version.sh
+    # directly, so without the override it always yields dev-... on the shallow
+    # clone (the v1.1.7 APK regression).
+    override_count = wf.count("MISRC_TOOLS_VERSION_OVERRIDE: ${{ steps.version.outputs.version }}")
+    if override_count < 5:
+        return fail(
+            f"All 5 build jobs must export MISRC_TOOLS_VERSION_OVERRIDE from the "
+            f"version step (Android was missing this in the v1.1.7 regression); "
+            f"found {override_count}."
+        )
+
+    # The release job must have the pre-upload assertion.
+    if "Assert release assets are tag-named" not in wf:
+        return fail(
+            "Release job is missing the pre-upload 'Assert release assets are "
+            "tag-named (no dev leak)' step."
+        )
+    if "*_MISRC_dev-*" not in wf:
+        return fail("Release pre-upload assertion must match '*_MISRC_dev-*' dev-named artifacts.")
+    return 0
+
 
 def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
     if not build_workflow_path.exists():
@@ -806,8 +1255,8 @@ def check_local_deps_cache_contract(repo_root: Path,
         return fail("build-local.sh must reference build-deps-unix.sh")
 
     workflow_text = read_text(workflow_path)
-    if "actions/cache@v4" not in workflow_text:
-        return fail("build.yml is missing actions/cache@v4 for deps caching")
+    if "actions/cache@v6" not in workflow_text:
+        return fail("build.yml is missing actions/cache@v6 for deps caching")
     if "deps cache hit" not in workflow_text:
         return fail("build.yml is missing the deps cache-hit guard ('deps cache hit')")
     if "v0.0.7" not in workflow_text:
@@ -1004,13 +1453,18 @@ def main() -> int:
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
+        ("dev version naming", lambda: check_dev_version_naming(repo_root, meson_path, workflow_path)),
+        ("no tracked generated dirty sources", lambda: check_no_tracked_generated_dirty_sources(repo_root)),
+        ("Windows GUI link no DLL import libs", lambda: check_windows_gui_link_no_dll_import_libs(meson_path)),
+        ("optional-dep guard consistency", lambda: check_optional_dep_guard_consistency(repo_root)),
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),
         ("settings persistence contract", lambda: check_settings_persistence_contract(gui_settings_c_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
-        ("release artifact naming contract", lambda: check_release_artifact_naming_contract(workflow_path)),
+        ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
+        ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),

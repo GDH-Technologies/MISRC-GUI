@@ -25,9 +25,12 @@ typedef enum {
     PANEL_VIEW_FFT,                // FFT spectrum analysis
     PANEL_VIEW_CVBS,               // CVBS luma decoder view
     PANEL_VIEW_HISTOGRAM,          // Amplitude histogram
+    PANEL_VIEW_WATERFALL,          // Scrolling FFT spectrogram (freq X, time Y, newest at top)
+    PANEL_VIEW_SPECTROGRAPH,       // Scrolling FFT spectrogram (time X, freq Y)
+    PANEL_VIEW_DEMOD,              // Demodulator (WFM/NFM/AM/USB/LSB) view on I/Q samples
     PANEL_VIEW_PREVIEW,            // USB video preview (V4L2; Linux only)
     PANEL_VIEW_COUNT
-    // Future: PANEL_VIEW_XY, PANEL_VIEW_SPECTROGRAM
+    // Future: PANEL_VIEW_XY
 } panel_view_type_t;
 
 // Waveform render modes (selected via dropdown on panel)
@@ -149,6 +152,9 @@ typedef enum {
 #endif
 #ifdef ENABLE_DDD
     DEVICE_TYPE_DDD,                     // DomesdayDuplicator USB device
+#endif
+#ifdef ENABLE_RTLSDR
+    DEVICE_TYPE_RTLSDR,                  // RTL-SDR (RTL2832) USB receiver
 #endif
 } device_type_t;
 
@@ -303,6 +309,21 @@ typedef struct {
     uint64_t update_last_check_unix_s;
     char update_last_release_tag[64];
     bool update_available_cached;
+
+    // RTL-SDR settings (only relevant when an RTL-SDR device is selected)
+    uint64_t rtlsdr_freq_hz;              // Center frequency (Hz), default 100.0 MHz
+    int     rtlsdr_gain_mode;             // 0 = auto, 1 = manual
+    int     rtlsdr_gain_tenths_db;        // Manual gain in tenths of dB (0 = auto when auto mode)
+    uint32_t rtlsdr_sample_rate_hz;       // Sample rate (Hz), default 2400000 (2.4 MSPS)
+    bool    rtlsdr_agc;                   // RTL2832 AGC on/off
+    bool    rtlsdr_offset_corr;           // RTL offset tuning correction on/off
+
+    // Demod view settings (device-agnostic; apply to the Demod panel)
+    int     demod_mode;                   // 0=WFM, 1=NFM, 2=AM, 3=USB, 4=LSB
+    int     demod_bandwidth_hz;           // Approx target bandwidth (Hz), 0 = mode default
+    float   demod_squelch;                // 0.0-1.0 squelch level (0 = open)
+    float   demod_volume;                 // 0.0-2.0 output volume (1.0 = unity)
+    int     demod_output_pair;            // 0 = CH1/2, 1 = CH3/4 (audio monitor output pair)
 
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback

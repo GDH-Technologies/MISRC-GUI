@@ -53,10 +53,10 @@ fail() { printf '[android-apk] ERROR: %s\n' "$*" >&2; exit 1; }
 # integer versionCode from the leading semver triplet (vMAJOR.MINOR.PATCH) so
 # release builds get unique, ordered codes; dev/untagged builds fall back to
 # code 1. versionName stays as the full resolved version string (e.g.
-# "v1.1.4-dev") to match the APK filename and the About box exactly.
+# "dev-2026-08-25-<sha>") to match the APK filename and the About box exactly.
 VERSION="$("$REPO_ROOT/misrc_tools/git-version.sh" 2>/dev/null || true)"
 if [[ -z "$VERSION" ]]; then
-  VERSION="v1.1.4-dev"
+  VERSION="dev-$(date -u +%Y-%m-%d)-nogit"
 fi
 
 SEMVER_BASE="$(printf '%s' "$VERSION" | sed -n 's/^v\?\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
@@ -159,7 +159,7 @@ log "verifying signature..."
 
 # --- 9. Output ---
 mkdir -p "$OUT_DIR"
-OUTPUT="$OUT_DIR/android_MISRC_${VERSION}_arm64.apk"
+OUTPUT="$OUT_DIR/Android_MISRC_${VERSION}_arm64.apk"
 cp "$WORK/signed.apk" "$OUTPUT"
 chmod +x "$OUTPUT"
 

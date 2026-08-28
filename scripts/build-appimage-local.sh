@@ -47,7 +47,7 @@ resolve_version() {
   local version
   version="$("$REPO_ROOT/misrc_tools/git-version.sh" 2>/dev/null || true)"
   if [[ -z "$version" ]]; then
-    version="v1.1.4-dev"
+    version="dev-$(date -u +%Y-%m-%d)-nogit"
   fi
   printf '%s\n' "$version"
 }
