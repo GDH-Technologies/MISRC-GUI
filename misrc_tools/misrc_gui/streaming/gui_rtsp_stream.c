@@ -17,6 +17,7 @@
 #include <spawn.h>
 #include <stdatomic.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -37,6 +38,8 @@ extern char **environ;
 #define RS_SNDBUF_BYTES    (4 << 20)
 #define RS_DRAIN_LIMIT_S   3.0
 #define RS_REAP_LIMIT_S    8.0
+/* capture-node's posture for its ffmpeg children, for the same reason. */
+#define RS_CHILD_NICE      5
 
 static struct {
     uint8_t  *slots[RS_RING_FRAMES];
@@ -488,6 +491,15 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
         close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
         snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
         return RS_SPAWN_FAIL_SETUP;
+    }
+
+    /* RTSP fan-out must yield to RF ingest. This app IS the RF recorder, so an
+     * encoder competing for the same cores is not a fair fight to leave to
+     * chance -- capture-node nices its ffmpeg children for the same reason.
+     * Raising niceness never needs privilege, so a failure here is not worth
+     * refusing the stream over. */
+    if (setpriority(PRIO_PROCESS, (id_t)pid, RS_CHILD_NICE) != 0) {
+        /* Nothing to do: the stream still works, it just competes harder. */
     }
 
     /* Frames must already be flowing before the child can be judged.

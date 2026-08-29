@@ -94,6 +94,7 @@ static void print_usage(const char *program_name) {
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
             "  --rtsp-fault-test <device> <none|kill|hang|bad-args|no-audio|busy-audio> [seconds]\n"
+            "  --rtsp-soak <device> <rf-device> [seconds-per-half]\n"
             "  --video-tap-test <device> [seconds]\n"
             "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
             "\n"
@@ -476,6 +477,12 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
+        }
+        if (strcmp(argv[i], "--rtsp-soak") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *rf = (i + 2 < argc) ? argv[i + 2] : NULL;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 20;
+            return gui_stream_soak_main(dev, rf, secs);
         }
         if (strcmp(argv[i], "--rtsp-fault-test") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;

@@ -132,4 +132,8 @@ int gui_rtsp_stream_test_main(const char *device, int seconds);
  * asserts the documented behaviour AND that the recorder never noticed. */
 int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int seconds);
 
+/* The acceptance test: recorder + RF ingest with the stream off, then on, and a
+ * comparison of the two halves of the same run. */
+int gui_stream_soak_main(const char *device, const char *rf_device, int seconds);
+
 #endif /* GUI_RTSP_STREAM_H */

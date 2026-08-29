@@ -1327,6 +1327,35 @@ def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
     return 0
 
 
+def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
+    """RTSP fan-out must yield to RF ingest. This app IS the RF recorder, so an
+    encoder and a media server competing for the same cores is not a fair fight
+    to leave to chance -- the design calls for the nice(+5) posture capture-node
+    uses on its ffmpeg children, and it was missing until the concurrency proof
+    went looking for it."""
+    for rel, define in (
+        ("misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c", "RS_CHILD_NICE"),
+        ("misrc_tools/misrc_gui/streaming/gui_mediamtx.c", "MTX_CHILD_NICE"),
+    ):
+        code = strip_c_comments(read_text(repo_root / rel))
+        m = re.search(rf"#define\s+{define}\s+(\d+)", code)
+        if not m:
+            return fail(f"{Path(rel).name} does not define {define}")
+        if int(m.group(1)) < 1:
+            return fail(
+                f"{Path(rel).name} sets {define}={m.group(1)}, so its child competes "
+                "with RF ingest on equal terms"
+            )
+        if f"setpriority(PRIO_PROCESS" not in code or define not in code.split("#define")[-1] + code:
+            return fail(f"{Path(rel).name} never applies {define} via setpriority()")
+        if "setpriority(PRIO_PROCESS, (id_t)pid" not in code:
+            return fail(
+                f"{Path(rel).name} must nice the SPAWNED CHILD by pid; a 0 pid would "
+                "nice this process instead and slow the RF path it is protecting"
+            )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1897,6 +1926,7 @@ def main() -> int:
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
+        ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
