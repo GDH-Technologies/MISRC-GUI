@@ -110,23 +110,60 @@ jobs:
 
           # Desktop entry, rewritten idempotently.
           #
-          # RESOURCE_NAME is load-bearing: GLFW derives WM_CLASS from the window title,
-          # which embeds the version string, so a literal StartupWMClass would stop
-          # matching on every rebuild and orphan the icon in the GNOME dash. Setting
-          # RESOURCE_NAME pins a stable WM_CLASS instance name instead.
+          # StartupWMClass must equal GUI_WINDOW_CLASS_NAME in
+          # misrc_tools/misrc_gui/core/misrc_gui.c. The GUI creates its window under that
+          # constant, so WM_CLASS is identical for every build and does not depend on how
+          # the app was started.
+          #
+          # This used to read `Exec=env RESOURCE_NAME=misrc_gui ...` with a matching
+          # StartupWMClass=misrc_gui, back when the window title (which carries the
+          # version) still fed WM_CLASS. RESOURCE_NAME only pins the *instance* half of
+          # WM_CLASS, and only for a process started through this exact Exec line -- launch
+          # the same binary from a terminal, a desktop shortcut or a second launcher and the
+          # instance name falls back to the title, so the dock lost the icon anyway. The
+          # constant class name makes the match hold however the app is started.
           cat > "$app_dir/misrc_gui.desktop" <<EOF
           [Desktop Entry]
           Type=Application
           Name=MISRC GUI
           Comment=Local Fedora build, installed by CI from main
-          Exec=env RESOURCE_NAME=misrc_gui $bin_dir/misrc_gui %U
+          Exec=$bin_dir/misrc_gui %U
           Icon=misrc
           Categories=Utility;
-          StartupWMClass=misrc_gui
-          X-GNOME-WMClass=misrc_gui
+          StartupWMClass=MISRC Capture
+          X-GNOME-WMClass=MISRC Capture
           Terminal=false
           StartupNotify=true
           EOF
+
+          # Sweep stale MISRC launchers this workflow did not write.
+          #
+          # A leftover .desktop naming an older, versioned StartupWMClass shows up as a
+          # second "MISRC GUI" in the app grid and matches no window, so clicking it gives
+          # the generic executable icon -- the exact symptom the constant class name above
+          # exists to avoid, reintroduced by a file nobody remembers creating.
+          #
+          # Deliberately narrow, because this deletes files in a real home directory: only
+          # *.desktop directly in $app_dir, only ones whose StartupWMClass names a MISRC
+          # class that cannot match our window (a versioned "MISRC Capture <ver>", or the
+          # retired misrc_gui/misrc-gui RESOURCE_NAME shim values), and never the entry
+          # just written above. A launcher with the correct StartupWMClass is left alone,
+          # and anything not naming a MISRC class is never even considered.
+          shopt -s nullglob
+          for stale in "$app_dir"/*.desktop; do
+            if [ "$stale" = "$app_dir/misrc_gui.desktop" ]; then
+              continue
+            fi
+            stale_class="$(sed -n 's/^StartupWMClass=//p' "$stale" | head -n1)"
+            case "$stale_class" in
+              "MISRC Capture "*|misrc_gui|misrc-gui)
+                echo "removing stale MISRC launcher: $stale (StartupWMClass=$stale_class)"
+                rm -f "$stale"
+                ;;
+            esac
+          done
+          shopt -u nullglob
+
           update-desktop-database "$app_dir" || true
 
       - name: Verify install

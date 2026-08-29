@@ -65,6 +65,22 @@ def find_versioned_wm_class(text: str) -> List[str]:
     return offenders
 
 
+def extract_deploy_desktop_entry(deploy_text: str) -> str:
+    """The .desktop body that selfhosted-deploy.yml installs onto workflow-master."""
+    marker = 'cat > "$app_dir/misrc_gui.desktop" <<EOF'
+    start = deploy_text.find(marker)
+    if start < 0:
+        raise RuntimeError("Could not find the installed .desktop heredoc in selfhosted-deploy.yml")
+    start = deploy_text.find("\n", start)
+    if start < 0:
+        raise RuntimeError("Malformed .desktop heredoc in selfhosted-deploy.yml")
+    start += 1
+    end = deploy_text.find("\n          EOF", start)
+    if end < 0:
+        raise RuntimeError("Unterminated .desktop heredoc in selfhosted-deploy.yml")
+    return textwrap.dedent(deploy_text[start:end]).lstrip("\n")
+
+
 def extract_apprun_script(workflow_text: str) -> str:
     marker = "cat > AppDir/AppRun <<'EOF'"
     start = workflow_text.find(marker)
@@ -931,15 +947,17 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path, gui_c_pa
     return 0
 
 
-def check_wm_class_consistency(
-    gui_c_path: Path, workflow_path: Path, local_appimage_script: Path
-) -> int:
+def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
     """WM_CLASS is what ties a running window back to its launcher. misrc_gui.c
-    creates the window under GUI_WINDOW_CLASS_NAME, so every .desktop we generate
-    must set StartupWMClass to exactly that string -- and must never decorate it
-    with a build version, or a launcher written by one build stops matching the
-    next build's window and the dock loses the app icon."""
+    creates the window under GUI_WINDOW_CLASS_NAME, so every .desktop we write --
+    release AppImage, local AppImage, and the self-hosted deploy that installs onto
+    workflow-master -- must set StartupWMClass to exactly that string, and must
+    never decorate it with a build version, or a launcher written by one build
+    stops matching the next build's window and the dock loses the app icon."""
     wm_class = read_gui_window_class_name(gui_c_path)
+    workflow_path = repo_root / ".github/workflows/build.yml"
+    deploy_workflow_path = repo_root / ".github/workflows/selfhosted-deploy.yml"
+    local_appimage_script = repo_root / "scripts/build-appimage-local.sh"
     required_by_surface = {
         workflow_path: (
             f"StartupWMClass={wm_class}",
@@ -966,6 +984,52 @@ def check_wm_class_consistency(
             return fail(
                 f"{path.name} bakes a build version into WM_CLASS, which breaks the "
                 f"launcher-to-window match the dock icon depends on: {offenders}"
+            )
+
+    # The deploy installs the launcher this machine actually uses, so assert on the
+    # .desktop it generates rather than on the file -- the surrounding comments are
+    # free to name the shim they warn against.
+    if not deploy_workflow_path.exists():
+        return fail(f"WM_CLASS surface is missing: {deploy_workflow_path}")
+    entry = extract_deploy_desktop_entry(read_text(deploy_workflow_path))
+    for key in ("StartupWMClass", "X-GNOME-WMClass"):
+        if f"{key}={wm_class}\n" not in entry + "\n":
+            return fail(
+                f"selfhosted-deploy.yml installs a .desktop whose {key} does not match "
+                f'GUI_WINDOW_CLASS_NAME ("{wm_class}") in misrc_gui.c'
+            )
+    offenders = find_versioned_wm_class(entry)
+    if offenders:
+        return fail(
+            f"selfhosted-deploy.yml bakes a build version into WM_CLASS: {offenders}"
+        )
+    # RESOURCE_NAME was the pre-GUI_WINDOW_CLASS_NAME shim. It pins only the instance
+    # half of WM_CLASS, and only for a process started through the Exec line that sets
+    # it, so the dock icon silently depended on which launcher you clicked. The constant
+    # class name replaces it -- reintroducing it re-splits the contract.
+    if "RESOURCE_NAME" in entry:
+        return fail(
+            "selfhosted-deploy.yml reintroduces the RESOURCE_NAME WM_CLASS shim in the "
+            f'installed .desktop; StartupWMClass="{wm_class}" already matches however '
+            "the app is started"
+        )
+
+    # The install must also sweep stale MISRC launchers it did not write. One leftover
+    # .desktop with a dead versioned StartupWMClass is enough to put a second, generic
+    # "MISRC GUI" in the app grid, which looks exactly like the bug the constant class
+    # name fixes. The sweep must never delete the entry the workflow just wrote.
+    deploy_text = read_text(deploy_workflow_path)
+    required_sweep_snippets = [
+        'for stale in "$app_dir"/*.desktop; do',
+        'if [ "$stale" = "$app_dir/misrc_gui.desktop" ]; then',
+        '"MISRC Capture "*|misrc_gui|misrc-gui)',
+        'rm -f "$stale"',
+    ]
+    for snippet in required_sweep_snippets:
+        if snippet not in deploy_text:
+            return fail(
+                "selfhosted-deploy.yml is missing the stale-launcher sweep, so a dead "
+                f"versioned .desktop can shadow the installed one: {snippet}"
             )
     return 0
 
@@ -1514,7 +1578,6 @@ def main() -> int:
     installation_md_path = repo_root / "INSTALLATION.md"
     dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
-    local_appimage_script = repo_root / "scripts/build-appimage-local.sh"
 
     checks: List[Tuple[str, Callable[[], int]]] = [
         ("cross-platform workflow coverage", lambda: check_cross_platform_workflow_coverage(workflow_path)),
@@ -1526,7 +1589,7 @@ def main() -> int:
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
         ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path, gui_c_path)),
-        ("WM_CLASS matches GUI window class", lambda: check_wm_class_consistency(gui_c_path, workflow_path, local_appimage_script)),
+        ("WM_CLASS matches GUI window class", lambda: check_wm_class_consistency(gui_c_path, repo_root)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),

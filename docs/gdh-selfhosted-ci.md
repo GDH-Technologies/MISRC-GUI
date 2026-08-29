@@ -88,20 +88,51 @@ Installs `misrc_gui`, `misrc_capture` and `misrc_extract` into `~/.local/bin`, w
 temp name plus `mv -f` — the rename is atomic, so a merge cannot fail with `ETXTBSY` while the GUI
 is open.
 
-It also rewrites `~/.local/share/applications/misrc_gui.desktop`. Note the `Exec` line:
+It also rewrites `~/.local/share/applications/misrc_gui.desktop`. Note the `StartupWMClass`:
 
 ```
-Exec=env RESOURCE_NAME=misrc_gui /home/rdodge/.local/bin/misrc_gui %U
+Exec=/home/rdodge/.local/bin/misrc_gui %U
+StartupWMClass=MISRC Capture
 ```
 
-`RESOURCE_NAME` is **load-bearing**. GLFW derives `WM_CLASS` from the window title, and the title
-is `"MISRC Capture " + version` — so a literal `StartupWMClass` stops matching the moment the
-version string changes, orphaning the icon in the GNOME dash on every rebuild. `RESOURCE_NAME`
-pins a stable `WM_CLASS` instance name (`misrc_gui`) that survives version changes. Verify with:
+`StartupWMClass` must equal `GUI_WINDOW_CLASS_NAME` in `misrc_tools/misrc_gui/core/misrc_gui.c`.
+The GUI passes that constant to `InitWindow` and only then applies the versioned title with
+`SetWindowTitle`, which touches `_NET_WM_NAME` and not `WM_CLASS` — so every build reports the same
+class and any launcher keeps matching the running window. `ci_guard_tests.py` enforces the
+equality, so renaming the constant without updating this workflow fails CI.
+
+Earlier revisions instead set `Exec=env RESOURCE_NAME=misrc_gui …` with a matching
+`StartupWMClass=misrc_gui`, from when the title still fed `WM_CLASS`. That shim pinned only the
+*instance* half of `WM_CLASS`, and only for a process started through that exact `Exec` line —
+launching the same binary from a terminal, the Desktop shortcut or a second launcher fell back to
+the title and lost the dock icon regardless. Don't reintroduce it; the guard tests reject it.
+
+Verify with:
 
 ```bash
-xprop -id <window> WM_CLASS
-# => "misrc_gui", "MISRC Capture dev-YYYY-MM-DD-<sha>"
+xprop WM_CLASS      # then click the window
+# => WM_CLASS(STRING) = "MISRC Capture", "MISRC Capture"
+```
+
+The install step then **sweeps stale MISRC launchers** it did not write. A leftover `.desktop`
+naming an older, versioned `StartupWMClass` shows up as a second "MISRC GUI" in the app grid and
+matches no window, which looks identical to the bug the constant class name fixes. The sweep is
+deliberately narrow, because it deletes files in a real home directory:
+
+- only `*.desktop` directly in `~/.local/share/applications`
+- only where `StartupWMClass` is a versioned `MISRC Capture <ver>`, or the retired `misrc_gui` /
+  `misrc-gui` shim values
+- never `misrc_gui.desktop`, the entry it just wrote
+
+A launcher carrying the correct `StartupWMClass` is left alone, and anything not naming a MISRC
+class is never considered. Removals are echoed in the job log.
+
+The sweep does not reach `~/Desktop`. A shortcut there pointing at an older AppImage
+(`~/.local/bin/misrc_gui.AppImage`) still runs that build, and a pre-v1.1.5 AppImage reports a
+versioned `WM_CLASS` of its own — repoint or delete it by hand:
+
+```bash
+grep -l MISRC ~/.local/share/applications/*.desktop ~/Desktop/*.desktop
 ```
 
 ## Security note
