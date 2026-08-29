@@ -1064,6 +1064,10 @@ static char stat_rec_raw[2][32];
 static char stat_rec_flac[2][32];
 static char stat_rec_ratio[2][24];
 static char stat_rec_duration[2][24];
+// CXADC gain, per channel. Clay stores the pointer it is handed and reads it
+// back after Clay_EndLayout, so this cannot be a stack buffer -- see the note
+// at its use site in render_channel_stats.
+static char stat_cx_level[2][16];
 
 // Playback file display buffers
 static char playback_file_a_display[64];
@@ -4622,11 +4626,18 @@ static void render_channel_stats(gui_app_t *app, int channel) {
             // is shown, because gain past CX_LEVEL_NOISE_WARN starts adding the
             // front end's own noise and the operator needs to see where it sits.
             int cx_level = dc_card_available ? gui_ui_cxadc_level_cached(card_idx, false) : -1;
-            char buf_cx_level[16];
+            // Clay does not copy strings: CLAY_TEXT keeps the char* and
+            // dereferences it during the render pass, after this function has
+            // returned. A stack buffer here dangles by then, and because
+            // render_channel_stats is called once per channel at the same stack
+            // depth, both calls share the slot -- so CH A's row drew CH B's
+            // value and A's gain appeared stuck. Per-channel static storage,
+            // matching every other stat row above.
+            char *buf_cx_level = stat_cx_level[(channel == 1) ? 1 : 0];
             if (cx_level >= 0) {
-                snprintf(buf_cx_level, sizeof(buf_cx_level), "%d", cx_level);
+                snprintf(buf_cx_level, sizeof(stat_cx_level[0]), "%d", cx_level);
             } else {
-                snprintf(buf_cx_level, sizeof(buf_cx_level), "--");
+                snprintf(buf_cx_level, sizeof(stat_cx_level[0]), "--");
             }
             Color cx_level_fg = (cx_level > CX_LEVEL_NOISE_WARN) ? COLOR_CLIP_RED
                               : (cx_level >= 0)                  ? COLOR_TEXT
