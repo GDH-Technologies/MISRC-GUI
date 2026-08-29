@@ -40,6 +40,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "gui_preview_tap.h"
 #include "raylib.h"
 
 typedef enum {
@@ -134,28 +135,12 @@ bool gui_preview_frame_sync(void);
 void gui_preview_draw(Rectangle bounds, bool with_status);
 
 /* ---- frame tap ----------------------------------------------------------- */
-/*
- * Tee the raw YUYV of every good frame, before the RGBA conversion. The
- * published RGBA slots are the wrong source for anything archival: the triple
- * buffer is deliberately lossy, and it has already discarded the YUYV.
+/* preview_tap_t and gui_preview_tap_install/remove live in gui_preview_tap.h,
+ * included above: the tap contract is raylib-free, and a unit test of a tap
+ * consumer should not have to link a window library to compile.
  *
- * The callback runs ON THE CAPTURE THREAD, between VIDIOC_DQBUF and
- * VIDIOC_QBUF. It must not block, must not call GL, and must copy anything it
- * wants to keep -- the buffer is requeued the moment it returns.
- */
-typedef void (*preview_tap_fn)(const uint8_t *yuyv, size_t pitch,
-                               uint32_t w, uint32_t h, void *user);
-
-typedef struct {
-    preview_tap_fn fn;
-    void          *user;
-} preview_tap_t;
-
-/* The tap must have static storage and outlive the install. One pointer
- * publishes fn and user together so neither can be seen half-updated. */
-void gui_preview_tap_install(const preview_tap_t *tap);
-/* Returns only once no tap callback is still in flight. */
-void gui_preview_tap_remove(void);
+ * There is one slot. Application code registers through
+ * streaming/gui_preview_tap_mux.h, which owns it and fans out. */
 
 /* ---- popout ------------------------------------------------------------- */
 

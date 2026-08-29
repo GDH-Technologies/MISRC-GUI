@@ -45,6 +45,27 @@ WM_CLASS_VERSION_TOKENS = (
 )
 
 
+def strip_c_comments(source: str) -> str:
+    """Blank out /* */ and // comments, preserving line structure."""
+    out = []
+    i, n = 0, len(source)
+    while i < n:
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+            i = end
+        elif source.startswith("//", i):
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+            out.append(" " * (end - i))
+            i = end
+        else:
+            out.append(source[i])
+            i += 1
+    return "".join(out)
+
+
 def read_gui_window_class_name(gui_c_path: Path) -> str:
     """The one source of truth for WM_CLASS. misrc_gui.c creates its window under
     this exact name, so every .desktop we generate must set StartupWMClass to it."""
@@ -1034,6 +1055,92 @@ def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
     return 0
 
 
+def check_preview_tap_mux_runtime(repo_root: Path) -> int:
+    """The preview publishes its frame tap through a SINGLE atomic slot, so a
+    second install silently displaces the first -- starting a stream would stop
+    the reference recording receiving frames, with nothing reporting it. The mux
+    owns that slot and fans out. Compiles the real module against a harness that
+    stands in for the capture thread, so the fan-out, the install/remove
+    lifecycle and the removal quiescence guarantee are all exercised."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: preview tap mux runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the preview tap mux runtime guard")
+        print("SKIP: preview tap mux runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/preview_tap_mux_harness.c"
+    mux_path = repo_root / "misrc_tools/misrc_gui/streaming/gui_preview_tap_mux.c"
+    mux_include = repo_root / "misrc_tools/misrc_gui/streaming"
+
+    for required in (harness_path, mux_path):
+        if not required.exists():
+            return fail(f"Preview tap mux guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_tap_mux_guard_") as temp_root:
+        exe_path = Path(temp_root) / "preview_tap_mux_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            "-pthread",
+            f"-I{mux_include}",
+            str(harness_path),
+            str(mux_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Preview tap mux harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Preview tap mux harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
+def check_preview_tap_single_slot_contract(repo_root: Path) -> int:
+    """Application code must register through the mux, never install the raw tap
+    directly -- a direct install displaces whatever the mux published and takes
+    every other consumer offline silently. Only the preview module (which owns
+    the slot) and the mux (which owns the fan-out) may call it."""
+    allowed = {
+        repo_root / "misrc_tools/misrc_gui/input/gui_preview_v4l2.c",
+        repo_root / "misrc_tools/misrc_gui/input/gui_preview_v4l2.h",
+        repo_root / "misrc_tools/misrc_gui/input/gui_preview_tap.h",
+        repo_root / "misrc_tools/misrc_gui/streaming/gui_preview_tap_mux.c",
+        repo_root / "misrc_tools/misrc_gui/streaming/gui_preview_tap_mux.h",
+        repo_root / "misrc_tools/test/preview_tap_mux_harness.c",
+    }
+    gui_root = repo_root / "misrc_tools/misrc_gui"
+    offenders = []
+    for path in sorted(gui_root.rglob("*.[ch]")):
+        if path in allowed:
+            continue
+        # Scan code, not prose: a comment explaining why the raw tap is wrong
+        # is exactly what a file that correctly uses the mux should contain.
+        code = strip_c_comments(read_text(path))
+        if "gui_preview_tap_install(" in code or "gui_preview_tap_remove(" in code:
+            offenders.append(str(path.relative_to(repo_root)))
+    if offenders:
+        return fail(
+            "These files install the raw preview tap directly, which displaces the "
+            f"mux and silently takes other consumers offline; use "
+            f"gui_preview_mux_add/remove instead: {offenders}"
+        )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1600,6 +1707,7 @@ def main() -> int:
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),
         ("settings persistence contract", lambda: check_settings_persistence_contract(gui_settings_c_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
+        ("preview tap single-slot contract", lambda: check_preview_tap_single_slot_contract(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -1615,6 +1723,7 @@ def main() -> int:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
+        checks.insert(10, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
