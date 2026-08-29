@@ -20,6 +20,7 @@ gui_mediamtx_config_t gui_mediamtx_default_config(void)
         .hls         = 8988,
         .webrtc_http = 8989,
         .webrtc_ice  = 8289,
+        .metrics     = 10098,
     };
     return cfg;
 }
@@ -118,10 +119,19 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "# A default is not a guarantee, and pprof reachable on a LAN interface\n"
         "# would be a genuine leak, so they are stated.\n"
         "api: no\n"
-        "metrics: no\n"
         "pprof: no\n"
         "playback: no\n"
         "\n");
+
+    /* Metrics is the one admin endpoint we do serve, because it is the only
+     * place the real published bitrate exists: ffmpeg's RTSP muxer reports
+     * total_size and bitrate as N/A, and the kernel's per-process io counters
+     * do not see socket writes. Both were measured before landing here.
+     *
+     * Bound to 127.0.0.1 unconditionally -- note this does NOT use `host` --
+     * so that turning on LAN mode exposes the stream and nothing else. */
+    yb_addf(&b, "metrics: yes\n");
+    yb_addf(&b, "metricsAddress: 127.0.0.1:%u\n\n", (unsigned)cfg->metrics);
 
     /* Who may do what.
      *
@@ -160,6 +170,14 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "    permissions:\n"
         "      - action: read\n"
         "        path: misrc-preview\n"
+        "  # Us, reading the bitrate back off the metrics endpoint. Without this\n"
+        "  # entry mediamtx answers /metrics with 401 -- which is the auth block\n"
+        "  # above doing its job.\n"
+        "  - user: any\n"
+        "    pass:\n"
+        "    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "    permissions:\n"
+        "      - action: metrics\n"
         "\n");
 
     /* Deliberately outside capture-node's naming, so the two are never
@@ -201,6 +219,7 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
 void gui_mediamtx_stop(void) { }
 void gui_mediamtx_shutdown(void) { }
 void gui_mediamtx_poll(void) { }
+uint32_t gui_mediamtx_stream_kbps(void) { return 0; }
 gui_mediamtx_status_t gui_mediamtx_get_status(void)
 {
     gui_mediamtx_status_t st = {0};
@@ -242,7 +261,34 @@ static struct {
     /* When the just-spawned child should be checked for an immediate exit. 0
      * once it has been checked. See gui_mediamtx_start(). */
     double verify_at;
+    uint16_t metrics_port;
 } mtx;
+
+/* Reading the bitrate back out of mediamtx.
+ *
+ * Deliberately a state machine driven by poll() rather than a blocking fetch:
+ * this runs on the render thread, and a mediamtx that has wedged must cost a
+ * dropped sample, not a frozen window. That lesson is already paid for -- see
+ * the non-blocking start path.  */
+#define MTX_METRICS_PERIOD_S  2.0
+#define MTX_METRICS_TIMEOUT_S 1.0
+
+typedef enum { MET_IDLE = 0, MET_CONNECTING, MET_SENDING, MET_READING } met_phase_t;
+
+static struct {
+    int         fd;            /* -1 when idle */
+    met_phase_t phase;
+    double      started_at;    /* of the in-flight request */
+    double      next_at;       /* when to start the next one */
+    char        req[160];
+    size_t      req_len, req_sent;
+    char        buf[16384];
+    size_t      len;
+
+    uint64_t    last_bytes;
+    double      last_at;       /* 0 = no previous sample */
+    uint32_t    kbps;
+} met = { .fd = -1 };
 
 static struct {
     bool probed;
@@ -407,6 +453,8 @@ static int mtx_write_config(const gui_mediamtx_config_t *cfg, char *err, size_t 
     snprintf(mtx.config_path, sizeof(mtx.config_path), "%s/mediamtx.yml", dir);
 
     char body[8192];
+    mtx.metrics_port = cfg->metrics;
+
     int n = gui_mediamtx_render_config(cfg, body, sizeof(body));
     if (n < 0) {
         snprintf(err, err_cap, "mediamtx config did not fit its buffer");
@@ -518,8 +566,155 @@ void gui_mediamtx_stop(void)
 
 void gui_mediamtx_shutdown(void) { gui_mediamtx_stop(); }
 
+/* Pulls paths_inbound_bytes for our path out of a Prometheus text dump.
+ * Returns false when the path is not present -- which is normal before the
+ * publisher connects. */
+static bool met_parse_bytes(const char *body, uint64_t *out)
+{
+    /* Newer mediamtx emits paths_inbound_bytes; paths_bytes_received is the
+     * older spelling of the same counter and both appear in 1.19. */
+    static const char *const keys[] = { "paths_inbound_bytes{", "paths_bytes_received{" };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        for (const char *p = strstr(body, keys[k]); p; p = strstr(p + 1, keys[k])) {
+            const char *eol = strchr(p, '\n');
+            if (!eol) eol = p + strlen(p);
+            /* Only our path. Any other would be someone else's stream. */
+            const char *name = strstr(p, "name=\"misrc-preview\"");
+            if (!name || name > eol) continue;
+            const char *sp = NULL;
+            for (const char *q = eol - 1; q > p; q--) {
+                if (*q == ' ') { sp = q + 1; break; }
+            }
+            if (!sp) continue;
+            char *end = NULL;
+            unsigned long long v = strtoull(sp, &end, 10);
+            if (end && end != sp) { *out = (uint64_t)v; return true; }
+        }
+    }
+    return false;
+}
+
+static void met_reset(void)
+{
+    if (met.fd >= 0) close(met.fd);
+    met.fd = -1;
+    met.phase = MET_IDLE;
+    met.len = 0;
+    met.req_sent = 0;
+}
+
+/* Forgets the rate but keeps the connection machinery tidy. Called when the
+ * server stops, so a stale number cannot linger next to a dead stream. */
+static void met_forget(void)
+{
+    met_reset();
+    met.last_at = 0.0;
+    met.last_bytes = 0;
+    met.kbps = 0;
+    met.next_at = 0.0;
+}
+
+static void met_finish(void)
+{
+    uint64_t bytes = 0;
+    if (met.len && met_parse_bytes(met.buf, &bytes)) {
+        double now = mtx_now();
+        if (met.last_at != 0.0 && now > met.last_at && bytes >= met.last_bytes) {
+            double secs = now - met.last_at;
+            met.kbps = (uint32_t)(((double)(bytes - met.last_bytes) * 8.0) / secs / 1000.0);
+        }
+        met.last_bytes = bytes;
+        met.last_at = now;
+    }
+    met_reset();
+    met.next_at = mtx_now() + MTX_METRICS_PERIOD_S;
+}
+
+static void met_step(void)
+{
+    if (!mtx.running || mtx.metrics_port == 0) { met_forget(); return; }
+
+    double now = mtx_now();
+
+    if (met.fd < 0) {
+        if (now < met.next_at) return;
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) { met.next_at = now + MTX_METRICS_PERIOD_S; return; }
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(mtx.metrics_port);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+        if (rc != 0 && errno != EINPROGRESS) {
+            close(fd);
+            met.next_at = now + MTX_METRICS_PERIOD_S;
+            return;
+        }
+        met.fd = fd;
+        met.phase = MET_CONNECTING;
+        met.started_at = now;
+        met.len = 0;
+        met.req_sent = 0;
+        met.req_len = (size_t)snprintf(met.req, sizeof(met.req),
+            "GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    /* A request that never completes must not wedge the sampler. */
+    if (now - met.started_at > MTX_METRICS_TIMEOUT_S) {
+        met_reset();
+        met.next_at = now + MTX_METRICS_PERIOD_S;
+        return;
+    }
+
+    if (met.phase == MET_CONNECTING) {
+        int err = 0;
+        socklen_t elen = sizeof(err);
+        if (getsockopt(met.fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0) { met_reset(); return; }
+        if (err == EINPROGRESS) return;         /* still connecting */
+        if (err != 0) {
+            met_reset();
+            met.next_at = now + MTX_METRICS_PERIOD_S;
+            return;
+        }
+        met.phase = MET_SENDING;
+    }
+
+    if (met.phase == MET_SENDING) {
+        ssize_t n = send(met.fd, met.req + met.req_sent, met.req_len - met.req_sent,
+                         MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            met_reset();
+            met.next_at = now + MTX_METRICS_PERIOD_S;
+            return;
+        }
+        met.req_sent += (size_t)n;
+        if (met.req_sent < met.req_len) return;
+        met.phase = MET_READING;
+    }
+
+    if (met.phase == MET_READING) {
+        for (;;) {
+            if (met.len + 1 >= sizeof(met.buf)) { met_finish(); return; }
+            ssize_t n = recv(met.fd, met.buf + met.len, sizeof(met.buf) - met.len - 1, 0);
+            if (n > 0) { met.len += (size_t)n; continue; }
+            if (n == 0) { met.buf[met.len] = '\0'; met_finish(); return; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;   /* more later */
+            met_reset();
+            met.next_at = now + MTX_METRICS_PERIOD_S;
+            return;
+        }
+    }
+}
+
+uint32_t gui_mediamtx_stream_kbps(void) { return met.kbps; }
+
 void gui_mediamtx_poll(void)
 {
+    met_step();
+
     if (!mtx.running || mtx.child_pid <= 0) return;
     int wstatus = 0;
     pid_t r = waitpid((pid_t)mtx.child_pid, &wstatus, WNOHANG);

@@ -41,6 +41,10 @@ typedef struct {
     uint16_t hls;           /* TCP */
     uint16_t webrtc_http;   /* TCP */
     uint16_t webrtc_ice;    /* UDP */
+    /* Prometheus metrics. ALWAYS bound to loopback, in both bind modes: it is
+     * how the panel learns the stream's real bitrate, and it is nobody else's
+     * business. mediamtx canonical 9998 + 100. */
+    uint16_t metrics;       /* TCP, loopback only */
 } gui_mediamtx_config_t;
 
 typedef struct {
@@ -82,6 +86,15 @@ void gui_mediamtx_shutdown(void);
 /* Cheap child liveness check; call about once a second from the render thread
  * so a server that died is visible rather than mysterious. */
 void gui_mediamtx_poll(void);
+
+/* The stream's real published bitrate, in kbit/s, sampled from mediamtx's
+ * loopback metrics endpoint every couple of seconds. 0 means not known yet:
+ * no stream, or no sample taken since it started.
+ *
+ * This is the only place the number exists. ffmpeg's RTSP muxer reports
+ * total_size and bitrate as N/A, and /proc/<pid>/io counts only write(2), not
+ * the send(2) family a socket uses -- both measured, not assumed. */
+uint32_t gui_mediamtx_stream_kbps(void);
 
 gui_mediamtx_status_t gui_mediamtx_get_status(void);
 bool gui_mediamtx_is_running(void);

@@ -3134,11 +3134,23 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                      * proportional face "1111" and "8888" are not the same width. */
                     {
                         static char rs_live[32];
-                        if (rs_st.running && !rs_st.starting) {
-                            snprintf(rs_live, sizeof(rs_live), "%llu sent",
-                                     (unsigned long long)rs_st.frames_written);
-                        } else {
+                        if (!rs_st.running || rs_st.starting) {
                             rs_live[0] = '\0';
+                        } else {
+                            /* Sampled from mediamtx's loopback metrics endpoint
+                             * every two seconds -- the only place the real
+                             * published rate exists. 0 until the first pair of
+                             * samples exists to difference. */
+                            uint32_t kbps = gui_mediamtx_stream_kbps();
+                            if (kbps == 0) {
+                                snprintf(rs_live, sizeof(rs_live), "-- kbit/s");
+                            } else if (kbps < 1000) {
+                                snprintf(rs_live, sizeof(rs_live), "%u kbit/s",
+                                         (unsigned)kbps);
+                            } else {
+                                snprintf(rs_live, sizeof(rs_live), "%.1f Mbit/s",
+                                         (double)kbps / 1000.0);
+                            }
                         }
                         CLAY(CLAY_ID("RtspLiveBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(104), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
                             CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
