@@ -51,10 +51,16 @@ def strip_shell_comments(source: str) -> str:
 
 
 def strip_c_comments(source: str) -> str:
-    """Blank out /* */ and // comments, preserving line structure."""
+    """Blank out /* */ and // comments, preserving line structure.
+
+    String and character literals are copied through untouched. Without that a
+    literal like "rtsp://" reads as the start of a line comment and silently
+    blanks the rest of the line, so a guard searching for it finds nothing and
+    reports the code missing when it is right there."""
     out = []
     i, n = 0, len(source)
     while i < n:
+        ch = source[i]
         if source.startswith("/*", i):
             end = source.find("*/", i + 2)
             end = n if end < 0 else end + 2
@@ -65,8 +71,23 @@ def strip_c_comments(source: str) -> str:
             end = n if end < 0 else end
             out.append(" " * (end - i))
             i = end
+        elif ch in ('"', "'"):
+            # Copy the literal verbatim, honouring backslash escapes so that an
+            # escaped quote does not end it early.
+            out.append(ch)
+            i += 1
+            while i < n:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append(source[i:i + 2])
+                    i += 2
+                    continue
+                out.append(source[i])
+                if source[i] == ch or source[i] == "\n":
+                    i += 1
+                    break
+                i += 1
         else:
-            out.append(source[i])
+            out.append(ch)
             i += 1
     return "".join(out)
 
@@ -1163,6 +1184,63 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
                 "mediamtx config harness failed:\n"
                 f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
             )
+
+        # The harness matches substrings, which cannot tell a valid YAML document
+        # from an invalid one. An unquoted "::1" in a flow sequence passed every
+        # strstr assertion while making the whole config unparseable -- mediamtx
+        # would have refused to start and the stream would simply never come up.
+        # So the rendered config is handed to a real parser, and the fields that
+        # carry the security contract are read back as data rather than as text.
+        try:
+            import yaml  # noqa: PLC0415
+        except ImportError:
+            print("SKIP: mediamtx config YAML validation (PyYAML not installed)")
+            return 0
+
+        for mode, args in (("loopback", ["--dump"]), ("lan", ["--dump", "lan"])):
+            dumped = subprocess.run([str(exe_path)] + args, capture_output=True, text=True)
+            if dumped.returncode != 0:
+                return fail(f"mediamtx config harness could not dump the {mode} config")
+            try:
+                doc = yaml.safe_load(dumped.stdout)
+            except yaml.YAMLError as exc:
+                return fail(
+                    f"the generated mediamtx config is not valid YAML in {mode} mode, "
+                    f"so mediamtx would refuse to load it:\n{exc}"
+                )
+            if not isinstance(doc, dict):
+                return fail(f"the generated {mode} config did not parse to a mapping")
+
+            users = doc.get("authInternalUsers")
+            if not isinstance(users, list) or not users:
+                return fail(f"{mode}: no authInternalUsers block; mediamtx would fall "
+                            "back to its default of anyone may publish and read")
+
+            publishers = [u for u in users
+                          if any(p.get("action") == "publish"
+                                 for p in (u.get("permissions") or []))]
+            if len(publishers) != 1:
+                return fail(f"{mode}: expected exactly one entry granting publish, "
+                            f"found {len(publishers)}")
+            ips = publishers[0].get("ips")
+            if sorted(ips or []) != ["127.0.0.1", "::1"]:
+                return fail(
+                    f"{mode}: publish is granted to ips={ips!r}. It must be loopback "
+                    "only -- anything wider lets a machine on the network displace "
+                    "the publisher and put its own video in front of the operator."
+                )
+
+            path_cfg = (doc.get("paths") or {}).get("misrc-preview") or {}
+            if path_cfg.get("overridePublisher") is not False:
+                return fail(f"{mode}: overridePublisher is "
+                            f"{path_cfg.get('overridePublisher')!r}, must be no")
+            if path_cfg.get("maxReaders") in (None, 0):
+                return fail(f"{mode}: maxReaders is {path_cfg.get('maxReaders')!r}; "
+                            "mediamtx reads 0 as unlimited")
+            for endpoint in ("api", "metrics", "pprof", "playback"):
+                if doc.get(endpoint) is not False:
+                    return fail(f"{mode}: {endpoint} is {doc.get(endpoint)!r}, must be "
+                                "explicitly no rather than left to a default")
     return 0
 
 
@@ -1505,6 +1583,83 @@ def check_streaming_writes_are_private(repo_root: Path) -> int:
             "mtx_config_dir() does not return mtx_dir_is_private(out); the directory "
             "check either is not called or does not decide the outcome"
         )
+    return 0
+
+
+def check_url_open_is_whitelisted(repo_root: Path) -> int:
+    """raylib's OpenURL() builds a shell command and runs it through system(),
+    rejecting only the single quote. Ctrl+click on a reader URL reaches it, and in
+    LAN mode part of that URL is gethostname(), with reader_host a public field a
+    future caller could wire to a hand-edited settings string. So every call site
+    must sit behind the whitelist rather than trusting one blacklisted character.
+    A second, unguarded OpenURL() added later is the regression this exists to
+    catch."""
+    gui_root = repo_root / "misrc_tools"
+    call_sites = []
+    for path in sorted(gui_root.rglob("*.c")) + sorted(gui_root.rglob("*.h")):
+        if ".deps" in path.parts or "build" in path.parts:
+            continue
+        code = strip_c_comments(read_text(path))
+        for m in re.finditer(r"\bOpenURL\s*\(", code):
+            call_sites.append((path, code[: m.start()].count("\n") + 1, code, m.start()))
+
+    if not call_sites:
+        return fail(
+            "no OpenURL() call site found; the Ctrl+click-to-open affordance is gone "
+            "and this guard is guarding nothing"
+        )
+    if len(call_sites) != 1:
+        where = ", ".join(f"{p.name}:{n}" for p, n, _, _ in call_sites)
+        return fail(
+            f"expected exactly one OpenURL() call site, found {len(call_sites)}: {where}. "
+            "Each one hands a string to a shell; route them all through "
+            "rtsp_url_is_safe_to_open() and update this guard deliberately."
+        )
+
+    path, lineno, code, offset = call_sites[0]
+    # The whitelist must be the branch condition guarding this call, not merely
+    # present somewhere in the file.
+    window = code[max(0, offset - 400):offset]
+    if "rtsp_url_is_safe_to_open" not in window:
+        return fail(
+            f"{path.name}:{lineno}: OpenURL() is not guarded by rtsp_url_is_safe_to_open(). "
+            "Unvalidated text reaching OpenURL() reaches system()."
+        )
+
+    checker = strip_c_comments(read_text(path))
+    m = re.search(r"static bool rtsp_url_is_safe_to_open\(const char \*url\)\s*\{(.*?)\n\}",
+                  checker, re.S)
+    if not m:
+        return fail(f"{path.name}: rtsp_url_is_safe_to_open() is missing or its shape changed")
+    body = m.group(1)
+    for required, why in (
+        ('"rtsp://"', "must require a scheme it built"),
+        ('"http://"', "must require a scheme it built"),
+        ("return false", "must reject by default rather than allow by default"),
+    ):
+        if required not in body:
+            return fail(f"rtsp_url_is_safe_to_open() {why}; missing {required}")
+    # Enumerate what the whitelist actually permits, rather than hunting for
+    # specific bad characters. Blacklisting misses what it was not told about --
+    # an earlier version of this guard looked for "*p == '\''" and sailed past
+    # the escaped form the compiler actually sees.
+    ALLOWED_PUNCTUATION = set(".-_:/")
+    permitted = re.findall(r"\*p == '(\\.|[^'])'", body)
+    if not permitted:
+        return fail(
+            "rtsp_url_is_safe_to_open() no longer names the punctuation it allows; "
+            "this guard can no longer tell a URL from a shell command"
+        )
+    for ch in permitted:
+        if ch not in ALLOWED_PUNCTUATION:
+            return fail(
+                f"rtsp_url_is_safe_to_open() permits {ch!r} in a URL that OpenURL() "
+                f"hands to system(); only {''.join(sorted(ALLOWED_PUNCTUATION))} are safe there"
+            )
+    # The alphanumeric ranges carry the rest of the hostname and path.
+    for rng in ("'a'", "'z'", "'A'", "'Z'", "'0'", "'9'"):
+        if rng not in body:
+            return fail(f"rtsp_url_is_safe_to_open() no longer bounds its {rng} range")
     return 0
 
 
@@ -2081,6 +2236,7 @@ def main() -> int:
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
+        ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),

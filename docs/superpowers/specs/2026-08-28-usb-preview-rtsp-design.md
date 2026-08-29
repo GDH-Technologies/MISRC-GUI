@@ -393,24 +393,68 @@ rtmp: no
 srt: no
 moq: no
 
-# api/metrics/pprof/playback default to no; left unset so we bind nothing on
-# 9996-9999.
+# These four default to no. So did rtmp/srt/moq -- except those default to YES,
+# which is the whole reason this file is generated rather than assumed.
+api: no
+metrics: no
+pprof: no
+playback: no
+
+authInternalUsers:
+  # Our own ffmpeg, which always publishes over loopback whatever the bind mode.
+  # Nothing off-box may publish, credential or not.
+  - user: any
+    pass:
+    # Quoted because ::1 is not a valid plain scalar inside a YAML flow sequence;
+    # unquoted, the whole file fails to parse and mediamtx refuses to start.
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+        path: misrc-preview
+  # Viewers, from anywhere the bind mode allows.
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+        path: misrc-preview
 
 paths:
   misrc-preview:
     source: publisher
     sourceOnDemand: no
-    overridePublisher: yes
-    # mediamtx reads 0 as "no limit", not "no readers".
-    maxReaders: 0
+    # Nothing takes this path out from under the publisher that owns it.
+    overridePublisher: no
+    maxReaders: 8
 ```
 
 `127.0.0.1` is the **default**, not the only option. Bound to loopback the stream is
 reachable only on this machine; the "share on LAN" setting swaps all six addresses to
 `:8654` / `:8100` / `:8101` / `:8988` / `:8989` / `:8289` and flips
-`webrtcIPsFromInterfaces` to `yes`. There is no auth, matching
-capture-node, which has none either — so LAN mode means anyone on `gdhvc.lan` can watch the
-tape being captured. The setting says so.
+`webrtcIPsFromInterfaces` to `yes`. **Reading** is unauthenticated by default, so LAN mode
+means anyone on `gdhvc.lan` can watch the tape being captured; the setting says so.
+**Publishing** is restricted to loopback in both modes.
+
+> **Amended 2026-08-29.** This section originally read "There is no auth, matching
+> capture-node, which has none either", and the config above carried no
+> `authInternalUsers` block at all. That was reasoned about entirely in terms of who
+> may *watch*, and it was wrong about who may *publish*.
+>
+> mediamtx's shipped default is `user: any` with publish, read **and** playback on every
+> path. Combined with `overridePublisher: yes`, LAN mode let any machine on the network
+> publish to `misrc-preview` and displace our ffmpeg — so the operator monitoring a
+> customer's tape would have been shown someone else's video, as would every viewer.
+> Demonstrated rather than argued: against this config as it stood, an ffmpeg publishing
+> from `192.168.18.3` took the path; against the amended one it gets `401 Unauthorized`.
+>
+> The fix costs no credential, because `rs_build_argv()` hard-codes the publish URL to
+> `rtsp://127.0.0.1:<port>` regardless of bind mode — an IP restriction is therefore
+> sufficient. That matters: a credential in ffmpeg's argv is readable from
+> `/proc/<pid>/cmdline` by any local user, and would land in its stderr log besides.
+>
+> `overridePublisher: no` was the one risk worth testing rather than assuming, since a
+> killed publisher must still be replaceable. It is: a `kill -9` followed by an
+> immediate re-publish reclaims the path.
 
 Path name `misrc-preview` is deliberately outside capture-node's naming convention (`VCR0`,
 `VCR1`, `CAM0`, `CAM1`), so the two are never confusable in a viewer's bookmarks even if
@@ -532,6 +576,9 @@ Recorded because each one changed real work, and the reasoning matters more than
 1. **Loopback or LAN by default?** → **Loopback, with one setting to open it to the LAN.**
    Streaming off-machine is an explicit act. capture-node binds `*` with no auth, so LAN mode
    matches house norms, but the default should not.
+   *Amended 2026-08-29:* matching capture-node's lack of auth was the wrong instinct for
+   publishing. Reading stays open by default; publishing is loopback-only. See the
+   amendment under [mediamtx configuration](#mediamtx-configuration).
 2. **Audio in the stream?** → **Yes, in v1, from the dongle's own ALSA node.** This was the
    decision that could have reshaped the architecture; it did not, because the dongle's audio
    is a separate device ffmpeg opens for itself.

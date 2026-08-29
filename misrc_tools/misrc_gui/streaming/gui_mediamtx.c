@@ -47,6 +47,14 @@ static void yb_addf(yaml_buf_t *b, const char *fmt, ...)
     b->len += (size_t)n;
 }
 
+/* Every reader costs bandwidth and CPU on the machine whose RF ingest we go out
+ * of our way to protect with nice(+5), so the stream does not get to be an
+ * unbounded fan-out. Far above any realistic number of people watching one tape
+ * conversion, far below anything that could starve capture. Deliberately not a
+ * setting: mediamtx reads 0 as "no limit", so an exposed value is a way for this
+ * cap to be switched off by accident. */
+#define MTX_MAX_READERS 8
+
 int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size_t cap)
 {
     if (cfg == NULL || out == NULL || cap == 0) {
@@ -105,8 +113,53 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "srt: no\n"
         "moq: no\n"
         "\n"
-        "# api/metrics/pprof/playback default to no; left unset so we bind nothing\n"
-        "# on their ports.\n"
+        "# These four default to no. So did rtmp/srt/moq -- except those default to\n"
+        "# YES, which is the whole reason this file is generated rather than assumed.\n"
+        "# A default is not a guarantee, and pprof reachable on a LAN interface\n"
+        "# would be a genuine leak, so they are stated.\n"
+        "api: no\n"
+        "metrics: no\n"
+        "pprof: no\n"
+        "playback: no\n"
+        "\n");
+
+    /* Who may do what.
+     *
+     * Without this block mediamtx applies its shipped default -- `user: any`
+     * with publish, read AND playback on every path. In LAN mode that let any
+     * machine on the network publish to misrc-preview and, with
+     * overridePublisher on, displace our ffmpeg: the operator monitoring a
+     * customer's tape would have been shown someone else's video.
+     *
+     * Publishing is pinned to loopback in BOTH bind modes. Our publisher always
+     * connects to rtsp://127.0.0.1 whatever the bind mode (gui_rtsp_stream.c),
+     * so this costs nothing and needs no credential -- which matters, because a
+     * credential in ffmpeg's argv would be readable from /proc/<pid>/cmdline by
+     * any local user, and would land in its stderr log besides.
+     *
+     * Reading stays open: passwordless is the documented default, and LAN mode
+     * exists precisely so that people can watch. */
+    yb_addf(&b,
+        "authInternalUsers:\n"
+        "  # Our own ffmpeg. Nothing off-box may publish, credential or not.\n"
+        "  - user: any\n"
+        "    pass:\n"
+        /* Quoted deliberately: ::1 is not a valid plain scalar inside a YAML
+         * flow sequence, and the unquoted form makes the entire file fail to
+         * parse -- mediamtx would refuse to start rather than misbehave, but
+         * the stream would simply never come up. mediamtx quotes these in its
+         * own shipped config for the same reason. */
+        "    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "    permissions:\n"
+        "      - action: publish\n"
+        "        path: misrc-preview\n"
+        "  # Viewers, from anywhere the bind mode allows.\n"
+        "  - user: any\n"
+        "    pass:\n"
+        "    ips: []\n"
+        "    permissions:\n"
+        "      - action: read\n"
+        "        path: misrc-preview\n"
         "\n");
 
     /* Deliberately outside capture-node's naming, so the two are never
@@ -116,9 +169,10 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "  misrc-preview:\n"
         "    source: publisher\n"
         "    sourceOnDemand: no\n"
-        "    overridePublisher: yes\n"
-        "    # mediamtx reads 0 as \"no limit\", not \"no readers\".\n"
-        "    maxReaders: 0\n");
+        "    # Nothing takes this path out from under the publisher that owns it,\n"
+        "    # not even from loopback.\n"
+        "    overridePublisher: no\n");
+    yb_addf(&b, "    maxReaders: %d\n", MTX_MAX_READERS);
 
     if (b.overflow) {
         /* Never hand back a truncated config: mediamtx would start on its own
