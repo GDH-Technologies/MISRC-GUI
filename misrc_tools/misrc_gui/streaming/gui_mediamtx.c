@@ -167,6 +167,7 @@ int gui_mediamtx_test_main(int seconds)
 #include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -177,6 +178,7 @@ extern char **environ;
 
 #define MTX_TERM_GRACE_S  3.0
 #define MTX_KILL_GRACE_S  2.0
+#define MTX_CHILD_NICE    5
 
 static struct {
     int  child_pid;
@@ -374,6 +376,12 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
      * a second of sleeping there is a visibly frozen window. Record when to look
      * instead, and let gui_mediamtx_poll() -- already called once a frame -- do
      * the looking. */
+    /* Same posture as the publisher: serving viewers must never come at the
+     * expense of getting RF onto disk. */
+    if (setpriority(PRIO_PROCESS, (id_t)pid, MTX_CHILD_NICE) != 0) {
+        /* Not worth refusing to stream over. */
+    }
+
     mtx.child_pid = (int)pid;
     mtx.running = true;
     mtx.err_text[0] = '\0';

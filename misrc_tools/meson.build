@@ -416,6 +416,7 @@ if raylib_dep.found()
     'misrc_gui/streaming/gui_mediamtx.c',
     'misrc_gui/streaming/gui_alsa_device.c',
     'misrc_gui/streaming/gui_rtsp_stream.c',
+    'misrc_gui/streaming/gui_stream_soak.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
