@@ -1230,6 +1230,23 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
                     "the publisher and put its own video in front of the operator."
                 )
 
+            # The metrics principal, like the publisher, is loopback-only. The
+            # endpoint is already bound to 127.0.0.1 so this is defence in depth
+            # -- but a widened allow-list is exactly the kind of edit that looks
+            # harmless and removes the second layer.
+            metric_users = [u for u in users
+                            if any(p.get("action") == "metrics"
+                                   for p in (u.get("permissions") or []))]
+            if len(metric_users) != 1:
+                return fail(f"{mode}: expected exactly one entry granting metrics, "
+                            f"found {len(metric_users)}")
+            mips = metric_users[0].get("ips")
+            if sorted(mips or []) != ["127.0.0.1", "::1"]:
+                return fail(
+                    f"{mode}: metrics is granted to ips={mips!r}; it must be loopback "
+                    "only, the same as publishing"
+                )
+
             path_cfg = (doc.get("paths") or {}).get("misrc-preview") or {}
             if path_cfg.get("overridePublisher") is not False:
                 return fail(f"{mode}: overridePublisher is "
@@ -1237,10 +1254,22 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
             if path_cfg.get("maxReaders") in (None, 0):
                 return fail(f"{mode}: maxReaders is {path_cfg.get('maxReaders')!r}; "
                             "mediamtx reads 0 as unlimited")
-            for endpoint in ("api", "metrics", "pprof", "playback"):
+            for endpoint in ("api", "pprof", "playback"):
                 if doc.get(endpoint) is not False:
                     return fail(f"{mode}: {endpoint} is {doc.get(endpoint)!r}, must be "
                                 "explicitly no rather than left to a default")
+            # metrics is served on purpose -- it is the only source of the real
+            # published bitrate -- but it must never follow the bind mode.
+            if doc.get("metrics") is not True:
+                return fail(f"{mode}: metrics is {doc.get('metrics')!r}; the panel "
+                            "reads the stream bitrate from it")
+            addr = doc.get("metricsAddress") or ""
+            if not str(addr).startswith("127.0.0.1:"):
+                return fail(
+                    f"{mode}: metricsAddress is {addr!r}. It must be loopback in BOTH "
+                    "modes -- on a LAN interface it would hand anyone who asked the "
+                    "session addresses and traffic volumes of a customer's tape."
+                )
     return 0
 
 
@@ -1714,6 +1743,40 @@ def check_url_open_is_whitelisted(repo_root: Path) -> int:
     for rng in ("'a'", "'z'", "'A'", "'Z'", "'0'", "'9'"):
         if rng not in body:
             return fail(f"rtsp_url_is_safe_to_open() no longer bounds its {rng} range")
+    return 0
+
+
+def check_live_stream_readout_cannot_resize_the_panel(repo_root: Path) -> int:
+    """The settings panel is CLAY_SIZING_FIT, so it measures itself from its
+    contents. A label that changes every frame therefore re-measures the whole
+    panel, and since the panel is centre-attached it grows and shrinks around the
+    middle -- the window visibly breathes while a stream runs.
+
+    The fix is that the live readout sits in a FIXED box. This pins that, because
+    the regression is invisible in a diff: dropping the wrapper leaves working,
+    correct-looking code that just happens to make the window pulse."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+
+    m = re.search(r'CLAY\(CLAY_ID\("RtspLiveBox"\),\s*\{(.*?)\}\)\s*\{', ui, re.S)
+    if not m:
+        return fail(
+            "the RtspLiveBox wrapper is gone; the live stream readout is free to "
+            "resize the settings panel again"
+        )
+    # The WIDTH specifically. The height is always fixed, so searching the whole
+    # sizing clause for CLAY_SIZING_FIXED passes even when the width has been
+    # loosened to FIT -- which is the only axis that matters here, and which
+    # mutation testing caught this check sailing past.
+    sizing = re.search(r"\.sizing\s*=\s*\{\s*([^,]+),", m.group(1))
+    if not sizing:
+        return fail("RtspLiveBox no longer states a sizing clause this guard can read")
+    width = sizing.group(1).strip()
+    if not width.startswith("CLAY_SIZING_FIXED"):
+        return fail(
+            f"RtspLiveBox width is {width}, not CLAY_SIZING_FIXED. Its text width "
+            "then feeds back into a CLAY_SIZING_FIT panel and the window breathes "
+            "as the numbers change."
+        )
     return 0
 
 
@@ -2288,6 +2351,7 @@ def main() -> int:
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
+        ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),

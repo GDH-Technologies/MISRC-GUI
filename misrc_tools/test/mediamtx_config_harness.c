@@ -292,10 +292,15 @@ static int test_caps_the_number_of_readers(void)
     return failures - before;
 }
 
-/* These four default to "no" today. So did rtmp/srt/moq -- except those default
- * to YES, which is exactly why this file exists. A default is not a guarantee,
- * and pprof reachable on a LAN interface would be a genuine leak. */
-static int test_admin_endpoints_are_explicitly_disabled(void)
+/* These default to "no" today. So did rtmp/srt/moq -- except those default to
+ * YES, which is exactly why this file exists. A default is not a guarantee.
+ *
+ * metrics is the one exception, and it is deliberate: it is the only place the
+ * stream's real published bitrate exists, so the panel reads it. It must
+ * therefore be bound to loopback in BOTH modes -- switching to LAN exposes the
+ * stream, and nothing else. A metrics endpoint on a LAN interface would leak
+ * session addresses and traffic volumes to anyone who asked. */
+static int test_admin_endpoints_are_locked_down(void)
 {
     int before = failures;
 
@@ -307,12 +312,18 @@ static int test_admin_endpoints_are_explicitly_disabled(void)
         gui_mediamtx_render_config(&cfg, yaml, sizeof yaml);
 
         expect_contains(yaml, "api: no", "control api disabled");
-        expect_contains(yaml, "metrics: no", "metrics endpoint disabled");
         expect_contains(yaml, "pprof: no", "pprof endpoint disabled");
         expect_contains(yaml, "playback: no", "recording playback disabled");
+
+        expect_contains(yaml, "metrics: yes", "metrics served for the bitrate readout");
+        expect_contains(yaml, "metricsAddress: 127.0.0.1:",
+                        "metrics bound to loopback whatever the bind mode");
+        /* The publish allow-list is the only other place metrics is named; if
+         * the endpoint were ever granted more widely this would be the tell. */
+        expect_contains(yaml, "      - action: metrics", "metrics permission exists");
     }
 
-    if (failures == before) puts("PASS: admin endpoints are explicitly disabled");
+    if (failures == before) puts("PASS: admin endpoints are locked down");
     return failures - before;
 }
 
@@ -365,7 +376,7 @@ int main(int argc, char **argv)
     test_publishing_is_restricted_to_loopback();
     test_never_lets_a_publisher_be_displaced();
     test_caps_the_number_of_readers();
-    test_admin_endpoints_are_explicitly_disabled();
+    test_admin_endpoints_are_locked_down();
     test_rejects_a_buffer_that_cannot_hold_the_config();
 
     if (failures != 0) {
