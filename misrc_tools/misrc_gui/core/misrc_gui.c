@@ -811,6 +811,9 @@ int main(int argc, char **argv) {
          * died mid-session stays "running" in the panel until something tries
          * to publish, which is how capture-node's equivalent hides the fact. */
         gui_mediamtx_poll();
+        /* Finishes a stream start that was deliberately left unfinished: the
+         * click handler spawns and returns, so the window never freezes. */
+        gui_rtsp_stream_poll();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
