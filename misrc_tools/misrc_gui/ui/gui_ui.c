@@ -2692,7 +2692,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // Sample rate row (cycle box)
                         CLAY(CLAY_ID("RtlsdrSampleRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY_TEXT(CLAY_STRING("Sample rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                            char sr_buf[24];
+                            // Clay reads this back after Clay_EndLayout, so it
+                            // cannot be a stack buffer -- see stat_cx_level.
+                            static char sr_buf[24];
                             snprintf(sr_buf, sizeof(sr_buf), "%.2f MSPS", (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
                             CLAY(CLAY_ID("RtlsdrSampleRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(sr_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -2711,7 +2713,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // Gain stepper row
                         CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
-                            char gain_buf[24];
+                            static char gain_buf[24];  // outlives the layout pass; see sr_buf
                             snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
                             CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                             CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
@@ -3057,15 +3059,28 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     // reading a port off a screen and retyping it is how people
                     // end up on capture-node's stream by accident.
                     if (rs_st.running && !rs_st.starting) {
+                        // rs_st is a copy on this frame's stack, and Clay does not
+                        // copy the text it is handed -- it keeps the pointer and
+                        // reads it back in Clay_EndLayout(), by which time this
+                        // frame is gone. Reading straight out of rs_st drew boxes
+                        // of exactly the right width, because layout measured a
+                        // live string, holding '?' -- raylib's stand-in for
+                        // whatever bytes had since landed on that stack slot.
+                        static char rs_url_rtsp[256];
+                        static char rs_url_webrtc[256];
+                        static char rs_url_hls[256];
+                        snprintf(rs_url_rtsp, sizeof(rs_url_rtsp), "%s", rs_st.url_rtsp);
+                        snprintf(rs_url_webrtc, sizeof(rs_url_webrtc), "%s", rs_st.url_webrtc);
+                        snprintf(rs_url_hls, sizeof(rs_url_hls), "%s", rs_st.url_hls);
                         CLAY(CLAY_ID("RtspUrlRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
                             CLAY(CLAY_ID("RtspUrlRtsp"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                CLAY_TEXT(make_string(rs_url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                             }
                             CLAY(CLAY_ID("RtspUrlWebrtc"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_webrtc), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                CLAY_TEXT(make_string(rs_url_webrtc), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                             }
                             CLAY(CLAY_ID("RtspUrlHls"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_hls), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                CLAY_TEXT(make_string(rs_url_hls), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                             }
                         }
                     }

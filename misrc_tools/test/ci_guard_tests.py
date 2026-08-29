@@ -1356,6 +1356,65 @@ def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
     return 0
 
 
+def check_clay_text_outlives_layout(repo_root: Path) -> int:
+    """Clay stores the pointer it is handed and reads it back in Clay_EndLayout(),
+    which misrc_gui.c calls after the whole layout function has returned. Anything
+    with automatic storage duration is freed by then, so the draw pass reads a dead
+    stack frame and raylib substitutes '?' for every byte that is not a glyph. The
+    failure is quiet and looks like a font problem, which is why it needs a guard:
+    the layout pass measures the real string, so the box is the right size and only
+    the text inside it is wrong. gui_ui.c states the rule in a comment; this makes
+    it enforceable."""
+    path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
+    code = strip_c_comments(read_text(path))
+
+    # Declarations inside a function body, i.e. automatic storage. File-scope
+    # declarations are unindented and live for the life of the process.
+    stack_arrays: dict = {}
+    stack_structs: dict = {}
+    for lineno, raw in enumerate(code.splitlines(), 1):
+        if not raw[:1].isspace():
+            continue
+        stmt = raw.strip()
+        if stmt.startswith("static ") or stmt.startswith("extern "):
+            continue
+        m = re.match(r"(?:const\s+)?char\s+([A-Za-z_]\w*)\s*\[", stmt)
+        if m:
+            stack_arrays.setdefault(m.group(1), lineno)
+            continue
+        # A struct copied onto the stack, e.g. `foo_status_t st = foo_get_status();`
+        m = re.match(r"([A-Za-z_]\w*_t)\s+([A-Za-z_]\w*)\s*=", stmt)
+        if m:
+            stack_structs.setdefault(m.group(2), lineno)
+
+    offenders = []
+    for m in re.finditer(r"make_string\(\s*([^();]*?)\s*\)", code):
+        arg = m.group(1)
+        base = re.match(r"([A-Za-z_]\w*)", arg)
+        if not base:
+            continue
+        name = base.group(1)
+        where = code[: m.start()].count("\n") + 1
+        if name in stack_arrays:
+            offenders.append((where, arg, stack_arrays[name], "stack buffer"))
+        elif name in stack_structs and arg != name:
+            offenders.append((where, arg, stack_structs[name], "field of a stack struct"))
+
+    if offenders:
+        lines = [
+            f"  gui_ui.c:{where}: make_string({arg}) reads a {kind} declared at line {decl}"
+            for where, arg, decl, kind in sorted(offenders)
+        ]
+        return fail(
+            "CLAY_TEXT was handed storage that does not outlive the layout pass:\n"
+            + "\n".join(lines)
+            + "\nClay keeps the pointer and dereferences it after Clay_EndLayout() in "
+            "misrc_gui.c, by which time the frame is gone. Copy the text into a "
+            "`static char` buffer first, as every other dynamic string in this file does."
+        )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1927,6 +1986,7 @@ def main() -> int:
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
+        ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
