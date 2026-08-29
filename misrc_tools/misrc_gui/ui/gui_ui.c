@@ -2778,6 +2778,121 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
 
+                    // Reference video: the USB preview dongle's picture, encoded
+                    // by ffmpeg alongside the RF. Greyed out when no usable
+                    // ffmpeg was found, so it cannot be armed into a state that
+                    // would later refuse to start a recording.
+                    bool ff_ok = gui_video_record_probe();
+                    CLAY(CLAY_ID("ToggleRowVideoRef"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                        Color vr_bg = app->settings.video_record_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        if (!ff_ok) vr_bg = ui_disabled_color(vr_bg);
+                        CLAY(CLAY_ID("ToggleVideoRecord"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(vr_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT((app->settings.video_record_enabled && ff_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        }
+                        CLAY_TEXT(CLAY_STRING("Reference video"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        CLAY(CLAY_ID("VideoCodecBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ff_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(app->settings.video_record_codec == 1 ? CLAY_STRING("FFV1") : CLAY_STRING("H.264"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        }
+                        Color vtag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
+                        Color vtag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                        CLAY(CLAY_ID("VideoTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(vtag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            const char *vtag = app->settings.video_output_tag[0] ? app->settings.video_output_tag : "(tag)";
+                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_VIDEO_TAG) && app->settings.auto_names_enabled) {
+                                gui_ui_render_active_text(UI_TEXT_FIELD_VIDEO_TAG, vtag, FONT_SIZE_STATS, 1, vtag_fg);
+                            } else {
+                                CLAY_TEXT(make_string(vtag), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(vtag_fg) }));
+                            }
+                        }
+                    }
+                    // Says which ffmpeg was found, or why the toggle is dead.
+                    CLAY(CLAY_ID("VideoRefHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+                        static char vr_hint[220];
+                        if (ff_ok) {
+                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s%s", gui_video_record_ffmpeg_path(),
+                                     app->settings.video_record_codec == 1
+                                       ? "   FFV1 is lossless, roughly 5-16 MB/s" : "   H.264 CRF 18, under 3 MB/s");
+                        } else {
+                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");
+                        }
+                        CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
+                    }
+
+                    // Stream: the same picture as the reference recording,
+                    // published live so a tape can be watched from another
+                    // machine. Greyed out when no mediamtx was found, for the
+                    // same reason as the ffmpeg toggle above -- it must not arm
+                    // into a state that would later refuse to start.
+                    bool mtx_ok = gui_mediamtx_probe();
+                    gui_rtsp_stream_status_t rs_st = gui_rtsp_stream_get_status();
+                    CLAY(CLAY_ID("ToggleRowRtsp"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                        Color rs_bg = rs_st.running ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        if (!mtx_ok) rs_bg = ui_disabled_color(rs_bg);
+                        Color rs_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                        CLAY(CLAY_ID("ToggleRtspStream"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rs_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(rs_st.running ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
+                        }
+                        CLAY_TEXT(CLAY_STRING("Stream"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
+                        CLAY(CLAY_ID("RtspEncoderBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(76), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            const char *enc_label = app->settings.rtsp_stream_encoder == 1 ? "NVENC"
+                                                  : app->settings.rtsp_stream_encoder == 2 ? "x264" : "Auto";
+                            CLAY_TEXT(make_string(enc_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
+                        }
+                        // Loopback vs LAN. There is no auth either way, so the
+                        // hint line below says so rather than hiding it.
+                        CLAY(CLAY_ID("RtspBindBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(84), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(app->settings.rtsp_stream_lan ? CLAY_STRING("LAN") : CLAY_STRING("Loopback"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
+                        }
+                        if (rs_st.running) {
+                            static char rs_live[96];
+                            snprintf(rs_live, sizeof(rs_live), "%llu sent  %llu dropped%s",
+                                     (unsigned long long)rs_st.frames_written,
+                                     (unsigned long long)rs_st.frames_dropped,
+                                     rs_st.audio_active ? "  +audio" : "  video only");
+                            CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+                    }
+                    // The URLs a viewer actually types. Click one to copy it --
+                    // reading a port off a screen and retyping it is how people
+                    // end up on capture-node's stream by accident.
+                    if (rs_st.running) {
+                        CLAY(CLAY_ID("RtspUrlRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+                            CLAY(CLAY_ID("RtspUrlRtsp"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(rs_st.url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY(CLAY_ID("RtspUrlWebrtc"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(rs_st.url_webrtc), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY(CLAY_ID("RtspUrlHls"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(rs_st.url_hls), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                        }
+                    }
+                    // One line that says what is wrong, or what is about to be
+                    // shared with the whole network.
+                    CLAY(CLAY_ID("RtspHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+                        static char rs_hint[260];
+                        Color hint_fg = COLOR_TEXT_DIM;
+                        if (!mtx_ok) {
+                            snprintf(rs_hint, sizeof(rs_hint),
+                                     "mediamtx not found - install it or set mediamtx_path in the settings file");
+                            hint_fg = COLOR_SYNC_RED;
+                        } else if (rs_st.error) {
+                            snprintf(rs_hint, sizeof(rs_hint), "stream error: %s", rs_st.err_text);
+                            hint_fg = COLOR_SYNC_RED;
+                        } else if (rs_st.running && !rs_st.audio_active) {
+                            snprintf(rs_hint, sizeof(rs_hint), "video only - %s",
+                                     rs_st.audio_note[0] ? rs_st.audio_note : "no audio device");
+                        } else if (app->settings.rtsp_stream_lan) {
+                            snprintf(rs_hint, sizeof(rs_hint),
+                                     "LAN: anyone on the network can watch this stream - there is no password");
+                            hint_fg = COLOR_SYNC_RED;
+                        } else {
+                            snprintf(rs_hint, sizeof(rs_hint), "mediamtx: %s   loopback only",
+                                     gui_mediamtx_binary_path());
+                        }
+                        CLAY_TEXT(make_string(rs_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(hint_fg) }));
+                    }
+
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.use_flac ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -2926,121 +3041,6 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                                 CLAY_TEXT(make_string(tag4), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(audio_tag_4ch_fg) }));
                             }
                         }
-                    }
-
-                    // Reference video: the USB preview dongle's picture, encoded
-                    // by ffmpeg alongside the RF. Greyed out when no usable
-                    // ffmpeg was found, so it cannot be armed into a state that
-                    // would later refuse to start a recording.
-                    bool ff_ok = gui_video_record_probe();
-                    CLAY(CLAY_ID("ToggleRowVideoRef"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color vr_bg = app->settings.video_record_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        if (!ff_ok) vr_bg = ui_disabled_color(vr_bg);
-                        CLAY(CLAY_ID("ToggleVideoRecord"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(vr_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT((app->settings.video_record_enabled && ff_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("Reference video"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        CLAY(CLAY_ID("VideoCodecBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ff_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.video_record_codec == 1 ? CLAY_STRING("FFV1") : CLAY_STRING("H.264"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                        Color vtag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-                        Color vtag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("VideoTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(vtag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *vtag = app->settings.video_output_tag[0] ? app->settings.video_output_tag : "(tag)";
-                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_VIDEO_TAG) && app->settings.auto_names_enabled) {
-                                gui_ui_render_active_text(UI_TEXT_FIELD_VIDEO_TAG, vtag, FONT_SIZE_STATS, 1, vtag_fg);
-                            } else {
-                                CLAY_TEXT(make_string(vtag), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(vtag_fg) }));
-                            }
-                        }
-                    }
-                    // Says which ffmpeg was found, or why the toggle is dead.
-                    CLAY(CLAY_ID("VideoRefHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-                        static char vr_hint[220];
-                        if (ff_ok) {
-                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s%s", gui_video_record_ffmpeg_path(),
-                                     app->settings.video_record_codec == 1
-                                       ? "   FFV1 is lossless, roughly 5-16 MB/s" : "   H.264 CRF 18, under 3 MB/s");
-                        } else {
-                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");
-                        }
-                        CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
-                    }
-
-                    // Stream: the same picture as the reference recording,
-                    // published live so a tape can be watched from another
-                    // machine. Greyed out when no mediamtx was found, for the
-                    // same reason as the ffmpeg toggle above -- it must not arm
-                    // into a state that would later refuse to start.
-                    bool mtx_ok = gui_mediamtx_probe();
-                    gui_rtsp_stream_status_t rs_st = gui_rtsp_stream_get_status();
-                    CLAY(CLAY_ID("ToggleRowRtsp"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color rs_bg = rs_st.running ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        if (!mtx_ok) rs_bg = ui_disabled_color(rs_bg);
-                        Color rs_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("ToggleRtspStream"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rs_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(rs_st.running ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("Stream"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
-                        CLAY(CLAY_ID("RtspEncoderBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(76), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *enc_label = app->settings.rtsp_stream_encoder == 1 ? "NVENC"
-                                                  : app->settings.rtsp_stream_encoder == 2 ? "x264" : "Auto";
-                            CLAY_TEXT(make_string(enc_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
-                        }
-                        // Loopback vs LAN. There is no auth either way, so the
-                        // hint line below says so rather than hiding it.
-                        CLAY(CLAY_ID("RtspBindBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(84), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.rtsp_stream_lan ? CLAY_STRING("LAN") : CLAY_STRING("Loopback"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
-                        }
-                        if (rs_st.running) {
-                            static char rs_live[96];
-                            snprintf(rs_live, sizeof(rs_live), "%llu sent  %llu dropped%s",
-                                     (unsigned long long)rs_st.frames_written,
-                                     (unsigned long long)rs_st.frames_dropped,
-                                     rs_st.audio_active ? "  +audio" : "  video only");
-                            CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        }
-                    }
-                    // The URLs a viewer actually types. Click one to copy it --
-                    // reading a port off a screen and retyping it is how people
-                    // end up on capture-node's stream by accident.
-                    if (rs_st.running) {
-                        CLAY(CLAY_ID("RtspUrlRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
-                            CLAY(CLAY_ID("RtspUrlRtsp"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                            CLAY(CLAY_ID("RtspUrlWebrtc"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_webrtc), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                            CLAY(CLAY_ID("RtspUrlHls"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_st.url_hls), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                        }
-                    }
-                    // One line that says what is wrong, or what is about to be
-                    // shared with the whole network.
-                    CLAY(CLAY_ID("RtspHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-                        static char rs_hint[260];
-                        Color hint_fg = COLOR_TEXT_DIM;
-                        if (!mtx_ok) {
-                            snprintf(rs_hint, sizeof(rs_hint),
-                                     "mediamtx not found - install it or set mediamtx_path in the settings file");
-                            hint_fg = COLOR_SYNC_RED;
-                        } else if (rs_st.error) {
-                            snprintf(rs_hint, sizeof(rs_hint), "stream error: %s", rs_st.err_text);
-                            hint_fg = COLOR_SYNC_RED;
-                        } else if (rs_st.running && !rs_st.audio_active) {
-                            snprintf(rs_hint, sizeof(rs_hint), "video only - %s",
-                                     rs_st.audio_note[0] ? rs_st.audio_note : "no audio device");
-                        } else if (app->settings.rtsp_stream_lan) {
-                            snprintf(rs_hint, sizeof(rs_hint),
-                                     "LAN: anyone on the network can watch this stream - there is no password");
-                            hint_fg = COLOR_SYNC_RED;
-                        } else {
-                            snprintf(rs_hint, sizeof(rs_hint), "mediamtx: %s   loopback only",
-                                     gui_mediamtx_binary_path());
-                        }
-                        CLAY_TEXT(make_string(rs_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(hint_fg) }));
                     }
 
                     CLAY(CLAY_ID("ToggleRowAudio2ch12"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {

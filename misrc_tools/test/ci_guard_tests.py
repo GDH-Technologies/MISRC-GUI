@@ -1290,6 +1290,9 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
     ):
         if "fetch-mediamtx.sh" not in read_text(consumer):
             return fail(f"{label} does not stage mediamtx via scripts/fetch-mediamtx.sh")
+    return 0
+
+
 def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
     """gui_settings.c keeps defaults, the writer and the parser in three
     separate places. A field added to two of them is silent: the setting
@@ -1929,9 +1932,16 @@ def main() -> int:
 
     for name, check in checks:
         rc = check()
+        if rc is None:
+            # A check that falls off its end returns None, and SystemExit(None)
+            # is a SUCCESSFUL exit -- so the suite would print FAILED and still
+            # go green. Treat it as the bug it is.
+            print(f"FAILED: {name} (check returned None; it is missing a return)",
+                  file=sys.stderr)
+            return 1
         if rc != 0:
             print(f"FAILED: {name}", file=sys.stderr)
-            return rc
+            return rc if isinstance(rc, int) and rc != 0 else 1
         print(f"PASS: {name}")
 
     return 0
