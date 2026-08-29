@@ -30,8 +30,10 @@
 
 typedef struct {
     /* false: bind 127.0.0.1, reachable only on this machine.
-     * true:  bind every interface. There is no auth -- matching capture-node,
-     *        which has none either -- so anyone on the LAN can watch. */
+     * true:  bind every interface, so anyone on the LAN can WATCH. Reading is
+     *        deliberately open (a password is opt-in, see the settings);
+     *        PUBLISHING is restricted to loopback in both modes, because our
+     *        own ffmpeg is the only thing that should ever own this path. */
     bool     lan;
     uint16_t rtsp;          /* TCP */
     uint16_t rtp;           /* UDP */
