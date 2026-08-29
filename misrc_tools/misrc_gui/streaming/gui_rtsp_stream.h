@@ -68,6 +68,10 @@ typedef struct {
 
 typedef struct {
     bool     running;
+    /* Spawned, but not yet known to have survived its first frames. The
+     * check is deferred to gui_rtsp_stream_poll() rather than slept for,
+     * because starting a stream must not freeze the window. */
+    bool     starting;
     bool     error;
     char     err_text[192];
     uint64_t frames_submitted;   /* handed over by the capture thread */
@@ -100,6 +104,11 @@ void gui_rtsp_stream_finish(void);
 
 /* Last-resort teardown for app exit. */
 void gui_rtsp_stream_shutdown(void);
+
+/* Completes a deferred startup check and applies the one video-only retry.
+ * Cheap -- a clock read, and a waitpid(WNOHANG) only once the window elapses.
+ * Call about once a frame, beside gui_mediamtx_poll(). */
+void gui_rtsp_stream_poll(void);
 
 gui_rtsp_stream_status_t gui_rtsp_stream_get_status(void);
 bool gui_rtsp_stream_is_running(void);

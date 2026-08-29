@@ -183,6 +183,9 @@ static struct {
     bool running;
     char config_path[512];
     char err_text[192];
+    /* When the just-spawned child should be checked for an immediate exit. 0
+     * once it has been checked. See gui_mediamtx_start(). */
+    double verify_at;
 } mtx;
 
 static struct {
@@ -366,27 +369,21 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
         return -1;
     }
 
-    /* capture-node's trick: a mediamtx that cannot bind exits at once, so give
-     * it a moment and check, rather than reporting success and failing later
-     * when the publisher cannot connect. */
-    mtx_sleep(0.4);
-    int wstatus = 0;
-    if (waitpid(pid, &wstatus, WNOHANG) == pid) {
-        if (err) snprintf(err, err_cap,
-                          "mediamtx exited immediately (port already bound?); config %s",
-                          mtx.config_path);
-        mtx.child_pid = 0;
-        return -1;
-    }
-
+    /* A mediamtx that cannot bind exits at once, and capture-node's answer is to
+     * sleep and then check. We cannot: this runs on the render thread, and half
+     * a second of sleeping there is a visibly frozen window. Record when to look
+     * instead, and let gui_mediamtx_poll() -- already called once a frame -- do
+     * the looking. */
     mtx.child_pid = (int)pid;
     mtx.running = true;
     mtx.err_text[0] = '\0';
+    mtx.verify_at = mtx_now() + 0.5;
     return 0;
 }
 
 void gui_mediamtx_stop(void)
 {
+    mtx.verify_at = 0.0;
     if (!mtx.running || mtx.child_pid <= 0) {
         mtx.running = false;
         mtx.child_pid = 0;
@@ -421,7 +418,24 @@ void gui_mediamtx_poll(void)
     if (!mtx.running || mtx.child_pid <= 0) return;
     int wstatus = 0;
     pid_t r = waitpid((pid_t)mtx.child_pid, &wstatus, WNOHANG);
-    if (r != (pid_t)mtx.child_pid) return;
+    if (r != (pid_t)mtx.child_pid) {
+        /* Survived its first half second, so it bound its ports. */
+        if (mtx.verify_at != 0.0 && mtx_now() > mtx.verify_at) mtx.verify_at = 0.0;
+        return;
+    }
+
+    /* Died inside the startup window: almost always a port it could not bind,
+     * which is the one failure worth naming precisely. */
+    if (mtx.verify_at != 0.0) {
+        /* The config path is already in the status struct; repeating it here
+         * would not fit err_text and the truncation is a build error. */
+        snprintf(mtx.err_text, sizeof(mtx.err_text),
+                 "mediamtx exited at startup - a port it needs is already bound");
+        mtx.verify_at = 0.0;
+        mtx.running = false;
+        mtx.child_pid = 0;
+        return;
+    }
 
     /* capture-node has no equivalent of this: there, a dead mediamtx is simply
      * gone until the daemon restarts, with nothing said. */

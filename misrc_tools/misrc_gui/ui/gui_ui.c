@@ -203,7 +203,9 @@ static void gui_ui_toggle_rtsp_stream(gui_app_t *app)
     }
     app->settings.rtsp_stream_enabled = true;
     gui_settings_save(&app->settings);
-    gui_app_set_status(app, gui_rtsp_stream_get_status().url_rtsp);
+    /* start() only launches. Whether ffmpeg survived shows up in the panel a
+     * moment later, via gui_rtsp_stream_poll(). */
+    gui_app_set_status(app, "Starting the stream...");
 }
 
 static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
@@ -3013,13 +3015,23 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     // same reason as the ffmpeg toggle above -- it must not arm
                     // into a state that would later refuse to start.
                     bool mtx_ok = gui_mediamtx_probe();
+                    /* Warm the encoder cache while the panel is merely being
+                     * looked at, so the click does not pay for an ffmpeg
+                     * -encoders popen. Both probes are cached. */
+                    (void)gui_rtsp_stream_probe();
                     gui_rtsp_stream_status_t rs_st = gui_rtsp_stream_get_status();
                     CLAY(CLAY_ID("ToggleRowRtsp"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color rs_bg = rs_st.running ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        Color rs_bg = (rs_st.running || rs_st.starting) ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
                         if (!mtx_ok) rs_bg = ui_disabled_color(rs_bg);
                         Color rs_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
                         CLAY(CLAY_ID("ToggleRtspStream"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rs_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(rs_st.running ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
+                            /* Three states: ffmpeg is spawned but not yet known
+                             * to have survived its first frames, and saying ON
+                             * during that would be a claim we cannot support. */
+                            CLAY_TEXT(rs_st.starting ? CLAY_STRING("...")
+                                                     : (rs_st.running ? CLAY_STRING("ON")
+                                                                      : CLAY_STRING("OFF")),
+                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
                         }
                         CLAY_TEXT(CLAY_STRING("RTSP Stream"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
                         CLAY(CLAY_ID("RtspEncoderBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(76), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
@@ -3032,7 +3044,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("RtspBindBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(84), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.rtsp_stream_lan ? CLAY_STRING("LAN") : CLAY_STRING("Loopback"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
                         }
-                        if (rs_st.running) {
+                        if (rs_st.running && !rs_st.starting) {
                             static char rs_live[96];
                             snprintf(rs_live, sizeof(rs_live), "%llu sent  %llu dropped%s",
                                      (unsigned long long)rs_st.frames_written,
@@ -3044,7 +3056,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     // The URLs a viewer actually types. Click one to copy it --
                     // reading a port off a screen and retyping it is how people
                     // end up on capture-node's stream by accident.
-                    if (rs_st.running) {
+                    if (rs_st.running && !rs_st.starting) {
                         CLAY(CLAY_ID("RtspUrlRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
                             CLAY(CLAY_ID("RtspUrlRtsp"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(rs_st.url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -3069,6 +3081,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         } else if (rs_st.error) {
                             snprintf(rs_hint, sizeof(rs_hint), "stream error: %s", rs_st.err_text);
                             hint_fg = COLOR_SYNC_RED;
+                        } else if (rs_st.starting) {
+                            snprintf(rs_hint, sizeof(rs_hint), "starting the stream...");
                         } else if (rs_st.running && !rs_st.audio_active) {
                             snprintf(rs_hint, sizeof(rs_hint), "video only - %s",
                                      rs_st.audio_note[0] ? rs_st.audio_note : "no audio device");
@@ -7732,16 +7746,24 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleRtspStream"))) {
-                gui_ui_toggle_rtsp_stream(app);
+                if (gui_rtsp_stream_get_status().starting) {
+                    /* Tearing down an attempt that has not resolved yet would
+                     * race the poll that is about to judge it. */
+                    gui_app_set_status(app, "the stream is still starting");
+                } else {
+                    gui_ui_toggle_rtsp_stream(app);
+                }
             }
-            if (Clay_PointerOver(CLAY_ID("RtspEncoderBox")) && !gui_rtsp_stream_is_running()) {
+            if (Clay_PointerOver(CLAY_ID("RtspEncoderBox")) && !gui_rtsp_stream_is_running() &&
+                !gui_rtsp_stream_get_status().starting) {
                 /* Only while stopped: the encoder is chosen when ffmpeg is
                  * spawned, so changing it mid-stream would show a setting that
                  * does not match what is being sent. */
                 app->settings.rtsp_stream_encoder = (app->settings.rtsp_stream_encoder + 1) % 3;
                 gui_settings_save(&app->settings);
             }
-            if (Clay_PointerOver(CLAY_ID("RtspBindBox")) && !gui_rtsp_stream_is_running()) {
+            if (Clay_PointerOver(CLAY_ID("RtspBindBox")) && !gui_rtsp_stream_is_running() &&
+                !gui_rtsp_stream_get_status().starting) {
                 app->settings.rtsp_stream_lan = !app->settings.rtsp_stream_lan;
                 gui_settings_save(&app->settings);
             }

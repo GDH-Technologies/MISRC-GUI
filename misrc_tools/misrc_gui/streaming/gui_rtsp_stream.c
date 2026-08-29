@@ -61,6 +61,18 @@ static struct {
     preview_tap_t tap;
     bool  holding_preview;
     double stop_at;
+
+    /* Deferred startup verification. ffmpeg cannot fail until frames reach it,
+     * so the check has to happen after the tap is live -- but sleeping for it on
+     * the render thread is what made the window freeze. */
+    double verify_at;              /* 0 = nothing pending */
+    bool   retried_video_only;
+    bool   use_nvenc;
+    char   audio_device[128];      /* what the current attempt is using */
+    gui_rtsp_stream_opts_t opts;   /* copy; the string fields point at the below */
+    char   opt_video_device[64];
+    char   opt_audio_device[128];
+    char   opt_reader_host[128];
 } rs;
 
 static rs_inject_t s_inject = RS_INJECT_NONE;
@@ -515,21 +527,18 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
     rs.tap.user = NULL;
     gui_preview_mux_add(&rs.tap);
 
-    /* Long enough for a frame or two to reach ffmpeg and for it to fail on
-     * them; short enough not to be felt when starting a stream that works. */
-    struct timespec settle = { 1, 500 * 1000 * 1000 };
-    nanosleep(&settle, NULL);
+    /* Wired up and running. Whether ffmpeg SURVIVES is checked later, from
+     * gui_rtsp_stream_poll(): it cannot fail until frames reach it, and waiting
+     * here for that to happen is what froze the window. */
+    if (sock_out) *sock_out = sv[0];
+    if (pid_out) *pid_out = pid;
+    return RS_SPAWN_OK;
+}
 
-    int wstatus = 0;
-    if (waitpid(pid, &wstatus, WNOHANG) != pid) {
-        *sock_out = sv[0];
-        *pid_out = pid;
-        return RS_SPAWN_OK;
-    }
-
-    /* It died. Unwind everything this attempt put in place, so the caller may
-     * retry into the same ring. Audio fields are left alone: the caller sets
-     * them before retrying and they must survive. */
+/* Tear down what one attempt put in place, leaving the ring alone so a retry
+ * can reuse it. Audio status fields are preserved: the retry sets them. */
+static void rs_unwind_attempt(void)
+{
     gui_preview_mux_remove(&rs.tap);
     if (rs.holding_preview) {
         gui_preview_hold_release();
@@ -554,7 +563,11 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
     rs.status.frames_written = 0;
     rs.status.frames_dropped = 0;
     rs_unlock();
+}
 
+/* Why did it die? Reads ffmpeg's log and turns it into something displayable. */
+static rs_spawn_result_t rs_classify_exit(char *err, size_t err_cap)
+{
     /* Classify over the WHOLE log, not just its last line. ffmpeg's final line
      * is a generic summary -- "Error opening input files: Input/output error"
      * -- while the line that says which input and why is several above it. The
@@ -579,10 +592,8 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
             line = nl ? nl + 1 : NULL;
         }
     }
-    close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
-
     if (strstr(log_text, "Connection refused")) {
-        snprintf(err, err_cap, "mediamtx is not accepting publishers on %s", url_buf);
+        snprintf(err, err_cap, "mediamtx is not accepting publishers on the RTSP port");
         return RS_SPAWN_FAIL_OTHER;
     }
     if (strstr(log_text, "CUDA") || strstr(log_text, "nvenc")) {
@@ -665,34 +676,103 @@ int gui_rtsp_stream_start(const gui_rtsp_stream_opts_t *opts, char *err, size_t 
         }
     }
 
+    /* Keep everything a retry will need. The caller's opts may be a stack
+     * temporary and its string fields may not outlive this call. */
+    rs.opts = *opts;
+    snprintf(rs.opt_video_device, sizeof(rs.opt_video_device), "%s",
+             opts->video_device ? opts->video_device : "");
+    snprintf(rs.opt_audio_device, sizeof(rs.opt_audio_device), "%s",
+             opts->audio_device ? opts->audio_device : "");
+    snprintf(rs.opt_reader_host, sizeof(rs.opt_reader_host), "%s",
+             opts->reader_host ? opts->reader_host : "");
+    rs.opts.video_device = rs.opt_video_device;
+    rs.opts.audio_device = rs.opt_audio_device;
+    rs.opts.reader_host = rs.opt_reader_host;
+    rs.use_nvenc = use_nvenc;
+    rs.retried_video_only = false;
+    snprintf(rs.audio_device, sizeof(rs.audio_device), "%s", audio_device);
+
     int sock = -1;
     pid_t pid = 0;
-    rs_spawn_result_t sr = rs_spawn_attempt(opts, use_nvenc, audio_device,
-                                            &sock, &pid, err, err_cap);
-    if (sr == RS_SPAWN_FAIL_AUDIO && audio_device[0]) {
-        /* One retry, video-only, per the failure-mode table: a sound card that
-         * cannot be opened must not cost the picture. Exactly one -- retrying a
-         * genuinely broken device in a loop burns CPU and fills logs, which is
-         * why capture-node leaves restarts to the operator. */
-        snprintf(rs.status.audio_note, sizeof(rs.status.audio_note),
-                 "audio device could not be opened; streaming video-only");
-        rs.status.audio_active = false;
-        audio_device[0] = '\0';
-        sr = rs_spawn_attempt(opts, use_nvenc, audio_device, &sock, &pid, err, err_cap);
-    }
-    if (sr != RS_SPAWN_OK) {
+    if (rs_spawn_attempt(&rs.opts, use_nvenc, rs.audio_device,
+                         &sock, &pid, err, err_cap) != RS_SPAWN_OK) {
         rs_free_ring();
         return -1;
     }
-
     (void)sock;
-    if (s_inject == RS_INJECT_KILL) kill((pid_t)rs.child_pid, SIGKILL);
-    if (s_inject == RS_INJECT_HANG) kill((pid_t)rs.child_pid, SIGSTOP);
+
+    /* Long enough for a frame or two to reach ffmpeg and for it to fail on
+     * them. Checked by gui_rtsp_stream_poll(), not slept for here: this runs on
+     * the render thread, and a second and a half of sleeping is a frozen
+     * window. Until then the stream reports itself as starting. */
+    rs.verify_at = rs_now() + 1.5;
+    rs_lock();
+    rs.status.starting = true;
+    rs_unlock();
+
     return 0;
+}
+
+void gui_rtsp_stream_poll(void)
+{
+    if (rs.verify_at == 0.0) return;              /* nothing pending */
+    if (rs_now() < rs.verify_at) return;          /* still inside the window */
+
+    int wstatus = 0;
+    if (rs.child_pid > 0 &&
+        waitpid((pid_t)rs.child_pid, &wstatus, WNOHANG) != (pid_t)rs.child_pid) {
+        rs.verify_at = 0.0;                       /* survived: it is a stream */
+        rs_lock();
+        rs.status.starting = false;
+        rs_unlock();
+        /* KILL and HANG model a fault in a stream that was already running, so
+         * they fire here rather than at spawn -- injected during the startup
+         * window they would merely look like a start that failed. */
+        if (s_inject == RS_INJECT_KILL) kill((pid_t)rs.child_pid, SIGKILL);
+        if (s_inject == RS_INJECT_HANG) kill((pid_t)rs.child_pid, SIGSTOP);
+        return;
+    }
+
+    char err[192] = {0};
+    rs_spawn_result_t why = rs_classify_exit(err, sizeof(err));
+    rs_unwind_attempt();
+
+    /* One retry, video-only, per the failure-mode table: a sound card that
+     * cannot be opened must not cost the picture. Exactly one -- retrying a
+     * genuinely broken device in a loop burns CPU and fills logs, which is why
+     * capture-node leaves restarts to the operator. */
+    if (why == RS_SPAWN_FAIL_AUDIO && !rs.retried_video_only && rs.audio_device[0]) {
+        rs.retried_video_only = true;
+        rs.audio_device[0] = '\0';
+        rs_lock();
+        rs.status.audio_active = false;
+        snprintf(rs.status.audio_note, sizeof(rs.status.audio_note),
+                 "audio device could not be opened; streaming video-only");
+        rs_unlock();
+
+        char retry_err[192] = {0};
+        if (rs_spawn_attempt(&rs.opts, rs.use_nvenc, rs.audio_device,
+                             NULL, NULL, retry_err, sizeof(retry_err)) == RS_SPAWN_OK) {
+            rs.verify_at = rs_now() + 1.5;
+            return;
+        }
+        snprintf(err, sizeof(err), "%s", retry_err[0] ? retry_err : err);
+    }
+
+    rs.verify_at = 0.0;
+    rs_free_ring();
+    rs_lock();
+    rs.status.starting = false;
+    rs.status.running = false;
+    rs.status.error = true;
+    snprintf(rs.status.err_text, sizeof(rs.status.err_text), "%s",
+             err[0] ? err : "the stream could not be started");
+    rs_unlock();
 }
 
 void gui_rtsp_stream_request_stop(void)
 {
+    rs.verify_at = 0.0;
     if (!rs.thread_running) return;
     gui_preview_mux_remove(&rs.tap);
     if (rs.stop_at == 0.0) rs.stop_at = rs_now();
@@ -724,6 +804,7 @@ static void rs_reap_child(void)
 
 void gui_rtsp_stream_finish(void)
 {
+    rs.verify_at = 0.0;
     if (!rs.thread_running) return;
 
     gui_preview_mux_remove(&rs.tap);
@@ -761,6 +842,20 @@ void gui_rtsp_stream_shutdown(void)
 }
 
 /* ---- headless harness ------------------------------------------------------ */
+
+/* The app drives gui_rtsp_stream_poll() from its frame loop; a headless harness
+ * has no frame loop, so it has to drive it too. Returns once the start has
+ * resolved one way or the other. */
+static void rs_settle_start(double limit_s)
+{
+    double deadline = rs_now() + limit_s;
+    while (rs_now() < deadline) {
+        gui_rtsp_stream_poll();
+        if (!gui_rtsp_stream_get_status().starting) return;
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
 
 int gui_rtsp_stream_test_main(const char *device, int seconds)
 {
@@ -826,7 +921,16 @@ int gui_rtsp_stream_test_main(const char *device, int seconds)
         return 1;
     }
 
+    rs_settle_start(6.0);
     gui_rtsp_stream_status_t s0 = gui_rtsp_stream_get_status();
+    if (s0.error) {
+        fprintf(stderr, "stream: %s\n", s0.err_text);
+        gui_rtsp_stream_finish();
+        gui_preview_disconnect();
+        gui_preview_shutdown();
+        gui_mediamtx_stop();
+        return 1;
+    }
     printf("streaming %ux%u @ %u/%u -> %s\n", opts.width, opts.height,
            opts.fps_num, opts.fps_den, s0.url_rtsp);
     printf("  audio: %s%s\n", s0.audio_active ? s0.audio_device : "off",
@@ -835,6 +939,7 @@ int gui_rtsp_stream_test_main(const char *device, int seconds)
     for (int i = 0; i < seconds; i++) {
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
+        gui_rtsp_stream_poll();
         gui_rtsp_stream_status_t s = gui_rtsp_stream_get_status();
         printf("  t=%2ds submitted=%llu written=%llu dropped=%llu%s\n", i + 1,
                (unsigned long long)s.frames_submitted,
@@ -940,8 +1045,21 @@ int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int s
     opts.ports = ports;
 
     gui_rtsp_stream_set_inject(inject);
+    /* The whole point of the async start: this call must not block the caller,
+     * because in the app the caller is the render thread. */
+    (void)gui_rtsp_stream_probe();   /* the panel has already done this */
+    double t_start = rs_now();
     int start_rc = gui_rtsp_stream_start(&opts, err, sizeof(err));
+    double start_ms = (rs_now() - t_start) * 1000.0;
+    printf("  gui_rtsp_stream_start() returned in %.1f ms\n", start_ms);
+    /* start() only launches now. A failure that used to come back in start_rc
+     * arrives through the status instead, once the poll has run. */
+    if (start_rc == 0) rs_settle_start(8.0);
     gui_rtsp_stream_status_t s0 = gui_rtsp_stream_get_status();
+    if (start_rc == 0 && s0.error) {
+        start_rc = -1;
+        snprintf(err, sizeof(err), "%s", s0.err_text);
+    }
 
     printf("fault=%s start_rc=%d%s%s\n", fault, start_rc,
            start_rc != 0 ? " err=" : "", start_rc != 0 ? err : "");
@@ -958,6 +1076,7 @@ int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int s
     for (int i = 0; i < seconds; i++) {
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
+        gui_rtsp_stream_poll();
     }
     gui_rtsp_stream_status_t s1 = gui_rtsp_stream_get_status();
     gui_video_record_status_t r1 = gui_video_record_get_status();
