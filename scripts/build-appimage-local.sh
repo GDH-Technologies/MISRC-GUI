@@ -213,6 +213,9 @@ esac
 EOF
   chmod +x "$appdir/AppRun"
 
+  # StartupWMClass must match GUI_WINDOW_CLASS_NAME in
+  # misrc_tools/misrc_gui/core/misrc_gui.c, or the desktop shell cannot tie the
+  # running window back to this launcher and falls back to a generic icon.
   cat > "$appdir/misrc.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -220,6 +223,8 @@ Name=MISRC GUI
 Exec=misrc_gui
 Icon=misrc
 Categories=Utility;
+StartupWMClass=MISRC Capture
+X-GNOME-WMClass=MISRC Capture
 Terminal=false
 StartupNotify=true
 EOF

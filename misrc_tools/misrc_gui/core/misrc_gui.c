@@ -385,6 +385,40 @@ static void gui_enable_debug_console(void) {
 }
 #endif
 
+// The window name GLFW turns into WM_CLASS. It must stay byte-identical across
+// releases and match StartupWMClass in every .desktop we generate
+// (.github/workflows/build.yml, scripts/build-appimage-local.sh); the cost of a
+// mismatch is spelled out where InitWindow is called.
+#define GUI_WINDOW_CLASS_NAME "MISRC Capture"
+
+// Publish the app icon as _NET_WM_ICON.
+//
+// X11 carries the whole property in one XChangeProperty, and the request is
+// capped at 256 KiB. _NET_WM_ICON is 32-bit words -- two for the dimensions
+// plus one per pixel -- so a single 256x256 image needs 2 + 65536 words, i.e.
+// eight bytes past the cap. The request is dropped and the property lands
+// *empty*, which is exactly what the old single-image call produced. Sending
+// the usual ladder of small sizes instead costs 98 KiB all in, lets the window
+// manager pick the size it wants, and gives the dock something to draw when no
+// .desktop matches the window.
+static void gui_install_window_icons(void) {
+    Image base = LoadImageFromMemory(".png", misrc_icon_png_data, misrc_icon_png_data_size);
+    if (base.data == NULL) return;
+
+    static const int icon_sizes[] = { 16, 24, 32, 48, 64, 128 };
+    const int icon_count = (int)(sizeof(icon_sizes) / sizeof(icon_sizes[0]));
+    Image icons[sizeof(icon_sizes) / sizeof(icon_sizes[0])];
+
+    for (int i = 0; i < icon_count; i++) {
+        icons[i] = ImageCopy(base);
+        ImageResize(&icons[i], icon_sizes[i], icon_sizes[i]);
+    }
+    SetWindowIcons(icons, icon_count);
+
+    for (int i = 0; i < icon_count; i++) UnloadImage(icons[i]);
+    UnloadImage(base);
+}
+
 int main(int argc, char **argv) {
     bool debug_view = false;
     bool show_help = false;
@@ -541,14 +575,19 @@ int main(int argc, char **argv) {
     // Allow quarter-screen tiling and compact desktop snapping on common displays.
     const int min_window_width = 640;
     const int min_window_height = 360;
+    // GLFW snapshots WM_CLASS from the name handed to InitWindow and never
+    // revisits it, while SetWindowTitle only rewrites _NET_WM_NAME. Creating
+    // the window under the versioned title therefore stamped the version into
+    // WM_CLASS, so every release needed its own StartupWMClass and any
+    // .desktop written by an older build stopped matching. An unmatched window
+    // is a window-backed app to GNOME: it drops the launcher's icon and paints
+    // the generic executable one in the dock. Create under the stable class
+    // name, then retitle -- the title bar still shows the version.
     char window_title[128];
-    snprintf(window_title, sizeof(window_title), "MISRC Capture %s", MIRSC_TOOLS_VERSION);
-    InitWindow(default_window_width, default_window_height, window_title);
-    Image app_icon = LoadImageFromMemory(".png", misrc_icon_png_data, misrc_icon_png_data_size);
-    if (app_icon.data != NULL) {
-        SetWindowIcon(app_icon);
-        UnloadImage(app_icon);
-    }
+    snprintf(window_title, sizeof(window_title), "%s %s", GUI_WINDOW_CLASS_NAME, MIRSC_TOOLS_VERSION);
+    InitWindow(default_window_width, default_window_height, GUI_WINDOW_CLASS_NAME);
+    SetWindowTitle(window_title);
+    gui_install_window_icons();
     SetWindowMinSize(min_window_width, min_window_height);
     SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
     SetTargetFPS(60);
