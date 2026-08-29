@@ -4,6 +4,7 @@
 
 #include "gui_video_record.h"
 #include "../input/gui_preview_v4l2.h"
+#include "../streaming/gui_preview_tap_mux.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -585,14 +586,14 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
 
     vr.tap.fn = vr_tap_cb;
     vr.tap.user = NULL;
-    gui_preview_tap_install(&vr.tap);
+    gui_preview_mux_add(&vr.tap);
     return 0;
 }
 
 void gui_video_record_request_stop(void)
 {
     if (!vr.thread_running) return;
-    gui_preview_tap_remove();          /* returns once no tap call is in flight */
+    gui_preview_mux_remove(&vr.tap);   /* returns once no tap call is in flight */
     vr.stop_at = vr_now();             /* published before the flag the writer reads */
     atomic_store_explicit(&vr.run, false, memory_order_release);
     uint64_t one = 1;
@@ -649,7 +650,10 @@ void gui_video_record_finish(void)
 {
     if (!vr.thread_running) return;
 
-    gui_preview_tap_remove();
+    /* Idempotent: request_stop() usually got here first. Must go through the
+     * mux -- a raw gui_preview_tap_remove() would tear down the shared tap and
+     * take every other consumer (the RTSP stream) offline with it. */
+    gui_preview_mux_remove(&vr.tap);
     if (vr.stop_at == 0.0) vr.stop_at = vr_now();
     atomic_store_explicit(&vr.run, false, memory_order_release);
     uint64_t one = 1;
