@@ -1163,6 +1163,63 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
                 "mediamtx config harness failed:\n"
                 f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
             )
+
+        # The harness matches substrings, which cannot tell a valid YAML document
+        # from an invalid one. An unquoted "::1" in a flow sequence passed every
+        # strstr assertion while making the whole config unparseable -- mediamtx
+        # would have refused to start and the stream would simply never come up.
+        # So the rendered config is handed to a real parser, and the fields that
+        # carry the security contract are read back as data rather than as text.
+        try:
+            import yaml  # noqa: PLC0415
+        except ImportError:
+            print("SKIP: mediamtx config YAML validation (PyYAML not installed)")
+            return 0
+
+        for mode, args in (("loopback", ["--dump"]), ("lan", ["--dump", "lan"])):
+            dumped = subprocess.run([str(exe_path)] + args, capture_output=True, text=True)
+            if dumped.returncode != 0:
+                return fail(f"mediamtx config harness could not dump the {mode} config")
+            try:
+                doc = yaml.safe_load(dumped.stdout)
+            except yaml.YAMLError as exc:
+                return fail(
+                    f"the generated mediamtx config is not valid YAML in {mode} mode, "
+                    f"so mediamtx would refuse to load it:\n{exc}"
+                )
+            if not isinstance(doc, dict):
+                return fail(f"the generated {mode} config did not parse to a mapping")
+
+            users = doc.get("authInternalUsers")
+            if not isinstance(users, list) or not users:
+                return fail(f"{mode}: no authInternalUsers block; mediamtx would fall "
+                            "back to its default of anyone may publish and read")
+
+            publishers = [u for u in users
+                          if any(p.get("action") == "publish"
+                                 for p in (u.get("permissions") or []))]
+            if len(publishers) != 1:
+                return fail(f"{mode}: expected exactly one entry granting publish, "
+                            f"found {len(publishers)}")
+            ips = publishers[0].get("ips")
+            if sorted(ips or []) != ["127.0.0.1", "::1"]:
+                return fail(
+                    f"{mode}: publish is granted to ips={ips!r}. It must be loopback "
+                    "only -- anything wider lets a machine on the network displace "
+                    "the publisher and put its own video in front of the operator."
+                )
+
+            path_cfg = (doc.get("paths") or {}).get("misrc-preview") or {}
+            if path_cfg.get("overridePublisher") is not False:
+                return fail(f"{mode}: overridePublisher is "
+                            f"{path_cfg.get('overridePublisher')!r}, must be no")
+            if path_cfg.get("maxReaders") in (None, 0):
+                return fail(f"{mode}: maxReaders is {path_cfg.get('maxReaders')!r}; "
+                            "mediamtx reads 0 as unlimited")
+            for endpoint in ("api", "metrics", "pprof", "playback"):
+                if doc.get(endpoint) is not False:
+                    return fail(f"{mode}: {endpoint} is {doc.get(endpoint)!r}, must be "
+                                "explicitly no rather than left to a default")
     return 0
 
 

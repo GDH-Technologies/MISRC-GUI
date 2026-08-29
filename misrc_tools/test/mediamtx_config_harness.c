@@ -162,7 +162,17 @@ static int test_lan_binds_all_interfaces_and_gathers_ice(void)
     /* Remote browsers need a reachable candidate. */
     expect_contains(yaml, "webrtcIPsFromInterfaces: yes", "ice gathering on in lan");
     expect_absent(yaml, "webrtcAdditionalHosts", "no pinned loopback host in lan");
-    expect_absent(yaml, "127.0.0.1", "no loopback binds in lan mode");
+    /* Assert the BIND directives specifically. A bare "127.0.0.1" search also
+     * matches the publish allow-list, which is loopback-only by design in both
+     * modes -- this test is about what mediamtx listens on, not who may reach
+     * it. */
+    expect_absent(yaml, "rtspAddress: 127.0.0.1", "no loopback rtsp bind in lan mode");
+    expect_absent(yaml, "rtpAddress: 127.0.0.1", "no loopback rtp bind in lan mode");
+    expect_absent(yaml, "rtcpAddress: 127.0.0.1", "no loopback rtcp bind in lan mode");
+    expect_absent(yaml, "hlsAddress: 127.0.0.1", "no loopback hls bind in lan mode");
+    expect_absent(yaml, "webrtcAddress: 127.0.0.1", "no loopback webrtc bind in lan mode");
+    expect_absent(yaml, "webrtcLocalUDPAddress: 127.0.0.1",
+                  "no loopback webrtc ice bind in lan mode");
 
     if (failures == before) puts("PASS: lan binds all interfaces and gathers ice");
     return failures - before;
@@ -211,6 +221,101 @@ static int test_publishes_the_expected_path(void)
     return failures - before;
 }
 
+/* The hole this file exists to keep shut.
+ *
+ * mediamtx's shipped default is `user: any` with publish, read AND playback on
+ * every path. With no authInternalUsers block, LAN mode let any machine on the
+ * network publish to misrc-preview and displace our ffmpeg -- replacing what
+ * viewers see, and what the operator sees while monitoring a customer's tape,
+ * with arbitrary video.
+ *
+ * Our publisher always connects over loopback (gui_rtsp_stream.c hard-codes
+ * rtsp://127.0.0.1 regardless of bind mode), so an IP restriction is enough and
+ * costs no credential -- which matters, because a credential in ffmpeg's argv
+ * would be readable from /proc/<pid>/cmdline by any local user. */
+static int test_publishing_is_restricted_to_loopback(void)
+{
+    int before = failures;
+
+    for (int lan = 0; lan <= 1; lan++) {
+        char yaml[8192];
+        gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
+        cfg.lan = (lan != 0);
+
+        gui_mediamtx_render_config(&cfg, yaml, sizeof yaml);
+
+        expect_contains(yaml, "authInternalUsers:", "an auth block at all");
+        expect_contains(yaml, "action: publish", "an explicit publish permission");
+        expect_contains(yaml, "ips: [\"127.0.0.1\", \"::1\"]",
+                        "publish restricted to loopback, quoted so it parses");
+        /* Readers are deliberately unrestricted: passwordless by default is the
+         * documented behaviour, and LAN mode exists to let people watch. */
+        expect_contains(yaml, "action: read", "an explicit read permission");
+        expect_contains(yaml, "ips: []", "readers not restricted by address");
+    }
+
+    if (failures == before) puts("PASS: publishing is restricted to loopback");
+    return failures - before;
+}
+
+/* Even from loopback, nothing should be able to take the path out from under
+ * the publisher that owns it. */
+static int test_never_lets_a_publisher_be_displaced(void)
+{
+    char yaml[8192];
+    gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
+    int before = failures;
+
+    gui_mediamtx_render_config(&cfg, yaml, sizeof yaml);
+
+    expect_contains(yaml, "overridePublisher: no", "publisher cannot be displaced");
+    expect_absent(yaml, "overridePublisher: yes", "publisher displacement disabled");
+
+    if (failures == before) puts("PASS: never lets a publisher be displaced");
+    return failures - before;
+}
+
+/* Every reader costs bandwidth and CPU on the machine whose RF ingest we go out
+ * of our way to protect with nice(+5). mediamtx reads 0 as "no limit". */
+static int test_caps_the_number_of_readers(void)
+{
+    char yaml[8192];
+    gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
+    int before = failures;
+
+    gui_mediamtx_render_config(&cfg, yaml, sizeof yaml);
+
+    expect_contains(yaml, "maxReaders: 8", "a finite reader cap");
+    expect_absent(yaml, "maxReaders: 0", "no unlimited readers");
+
+    if (failures == before) puts("PASS: caps the number of readers");
+    return failures - before;
+}
+
+/* These four default to "no" today. So did rtmp/srt/moq -- except those default
+ * to YES, which is exactly why this file exists. A default is not a guarantee,
+ * and pprof reachable on a LAN interface would be a genuine leak. */
+static int test_admin_endpoints_are_explicitly_disabled(void)
+{
+    int before = failures;
+
+    for (int lan = 0; lan <= 1; lan++) {
+        char yaml[8192];
+        gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
+        cfg.lan = (lan != 0);
+
+        gui_mediamtx_render_config(&cfg, yaml, sizeof yaml);
+
+        expect_contains(yaml, "api: no", "control api disabled");
+        expect_contains(yaml, "metrics: no", "metrics endpoint disabled");
+        expect_contains(yaml, "pprof: no", "pprof endpoint disabled");
+        expect_contains(yaml, "playback: no", "recording playback disabled");
+    }
+
+    if (failures == before) puts("PASS: admin endpoints are explicitly disabled");
+    return failures - before;
+}
+
 /* A truncated config would be a mediamtx that silently starts with defaults --
  * including every listener we meant to disable. */
 static int test_rejects_a_buffer_that_cannot_hold_the_config(void)
@@ -226,8 +331,30 @@ static int test_rejects_a_buffer_that_cannot_hold_the_config(void)
     return failures - before;
 }
 
-int main(void)
+/* Renders a config to stdout so ci_guard_tests.py can hand it to a real YAML
+ * parser. The assertions below match substrings, which cannot tell a valid
+ * document from an invalid one -- the unquoted "::1" that broke this file's
+ * first draft passed every strstr check while making mediamtx unable to read
+ * the config at all. */
+static int dump_config(int lan)
 {
+    char yaml[8192];
+    gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
+    cfg.lan = (lan != 0);
+    if (gui_mediamtx_render_config(&cfg, yaml, sizeof yaml) < 0) {
+        fprintf(stderr, "render failed\n");
+        return 1;
+    }
+    fputs(yaml, stdout);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
+        return dump_config(argc > 2 && strcmp(argv[2], "lan") == 0);
+    }
+
     test_default_ports_are_canonical_plus_100();
     test_never_emits_a_capture_node_port();
     test_disables_every_listener_we_do_not_serve();
@@ -235,6 +362,10 @@ int main(void)
     test_lan_binds_all_interfaces_and_gathers_ice();
     test_ports_come_from_config();
     test_publishes_the_expected_path();
+    test_publishing_is_restricted_to_loopback();
+    test_never_lets_a_publisher_be_displaced();
+    test_caps_the_number_of_readers();
+    test_admin_endpoints_are_explicitly_disabled();
     test_rejects_a_buffer_that_cannot_hold_the_config();
 
     if (failures != 0) {
