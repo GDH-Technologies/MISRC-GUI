@@ -29,6 +29,42 @@ def extract_function_body(source: str, signature: str) -> str:
     return match.group("body")
 
 
+GUI_WINDOW_CLASS_DEFINE = re.compile(r'^#define\s+GUI_WINDOW_CLASS_NAME\s+"([^"]+)"', re.M)
+
+# Tokens that would bake a build version back into WM_CLASS. This is the exact
+# regression that broke the dock icon: every build produced a different WM_CLASS,
+# so a launcher written by one build stopped matching the next build's window and
+# GNOME fell back to the generic executable icon.
+WM_CLASS_VERSION_TOKENS = (
+    "${BUILD_VERSION}",
+    "$BUILD_VERSION",
+    "${gui_version}",
+    "$gui_version",
+    "${VERSION}",
+    "MIRSC_TOOLS_VERSION",
+)
+
+
+def read_gui_window_class_name(gui_c_path: Path) -> str:
+    """The one source of truth for WM_CLASS. misrc_gui.c creates its window under
+    this exact name, so every .desktop we generate must set StartupWMClass to it."""
+    match = GUI_WINDOW_CLASS_DEFINE.search(read_text(gui_c_path))
+    if not match:
+        raise RuntimeError("Could not find #define GUI_WINDOW_CLASS_NAME in misrc_gui.c")
+    return match.group(1)
+
+
+def find_versioned_wm_class(text: str) -> List[str]:
+    """Lines that decorate a WM_CLASS assignment with a build version."""
+    offenders = []
+    for line in text.splitlines():
+        if "WMClass" not in line and "startup_wm_class" not in line:
+            continue
+        if any(token in line for token in WM_CLASS_VERSION_TOKENS):
+            offenders.append(line.strip())
+    return offenders
+
+
 def extract_apprun_script(workflow_text: str) -> str:
     marker = "cat > AppDir/AppRun <<'EOF'"
     start = workflow_text.find(marker)
@@ -313,14 +349,15 @@ def check_built_gui_has_fx3_symbols(repo_root: Path, gui_path: Optional[Path] = 
     return 0
 
 
-def check_linux_desktop_metadata(workflow_path: Path) -> int:
+def check_linux_desktop_metadata(workflow_path: Path, gui_c_path: Path) -> int:
     workflow_text = read_text(workflow_path)
+    wm_class = read_gui_window_class_name(gui_c_path)
     required_desktop_fields = [
         "cat > AppDir/misrc.desktop <<EOF",
         "Exec=misrc_gui",
         "Icon=misrc",
-        "StartupWMClass=MISRC Capture ${BUILD_VERSION}",
-        "X-GNOME-WMClass=MISRC Capture ${BUILD_VERSION}",
+        f"StartupWMClass={wm_class}",
+        f"X-GNOME-WMClass={wm_class}",
         "Terminal=false",
         "StartupNotify=true",
         "ln -sf misrc.png AppDir/.DirIcon",
@@ -783,17 +820,16 @@ def check_flac_large_file_offsets_contract(flac_writer_c_path: Path) -> int:
     return 0
 
 
-def check_apprun_static_contract(workflow_path: Path) -> int:
+def check_apprun_static_contract(workflow_path: Path, gui_c_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     apprun = extract_apprun_script(workflow_text)
+    wm_class = read_gui_window_class_name(gui_c_path)
     required_snippets = [
         "install_shortcuts()",
         "--create-shortcut",
         "local stable_appimage=\"$local_bin_dir/misrc_gui.AppImage\"",
         "ln -sfn \"$appimage_path\" \"$stable_appimage\"",
-        "local startup_wm_class=\"misrc_gui\"",
-        "\"$HERE/usr/bin/misrc_gui\" --version",
-        "startup_wm_class=\"MISRC Capture $gui_version\"",
+        f"local startup_wm_class=\"{wm_class}\"",
         "Icon=misrc",
         "StartupWMClass=${escaped_startup_wm_class}",
         "X-GNOME-WMClass=${escaped_startup_wm_class}",
@@ -807,7 +843,7 @@ def check_apprun_static_contract(workflow_path: Path) -> int:
     return 0
 
 
-def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
+def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path, gui_c_path: Path) -> int:
     if not sys.platform.startswith("linux"):
         print("SKIP: AppRun runtime behavior (linux-only)")
         return 0
@@ -885,13 +921,52 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
         expected_exec = f'Exec=\"{stable_exec_path}\" %U'
         if expected_exec not in launcher:
             return fail(f"Launcher Exec entry mismatch. Expected: {expected_exec}")
-        expected_wm_class = "MISRC Capture test-version"
+        expected_wm_class = read_gui_window_class_name(gui_c_path)
         for required in ("Icon=misrc", "Terminal=false", f"StartupWMClass={expected_wm_class}", f"X-GNOME-WMClass={expected_wm_class}", "StartupNotify=true"):
             if required not in launcher:
                 return fail(f"Launcher is missing required key: {required}")
 
         run_checked(["bash", str(apprun_path), "--smoke-test"], env=env)
 
+    return 0
+
+
+def check_wm_class_consistency(
+    gui_c_path: Path, workflow_path: Path, local_appimage_script: Path
+) -> int:
+    """WM_CLASS is what ties a running window back to its launcher. misrc_gui.c
+    creates the window under GUI_WINDOW_CLASS_NAME, so every .desktop we generate
+    must set StartupWMClass to exactly that string -- and must never decorate it
+    with a build version, or a launcher written by one build stops matching the
+    next build's window and the dock loses the app icon."""
+    wm_class = read_gui_window_class_name(gui_c_path)
+    required_by_surface = {
+        workflow_path: (
+            f"StartupWMClass={wm_class}",
+            f"X-GNOME-WMClass={wm_class}",
+            f'local startup_wm_class="{wm_class}"',
+        ),
+        local_appimage_script: (
+            f"StartupWMClass={wm_class}",
+            f"X-GNOME-WMClass={wm_class}",
+        ),
+    }
+    for path, required in required_by_surface.items():
+        if not path.exists():
+            return fail(f"WM_CLASS surface is missing: {path}")
+        text = read_text(path)
+        for snippet in required:
+            if snippet not in text:
+                return fail(
+                    f"{path.name} does not match GUI_WINDOW_CLASS_NAME "
+                    f'("{wm_class}") in misrc_gui.c: missing {snippet!r}'
+                )
+        offenders = find_versioned_wm_class(text)
+        if offenders:
+            return fail(
+                f"{path.name} bakes a build version into WM_CLASS, which breaks the "
+                f"launcher-to-window match the dock icon depends on: {offenders}"
+            )
     return 0
 
 
@@ -1439,6 +1514,7 @@ def main() -> int:
     installation_md_path = repo_root / "INSTALLATION.md"
     dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
+    local_appimage_script = repo_root / "scripts/build-appimage-local.sh"
 
     checks: List[Tuple[str, Callable[[], int]]] = [
         ("cross-platform workflow coverage", lambda: check_cross_platform_workflow_coverage(workflow_path)),
@@ -1449,7 +1525,8 @@ def main() -> int:
         ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
-        ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path)),
+        ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path, gui_c_path)),
+        ("WM_CLASS matches GUI window class", lambda: check_wm_class_consistency(gui_c_path, workflow_path, local_appimage_script)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
@@ -1460,7 +1537,7 @@ def main() -> int:
         ("debug-view runtime contract", lambda: check_debug_view_contract(gui_c_path)),
         ("settings persistence contract", lambda: check_settings_persistence_contract(gui_settings_c_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
-        ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
+        ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
@@ -1472,7 +1549,7 @@ def main() -> int:
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
     ]
     if not args.static_only:
-        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
+        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
