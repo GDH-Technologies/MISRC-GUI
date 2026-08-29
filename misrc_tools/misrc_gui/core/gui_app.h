@@ -274,6 +274,17 @@ typedef struct {
     char audio_output_tags[3][32];
     char video_output_tag[32];
     char ffmpeg_path[512];                   // empty = resolve automatically
+    // RTSP stream: publishes the preview picture and the dongle's own audio so
+    // a tape can be watched from another machine. Monitoring only -- the RF
+    // stays the archival master and the MKV stays the QC artifact.
+    bool rtsp_stream_enabled;
+    bool rtsp_stream_lan;                    // false = loopback only (default)
+    int  rtsp_stream_port;                   // 0 = the built-in default (8654)
+    int  rtsp_stream_encoder;                // 0 auto, 1 NVENC, 2 software
+    int  rtsp_stream_bitrate_kbps;           // software encoder only; 0 = 2000
+    bool rtsp_stream_deinterlace;            // bwdif; costs latency, off by default
+    char mediamtx_path[512];                 // empty = bundled copy, then PATH
+    char rtsp_audio_device[96];              // empty = resolve from the video device
     // Ingest metadata (saved to settings and written to capture log at record start)
     char ingest_project[128];
     char ingest_tape_id[128];

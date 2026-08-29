@@ -780,6 +780,10 @@ int main(int argc, char **argv) {
         // Check for pending popup result (for async confirmations like file overwrite)
         gui_record_check_popup(&app);
         gui_preview_tick();
+        /* Cheap: a waitpid(WNOHANG) on one child. Without it a mediamtx that
+         * died mid-session stays "running" in the panel until something tries
+         * to publish, which is how capture-node's equivalent hides the fact. */
+        gui_mediamtx_poll();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
@@ -1068,6 +1072,10 @@ int main(int argc, char **argv) {
     gui_settings_save(&app.settings);
     
     gui_video_record_shutdown();
+    /* Publisher before server: the publisher holds a preview hold and a tap,
+     * and mediamtx is the thing it publishes into. */
+    gui_rtsp_stream_shutdown();
+    gui_mediamtx_shutdown();
     gui_preview_shutdown();
     gui_app_cleanup(&app);
     free(clay_memory);

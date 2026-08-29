@@ -1293,6 +1293,39 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
+    """gui_settings.c keeps defaults, the writer and the parser in three
+    separate places. A field added to two of them is silent: the setting
+    appears to work until it is reloaded, and then it is quietly the default
+    again. Assert every stream setting exists in all three."""
+    struct_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    settings_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
+
+    fields = sorted(set(
+        re.findall(r"\b(rtsp_[a-z0-9_]+|mediamtx_path)\b(?:\[\d+\])?\s*;", struct_src)
+    ))
+    if not fields:
+        return fail("gui_app.h declares no rtsp_* stream settings")
+
+    for field in fields:
+        # The three sites, checked as the three distinct shapes they take.
+        # The writer escapes its quotes, so its key looks like \\"field\\" in source.
+        defaulted = re.search(rf"settings->{field}(\[0\])?\s*=", settings_src) is not None
+        written = f'\\"{field}\\"' in settings_src
+        parsed = f'find_value(content, "{field}")' in settings_src
+
+        missing = [name for name, ok in
+                   (("a default", defaulted), ("a writer line", written),
+                    ("a find_value() parse", parsed)) if not ok]
+        if missing:
+            return fail(
+                f"gui_settings.c is missing {' and '.join(missing)} for {field}. "
+                "A setting present in only some of the three sites is silent: it "
+                "appears to work until it is reloaded as the default."
+            )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1862,6 +1895,7 @@ def main() -> int:
         ("preview tap single-slot contract", lambda: check_preview_tap_single_slot_contract(repo_root)),
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
+        ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -1898,9 +1932,16 @@ def main() -> int:
 
     for name, check in checks:
         rc = check()
+        if rc is None:
+            # A check that falls off its end returns None, and SystemExit(None)
+            # is a SUCCESSFUL exit -- so the suite would print FAILED and still
+            # go green. Treat it as the bug it is.
+            print(f"FAILED: {name} (check returned None; it is missing a return)",
+                  file=sys.stderr)
+            return 1
         if rc != 0:
             print(f"FAILED: {name}", file=sys.stderr)
-            return rc
+            return rc if isinstance(rc, int) and rc != 0 else 1
         print(f"PASS: {name}")
 
     return 0
