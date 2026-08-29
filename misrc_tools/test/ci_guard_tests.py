@@ -1161,6 +1161,60 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_alsa_device_resolution(repo_root: Path) -> int:
+    """The stream's audio must come from the SAME physical device as its picture,
+    or A/V sync stops being free. On this host the CXADC clock-gen -- the RF audio
+    path, on a different clock -- sits one USB port away on the same controller,
+    so anything coarser than a full bus-address match streams the wrong audio.
+    Card indices are never used: they move across reboots and replugs."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: alsa device resolution guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the alsa device resolution guard")
+        print("SKIP: alsa device resolution guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/alsa_device_resolve_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/streaming/gui_alsa_device.c"
+    include_dir = repo_root / "misrc_tools/misrc_gui/streaming"
+
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"alsa device guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_alsa_guard_") as temp_root:
+        exe_path = Path(temp_root) / "alsa_device_guard"
+        compile_cmd = [
+            cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE",
+            f"-I{include_dir}", str(harness_path), str(module_path), "-o", str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"alsa device harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(f"alsa device harness failed:\n{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    return 0
+
+
+def check_alsa_never_stores_a_card_index(repo_root: Path) -> int:
+    """A stored hw:N,0 breaks intermittently across reboots and replugs, pointing
+    at whatever card inherited the number. Resolution is by USB bus address, and
+    the emitted device name must always be plughw:CARD=<name>."""
+    module = read_text(repo_root / "misrc_tools/misrc_gui/streaming/gui_alsa_device.c")
+    code = strip_c_comments(module)
+    if "plughw:CARD=%s,DEV=0" not in code:
+        return fail("gui_alsa_device.c no longer emits a name-based plughw:CARD= device")
+    for banned in ('"hw:%d', "'hw:%d", '"hw:%u'):
+        if banned in code:
+            return fail(f"gui_alsa_device.c builds an index-based ALSA device name: {banned}")
+    return 0
+
+
 def check_preview_tap_single_slot_contract(repo_root: Path) -> int:
     """Application code must register through the mux, never install the raw tap
     directly -- a direct install displaces whatever the mux published and takes
@@ -1760,6 +1814,7 @@ def main() -> int:
         ("settings persistence contract", lambda: check_settings_persistence_contract(gui_settings_c_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("preview tap single-slot contract", lambda: check_preview_tap_single_slot_contract(repo_root)),
+        ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -1777,6 +1832,7 @@ def main() -> int:
         checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(10, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
         checks.insert(11, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
+        checks.insert(12, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
