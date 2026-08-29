@@ -410,6 +410,195 @@ static void rs_fill_urls(const gui_rtsp_stream_opts_t *opts)
              "http://%s:%u/misrc-preview", host, (unsigned)opts->ports.hls);
 }
 
+typedef enum {
+    RS_SPAWN_OK = 0,
+    RS_SPAWN_FAIL_SETUP,   /* our own sockets/eventfd, or exec itself */
+    RS_SPAWN_FAIL_AUDIO,   /* ffmpeg died on the ALSA input specifically */
+    RS_SPAWN_FAIL_OTHER    /* ffmpeg died for some other reason */
+} rs_spawn_result_t;
+
+/* Spawns ffmpeg and waits a beat to see whether it survives. Owns the socket
+ * pair and the wake eventfd; cleans both up on failure. The ring belongs to the
+ * caller, because a retry reuses it. */
+static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
+                                          bool use_nvenc, const char *audio_device,
+                                          int *sock_out, pid_t *pid_out,
+                                          char *err, size_t err_cap)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
+        snprintf(err, err_cap, "could not create the encoder socket: %s", strerror(errno));
+        return RS_SPAWN_FAIL_SETUP;
+    }
+    int want = RS_SNDBUF_BYTES;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
+    /* Without a send timeout a wedged ffmpeg blocks the writer inside send()
+     * forever, where it can never observe the stop flag. */
+    struct timeval sndto = { 0, 200 * 1000 };
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
+
+    rs.wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (rs.wake_fd < 0) {
+        close(sv[0]); close(sv[1]);
+        snprintf(err, err_cap, "could not create the stream wake eventfd: %s", strerror(errno));
+        return RS_SPAWN_FAIL_SETUP;
+    }
+
+    char size_buf[32], rate_buf[32], gop_buf[16], br_buf[16], maxr_buf[16], bufs_buf[16];
+    char url_buf[256];
+    char *argv[80];
+    int argc = 0;
+    rs_build_argv(argv, &argc, opts, use_nvenc, audio_device,
+                  size_buf, sizeof(size_buf), rate_buf, sizeof(rate_buf),
+                  gop_buf, sizeof(gop_buf), br_buf, sizeof(br_buf),
+                  maxr_buf, sizeof(maxr_buf), bufs_buf, sizeof(bufs_buf),
+                  url_buf, sizeof(url_buf));
+
+    snprintf(rs.ffmpeg_log, sizeof(rs.ffmpeg_log), "%s/misrc-rtsp-ffmpeg.log",
+             getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    /* Keeps the terminal clean while leaving a failure diagnosable -- the
+     * difference between "stream failed" and "stream failed: Connection
+     * refused". */
+    posix_spawn_file_actions_addopen(&fa, 2, rs.ffmpeg_log,
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, gui_video_record_ffmpeg_path(), &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
+
+    if (rc != 0) {
+        close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
+        snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
+        return RS_SPAWN_FAIL_SETUP;
+    }
+
+    /* Frames must already be flowing before the child can be judged.
+     *
+     * capture-node checks its ffmpeg a second after spawning, but its ffmpeg
+     * opens -f v4l2 itself and so reaches any failure unaided. Ours takes video
+     * on stdin, and ffmpeg blocks reading input 0 before it opens input 1 or the
+     * output. Measured: with stdin held open and empty, both a deliberately
+     * unknown encoder and a nonexistent ALSA card leave ffmpeg alive
+     * indefinitely -- it never gets far enough to fail. So the writer and the
+     * tap go in first, and only then does the probe mean anything. */
+    rs.sock = sv[0];
+    rs.child_pid = (int)pid;
+    rs.status.child_pid = (int)pid;
+    rs.status.running = true;
+    atomic_store(&rs.run, true);
+    atomic_store(&rs.head, 0);
+    atomic_store(&rs.tail, 0);
+
+    if (pthread_create(&rs.thread, NULL, rs_writer_thread, NULL) != 0) {
+        close(rs.sock); rs.sock = -1;
+        close(rs.wake_fd); rs.wake_fd = -1;
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        rs.child_pid = 0;
+        rs.status.running = false;
+        snprintf(err, err_cap, "could not start the stream writer thread");
+        return RS_SPAWN_FAIL_SETUP;
+    }
+    rs.thread_running = true;
+
+    /* Hold the preview open for the life of the stream, so closing the panel
+     * does not silently end the broadcast. */
+    gui_preview_hold_acquire();
+    rs.holding_preview = true;
+    rs.tap.fn = rs_tap_cb;
+    rs.tap.user = NULL;
+    gui_preview_mux_add(&rs.tap);
+
+    /* Long enough for a frame or two to reach ffmpeg and for it to fail on
+     * them; short enough not to be felt when starting a stream that works. */
+    struct timespec settle = { 1, 500 * 1000 * 1000 };
+    nanosleep(&settle, NULL);
+
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, WNOHANG) != pid) {
+        *sock_out = sv[0];
+        *pid_out = pid;
+        return RS_SPAWN_OK;
+    }
+
+    /* It died. Unwind everything this attempt put in place, so the caller may
+     * retry into the same ring. Audio fields are left alone: the caller sets
+     * them before retrying and they must survive. */
+    gui_preview_mux_remove(&rs.tap);
+    if (rs.holding_preview) {
+        gui_preview_hold_release();
+        rs.holding_preview = false;
+    }
+    atomic_store_explicit(&rs.run, false, memory_order_release);
+    uint64_t wake = 1;
+    ssize_t wrote = write(rs.wake_fd, &wake, sizeof(wake));
+    (void)wrote;
+    pthread_join(rs.thread, NULL);
+    rs.thread_running = false;
+    close(rs.sock); rs.sock = -1;
+    close(rs.wake_fd); rs.wake_fd = -1;
+    rs.child_pid = 0;
+
+    rs_lock();
+    rs.status.running = false;
+    rs.status.child_pid = 0;
+    rs.status.error = false;          /* the retry deserves a clean slate */
+    rs.status.err_text[0] = '\0';
+    rs.status.frames_submitted = 0;
+    rs.status.frames_written = 0;
+    rs.status.frames_dropped = 0;
+    rs_unlock();
+
+    /* Classify over the WHOLE log, not just its last line. ffmpeg's final line
+     * is a generic summary -- "Error opening input files: Input/output error"
+     * -- while the line that says which input and why is several above it. The
+     * last line is still the best thing to SHOW; it is just useless to match
+     * on. */
+    char log_text[4096] = {0};
+    char reason[256] = {0};
+    FILE *lf = fopen(rs.ffmpeg_log, "r");
+    if (lf) {
+        size_t used = fread(log_text, 1, sizeof(log_text) - 1, lf);
+        log_text[used] = '\0';
+        fclose(lf);
+
+        const char *line = log_text;
+        while (line && *line) {
+            const char *nl = strchr(line, '\n');
+            size_t len = nl ? (size_t)(nl - line) : strlen(line);
+            if (len > 0 && len < sizeof(reason)) {
+                memcpy(reason, line, len);
+                reason[len] = '\0';
+            }
+            line = nl ? nl + 1 : NULL;
+        }
+    }
+    close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
+
+    if (strstr(log_text, "Connection refused")) {
+        snprintf(err, err_cap, "mediamtx is not accepting publishers on %s", url_buf);
+        return RS_SPAWN_FAIL_OTHER;
+    }
+    if (strstr(log_text, "CUDA") || strstr(log_text, "nvenc")) {
+        snprintf(err, err_cap, "NVENC is unavailable: %s", reason);
+        return RS_SPAWN_FAIL_OTHER;
+    }
+    if (strstr(log_text, "cannot open audio device") || strstr(log_text, "ALSA lib") ||
+        strstr(log_text, "Device or resource busy") || strstr(log_text, "snd_config") ||
+        strstr(log_text, "Cannot get card index")) {
+        snprintf(err, err_cap, "the dongle's audio device could not be opened: %s", reason);
+        return RS_SPAWN_FAIL_AUDIO;
+    }
+    snprintf(err, err_cap, "ffmpeg exited at startup: %s", reason[0] ? reason : "see the log");
+    return RS_SPAWN_FAIL_OTHER;
+}
+
 int gui_rtsp_stream_start(const gui_rtsp_stream_opts_t *opts, char *err, size_t err_cap)
 {
     if (err && err_cap) err[0] = '\0';
@@ -433,6 +622,13 @@ int gui_rtsp_stream_start(const gui_rtsp_stream_opts_t *opts, char *err, size_t 
     if (!use_nvenc && !enc.has_x264) {
         snprintf(err, err_cap, "%s cannot encode with libx264",
                  gui_video_record_ffmpeg_path());
+        return -1;
+    }
+
+    /* The supervisor must be up before the first publisher. Idempotent, and
+     * deliberately NOT stopped when a stream stops: restarting mediamtx per
+     * stream would drop every viewer that was reconnecting. App exit stops it. */
+    if (gui_mediamtx_start(&opts->ports, err, err_cap) != 0) {
         return -1;
     }
 
@@ -469,124 +665,29 @@ int gui_rtsp_stream_start(const gui_rtsp_stream_opts_t *opts, char *err, size_t 
         }
     }
 
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
-        rs_free_ring();
-        snprintf(err, err_cap, "could not create the encoder socket: %s", strerror(errno));
-        return -1;
-    }
-    int want = RS_SNDBUF_BYTES;
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
-    /* Without a send timeout a wedged ffmpeg blocks the writer inside send()
-     * forever, where it can never observe the stop flag. */
-    struct timeval sndto = { 0, 200 * 1000 };
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
-
-    rs.wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (rs.wake_fd < 0) {
-        close(sv[0]); close(sv[1]); rs_free_ring();
-        snprintf(err, err_cap, "could not create the stream wake eventfd: %s", strerror(errno));
-        return -1;
-    }
-
-    char size_buf[32], rate_buf[32], gop_buf[16], br_buf[16], maxr_buf[16], bufs_buf[16];
-    char url_buf[256];
-    char *argv[80];
-    int argc = 0;
-    rs_build_argv(argv, &argc, opts, use_nvenc, audio_device,
-                  size_buf, sizeof(size_buf), rate_buf, sizeof(rate_buf),
-                  gop_buf, sizeof(gop_buf), br_buf, sizeof(br_buf),
-                  maxr_buf, sizeof(maxr_buf), bufs_buf, sizeof(bufs_buf),
-                  url_buf, sizeof(url_buf));
-
-    snprintf(rs.ffmpeg_log, sizeof(rs.ffmpeg_log), "%s/misrc-rtsp-ffmpeg.log",
-             getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");
-
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
-    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-    /* Keeps the terminal clean while leaving a failure diagnosable -- the
-     * difference between "stream failed" and "stream failed: Connection
-     * refused". */
-    posix_spawn_file_actions_addopen(&fa, 2, rs.ffmpeg_log,
-                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
+    int sock = -1;
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, gui_video_record_ffmpeg_path(), &fa, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
-
-    if (rc != 0) {
-        close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
+    rs_spawn_result_t sr = rs_spawn_attempt(opts, use_nvenc, audio_device,
+                                            &sock, &pid, err, err_cap);
+    if (sr == RS_SPAWN_FAIL_AUDIO && audio_device[0]) {
+        /* One retry, video-only, per the failure-mode table: a sound card that
+         * cannot be opened must not cost the picture. Exactly one -- retrying a
+         * genuinely broken device in a loop burns CPU and fills logs, which is
+         * why capture-node leaves restarts to the operator. */
+        snprintf(rs.status.audio_note, sizeof(rs.status.audio_note),
+                 "audio device could not be opened; streaming video-only");
+        rs.status.audio_active = false;
+        audio_device[0] = '\0';
+        sr = rs_spawn_attempt(opts, use_nvenc, audio_device, &sock, &pid, err, err_cap);
+    }
+    if (sr != RS_SPAWN_OK) {
         rs_free_ring();
-        snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
         return -1;
     }
 
-    /* capture-node's trick: an ffmpeg that cannot reach mediamtx, or cannot
-     * open the ALSA device, exits within a moment. Catching it here turns
-     * "the stream is dead and nobody knows" into a message naming the cause. */
-    struct timespec settle = { 1, 0 };
-    nanosleep(&settle, NULL);
-    int wstatus = 0;
-    if (waitpid(pid, &wstatus, WNOHANG) == pid) {
-        char reason[256] = {0};
-        FILE *lf = fopen(rs.ffmpeg_log, "r");
-        if (lf) {
-            char line[256];
-            while (fgets(line, sizeof(line), lf)) {
-                line[strcspn(line, "\r\n")] = '\0';
-                if (line[0]) snprintf(reason, sizeof(reason), "%s", line);
-            }
-            fclose(lf);
-        }
-        close(sv[0]); close(rs.wake_fd); rs.wake_fd = -1;
-        rs_free_ring();
-        if (strstr(reason, "Connection refused")) {
-            snprintf(err, err_cap, "mediamtx is not accepting publishers on %s", url_buf);
-        } else if (strstr(reason, "CUDA") || strstr(reason, "nvenc")) {
-            snprintf(err, err_cap, "NVENC is unavailable: %s", reason);
-        } else if (strstr(reason, "alsa") || strstr(reason, "ALSA") ||
-                   strstr(reason, "Device or resource busy")) {
-            snprintf(err, err_cap, "the dongle's audio device could not be opened: %s", reason);
-        } else {
-            snprintf(err, err_cap, "ffmpeg exited at startup: %s",
-                     reason[0] ? reason : "see the log");
-        }
-        return -1;
-    }
-
-    rs.sock = sv[0];
-    rs.child_pid = (int)pid;
-    rs.status.child_pid = (int)pid;
-    rs.status.running = true;
-    atomic_store(&rs.run, true);
-
-    if (pthread_create(&rs.thread, NULL, rs_writer_thread, NULL) != 0) {
-        close(rs.sock); rs.sock = -1;
-        close(rs.wake_fd); rs.wake_fd = -1;
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
-        rs.child_pid = 0;
-        rs.status.running = false;
-        rs_free_ring();
-        snprintf(err, err_cap, "could not start the stream writer thread");
-        return -1;
-    }
-    rs.thread_running = true;
-
-    /* Hold the preview open for the life of the stream, so closing the panel
-     * does not silently end the broadcast. */
-    gui_preview_hold_acquire();
-    rs.holding_preview = true;
-
-    rs.tap.fn = rs_tap_cb;
-    rs.tap.user = NULL;
-    gui_preview_mux_add(&rs.tap);
-
-    if (s_inject == RS_INJECT_KILL) kill(pid, SIGKILL);
-    if (s_inject == RS_INJECT_HANG) kill(pid, SIGSTOP);
+    (void)sock;
+    if (s_inject == RS_INJECT_KILL) kill((pid_t)rs.child_pid, SIGKILL);
+    if (s_inject == RS_INJECT_HANG) kill((pid_t)rs.child_pid, SIGSTOP);
     return 0;
 }
 
@@ -761,6 +862,167 @@ int gui_rtsp_stream_test_main(const char *device, int seconds)
     return 0;
 }
 
+
+/* ---- fault injection harness ---------------------------------------------- */
+
+static int fault_expect(bool ok, const char *what)
+{
+    printf("  %s %s\n", ok ? "ok:  " : "FAIL:", what);
+    return ok ? 0 : 1;
+}
+
+/* Runs the recorder and the stream against the same tap, injects one fault, and
+ * asserts both the documented stream behaviour AND that the recorder never
+ * noticed. The second half is the point: a monitoring feature that can cost the
+ * QC artifact a frame is not worth having. */
+int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int seconds)
+{
+    if (!device || !device[0]) device = "/dev/video0";
+    if (!fault || !fault[0]) fault = "none";
+    if (seconds <= 0) seconds = 6;
+
+    rs_inject_t inject = RS_INJECT_NONE;
+    if      (strcmp(fault, "none") == 0)       inject = RS_INJECT_NONE;
+    else if (strcmp(fault, "kill") == 0)       inject = RS_INJECT_KILL;
+    else if (strcmp(fault, "hang") == 0)       inject = RS_INJECT_HANG;
+    else if (strcmp(fault, "bad-args") == 0)   inject = RS_INJECT_BAD_ARGS;
+    else if (strcmp(fault, "no-audio") == 0)   inject = RS_INJECT_NO_AUDIO;
+    else if (strcmp(fault, "busy-audio") == 0) inject = RS_INJECT_BUSY_AUDIO;
+    else {
+        fprintf(stderr, "unknown fault: %s "
+                        "(none|kill|hang|bad-args|no-audio|busy-audio)\n", fault);
+        return 2;
+    }
+
+    gui_mediamtx_config_t ports = gui_mediamtx_default_config();
+    char err[256] = {0};
+
+    gui_preview_init(NULL);
+    gui_preview_refresh_devices();
+    size_t n_devs = 0;
+    const preview_device_t *devs = gui_preview_devices(&n_devs);
+    int idx = -1;
+    for (size_t i = 0; i < n_devs; i++) {
+        if (strcmp(devs[i].path, device) == 0) { idx = (int)i; break; }
+    }
+    if (idx < 0) { fprintf(stderr, "no such device: %s\n", device); return 1; }
+    gui_preview_select(idx, 0);
+    if (gui_preview_connect() != 0) {
+        preview_status_t ps = gui_preview_get_status();
+        fprintf(stderr, "preview: %s\n", ps.err_text);
+        gui_preview_shutdown();
+        return 1;
+    }
+    preview_status_t st = gui_preview_get_status();
+    uint32_t pitch = gui_preview_negotiated_pitch();
+    if (pitch == 0) pitch = st.width * 2;
+
+    /* The recorder is the control: it shares the tap through the mux, and its
+     * counters are what must not move when the stream misbehaves. */
+    char mkv[256];
+    snprintf(mkv, sizeof(mkv), "%s/misrc-fault-control.mkv",
+             getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");
+    if (gui_video_record_start(mkv, VIDEO_CODEC_H264, st.width, st.height, pitch,
+                               st.fps_num, st.fps_den, err, sizeof(err)) != 0) {
+        fprintf(stderr, "control recorder: %s\n", err);
+        gui_preview_disconnect();
+        gui_preview_shutdown();
+        return 1;
+    }
+
+    gui_rtsp_stream_opts_t opts = {0};
+    opts.width = st.width; opts.height = st.height; opts.pitch = pitch;
+    opts.fps_num = st.fps_num ? st.fps_num : 25;
+    opts.fps_den = st.fps_den ? st.fps_den : 1;
+    opts.video_device = device;
+    opts.audio_device = "";
+    opts.encoder = RTSP_ENCODER_AUTO;
+    opts.ports = ports;
+
+    gui_rtsp_stream_set_inject(inject);
+    int start_rc = gui_rtsp_stream_start(&opts, err, sizeof(err));
+    gui_rtsp_stream_status_t s0 = gui_rtsp_stream_get_status();
+
+    printf("fault=%s start_rc=%d%s%s\n", fault, start_rc,
+           start_rc != 0 ? " err=" : "", start_rc != 0 ? err : "");
+    if (start_rc == 0) {
+        if (s0.audio_active) {
+            printf("  audio: %s\n", s0.audio_device);
+        } else {
+            printf("  audio: off (%s)\n",
+                   s0.audio_note[0] ? s0.audio_note : "no reason recorded");
+        }
+    }
+
+    gui_video_record_status_t r0 = gui_video_record_get_status();
+    for (int i = 0; i < seconds; i++) {
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
+    }
+    gui_rtsp_stream_status_t s1 = gui_rtsp_stream_get_status();
+    gui_video_record_status_t r1 = gui_video_record_get_status();
+
+    int bad = 0;
+    switch (inject) {
+    case RS_INJECT_NONE:
+        bad |= fault_expect(start_rc == 0, "stream started");
+        bad |= fault_expect(s1.frames_written > 0, "frames reached the encoder");
+        bad |= fault_expect(!s1.error, "no error reported");
+        break;
+    case RS_INJECT_KILL:
+        bad |= fault_expect(start_rc == 0, "stream started before the kill");
+        bad |= fault_expect(s1.error, "a killed encoder is reported, not hidden");
+        break;
+    case RS_INJECT_HANG:
+        bad |= fault_expect(start_rc == 0, "stream started before the stop");
+        bad |= fault_expect(s1.frames_dropped > 0, "a wedged encoder drops frames");
+        break;
+    case RS_INJECT_BAD_ARGS:
+        bad |= fault_expect(start_rc != 0, "an unusable encoder fails the start");
+        bad |= fault_expect(err[0] != '\0', "the failure names a reason");
+        break;
+    case RS_INJECT_NO_AUDIO:
+        bad |= fault_expect(start_rc == 0, "an absent audio device still streams video");
+        bad |= fault_expect(!s0.audio_active, "audio reported inactive");
+        bad |= fault_expect(s0.audio_note[0] != '\0', "the reason is displayable");
+        bad |= fault_expect(s1.frames_written > 0, "video kept flowing");
+        break;
+    case RS_INJECT_BUSY_AUDIO:
+        bad |= fault_expect(start_rc == 0, "an unopenable audio device still streams video");
+        bad |= fault_expect(!gui_rtsp_stream_get_status().audio_active,
+                            "audio dropped after the retry");
+        bad |= fault_expect(s1.frames_written > 0, "video kept flowing");
+        break;
+    }
+
+    /* The control, in every case. */
+    bad |= fault_expect(r1.frames_written > r0.frames_written,
+                        "the recorder kept writing throughout");
+    bad |= fault_expect(r1.frames_dropped == r0.frames_dropped,
+                        "the recorder dropped nothing");
+    bad |= fault_expect(!r1.error, "the recorder reported no error");
+
+    double t0 = rs_now();
+    gui_rtsp_stream_request_stop();
+    gui_rtsp_stream_finish();
+    double teardown = rs_now() - t0;
+    bad |= fault_expect(teardown < (double)RS_REAP_LIMIT_S + 3.0,
+                        "teardown completed within its deadline");
+    printf("  teardown %.2fs\n", teardown);
+
+    gui_video_record_request_stop();
+    gui_video_record_finish();
+    gui_preview_disconnect();
+    gui_preview_shutdown();
+    gui_mediamtx_stop();
+    remove(mkv);
+    gui_rtsp_stream_set_inject(RS_INJECT_NONE);
+
+    if (bad) { fprintf(stderr, "fault test FAILED (%s)\n", fault); return 1; }
+    printf("fault test passed (%s)\n", fault);
+    return 0;
+}
+
 #else /* not Linux */
 
 bool gui_rtsp_stream_probe(void) { return false; }
@@ -784,6 +1046,12 @@ void gui_rtsp_stream_set_inject(rs_inject_t what) { (void)what; }
 int gui_rtsp_stream_test_main(const char *device, int seconds)
 {
     (void)device; (void)seconds;
+    fprintf(stderr, "requires Linux\n");
+    return 2;
+}
+int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int seconds)
+{
+    (void)device; (void)fault; (void)seconds;
     fprintf(stderr, "requires Linux\n");
     return 2;
 }

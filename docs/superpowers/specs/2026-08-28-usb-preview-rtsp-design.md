@@ -176,9 +176,32 @@ back-pressuring a `-f v4l2` input. Our ring already provides that property upstr
 ffmpeg, so the RTSP output can be a plain `-f rtsp`. One less moving part.
 
 Where the two modules genuinely differ: the recorder must not drop frames if it can help it
-(it dupes to keep the timeline honest), whereas the streamer should always prefer the
-freshest frame. Under sustained ring pressure the streamer discards oldest, the recorder
-does not.
+(it dupes to keep the timeline honest), whereas the streamer would rather be current than
+complete. It carries **four** slots against the recorder's sixteen, and under pressure it
+**drops the incoming frame** while the consumer keeps the one it is sending.
+
+> **Amended 2026-08-29.** This originally read "the streamer discards oldest". It does not,
+> and the reason is worth recording, because the obvious reading is a bug.
+>
+> A slot holds one raw YUYV frame — 829,440 bytes at 720x576 — and the writer thread holds
+> `slots[tail]` for the whole of its `send()`, because a partial send must resume from the
+> same buffer. The ring can only fill *after* the 4 MiB socket buffer has filled, which
+> means the writer is by then parked inside `send()` on that slot. Discarding oldest would
+> hand the producer that exact buffer to overwrite while the kernel is copying out of it:
+> a torn frame, half old and half new, delivered to every viewer with `frames_written`
+> still incrementing. The policy would be unsafe precisely and only in the situation it
+> exists for.
+>
+> Doing it safely is possible — a per-slot seqlock plus a scratch copy on the consumer, so
+> no slot is ever held across a `send()` — at one extra 810 KiB memcpy per frame on the
+> writer thread. It was not worth it. The ring is 160 ms deep, so that bounds the entire
+> difference: after a stall clears, a viewer sees up to 160 ms of slightly stale video
+> before catching up, instead of jumping straight to live. Measured runs drop no frames at
+> all, so this buys a sixth of a second in a failure mode not yet observed, and pays for it
+> with a second concurrency mechanism in a path whose current correctness argument is
+> "the consumer owns `slots[tail]`, full stop."
+>
+> Revisit if `frames_dropped` is ever seen climbing in the field.
 
 **Audio is not this module's data path.** The module resolves the device name and puts it in
 the argv; ffmpeg does the rest. If resolution fails the stream still starts, video-only,
