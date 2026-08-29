@@ -135,6 +135,35 @@ jobs:
           Terminal=false
           StartupNotify=true
           EOF
+
+          # Sweep stale MISRC launchers this workflow did not write.
+          #
+          # A leftover .desktop naming an older, versioned StartupWMClass shows up as a
+          # second "MISRC GUI" in the app grid and matches no window, so clicking it gives
+          # the generic executable icon -- the exact symptom the constant class name above
+          # exists to avoid, reintroduced by a file nobody remembers creating.
+          #
+          # Deliberately narrow, because this deletes files in a real home directory: only
+          # *.desktop directly in $app_dir, only ones whose StartupWMClass names a MISRC
+          # class that cannot match our window (a versioned "MISRC Capture <ver>", or the
+          # retired misrc_gui/misrc-gui RESOURCE_NAME shim values), and never the entry
+          # just written above. A launcher with the correct StartupWMClass is left alone,
+          # and anything not naming a MISRC class is never even considered.
+          shopt -s nullglob
+          for stale in "$app_dir"/*.desktop; do
+            if [ "$stale" = "$app_dir/misrc_gui.desktop" ]; then
+              continue
+            fi
+            stale_class="$(sed -n 's/^StartupWMClass=//p' "$stale" | head -n1)"
+            case "$stale_class" in
+              "MISRC Capture "*|misrc_gui|misrc-gui)
+                echo "removing stale MISRC launcher: $stale (StartupWMClass=$stale_class)"
+                rm -f "$stale"
+                ;;
+            esac
+          done
+          shopt -u nullglob
+
           update-desktop-database "$app_dir" || true
 
       - name: Verify install

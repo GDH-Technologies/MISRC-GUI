@@ -114,12 +114,25 @@ xprop WM_CLASS      # then click the window
 # => WM_CLASS(STRING) = "MISRC Capture", "MISRC Capture"
 ```
 
-If the dock still shows a generic icon, look for **stale duplicate launchers** before suspecting
-the workflow — any leftover `.desktop` in `~/.local/share/applications/` naming an older,
-versioned `StartupWMClass` shows up as a second "MISRC GUI" in the app grid and matches nothing:
+The install step then **sweeps stale MISRC launchers** it did not write. A leftover `.desktop`
+naming an older, versioned `StartupWMClass` shows up as a second "MISRC GUI" in the app grid and
+matches no window, which looks identical to the bug the constant class name fixes. The sweep is
+deliberately narrow, because it deletes files in a real home directory:
+
+- only `*.desktop` directly in `~/.local/share/applications`
+- only where `StartupWMClass` is a versioned `MISRC Capture <ver>`, or the retired `misrc_gui` /
+  `misrc-gui` shim values
+- never `misrc_gui.desktop`, the entry it just wrote
+
+A launcher carrying the correct `StartupWMClass` is left alone, and anything not naming a MISRC
+class is never considered. Removals are echoed in the job log.
+
+The sweep does not reach `~/Desktop`. A shortcut there pointing at an older AppImage
+(`~/.local/bin/misrc_gui.AppImage`) still runs that build, and a pre-v1.1.5 AppImage reports a
+versioned `WM_CLASS` of its own — repoint or delete it by hand:
 
 ```bash
-grep -l MISRC ~/.local/share/applications/*.desktop
+grep -l MISRC ~/.local/share/applications/*.desktop ~/Desktop/*.desktop
 ```
 
 ## Security note

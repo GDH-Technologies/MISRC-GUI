@@ -1013,6 +1013,24 @@ def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
             f'installed .desktop; StartupWMClass="{wm_class}" already matches however '
             "the app is started"
         )
+
+    # The install must also sweep stale MISRC launchers it did not write. One leftover
+    # .desktop with a dead versioned StartupWMClass is enough to put a second, generic
+    # "MISRC GUI" in the app grid, which looks exactly like the bug the constant class
+    # name fixes. The sweep must never delete the entry the workflow just wrote.
+    deploy_text = read_text(deploy_workflow_path)
+    required_sweep_snippets = [
+        'for stale in "$app_dir"/*.desktop; do',
+        'if [ "$stale" = "$app_dir/misrc_gui.desktop" ]; then',
+        '"MISRC Capture "*|misrc_gui|misrc-gui)',
+        'rm -f "$stale"',
+    ]
+    for snippet in required_sweep_snippets:
+        if snippet not in deploy_text:
+            return fail(
+                "selfhosted-deploy.yml is missing the stale-launcher sweep, so a dead "
+                f"versioned .desktop can shadow the installed one: {snippet}"
+            )
     return 0
 
 
