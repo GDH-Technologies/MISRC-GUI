@@ -19,6 +19,7 @@
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -479,8 +480,14 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
     /* Keeps the terminal clean while leaving a failure diagnosable -- the
      * difference between "stream failed" and "stream failed: Connection
      * refused". */
+    /* 0600 and O_NOFOLLOW for the same reasons as the mediamtx config: this
+     * log carries the publish URL and the stream's detail, the path falls back
+     * to world-writable /tmp when a session has no XDG_RUNTIME_DIR, and without
+     * O_NOFOLLOW a symlink planted at our filename would have ffmpeg truncate
+     * and overwrite whatever it points at. */
     posix_spawn_file_actions_addopen(&fa, 2, rs.ffmpeg_log,
-                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                     O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                                     S_IRUSR | S_IWUSR);
 
     pid_t pid = 0;
     int rc = posix_spawn(&pid, gui_video_record_ffmpeg_path(), &fa, NULL, argv, environ);

@@ -1415,6 +1415,99 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     return 0
 
 
+def check_streaming_writes_are_private(repo_root: Path) -> int:
+    """The mediamtx config and ffmpeg's stderr log are written into
+    $XDG_RUNTIME_DIR -- or, for a session that has none, into world-writable
+    /tmp. Both describe the stream, the config is where a password will live,
+    and both were being created 0644 through a path that would follow a symlink.
+    Another user could pre-create the directory, read what we wrote, or plant a
+    link at our filename and have us truncate a file of their choosing.
+
+    Asserts the two creation sites stay private and refuse to follow links, and
+    that the directory is checked rather than assumed to be ours."""
+    checks = (
+        (
+            "misrc_tools/misrc_gui/streaming/gui_mediamtx.c",
+            "the generated mediamtx config",
+            "mtx.config_path",
+        ),
+        (
+            "misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c",
+            "ffmpeg's stderr log",
+            "rs.ffmpeg_log",
+        ),
+    )
+
+    for rel, what, target in checks:
+        path = repo_root / rel
+        code = strip_c_comments(read_text(path))
+
+        # Find the open() that creates it, and read the flags and mode it passes.
+        m = re.search(
+            rf"open\w*\([^;]*?{re.escape(target)}\s*,\s*([^;]*?)\)\s*;",
+            code,
+            re.S,
+        )
+        if not m:
+            return fail(
+                f"{Path(rel).name}: could not find the open() that creates {what}; "
+                "if it moved, this guard must move with it"
+            )
+        args = re.sub(r"\s+", " ", m.group(1))
+
+        if "O_NOFOLLOW" not in args:
+            return fail(
+                f"{Path(rel).name}: {what} is created without O_NOFOLLOW ({args}). "
+                "Under /tmp a symlink planted at that filename would redirect the "
+                "write to a file the attacker chose and we can reach."
+            )
+        if "S_IRUSR | S_IWUSR" not in args and "S_IWUSR | S_IRUSR" not in args:
+            return fail(
+                f"{Path(rel).name}: {what} is not created 0600 ({args}). It describes "
+                "the stream, and the config is where the stream password lives."
+            )
+        for octal in ("0644", "0666", "0640", "0604"):
+            if octal in args:
+                return fail(f"{Path(rel).name}: {what} is created {octal}")
+
+    # The directory itself has to be verified, not merely mkdir'd.
+    mtx = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/streaming/gui_mediamtx.c"))
+    if "mtx_dir_is_private" not in mtx:
+        return fail(
+            "gui_mediamtx.c no longer checks that its runtime directory is private. "
+            "mkdir() tolerating EEXIST is not the same as owning what already exists."
+        )
+    body = re.search(r"static bool mtx_dir_is_private\(const char \*path\)\s*\{(.*?)\n\}",
+                     mtx, re.S)
+    if not body:
+        return fail("mtx_dir_is_private() is missing or its shape changed")
+    for needle, why in (
+        ("lstat", "must lstat, not stat -- a symlink is not a directory we own"),
+        ("S_ISDIR", "must confirm it is a directory"),
+        ("geteuid", "must confirm we own it"),
+        ("S_IRWXG", "must reject or repair group access"),
+        ("S_IRWXO", "must reject or repair world access"),
+    ):
+        if needle not in body.group(1):
+            return fail(f"mtx_dir_is_private() {why}")
+
+    # And it must actually be called by the path that builds the directory.
+    dir_fn = re.search(r"static bool mtx_config_dir\(char \*out, size_t cap\)\s*\{(.*?)\n\}",
+                       mtx, re.S)
+    if not dir_fn:
+        return fail("mtx_config_dir() is missing or its shape changed")
+    # The result must GATE the return, not merely be mentioned. Naming the
+    # function is not calling it: a `(void)mtx_dir_is_private;` satisfies a
+    # substring search, keeps -Werror quiet about an unused static, and checks
+    # nothing at all. Mutation testing caught exactly that.
+    if not re.search(r"return\s+mtx_dir_is_private\s*\(\s*out\s*\)\s*;", dir_fn.group(1)):
+        return fail(
+            "mtx_config_dir() does not return mtx_dir_is_private(out); the directory "
+            "check either is not called or does not decide the outcome"
+        )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1986,6 +2079,7 @@ def main() -> int:
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
+        ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
