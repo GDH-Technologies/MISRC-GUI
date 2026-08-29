@@ -315,14 +315,11 @@ jobs:
             local escaped_launcher_exec_path="$launcher_exec_path"
             escaped_launcher_exec_path="${escaped_launcher_exec_path//\\/\\\\}"
             escaped_launcher_exec_path="${escaped_launcher_exec_path//\"/\\\"}"
-            local gui_version=""
-            local startup_wm_class="misrc_gui"
-            if [[ -x "$HERE/usr/bin/misrc_gui" ]]; then
-              gui_version="$("$HERE/usr/bin/misrc_gui" --version 2>/dev/null | head -n1 | tr -d '\r')"
-              if [[ -n "$gui_version" ]]; then
-                startup_wm_class="MISRC Capture $gui_version"
-              fi
-            fi
+            # Must match GUI_WINDOW_CLASS_NAME in misrc_tools/misrc_gui/core/misrc_gui.c.
+            # Deliberately version-free: the GUI creates its window under this exact
+            # name so WM_CLASS is stable, which is what lets a launcher written by any
+            # build keep matching the running window (and keep its icon in the dock).
+            local startup_wm_class="MISRC Capture"
             local escaped_startup_wm_class="$startup_wm_class"
             escaped_startup_wm_class="${escaped_startup_wm_class//\\/\\\\}"
             escaped_startup_wm_class="${escaped_startup_wm_class//\"/\\\"}"
@@ -390,8 +387,8 @@ jobs:
           Exec=misrc_gui
           Icon=misrc
           Categories=Utility;
-          StartupWMClass=MISRC Capture ${BUILD_VERSION}
-          X-GNOME-WMClass=MISRC Capture ${BUILD_VERSION}
+          StartupWMClass=MISRC Capture
+          X-GNOME-WMClass=MISRC Capture
           Terminal=false
           StartupNotify=true
           EOF
