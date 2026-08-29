@@ -1302,7 +1302,8 @@ def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
     settings_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
 
     fields = sorted(set(
-        re.findall(r"\b(rtsp_[a-z0-9_]+|mediamtx_path)\b(?:\[\d+\])?\s*;", struct_src)
+        re.findall(r"\b(rtsp_[a-z0-9_]+|mediamtx_path|preview_device_path)\b(?:\[\d+\])?\s*;",
+                   struct_src)
     ))
     if not fields:
         return fail("gui_app.h declares no rtsp_* stream settings")

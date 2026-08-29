@@ -654,6 +654,33 @@ int main(int argc, char **argv) {
     gui_preview_init(argc > 0 ? argv[0] : NULL);
     gui_app_init(&app);
 
+    /* Reopen the USB preview the user last used. Without this the RTSP stream
+     * cannot be armed until someone visits the Preview pane and clicks Connect,
+     * which is a strange prerequisite for a setting in the settings dialog.
+     *
+     * Quiet on failure by design: a dongle that is unplugged, or in use
+     * elsewhere, must not produce a dialog on every launch. The picker keeps
+     * showing the remembered name and the status line says what happened. */
+    if (app.settings.preview_device_path[0]) {
+        gui_preview_refresh_devices();
+        size_t n_pv = 0;
+        const preview_device_t *pv = gui_preview_devices(&n_pv);
+        int want = -1;
+        for (size_t i = 0; i < n_pv; i++) {
+            if (strcmp(pv[i].path, app.settings.preview_device_path) == 0) { want = (int)i; break; }
+        }
+        if (want >= 0) {
+            gui_preview_select(want, 0);
+            if (gui_preview_connect() != 0) {
+                preview_status_t pst = gui_preview_get_status();
+                gui_app_set_status(&app, pst.err_text[0] ? pst.err_text
+                                                         : "USB preview could not be reopened");
+            }
+        } else {
+            gui_app_set_status(&app, "the remembered USB preview device is not present");
+        }
+    }
+
     // Set app for text rendering font access
     gui_text_set_app(&app);
 

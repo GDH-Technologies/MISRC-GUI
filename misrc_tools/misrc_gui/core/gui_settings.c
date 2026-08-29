@@ -459,6 +459,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->video_record_codec = 0;        /* H.264 */
     settings->video_output_tag[0] = '\0';
     settings->ffmpeg_path[0] = '\0';
+    settings->preview_device_path[0] = '\0';
     settings->rtsp_stream_enabled = false;
     settings->rtsp_stream_lan = false;       /* loopback: going off-box is explicit */
     settings->rtsp_stream_port = 0;          /* 0 = the module's default */
@@ -576,6 +577,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"enable_audio_4ch\": %s,\n", settings->enable_audio_4ch ? "true" : "false");
     fprintf(f, "  \"video_record_enabled\": %s,\n", settings->video_record_enabled ? "true" : "false");
     fprintf(f, "  \"video_record_codec\": %d,\n", settings->video_record_codec);
+    fprintf(f, "  \"preview_device_path\": \"%s\",\n", settings->preview_device_path);
     fprintf(f, "  \"rtsp_stream_enabled\": %s,\n", settings->rtsp_stream_enabled ? "true" : "false");
     fprintf(f, "  \"rtsp_stream_lan\": %s,\n", settings->rtsp_stream_lan ? "true" : "false");
     fprintf(f, "  \"rtsp_stream_port\": %d,\n", settings->rtsp_stream_port);
@@ -1120,6 +1122,10 @@ void gui_settings_load(gui_settings_t *settings) {
         int c = atoi(value);
         /* Clamp: a hand-edited file must not select a codec that does not exist. */
         settings->video_record_codec = (c == 1) ? 1 : 0;
+    }
+    if ((value = find_value(content, "preview_device_path")) != NULL) {
+        strncpy(settings->preview_device_path, value, sizeof(settings->preview_device_path) - 1);
+        settings->preview_device_path[sizeof(settings->preview_device_path) - 1] = '\0';
     }
     if ((value = find_value(content, "rtsp_stream_enabled")) != NULL) {
         settings->rtsp_stream_enabled = (strcmp(value, "true") == 0);
