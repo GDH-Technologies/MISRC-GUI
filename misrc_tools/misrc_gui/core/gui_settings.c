@@ -459,6 +459,14 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->video_record_codec = 0;        /* H.264 */
     settings->video_output_tag[0] = '\0';
     settings->ffmpeg_path[0] = '\0';
+    settings->rtsp_stream_enabled = false;
+    settings->rtsp_stream_lan = false;       /* loopback: going off-box is explicit */
+    settings->rtsp_stream_port = 0;          /* 0 = the module's default */
+    settings->rtsp_stream_encoder = 0;       /* auto */
+    settings->rtsp_stream_bitrate_kbps = 0;  /* 0 = the module's default */
+    settings->rtsp_stream_deinterlace = false;
+    settings->mediamtx_path[0] = '\0';
+    settings->rtsp_audio_device[0] = '\0';
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -568,6 +576,14 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"enable_audio_4ch\": %s,\n", settings->enable_audio_4ch ? "true" : "false");
     fprintf(f, "  \"video_record_enabled\": %s,\n", settings->video_record_enabled ? "true" : "false");
     fprintf(f, "  \"video_record_codec\": %d,\n", settings->video_record_codec);
+    fprintf(f, "  \"rtsp_stream_enabled\": %s,\n", settings->rtsp_stream_enabled ? "true" : "false");
+    fprintf(f, "  \"rtsp_stream_lan\": %s,\n", settings->rtsp_stream_lan ? "true" : "false");
+    fprintf(f, "  \"rtsp_stream_port\": %d,\n", settings->rtsp_stream_port);
+    fprintf(f, "  \"rtsp_stream_encoder\": %d,\n", settings->rtsp_stream_encoder);
+    fprintf(f, "  \"rtsp_stream_bitrate_kbps\": %d,\n", settings->rtsp_stream_bitrate_kbps);
+    fprintf(f, "  \"rtsp_stream_deinterlace\": %s,\n", settings->rtsp_stream_deinterlace ? "true" : "false");
+    fprintf(f, "  \"mediamtx_path\": \"%s\",\n", settings->mediamtx_path);
+    fprintf(f, "  \"rtsp_audio_device\": \"%s\",\n", settings->rtsp_audio_device);
     fprintf(f, "  \"enable_audio_2ch_12\": %s,\n", settings->enable_audio_2ch_12 ? "true" : "false");
     fprintf(f, "  \"enable_audio_2ch_34\": %s,\n", settings->enable_audio_2ch_34 ? "true" : "false");
     fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
@@ -1104,6 +1120,39 @@ void gui_settings_load(gui_settings_t *settings) {
         int c = atoi(value);
         /* Clamp: a hand-edited file must not select a codec that does not exist. */
         settings->video_record_codec = (c == 1) ? 1 : 0;
+    }
+    if ((value = find_value(content, "rtsp_stream_enabled")) != NULL) {
+        settings->rtsp_stream_enabled = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "rtsp_stream_lan")) != NULL) {
+        settings->rtsp_stream_lan = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "rtsp_stream_port")) != NULL) {
+        int p = atoi(value);
+        /* Clamp to a usable, unprivileged port. A hand-edited 0 means "default",
+         * and anything below 1024 would need root we do not have. */
+        settings->rtsp_stream_port = (p == 0 || (p >= 1024 && p <= 65535)) ? p : 0;
+    }
+    if ((value = find_value(content, "rtsp_stream_encoder")) != NULL) {
+        int e = atoi(value);
+        settings->rtsp_stream_encoder = (e >= 0 && e <= 2) ? e : 0;
+    }
+    if ((value = find_value(content, "rtsp_stream_bitrate_kbps")) != NULL) {
+        int b = atoi(value);
+        /* 0 means "the module's default"; a silly value would otherwise produce
+         * a stream nobody can watch. */
+        settings->rtsp_stream_bitrate_kbps = (b == 0 || (b >= 100 && b <= 100000)) ? b : 0;
+    }
+    if ((value = find_value(content, "rtsp_stream_deinterlace")) != NULL) {
+        settings->rtsp_stream_deinterlace = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "mediamtx_path")) != NULL) {
+        strncpy(settings->mediamtx_path, value, sizeof(settings->mediamtx_path) - 1);
+        settings->mediamtx_path[sizeof(settings->mediamtx_path) - 1] = '\0';
+    }
+    if ((value = find_value(content, "rtsp_audio_device")) != NULL) {
+        strncpy(settings->rtsp_audio_device, value, sizeof(settings->rtsp_audio_device) - 1);
+        settings->rtsp_audio_device[sizeof(settings->rtsp_audio_device) - 1] = '\0';
     }
     if ((value = find_value(content, "audio_4ch_filename")) != NULL) {
         strncpy(settings->audio_4ch_filename, value, MAX_FILENAME_LEN - 1);
