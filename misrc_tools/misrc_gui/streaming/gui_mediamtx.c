@@ -357,6 +357,30 @@ bool gui_mediamtx_probe(void)
 const char *gui_mediamtx_binary_path(void) { return mtx_bin.found ? mtx_bin.path : ""; }
 const char *gui_mediamtx_version(void)     { return mtx_bin.version; }
 
+/* The directory must be ours and private before anything is written into it.
+ *
+ * mkdir() tolerating EEXIST is not the same as owning what already exists, and
+ * the last fallback below is /tmp, which is world-writable: another user can
+ * pre-create /tmp/misrc-gui and then read -- or replace -- everything we put
+ * there. Once the config carries a stream password that stops being untidy and
+ * starts being a leak, so it is checked here rather than assumed.
+ *
+ * lstat rather than stat: a symlink is not a directory we own, and following it
+ * is exactly the trick being guarded against. */
+static bool mtx_dir_is_private(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return false; }
+    if (st.st_uid != geteuid()) { errno = EPERM;  return false; }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        /* Ours, but looser than it should be. Tighten rather than refuse -- an
+         * older build, or a stray umask, should not wedge the feature. */
+        if (chmod(path, 0700) != 0) return false;
+    }
+    return true;
+}
+
 /* $XDG_RUNTIME_DIR is cleaned on reboot and is per-user; $TMPDIR is the
  * fallback for a session that has none. */
 static bool mtx_config_dir(char *out, size_t cap)
@@ -366,7 +390,7 @@ static bool mtx_config_dir(char *out, size_t cap)
     if (!base || !base[0]) base = "/tmp";
     snprintf(out, cap, "%s/misrc-gui", base);
     if (mkdir(out, 0700) != 0 && errno != EEXIST) return false;
-    return true;
+    return mtx_dir_is_private(out);
 }
 
 static int mtx_write_config(const gui_mediamtx_config_t *cfg, char *err, size_t err_cap)
@@ -388,9 +412,28 @@ static int mtx_write_config(const gui_mediamtx_config_t *cfg, char *err, size_t 
         snprintf(err, err_cap, "mediamtx config did not fit its buffer");
         return -1;
     }
-    FILE *f = fopen(mtx.config_path, "w");
+    /* 0600 at creation rather than after the fact, so there is no window in
+     * which the file exists and is readable. O_NOFOLLOW because the path may sit
+     * under /tmp on a session with no XDG_RUNTIME_DIR, where a symlink planted
+     * at our filename would redirect the write somewhere we can reach but did
+     * not intend. */
+    int fd = open(mtx.config_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        snprintf(err, err_cap, "cannot write %s: %s", mtx.config_path, strerror(errno));
+        return -1;
+    }
+    /* O_CREAT leaves an existing file's mode alone, so a config written by an
+     * older build stays 0644 unless this is said explicitly. */
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        snprintf(err, err_cap, "cannot restrict %s: %s", mtx.config_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "w");
     if (!f) {
         snprintf(err, err_cap, "cannot write %s: %s", mtx.config_path, strerror(errno));
+        close(fd);
         return -1;
     }
     size_t wrote = fwrite(body, 1, (size_t)n, f);
