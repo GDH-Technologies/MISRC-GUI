@@ -1,11 +1,27 @@
 # Build output dirs
-/build/
 /build-android/
+/build-appimage-local/
+/build-ci/
 /build-gha/
 /build-local/
 /builddir/
 /dist/
 /misrc_tools/build/
+
+# /build/ is two things at once: it holds tracked helper scripts (build-static.sh,
+# install-udev-rules.sh, LEGAL.txt) and it is where `cmake -B build` drops output for
+# the root CMakeLists.txt. A bare `/build/` ignored both, so a new script added next
+# to the tracked ones vanished from `git status` instead of being committed. Ignore
+# the CMake output, keep the helpers visible.
+/build/*
+!/build/*.sh
+!/build/LEGAL.txt
+
+# Python bytecode. misrc_tools/test/ci_guard_tests.py is importable as a module and
+# not only runnable as a script, so anything that imports it (tooling, a REPL, another
+# test) drops a __pycache__ next to the tests.
+__pycache__/
+*.pyc
 
 # Vendored dependency build/install staging
 /.deps/
