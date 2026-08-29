@@ -5,6 +5,7 @@
 
 #include <clay.h>
 #include "raylib.h"
+#include "rlgl.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_vu_meter.h"
@@ -83,6 +84,11 @@ void Clay_Raylib_Close()
 
 void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
 {
+    float ui_scale = gui_ui_get_scale_factor();
+    Matrix outer_modelview = rlGetMatrixModelview();
+    rlDrawRenderBatchActive();
+    rlScalef(ui_scale, ui_scale, 1.0f);
+
     for (int j = 0; j < renderCommands.length; j++)
     {
         Clay_RenderCommand *renderCommand = Clay_RenderCommandArray_Get(&renderCommands, j);
@@ -125,7 +131,12 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                 break;
             }
             case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START: {
-                BeginScissorMode((int)roundf(boundingBox.x), (int)roundf(boundingBox.y), (int)roundf(boundingBox.width), (int)roundf(boundingBox.height));
+                Clay_BoundingBox box = renderCommand->boundingBox;
+                int left = (int)floorf(box.x * ui_scale);
+                int top = (int)floorf(box.y * ui_scale);
+                int right = (int)ceilf((box.x + box.width) * ui_scale);
+                int bottom = (int)ceilf((box.y + box.height) * ui_scale);
+                BeginScissorMode(left, top, right - left, bottom - top);
                 break;
             }
             case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END: {
@@ -367,4 +378,7 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
             }
         }
     }
+
+    rlDrawRenderBatchActive();
+    rlSetMatrixModelview(outer_modelview);
 }

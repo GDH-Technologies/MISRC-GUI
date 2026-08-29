@@ -351,7 +351,7 @@ static void histogram_vtable_render_overlay(void *state_ptr, Rectangle bounds) {
             state->options_rect[i] = opt_rect;
 
             bool is_selected = (hist->num_bins == s_bin_options[i]);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
 
             Color opt_bg = gui_dropdown_option_color(is_selected, hover);

@@ -525,7 +525,9 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     phosphor_rt_t *prt = state->phosphor;
     if (prt) {
         // Initialize/resize phosphor if needed
-        phosphor_rt_init(prt, buf_width, buf_height);
+        Vector2 render_scale = gui_ui_get_render_scale();
+        phosphor_rt_init(prt, buf_width, buf_height,
+                         render_scale.x, render_scale.y);
 
         // Update phosphor
         phosphor_rt_begin_frame(prt);
@@ -965,7 +967,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     float btn_h = 18;
     float btn_y = bounds.y + 8;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
 
     // Button widths
     float trig_btn_w = 98;
@@ -1240,7 +1242,7 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
     if (!state || !app || !state->dragging) return;
 
     if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
-        Vector2 mouse = GetMousePosition();
+        Vector2 mouse = gui_ui_get_mouse_position();
 
         // Calculate trigger level from mouse position
         float center_y = bounds.y + bounds.height / 2.0f;
@@ -1266,7 +1268,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
 
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     if (!CheckCollisionPointRec(mouse, bounds)) return false;
 
     // Smooth zoom: multiply/divide by a factor for each scroll step

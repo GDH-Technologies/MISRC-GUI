@@ -5,6 +5,7 @@
  */
 
 #include "../core/gui_app.h"
+#include "../ui/gui_ui_scale.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -465,6 +466,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->show_grid = true;
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
+    settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 
     // V4L2/simple_capture device discovery is opt-in (disabled by default).
     settings->discover_simple_capture = false;
@@ -603,6 +605,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"show_grid\": %s,\n", settings->show_grid ? "true" : "false");
     fprintf(f, "  \"time_scale\": %.2f,\n", settings->time_scale);
     fprintf(f, "  \"amplitude_scale\": %.2f,\n", settings->amplitude_scale);
+    fprintf(f, "  \"ui_scale_percent\": %d,\n", settings->ui_scale_percent);
     fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
     fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
@@ -1031,6 +1034,9 @@ void gui_settings_load(gui_settings_t *settings) {
     
     if ((value = find_value(content, "amplitude_scale")) != NULL) {
         settings->amplitude_scale = (float)atof(value);
+    }
+    if ((value = find_value(content, "ui_scale_percent")) != NULL) {
+        settings->ui_scale_percent = gui_ui_scale_parse_percent(value);
     }
     if ((value = find_value(content, "discover_simple_capture")) != NULL) {
         settings->discover_simple_capture = (strcmp(value, "true") == 0);

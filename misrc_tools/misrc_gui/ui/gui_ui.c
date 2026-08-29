@@ -48,6 +48,10 @@ extern const char *android_get_storage_path(void);
 
 // Track if UI consumed the current frame's click (prevents click-through)
 static bool s_ui_consumed_click = false;
+static int s_ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+static double s_ui_scale_hud_visible_until_s = 0.0;
+static char s_ui_scale_hud_title[32] = "UI Scale 100%";
+static bool s_toolbar_uses_two_rows = false;
 // Authoritative capture mode selected by user via CaptureModeToggle.
 // Keeping this outside gui_app_t protects mode from unrelated runtime mutations.
 static bool s_capture_mode_state_initialized = false;
@@ -72,6 +76,88 @@ static int s_cxadc_dc_anchor_device_index = -1;
 static bool s_cxadc_dc_anchor_valid[2] = { false, false };
 static int s_cxadc_dc_anchor_raw[2] = { 0, 0 };
 static int s_cxadc_dc_relative[2] = { 0, 0 };
+
+void gui_ui_set_scale_percent(int percent)
+{
+    s_ui_scale_percent = gui_ui_scale_sanitize_percent(percent);
+}
+
+float gui_ui_get_scale_factor(void)
+{
+    return (float)s_ui_scale_percent / 100.0f;
+}
+
+void gui_ui_show_scale_hud(int percent)
+{
+    int sanitized_percent = gui_ui_scale_sanitize_percent(percent);
+    snprintf(s_ui_scale_hud_title,
+             sizeof(s_ui_scale_hud_title),
+             "UI Scale %d%%",
+             sanitized_percent);
+    s_ui_scale_hud_visible_until_s = GetTime() + GUI_UI_SCALE_HUD_DURATION_S;
+}
+
+static int gui_ui_get_base_layout_width(void)
+{
+#if defined(__APPLE__)
+    int width = GetScreenWidth();
+#else
+    int width = GetRenderWidth();
+    if (width <= 0) width = GetScreenWidth();
+#endif
+    return (width > 0) ? width : 1;
+}
+
+static int gui_ui_get_base_layout_height(void)
+{
+#if defined(__APPLE__)
+    int height = GetScreenHeight();
+#else
+    int height = GetRenderHeight();
+    if (height <= 0) height = GetScreenHeight();
+#endif
+    return (height > 0) ? height : 1;
+}
+
+int gui_ui_get_layout_width(void)
+{
+    int width = (int)ceilf((float)gui_ui_get_base_layout_width() /
+                           gui_ui_get_scale_factor());
+    return (width > 0) ? width : 1;
+}
+
+int gui_ui_get_layout_height(void)
+{
+    int height = (int)ceilf((float)gui_ui_get_base_layout_height() /
+                            gui_ui_get_scale_factor());
+    return (height > 0) ? height : 1;
+}
+
+Vector2 gui_ui_get_render_scale(void)
+{
+    float app_scale = gui_ui_get_scale_factor();
+    Vector2 render_scale = { app_scale, app_scale };
+    int layout_width = gui_ui_get_layout_width();
+    int layout_height = gui_ui_get_layout_height();
+    int render_width = GetRenderWidth();
+    int render_height = GetRenderHeight();
+    if (render_width > 0 && layout_width > 0) {
+        render_scale.x = (float)render_width / (float)layout_width;
+    }
+    if (render_height > 0 && layout_height > 0) {
+        render_scale.y = (float)render_height / (float)layout_height;
+    }
+    return render_scale;
+}
+
+Vector2 gui_ui_get_mouse_position(void)
+{
+    Vector2 position = GetMousePosition();
+    float scale = gui_ui_get_scale_factor();
+    position.x /= scale;
+    position.y /= scale;
+    return position;
+}
 
 static const char *gui_ui_capture_mode_name(bool misrc_mode) {
     return misrc_mode ? "MISRC" : "HSDAOH";
@@ -895,7 +981,7 @@ static void record_limit_set_cursor_from_field_click(gui_app_t *app)
         return;
     }
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     float content_left = field.boundingBox.x + (float)RECORD_LIMIT_TIMECODE_BORDER_X;
     float content_width = field.boundingBox.width - (float)(RECORD_LIMIT_TIMECODE_BORDER_X * 2);
     if (content_width < 8.0f) content_width = 8.0f;
@@ -1304,6 +1390,23 @@ static void format_status_free_space_label(char *dst, size_t dst_len, uint64_t f
     }
 }
 
+// Keep growing status counters inside a predictable four-character budget.
+// The detailed panels retain exact values; the footer only needs a compact
+// at-a-glance magnitude once a count reaches four digits.
+static void format_status_counter(char *dst, size_t dst_len, uint32_t value)
+{
+    if (!dst || dst_len == 0) return;
+    if (value >= 1000000000U) {
+        snprintf(dst, dst_len, "%uG", value / 1000000000U);
+    } else if (value >= 1000000U) {
+        snprintf(dst, dst_len, "%uM", value / 1000000U);
+    } else if (value >= 1000U) {
+        snprintf(dst, dst_len, "%uK", value / 1000U);
+    } else {
+        snprintf(dst, dst_len, "%u", value);
+    }
+}
+
 static uint64_t gui_ui_recording_output_total_bytes(const gui_app_t *app)
 {
     if (!app) return 0;
@@ -1437,6 +1540,7 @@ static int gui_ui_clamp_int(int value, int min_value, int max_value)
     if (value > max_value) return max_value;
     return value;
 }
+
 static int gui_ui_measure_button_width(const gui_app_t *app,
                                        const char *text,
                                        int font_size,
@@ -1456,6 +1560,42 @@ static int gui_ui_measure_button_width(const gui_app_t *app,
     Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
     int measured_width = (int)ceilf(m.x) + (horizontal_padding * 2) + extra_width;
     return gui_ui_clamp_int(measured_width, min_width, max_width);
+}
+
+static void gui_ui_ellipsize_text(const gui_app_t *app,
+                                  char *text,
+                                  size_t text_capacity,
+                                  int font_size,
+                                  int max_text_width)
+{
+    if (!text || text_capacity == 0 || text[0] == '\0') return;
+    Font font = GetFontDefault();
+    if (app && app->fonts && app->fonts[0].texture.id != 0) {
+        font = app->fonts[0];
+    }
+    if (!font.glyphs) {
+        font = GetFontDefault();
+    }
+    if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+        (float)max_text_width) {
+        return;
+    }
+
+    size_t cut = strlen(text);
+    while (cut > 0) {
+        cut--;
+        while (cut > 0 && (((unsigned char)text[cut] & 0xC0U) == 0x80U)) {
+            cut--;
+        }
+        text[cut] = '\0';
+        strncat(text, "...", text_capacity - strlen(text) - 1);
+        if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+            (float)max_text_width) {
+            return;
+        }
+        text[cut] = '\0';
+    }
+    snprintf(text, text_capacity, "...");
 }
 
 static const char *rf_bits_label(uint8_t bits) {
@@ -1840,7 +1980,7 @@ static int gui_ui_text_cursor_from_click(gui_app_t *app,
     Clay_ElementData element_data = Clay_GetElementData(element_id);
     if (!element_data.found || len == 0) return (int)len;
 
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     float content_left = element_data.boundingBox.x + left_padding;
     float content_width = element_data.boundingBox.width - (left_padding + right_padding);
     if (content_width < 1.0f) return (int)len;
@@ -2312,6 +2452,10 @@ static CustomLayoutElement s_metadata_icon_element;
 // Render settings panel (floating modal)
 static void render_settings_panel(gui_app_t *app) {
     if (!app->settings_panel_open) return;
+    int settings_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 1080);
+    int settings_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
+    int settings_min_width = gui_ui_clamp_int(settings_max_width, 1, 620);
+    int settings_min_height = gui_ui_clamp_int(settings_max_height, 1, 420);
     bool settings_cxadc_has_channel_b = false;
     bool settings_cxadc_mode = gui_ui_selected_device_is_cxadc(app, &settings_cxadc_has_channel_b);
 #ifdef ENABLE_DDD
@@ -2346,7 +2490,10 @@ static void render_settings_panel(gui_app_t *app) {
     // Panel
     CLAY(CLAY_ID("SettingsPanel"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 620, .max = 1080), CLAY_SIZING_FIT(.min = 420, .max = 780) },
+            .sizing = {
+                CLAY_SIZING_FIT(.min = settings_min_width, .max = settings_max_width),
+                CLAY_SIZING_FIT(.min = settings_min_height, .max = settings_max_height)
+            },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { 16, 16, 16, 16 },
             .childGap = 12
@@ -2500,7 +2647,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
             },
             .clip = {
                 .vertical = true,
-                .horizontal = false,
+                .horizontal = true,
                 .childOffset = Clay_GetScrollOffset()
             }
         }) {
@@ -2927,6 +3074,11 @@ static void render_record_limit_window(gui_app_t *app)
 {
     if (!s_record_limit_window_open) return;
 
+    int record_limit_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 420);
+    int record_limit_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 440);
+    int record_limit_min_width = gui_ui_clamp_int(record_limit_max_width, 1, 420);
+    int record_limit_min_height = gui_ui_clamp_int(record_limit_max_height, 1, 235);
+
     uint32_t parsed_seconds = 0;
     bool timecode_valid = parse_record_limit_timecode(s_record_limit_timecode, &parsed_seconds);
     bool timecode_usable = timecode_valid && parsed_seconds > 0;
@@ -2965,7 +3117,10 @@ static void render_record_limit_window(gui_app_t *app)
 
     CLAY(CLAY_ID("RecordLimitWindow"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 420, .max = 420), CLAY_SIZING_FIT(.min = 235, .max = 440) },
+            .sizing = {
+                CLAY_SIZING_FIT(.min = record_limit_min_width, .max = record_limit_max_width),
+                CLAY_SIZING_FIT(.min = record_limit_min_height, .max = record_limit_max_height)
+            },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { 16, 16, 16, 16 },
             .childGap = 12
@@ -2973,6 +3128,11 @@ static void render_record_limit_window(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
+        },
+        .clip = {
+            .horizontal = true,
+            .vertical = true,
+            .childOffset = Clay_GetScrollOffset()
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(8)
@@ -3247,6 +3407,10 @@ static void render_version_info_window(gui_app_t *app)
 {
     if (!s_version_info_window_open) return;
 
+    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 460);
+    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 380);
+    int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
+
     static char vi_version[64];
     static char vi_state[24];
     static char vi_device[96];
@@ -3329,7 +3493,10 @@ static void render_version_info_window(gui_app_t *app)
 
     CLAY(CLAY_ID("VersionInfoWindow"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 380, .max = 460), CLAY_SIZING_FIT(0) },
+            .sizing = {
+                CLAY_SIZING_FIT(.min = version_min_width, .max = version_max_width),
+                CLAY_SIZING_FIT(.max = version_max_height)
+            },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { 16, 16, 16, 16 },
             .childGap = 10
@@ -3337,6 +3504,11 @@ static void render_version_info_window(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
+        },
+        .clip = {
+            .horizontal = true,
+            .vertical = true,
+            .childOffset = Clay_GetScrollOffset()
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(8)
@@ -3588,6 +3760,10 @@ static void render_metadata_window(gui_app_t *app)
 {
     if (!s_metadata_window_open) return;
 
+    int metadata_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 840);
+    int metadata_min_width = gui_ui_clamp_int(metadata_max_width, 1, 640);
+    int metadata_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
+
     CLAY(CLAY_ID("MetadataBackdrop"), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
@@ -3601,7 +3777,10 @@ static void render_metadata_window(gui_app_t *app)
 
     CLAY(CLAY_ID("MetadataWindow"), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 640, .max = 840), CLAY_SIZING_FIT(0) },
+            .sizing = {
+                CLAY_SIZING_FIT(.min = metadata_min_width, .max = metadata_max_width),
+                CLAY_SIZING_FIT(.max = metadata_max_height)
+            },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { 16, 16, 16, 16 },
             .childGap = 10
@@ -3609,6 +3788,11 @@ static void render_metadata_window(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
+        },
+        .clip = {
+            .horizontal = true,
+            .vertical = true,
+            .childOffset = Clay_GetScrollOffset()
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(8)
@@ -3922,6 +4106,184 @@ static void render_metadata_window(gui_app_t *app)
     }
 }
 
+static void render_toolbar_audio_group(gui_app_t *app,
+                                       bool cxadc_mode,
+                                       bool toolbar_ultra_narrow,
+                                       bool toolbar_very_narrow,
+                                       bool show_audio_meter_labels,
+                                       int toolbar_text_size,
+                                       int toolbar_gap,
+                                       int audio_mon_width,
+                                       int audio_ch_width,
+                                       int audio_bars_panel_width,
+                                       int audio_meter_col_width,
+                                       int audio_meter_width,
+                                       int audio_meter_height,
+                                       int audio_meter_gap)
+{
+    CLAY(CLAY_ID("ToolbarAudioGroup"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(32) },
+            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = toolbar_gap
+        }
+    }) {
+        Color mon_bg = app->settings.audio_monitor_playback ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+        const char *audio_mon_label = toolbar_very_narrow ? "Mon" : "Audio Mon";
+        CLAY(CLAY_ID("AudioPlaybackToggle"), {
+            .layout = { .sizing = { CLAY_SIZING_FIXED(audio_mon_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+            .backgroundColor = to_clay_color(mon_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(make_string(audio_mon_label),
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
+        }
+
+        Color ch_bg = app->settings.audio_monitor_ch34 ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+#if defined(_WIN32)
+        bool cxadc_win_audio_map = cxadc_mode;
+#else
+        (void)cxadc_mode;
+        bool cxadc_win_audio_map = false;
+#endif
+        const char *audio_ch_toggle_label = NULL;
+        if (cxadc_win_audio_map) {
+            audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                ? (toolbar_ultra_narrow ? "HSW" : "HSW CH3")
+                : (toolbar_ultra_narrow ? "A1/2" : "AUD 1/2");
+        } else {
+            audio_ch_toggle_label = app->settings.audio_monitor_ch34
+                ? (toolbar_ultra_narrow ? "3/4" : "CH3/4")
+                : (toolbar_ultra_narrow ? "1/2" : "CH1/2");
+        }
+        CLAY(CLAY_ID("AudioChannelToggle"), {
+            .layout = { .sizing = { CLAY_SIZING_FIXED(audio_ch_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+            .backgroundColor = to_clay_color(ch_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(make_string(audio_ch_toggle_label),
+                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
+        }
+
+        CLAY(CLAY_ID("AudioLevelBars"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(audio_bars_panel_width), CLAY_SIZING_FIXED(32) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childGap = audio_meter_gap,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .padding = { 4, 4, 4, 4 }
+            },
+            .backgroundColor = to_clay_color((Color){25,25,30,255}),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            for (int i = 0; i < 4; i++) {
+                uint32_t p = atomic_load(&app->audio_peak[i]);
+                float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
+                if (frac > 1.0f) frac = 1.0f;
+                int fill_w = (int)(frac * (float)audio_meter_width);
+                if (fill_w < 0) fill_w = 0;
+                if (fill_w > audio_meter_width) fill_w = audio_meter_width;
+
+                Color bar_col = (frac > 0.95f) ? COLOR_CLIP_RED : (frac > 0.75f) ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN;
+
+                CLAY(CLAY_IDI("AudioMeterCol", i), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(audio_meter_col_width), CLAY_SIZING_FIXED(24) },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .childGap = show_audio_meter_labels ? 1 : 0,
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER }
+                    }
+                }) {
+                    if (show_audio_meter_labels) {
+                        snprintf(audio_ch_label[i], sizeof(audio_ch_label[i]), "CH%d", i + 1);
+                        CLAY(CLAY_IDI("AudioChLabel", i), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) } } }) {
+                            CLAY_TEXT(make_string(audio_ch_label[i]),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+                    }
+
+                    CLAY(CLAY_IDI("AudioMeter", i), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(audio_meter_width), CLAY_SIZING_FIXED(audio_meter_height) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childGap = 0
+                        },
+                        .backgroundColor = to_clay_color((Color){40,40,48,255}),
+                        .cornerRadius = CLAY_CORNER_RADIUS(2)
+                    }) {
+                        if (fill_w > 0) {
+                            CLAY(CLAY_IDI("AudioMeterFill", i), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
+                                .backgroundColor = to_clay_color(bar_col),
+                                .cornerRadius = CLAY_CORNER_RADIUS(2)
+                            }) { }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void render_toolbar_connection_group(gui_app_t *app,
+                                            bool toolbar_tiny,
+                                            bool toolbar_very_narrow,
+                                            int toolbar_text_size,
+                                            int toolbar_gap,
+                                            int connect_button_width,
+                                            int mode_toggle_width,
+                                            Color mode_bg,
+                                            Color mode_fg,
+                                            const char *mode_label)
+{
+    CLAY(CLAY_ID("ToolbarConnectionGroup"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(32) },
+            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = toolbar_gap
+        }
+    }) {
+        Color connect_color = app->is_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
+        const char *connect_label = app->is_capturing
+            ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
+            : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
+        CLAY(CLAY_ID("ConnectButton"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(connect_color),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(make_string(connect_label),
+                CLAY_TEXT_CONFIG({
+                    .fontSize = toolbar_text_size,
+                    .textColor = { 255, 255, 255, 255 },
+                    .wrapMode = CLAY_TEXT_WRAP_NONE
+                }));
+        }
+
+        // Capture mode toggle also selects HSDAOH backend at connect time.
+        CLAY(CLAY_ID("CaptureModeToggle"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(mode_toggle_width), CLAY_SIZING_FIXED(32) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(mode_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(make_string(mode_label),
+                CLAY_TEXT_CONFIG({
+                    .fontSize = toolbar_text_size,
+                    .textColor = to_clay_color(mode_fg),
+                    .wrapMode = CLAY_TEXT_WRAP_NONE
+                }));
+        }
+    }
+}
+
 // Render the toolbar
 static void render_toolbar(gui_app_t *app) {
     s_settings_icon_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON;
@@ -3938,12 +4300,11 @@ static void render_toolbar(gui_app_t *app) {
         version_icon_state = GUI_VERSION_ICON_CAPTURING;
     }
     s_version_icon_element.customData.version_icon.state = version_icon_state;
-    int toolbar_width = GetScreenWidth();
+    int toolbar_width = gui_ui_get_layout_width();
     bool toolbar_tiny = toolbar_width < 760;
     bool toolbar_ultra_narrow = toolbar_width < 900;
     bool toolbar_very_narrow = toolbar_width < 1020;
     bool toolbar_narrow = toolbar_width < 1180;
-    bool toolbar_medium = toolbar_width < 1360;
     int toolbar_padding_h = toolbar_tiny ? 4 : 8;
     int toolbar_gap = toolbar_tiny ? 2 : (toolbar_ultra_narrow ? 4 : (toolbar_very_narrow ? 6 : 12));
     int toolbar_text_size = toolbar_very_narrow ? FONT_SIZE_DROPDOWN : FONT_SIZE_NORMAL;
@@ -3951,33 +4312,37 @@ static void render_toolbar(gui_app_t *app) {
     int toolbar_version_icon_size = toolbar_tiny ? 16 : 20;
     int toolbar_metadata_icon_size = toolbar_tiny ? 14 : 18;
     int device_dropdown_min_width = toolbar_tiny ? 100 : (toolbar_ultra_narrow ? 120 : (toolbar_very_narrow ? 138 : (toolbar_narrow ? 160 : 180)));
-    int device_dropdown_max_width = toolbar_tiny ? 170 : (toolbar_ultra_narrow ? 190 : (toolbar_very_narrow ? 210 : (toolbar_narrow ? 230 : 280)));
+    int device_dropdown_max_width = toolbar_tiny ? 150 : (toolbar_ultra_narrow ? 190 : (toolbar_very_narrow ? 210 : (toolbar_narrow ? 230 : 280)));
     int device_dropdown_width = 0;
     int connect_button_width = toolbar_tiny ? 52 : (toolbar_ultra_narrow ? 66 : (toolbar_very_narrow ? 82 : (toolbar_narrow ? 92 : 100)));
     int mode_toggle_min_width = toolbar_tiny ? 58 : (toolbar_ultra_narrow ? 78 : (toolbar_very_narrow ? 96 : 112));
-    int mode_toggle_max_width = toolbar_tiny ? 118 : (toolbar_ultra_narrow ? 136 : (toolbar_very_narrow ? 156 : (toolbar_narrow ? 178 : 230)));
+    int mode_toggle_max_width = toolbar_tiny ? 76 : (toolbar_ultra_narrow ? 136 : (toolbar_very_narrow ? 156 : (toolbar_narrow ? 178 : 230)));
     int mode_toggle_width = 0;
     int audio_mon_width = toolbar_tiny ? 44 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 68 : 90));
     int audio_ch_width = toolbar_tiny ? 46 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 64 : 70));
     int record_button_width = toolbar_tiny ? 56 : (toolbar_ultra_narrow ? 68 : (toolbar_very_narrow ? 74 : 80));
     int icon_button_size = toolbar_tiny ? 28 : 32;
-    int toolbar_center_gap = toolbar_narrow ? 4 : 0;
     int dropdown_padding = toolbar_very_narrow ? 6 : 10;
-    int audio_bars_panel_width = toolbar_tiny ? 132 : (toolbar_ultra_narrow ? 164 : (toolbar_very_narrow ? 200 : 240));
-    int audio_meter_col_width = toolbar_tiny ? 30 : (toolbar_ultra_narrow ? 36 : (toolbar_very_narrow ? 44 : 54));
-    int audio_meter_width = toolbar_tiny ? 26 : (toolbar_ultra_narrow ? 30 : (toolbar_very_narrow ? 38 : 50));
+    // The tiny profile still shows all four meters, but compresses them enough
+    // for the 640px minimum window at 200% scale (320 logical pixels).
+    int audio_bars_panel_width = toolbar_tiny ? 82 : (toolbar_ultra_narrow ? 164 : (toolbar_very_narrow ? 200 : 240));
+    int audio_meter_col_width = toolbar_tiny ? 17 : (toolbar_ultra_narrow ? 36 : (toolbar_very_narrow ? 44 : 54));
+    int audio_meter_width = toolbar_tiny ? 13 : (toolbar_ultra_narrow ? 30 : (toolbar_very_narrow ? 38 : 50));
     int audio_meter_height = toolbar_tiny ? 6 : 8;
     int audio_meter_gap = toolbar_tiny ? 2 : 4;
     bool show_audio_meter_labels = !toolbar_tiny;
     bool show_version_icon = !toolbar_ultra_narrow;
     bool show_metadata_icon = true;
     bool show_device_label = !toolbar_very_narrow;
-    bool show_audio_monitor_controls = true;
-    bool show_audio_level_bars = true;
     const char *device_name = app->device_count > 0
         ? app->devices[app->selected_device].name
         : "No devices";
     snprintf(device_dropdown_buf, sizeof(device_dropdown_buf), "%s", device_name);
+    gui_ui_ellipsize_text(app,
+                          device_dropdown_buf,
+                          sizeof(device_dropdown_buf),
+                          toolbar_text_size,
+                          device_dropdown_max_width - (dropdown_padding * 2) - 16);
     device_dropdown_width = gui_ui_measure_button_width(app,
                                                         device_dropdown_buf,
                                                         toolbar_text_size,
@@ -4061,16 +4426,50 @@ static void render_toolbar(gui_app_t *app) {
                                                     16,
                                                     mode_toggle_min_width,
                                                     mode_toggle_max_width);
+    // Measure the actual current composition instead of using a blanket width
+    // breakpoint. This preserves the original one-row 1425px default layout
+    // when its labels fit, while long device/Clockgen labels wrap early enough
+    // to keep Record, limit, and Settings visible.
+    int device_label_width = show_device_label
+        ? gui_ui_measure_button_width(app, "Device:", toolbar_text_size,
+                                      0, 0, 0, 200)
+        : 0;
+    int toolbar_child_count = 8 +
+        (show_version_icon ? 1 : 0) +
+        (show_metadata_icon ? 1 : 0) +
+        (show_device_label ? 1 : 0);
+    int toolbar_single_row_required_width =
+        (toolbar_padding_h * 2) +
+        (show_version_icon ? toolbar_icon_button_size : 0) +
+        (show_metadata_icon ? toolbar_icon_button_size : 0) +
+        (show_metadata_icon ? 8 : (show_version_icon ? 4 : 0)) +
+        device_label_width + device_dropdown_width +
+        connect_button_width + mode_toggle_width + toolbar_gap +
+        audio_mon_width + audio_ch_width + audio_bars_panel_width +
+        (toolbar_gap * 2) +
+        record_button_width + (icon_button_size * 2) +
+        ((toolbar_child_count - 1) * toolbar_gap) + 8;
+    bool toolbar_two_rows =
+        gui_ui_toolbar_uses_two_rows(toolbar_width,
+                                     toolbar_single_row_required_width);
+    s_toolbar_uses_two_rows = toolbar_two_rows;
     CLAY(CLAY_ID("Toolbar"), {
         .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(48) },
-            .layoutDirection = CLAY_LEFT_TO_RIGHT,
-            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(toolbar_two_rows ? 84 : 48) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .padding = { toolbar_padding_h, toolbar_padding_h, 8, 8 },
-            .childGap = toolbar_gap
+            .childGap = toolbar_two_rows ? 4 : 0
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
+        CLAY(CLAY_ID("ToolbarPrimaryRow"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = toolbar_gap
+            }
+        }) {
         // Version/status icon (fixed, compact-hidden in tiny layouts)
         if (show_version_icon) {
             CLAY(CLAY_ID("VersionIconButton"), {
@@ -4127,156 +4526,48 @@ static void render_toolbar(gui_app_t *app) {
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
             CLAY_TEXT(make_string(device_dropdown_buf),
-                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
+                CLAY_TEXT_CONFIG({
+                    .fontSize = toolbar_text_size,
+                    .textColor = to_clay_color(COLOR_TEXT),
+                    .wrapMode = CLAY_TEXT_WRAP_NONE
+                }));
         }
 
-        // Connect/Disconnect button (next to device dropdown)
-        Color connect_color = app->is_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
-        const char *connect_label = app->is_capturing
-            ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
-            : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
-        CLAY(CLAY_ID("ConnectButton"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
-                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-            },
-            .backgroundColor = to_clay_color(connect_color),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY_TEXT(make_string(connect_label),
-                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = { 255, 255, 255, 255 } }));
-        }
-        // Capture mode toggle also selects HSDAOH backend at connect time:
-        // MISRC -> raw/parser backend, HSDAOH -> upstream backend.
-        // For non-hsdaoh USB backends (CXADC, FX3, DdD) the MISRC/HSDAOH A/B-swap
-        // concept does not apply, so the toggle shows the backend name as the
-        // mode label and is disabled.
-        CLAY(CLAY_ID("CaptureModeToggle"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_FIXED(mode_toggle_width), CLAY_SIZING_FIXED(32) },
-                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-            },
-            .backgroundColor = to_clay_color(mode_bg),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY_TEXT(make_string(mode_label),
-                CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(mode_fg) }));
+        if (!toolbar_two_rows) {
+            render_toolbar_connection_group(app,
+                                            toolbar_tiny,
+                                            toolbar_very_narrow,
+                                            toolbar_text_size,
+                                            toolbar_gap,
+                                            connect_button_width,
+                                            mode_toggle_width,
+                                            mode_bg,
+                                            mode_fg,
+                                            mode_label);
         }
 
         // Spacer
         CLAY(CLAY_ID("ToolbarSpacer2"), {
             .layout = {
-                .sizing = {
-                    toolbar_medium ? CLAY_SIZING_FIXED(toolbar_center_gap) : CLAY_SIZING_GROW(0),
-                    CLAY_SIZING_GROW(0)
-                }
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
             }
         }) {}
 
-        if (show_audio_monitor_controls) {
-            // Audio playback monitoring toggle
-            Color mon_bg = app->settings.audio_monitor_playback ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-            const char *audio_mon_label = toolbar_very_narrow ? "Mon" : "Audio Mon";
-            CLAY(CLAY_ID("AudioPlaybackToggle"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(audio_mon_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(mon_bg),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(make_string(audio_mon_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            // Audio channel select (CH1/2 vs CH3/4)
-            Color ch_bg = app->settings.audio_monitor_ch34 ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-#if defined(_WIN32)
-            bool cxadc_win_audio_map = cxadc_mode;
-#else
-            bool cxadc_win_audio_map = false;
-#endif
-            const char *audio_ch_toggle_label = NULL;
-            if (cxadc_win_audio_map) {
-                audio_ch_toggle_label = app->settings.audio_monitor_ch34
-                    ? (toolbar_ultra_narrow ? "HSW" : "HSW CH3")
-                    : (toolbar_ultra_narrow ? "A1/2" : "AUD 1/2");
-            } else {
-                audio_ch_toggle_label = app->settings.audio_monitor_ch34
-                    ? (toolbar_ultra_narrow ? "3/4" : "CH3/4")
-                    : (toolbar_ultra_narrow ? "1/2" : "CH1/2");
-            }
-            CLAY(CLAY_ID("AudioChannelToggle"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(audio_ch_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(ch_bg),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(make_string(audio_ch_toggle_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-
-        if (show_audio_level_bars) {
-            // 4 channel horizontal audio meters (compact for toolbar)
-            CLAY(CLAY_ID("AudioLevelBars"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIXED(audio_bars_panel_width), CLAY_SIZING_FIXED(32) },
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .childGap = audio_meter_gap,
-                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 4, 4, 4, 4 }
-                },
-                .backgroundColor = to_clay_color((Color){25,25,30,255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                // 4 horizontal meters in a row with labels
-                for (int i = 0; i < 4; i++) {
-                    uint32_t p = atomic_load(&app->audio_peak[i]);
-                    float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
-                    if (frac > 1.0f) frac = 1.0f;
-                    int fill_w = (int)(frac * (float)audio_meter_width);
-                    if (fill_w < 0) fill_w = 0;
-                    if (fill_w > audio_meter_width) fill_w = audio_meter_width;
-
-                    // Color thresholds
-                    Color bar_col = (frac > 0.95f) ? COLOR_CLIP_RED : (frac > 0.75f) ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN;
-
-                    // Column: channel label above meter
-                    CLAY(CLAY_IDI("AudioMeterCol", i), {
-                        .layout = {
-                            .sizing = { CLAY_SIZING_FIXED(audio_meter_col_width), CLAY_SIZING_FIXED(24) },
-                            .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                            .childGap = show_audio_meter_labels ? 1 : 0,
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER }
-                        }
-                    }) {
-                        // Channel label (CH1-CH4)
-                        if (show_audio_meter_labels) {
-                            snprintf(audio_ch_label[i], sizeof(audio_ch_label[i]), "CH%d", i + 1);
-                            CLAY(CLAY_IDI("AudioChLabel", i), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) } } }) {
-                                CLAY_TEXT(make_string(audio_ch_label[i]),
-                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            }
-                        }
-
-                        // Horizontal meter bar container
-                        CLAY(CLAY_IDI("AudioMeter", i), {
-                            .layout = {
-                                .sizing = { CLAY_SIZING_FIXED(audio_meter_width), CLAY_SIZING_FIXED(audio_meter_height) },
-                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                                .childGap = 0
-                            },
-                            .backgroundColor = to_clay_color((Color){40,40,48,255}),
-                            .cornerRadius = CLAY_CORNER_RADIUS(2)
-                        }) {
-                            // Fill bar (left side)
-                            if (fill_w > 0) {
-                                CLAY(CLAY_IDI("AudioMeterFill", i), {
-                                    .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
-                                    .backgroundColor = to_clay_color(bar_col),
-                                    .cornerRadius = CLAY_CORNER_RADIUS(2)
-                                }) { }
-                            }
-                        }
-                    }
-                }
-            }
+        if (!toolbar_two_rows) {
+            render_toolbar_audio_group(app,
+                                       cxadc_mode,
+                                       toolbar_ultra_narrow,
+                                       toolbar_very_narrow,
+                                       show_audio_meter_labels,
+                                       toolbar_text_size,
+                                       toolbar_gap,
+                                       audio_mon_width,
+                                       audio_ch_width,
+                                       audio_bars_panel_width,
+                                       audio_meter_col_width,
+                                       audio_meter_width,
+                                       audio_meter_height,
+                                       audio_meter_gap);
         }
         bool playback_mode = gui_ui_selected_device_is_playback(app);
         bool playback_running = playback_mode && gui_playback_is_running(app);
@@ -4372,6 +4663,49 @@ static void render_toolbar(gui_app_t *app) {
             }) {}
         }
 
+        }
+        if (toolbar_two_rows) {
+            CLAY(CLAY_ID("ToolbarAudioRow"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                    .childGap = toolbar_gap
+                }
+            }) {
+                render_toolbar_connection_group(app,
+                                                toolbar_tiny,
+                                                toolbar_very_narrow,
+                                                toolbar_text_size,
+                                                toolbar_gap,
+                                                connect_button_width,
+                                                mode_toggle_width,
+                                                mode_bg,
+                                                mode_fg,
+                                                mode_label);
+
+                CLAY(CLAY_ID("ToolbarSecondarySpacer"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
+                    }
+                }) {}
+
+                render_toolbar_audio_group(app,
+                                           cxadc_mode,
+                                           toolbar_ultra_narrow,
+                                           toolbar_very_narrow,
+                                           show_audio_meter_labels,
+                                           toolbar_text_size,
+                                           toolbar_gap,
+                                           audio_mon_width,
+                                           audio_ch_width,
+                                           audio_bars_panel_width,
+                                           audio_meter_col_width,
+                                           audio_meter_width,
+                                           audio_meter_height,
+                                           audio_meter_gap);
+            }
+        }
     }
 }
 
@@ -4388,8 +4722,8 @@ static void render_toolbar(gui_app_t *app) {
 
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
 static void render_channel_stats(gui_app_t *app, int channel) {
-    int screen_w = GetScreenWidth();
-    int screen_h = GetScreenHeight();
+    int screen_w = gui_ui_get_layout_width();
+    int screen_h = gui_ui_get_layout_height();
     bool quarter_scale_layout = (screen_w <= 1000 && screen_h <= 700);
     // Get per-channel stats
     uint32_t clip_pos, clip_neg;
@@ -4777,7 +5111,7 @@ static void render_playback_timeline_row(int channel_index, const char *timeline
     Color timeline_text_color = enabled ? COLOR_TEXT : COLOR_TEXT_DIM;
     Color timeline_track_color = enabled ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = enabled ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM;
-    int screen_width = GetScreenWidth();
+    int screen_width = gui_ui_get_layout_width();
     int left_pad_width = screen_width < 900 ? 60 : 74;
     int label_width = screen_width < 900 ? 120 : 150;
     int right_pad_width = screen_width < 900 ? 0 : 189;
@@ -4884,7 +5218,7 @@ static void render_channels_panel(gui_app_t *app) {
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG)
     }) {
-        int screen_width = GetScreenWidth();
+        int screen_width = gui_ui_get_layout_width();
         int playback_track_width_px = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
         int playback_fill_w_a = 0;
         int playback_fill_w_b = 0;
@@ -4970,19 +5304,26 @@ static void render_channels_panel(gui_app_t *app) {
 
 // Render status bar
 static void render_status_bar(gui_app_t *app) {
-    int status_width = GetScreenWidth();
-    int status_height = GetScreenHeight();
-    bool status_quarter_scale = (status_width <= 1000 && status_height <= 700);
-    bool status_compact = status_width < 1040;
-    bool status_narrow = status_width < 900;
-    bool status_tiny = status_width < 760;
-    bool show_sync_status = !status_tiny && !status_quarter_scale;
-    bool show_sample_rate = !status_tiny && !status_quarter_scale;
+    int status_width = gui_ui_get_layout_width();
+    int status_height = gui_ui_get_layout_height();
+    gui_ui_status_layout_mode_t status_layout =
+        gui_ui_get_status_layout_mode(status_width, status_height,
+                                      app->is_recording);
+    bool status_quarter_scale =
+        status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
+        status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
+    bool status_compact = status_layout != GUI_UI_STATUS_LAYOUT_FULL_SINGLE;
+    bool status_narrow =
+        !gui_ui_status_shows_extended_counters(status_width,
+                                               app->is_recording);
+    bool status_tiny = status_width < GUI_UI_STATUS_TINY_BREAKPOINT;
+    bool status_minimal = status_layout == GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE;
+    bool show_sync_status = !status_minimal;
+    bool show_sample_rate = !status_minimal;
     bool show_frame_count = !status_narrow;
     bool show_missed_count = !status_narrow;
     bool show_error_count = !status_narrow;
-    bool show_status_message = !status_tiny && !status_quarter_scale;
-    // Detect an error/denied/failed status message so the status bar can
+    // Detect an error/denied/failed or critical capture-stop status so the bar can
     // yield space to it: when an error is being shown, hide the free-space
     // readout (and widen the message budget) so the actual error text isn't
     // truncated behind the free-space label. This is what makes CXADC/USB
@@ -4998,45 +5339,65 @@ static void render_status_bar(gui_app_t *app) {
             strstr(raw_status_gate, "failed") != NULL ||
             strstr(raw_status_gate, "Failed") != NULL ||
             strstr(raw_status_gate, "not granted") != NULL ||
-            strstr(raw_status_gate, "timed out") != NULL;
+            strstr(raw_status_gate, "timed out") != NULL ||
+            strstr(raw_status_gate, "Capture stopped:") != NULL;
     }
+    // Long error messages get an explicit second line whenever there is enough
+    // height. Normal recording status is redundant with the timer, so omit it
+    // at every width to leave room for free-space/runway information.
+    bool status_two_rows = gui_ui_status_uses_two_rows(status_layout,
+                                                       status_is_error);
+    bool show_status_message = status_is_error ||
+        (!status_minimal && !app->is_recording);
     /* Keep free-space visible during normal startup/layout sizes; hide it when
      * an error/denied status is active so the error text gets the left-side
      * space, and on very tiny widths where preserving right-side counters
      * takes priority. */
-    bool show_free_space = !status_tiny && !status_is_error;
-    int sample_rate_value_width = status_narrow ? 68 : 80;
-    int samples_value_width = status_tiny ? 48 : (status_narrow ? 54 : 60);
-    int frames_value_width = 50;
-    int small_counter_width = 20;
+    bool show_free_space = !status_tiny && !status_minimal && !status_is_error;
+    int sample_rate_value_width = status_compact ? 68 : 80;
+    int samples_value_width = status_tiny ? 48 : (status_compact ? 54 : 60);
+    int frames_value_width = 32;
+    int small_counter_width = 32;
     int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
-    int status_bar_gap = status_tiny ? 6 : (status_compact ? 10 : 20);
-    int status_right_gap = status_tiny ? 8 : (status_compact ? 12 : 16);
-    int status_left_gap = show_status_message ? (status_tiny ? 4 : 8) : 0;
+    int status_bar_gap = status_tiny ? 6 : (status_compact ? 8 : 20);
+    int status_right_gap = status_tiny ? 8 : (status_compact ? 8 : 16);
+    int status_left_gap = status_tiny ? 4 : (status_compact ? 6 : 8);
     // Widen the message budget when free-space is hidden (error case) so the
     // full error reason fits instead of being ellipsised at the normal width.
     int status_message_max_chars = status_is_error
-        ? (status_narrow ? 48 : 64)
-        : (status_narrow ? 16 : (status_compact ? 22 : 30));
+        ? (status_tiny ? 30 : (status_two_rows ? 64 : 36))
+        : (status_narrow ? 16 : (status_compact ? 20 : 30));
     int status_font_size = FONT_SIZE_STATUS - 1;
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
-    const char *audio_buffer_label = status_compact ? "Audio:" : "Audio Buffer:";
-    const char *samples_label = status_tiny ? "S:" : (status_narrow ? "Samp:" : "Samples:");
+    const char *audio_buffer_label = status_compact ? "Aud:" : "Audio Buffer:";
+    const char *samples_label = status_tiny ? "S:" : (status_compact ? "Samp:" : "Samples:");
+    const char *frames_label = status_compact ? "F:" : "Frames:";
+    const char *missed_label = status_compact ? "M:" : "Missed:";
+    const char *errors_label = status_compact ? "E:" : "Errors:";
+    Clay_SizingAxis status_row_width = status_two_rows
+        ? CLAY_SIZING_GROW(0)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_row_height = status_two_rows
+        ? CLAY_SIZING_FIXED(22)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_spacer_height = status_two_rows
+        ? CLAY_SIZING_FIXED(0)
+        : CLAY_SIZING_GROW(0);
     update_status_free_space(app);
     CLAY(CLAY_ID("StatusBar"), {
         .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
-            .layoutDirection = CLAY_LEFT_TO_RIGHT,
-            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-            .padding = { 12, 12, 0, 0 },
-            .childGap = status_bar_gap
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(status_two_rows ? 52 : 28) },
+            .layoutDirection = status_two_rows ? CLAY_TOP_TO_BOTTOM : CLAY_LEFT_TO_RIGHT,
+            .childAlignment = { .y = status_two_rows ? CLAY_ALIGN_Y_TOP : CLAY_ALIGN_Y_CENTER },
+            .padding = { 12, 12, status_two_rows ? 2 : 0, status_two_rows ? 2 : 0 },
+            .childGap = status_two_rows ? 2 : status_bar_gap
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
         // Left side: status + free space/runway
         CLAY(CLAY_ID("StatusLeft"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                .sizing = { status_row_width, status_row_height },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
                 .childGap = status_left_gap
@@ -5062,7 +5423,7 @@ static void render_status_bar(gui_app_t *app) {
                 snprintf(status_record_timer_display, sizeof(status_record_timer_display),
                          "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
                 CLAY_TEXT(make_string(status_record_timer_display),
-                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
             }
 
             if (show_status_message) {
@@ -5078,14 +5439,7 @@ static void render_status_bar(gui_app_t *app) {
                     snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
                 }
                 Color status_color = COLOR_TEXT_DIM;
-                if (strstr(raw_status, "denied") != NULL ||
-                    strstr(raw_status, "Denied") != NULL ||
-                    strstr(raw_status, "error") != NULL ||
-                    strstr(raw_status, "Error") != NULL ||
-                    strstr(raw_status, "failed") != NULL ||
-                    strstr(raw_status, "Failed") != NULL ||
-                    strstr(raw_status, "not granted") != NULL ||
-                    strstr(raw_status, "timed out") != NULL) {
+                if (status_is_error) {
                     status_color = COLOR_CLIP_RED;
                 } else if (strstr(raw_status, "Requesting") != NULL ||
                            strstr(raw_status, "Reconnecting") != NULL ||
@@ -5101,7 +5455,7 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(status_message_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(status_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(status_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
 
@@ -5155,25 +5509,31 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(status_free_space_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
         }
 
         // Flexible spacer between left and right sections.
         CLAY(CLAY_ID("StatusSpacer"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), status_spacer_height } }
         }) {}
 
-        // Right side: stream/capture counters
-        CLAY(CLAY_ID("StatusRight"), {
+        // On minimal layouts a critical stop reason owns the full row; stream
+        // counters are lower priority and would otherwise make it unreadable.
+        if (!(status_is_error && status_minimal)) {
+            // Right side: stream/capture counters
+            CLAY(CLAY_ID("StatusRight"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                .sizing = { status_row_width, status_row_height },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childAlignment = {
+                    .x = status_two_rows ? CLAY_ALIGN_X_RIGHT : CLAY_ALIGN_X_LEFT,
+                    .y = CLAY_ALIGN_Y_CENTER
+                },
                 .childGap = status_right_gap
             }
-        }) {
+            }) {
             if (show_sync_status) {
                 bool synced = atomic_load(&app->stream_synced);
                 Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
@@ -5185,9 +5545,9 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(CLAY_STRING("Sync:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
             // Sample rate
@@ -5199,7 +5559,7 @@ static void render_status_bar(gui_app_t *app) {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
             }
@@ -5227,18 +5587,20 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(samples_label),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     CLAY(CLAY_ID("SamplesValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_samples_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
                 if (show_frame_count) {
                     // Frames count placed next to Samples
                     uint32_t frames = atomic_load(&app->frame_count);
-                    snprintf(status_frames_display, sizeof(status_frames_display), "%u", frames);
+                    format_status_counter(status_frames_display,
+                                          sizeof(status_frames_display),
+                                          frames);
                     CLAY(CLAY_ID("FrameStatus"), {
                         .layout = {
                             .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
@@ -5246,13 +5608,13 @@ static void render_status_bar(gui_app_t *app) {
                             .childGap = 4
                         }
                     }) {
-                        CLAY_TEXT(CLAY_STRING("Frames:"),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT(make_string(frames_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         CLAY(CLAY_ID("FrameValue"), {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_frames_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -5261,7 +5623,9 @@ static void render_status_bar(gui_app_t *app) {
             // Missed frames count
             uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
             if (show_missed_count) {
-                snprintf(status_missed_display, sizeof(status_missed_display), "%u", missed);
+                format_status_counter(status_missed_display,
+                                      sizeof(status_missed_display),
+                                      missed);
                 CLAY(CLAY_ID("MissedStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
@@ -5269,13 +5633,13 @@ static void render_status_bar(gui_app_t *app) {
                         .childGap = 4
                     }
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Missed:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT(make_string(missed_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     CLAY(CLAY_ID("MissedValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_missed_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
             }
@@ -5283,7 +5647,9 @@ static void render_status_bar(gui_app_t *app) {
             // Total errors (single combined counter)
             uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
             if (show_error_count) {
-                snprintf(status_errors_display, sizeof(status_errors_display), "%u", errors);
+                format_status_counter(status_errors_display,
+                                      sizeof(status_errors_display),
+                                      errors);
                 CLAY(CLAY_ID("ErrorStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
@@ -5291,13 +5657,13 @@ static void render_status_bar(gui_app_t *app) {
                         .childGap = 4
                     }
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Errors:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT(make_string(errors_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     CLAY(CLAY_ID("ErrorValue"), {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_errors_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
             }
@@ -5317,13 +5683,13 @@ static void render_status_bar(gui_app_t *app) {
                 }
             }) {
                 CLAY_TEXT(make_string(rf_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 CLAY(CLAY_ID("RFBufValue"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_rf_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
 
@@ -5342,16 +5708,79 @@ static void render_status_bar(gui_app_t *app) {
                 }
             }) {
                 CLAY_TEXT(make_string(audio_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 CLAY(CLAY_ID("AudBufValue"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                     CLAY_TEXT(make_string(status_aud_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
+            }
         }
+    }
+}
+
+static void render_ui_scale_hud(void)
+{
+    double remaining_s = s_ui_scale_hud_visible_until_s - GetTime();
+    float opacity = gui_ui_scale_hud_opacity(remaining_s);
+    if (opacity <= 0.0f) return;
+
+    Color hud_background = COLOR_PANEL_BG;
+    Color hud_border = COLOR_BUTTON_ACTIVE;
+    Color hud_text = COLOR_TEXT;
+    Color hud_hint = COLOR_TEXT_DIM;
+    hud_background.a = (unsigned char)(232.0f * opacity);
+    hud_border.a = (unsigned char)(220.0f * opacity);
+    hud_text.a = (unsigned char)(255.0f * opacity);
+    hud_hint.a = (unsigned char)(255.0f * opacity);
+
+#if defined(__APPLE__)
+    const Clay_String reset_hint = CLAY_STRING("Cmd+0 to reset to 100%");
+#else
+    const Clay_String reset_hint = CLAY_STRING("Ctrl+0 to reset to 100%");
+#endif
+
+    CLAY(CLAY_ID("UiScaleHud"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(224), CLAY_SIZING_FIT(0) },
+            .padding = { 12, 12, 10, 10 },
+            .childGap = 4,
+            .childAlignment = { .x = CLAY_ALIGN_X_CENTER },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        },
+        .floating = {
+            .offset = { .x = 0, .y = 10 },
+            .zIndex = 1100,
+            .parentId = CLAY_ID("Toolbar").id,
+            .attachPoints = {
+                .element = CLAY_ATTACH_POINT_CENTER_TOP,
+                .parent = CLAY_ATTACH_POINT_CENTER_BOTTOM
+            },
+            .pointerCaptureMode = CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH,
+            .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID
+        },
+        .backgroundColor = to_clay_color(hud_background),
+        .cornerRadius = CLAY_CORNER_RADIUS(8),
+        .border = {
+            .width = { 1, 1, 1, 1 },
+            .color = to_clay_color(hud_border)
+        }
+    }) {
+        CLAY_TEXT(make_string(s_ui_scale_hud_title),
+            CLAY_TEXT_CONFIG({
+                .fontSize = 24,
+                .textColor = to_clay_color(hud_text),
+                .wrapMode = CLAY_TEXT_WRAP_NONE
+            }));
+        CLAY_TEXT(reset_hint,
+            CLAY_TEXT_CONFIG({
+                .fontSize = 14,
+                .textColor = to_clay_color(hud_hint),
+                .wrapMode = CLAY_TEXT_WRAP_NONE
+            }));
     }
 }
 
@@ -5393,7 +5822,8 @@ void gui_render_layout(gui_app_t *app) {
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
-        int overlay_screen_width = GetScreenWidth();
+        int overlay_screen_width = gui_ui_get_layout_width();
+        bool overlay_toolbar_two_rows = s_toolbar_uses_two_rows;
         bool overlay_toolbar_tiny = overlay_screen_width < 760;
         bool overlay_toolbar_ultra_narrow = overlay_screen_width < 900;
         bool overlay_toolbar_very_narrow = overlay_screen_width < 1020;
@@ -5429,7 +5859,8 @@ void gui_render_layout(gui_app_t *app) {
             .floating = {
                 .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID,
                 .parentId = CLAY_ID("DeviceDropdown").id,
-                .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_BOTTOM }
+                .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_BOTTOM },
+                .offset = { .x = 0, .y = overlay_toolbar_two_rows ? 44 : 0 }
             },
             .backgroundColor = to_clay_color(COLOR_PANEL_BG),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
@@ -5453,6 +5884,10 @@ void gui_render_layout(gui_app_t *app) {
             }
         }
     }
+
+    // Transient, pointer-transparent zoom feedback. It is attached to the
+    // toolbar so its position follows both the one-row and wrapped layouts.
+    render_ui_scale_hud();
 
     // Popup overlay (renders on top of everything)
     gui_popup_render();
@@ -5582,7 +6017,8 @@ void gui_handle_interactions(gui_app_t *app) {
                !s_record_limit_window_open &&
                !s_version_info_window_open &&
                !s_metadata_window_open) {
-        if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+        if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                             gui_ui_get_mouse_position().x)) {
             s_playback_scrub_active = false;
         }
     }
@@ -6128,7 +6564,8 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_selected_device_is_playback(app) &&
             Clay_PointerOver(CLAY_IDI("PlaybackTimelineTrack", 0))) {
             s_playback_scrub_track_index = 0;
-            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                                gui_ui_get_mouse_position().x)) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
@@ -6141,7 +6578,8 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_selected_device_is_playback(app) &&
             Clay_PointerOver(CLAY_IDI("PlaybackTimelineTrack", 1))) {
             s_playback_scrub_track_index = 1;
-            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index, GetMousePosition().x)) {
+            if (gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
+                                                gui_ui_get_mouse_position().x)) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
@@ -6150,7 +6588,7 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_set_click_consumed();
             return;
         }
-        Vector2 click_pos = GetMousePosition();
+        Vector2 click_pos = gui_ui_get_mouse_position();
         bool mode_toggle_hit = Clay_PointerOver(CLAY_ID("CaptureModeToggle"));
         bool mode_toggle_cxadc_clockgen = false;
         bool mode_toggle_is_cxadc = gui_ui_selected_device_is_cxadc(app, &mode_toggle_cxadc_clockgen);
