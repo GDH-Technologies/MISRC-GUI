@@ -290,6 +290,10 @@ typedef struct {
     // Set once the LAN warning has been read and accepted. Putting a tape on
     // the network is a deliberate act; after the first time, it is a toggle.
     bool rtsp_lan_acknowledged;              // false = ask before the first LAN switch
+    // Require a password to WATCH. Off by default -- the stream is open unless
+    // asked otherwise. The password itself is never stored: a fresh one is
+    // drawn each time the stream starts and shown in the panel.
+    bool rtsp_stream_password;               // false = anyone who can reach it can watch
     char mediamtx_path[512];                 // empty = bundled copy, then PATH
     char rtsp_audio_device[96];              // empty = resolve from the video device
     // Ingest metadata (saved to settings and written to capture log at record start)

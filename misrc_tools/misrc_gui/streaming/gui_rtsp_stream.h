@@ -64,6 +64,9 @@ typedef struct {
     /* Where to publish, and what the reader-facing URLs should say. */
     gui_mediamtx_config_t ports;
     const char *reader_host;  /* "" = derive from the bind mode */
+    /* Ask for a fresh read credential this session. Off by default: the
+     * stream is passwordless unless someone chooses otherwise. */
+    bool        want_password;
 } gui_rtsp_stream_opts_t;
 
 typedef struct {
@@ -84,6 +87,11 @@ typedef struct {
     char     url_rtsp[256];
     char     url_webrtc[256];
     char     url_hls[256];
+    /* The credential viewers must type, or "" when the stream is open. Shown
+     * in the panel; deliberately NOT put into the URLs above -- that would put
+     * a secret on the clipboard and in every screenshot of them. VLC and
+     * browsers prompt for it. */
+    char     password[40];
 } gui_rtsp_stream_status_t;
 
 /* Which encoders the resolved ffmpeg actually has. Cached. */

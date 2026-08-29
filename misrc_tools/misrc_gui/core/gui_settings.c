@@ -467,6 +467,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->rtsp_stream_bitrate_kbps = 0;  /* 0 = the module's default */
     settings->rtsp_stream_deinterlace = false;
     settings->rtsp_lan_acknowledged = false; /* the warning has not been seen yet */
+    settings->rtsp_stream_password = false;  /* passwordless unless asked */
     settings->mediamtx_path[0] = '\0';
     settings->rtsp_audio_device[0] = '\0';
     settings->enable_audio_2ch_12 = false;
@@ -586,6 +587,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"rtsp_stream_bitrate_kbps\": %d,\n", settings->rtsp_stream_bitrate_kbps);
     fprintf(f, "  \"rtsp_stream_deinterlace\": %s,\n", settings->rtsp_stream_deinterlace ? "true" : "false");
     fprintf(f, "  \"rtsp_lan_acknowledged\": %s,\n", settings->rtsp_lan_acknowledged ? "true" : "false");
+    fprintf(f, "  \"rtsp_stream_password\": %s,\n", settings->rtsp_stream_password ? "true" : "false");
     fprintf(f, "  \"mediamtx_path\": \"%s\",\n", settings->mediamtx_path);
     fprintf(f, "  \"rtsp_audio_device\": \"%s\",\n", settings->rtsp_audio_device);
     fprintf(f, "  \"enable_audio_2ch_12\": %s,\n", settings->enable_audio_2ch_12 ? "true" : "false");
@@ -1137,6 +1139,9 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "rtsp_lan_acknowledged")) != NULL) {
         settings->rtsp_lan_acknowledged = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "rtsp_stream_password")) != NULL) {
+        settings->rtsp_stream_password = (strcmp(value, "true") == 0);
     }
     if ((value = find_value(content, "rtsp_stream_port")) != NULL) {
         int p = atoi(value);

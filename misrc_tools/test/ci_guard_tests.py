@@ -1780,6 +1780,77 @@ def check_live_stream_readout_cannot_resize_the_panel(repo_root: Path) -> int:
     return 0
 
 
+def check_stream_password_is_strong_and_unleaked(repo_root: Path) -> int:
+    """The stream password guards a customer's tape on a shared network, so two
+    things must hold and neither is visible in a diff.
+
+    It must be unguessable: rand() is seeded from the clock, and anyone who can
+    see the stream exists already knows roughly when it started, so a password
+    from rand() is worth very little. It must come from the kernel's CSPRNG.
+
+    And it must not leak. The reader URLs are shown on screen, copied to the
+    clipboard and opened with Ctrl+click; the ffmpeg argv is readable from
+    /proc/<pid>/cmdline by any local user and is echoed into its log. A password
+    in either would defeat the point of having one."""
+    stream = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c"))
+
+    gen = re.search(r"static bool rs_make_password\(char \*out, size_t cap\)\s*\{(.*?)\n\}",
+                    stream, re.S)
+    if not gen:
+        return fail("rs_make_password() is missing or its shape changed")
+    body = gen.group(1)
+
+    if "getrandom" not in body:
+        return fail("rs_make_password() does not use getrandom(); the stream password "
+                    "must come from the kernel CSPRNG")
+    if "/dev/urandom" not in body:
+        return fail("rs_make_password() has no /dev/urandom fallback for a kernel "
+                    "without getrandom()")
+    # Word-boundaried: a bare "random(" substring also matches getrandom(),
+    # which is the one call we require.
+    for banned in ("rand", "srand", "random", "drand48", "lrand48", "GetTime"):
+        if re.search(rf"\b{banned}\s*\(", body):
+            return fail(
+                f"rs_make_password() uses {banned}(). A clock-seeded or otherwise "
+                "predictable source makes the password guessable from roughly when "
+                "the stream started, which anyone who can see it already knows."
+            )
+
+    # Enough of it to be worth having: 16 draws from a 32-symbol alphabet is 80 bits.
+    alpha = re.search(r'alphabet\[\]\s*=\s*"([^"]+)"', body)
+    if not alpha or len(set(alpha.group(1))) < 32:
+        return fail("the stream password alphabet is smaller than 32 distinct symbols")
+    draws = re.search(r"unsigned char raw\[(\d+)\]", body)
+    if not draws or int(draws.group(1)) < 12:
+        return fail("the stream password draws fewer than 12 symbols; too short to "
+                    "resist an offline guess")
+
+    # It must not reach the reader URLs...
+    urls = re.search(r"static void rs_fill_urls\(const gui_rtsp_stream_opts_t \*opts\)\s*\{(.*?)\n\}",
+                     stream, re.S)
+    if not urls:
+        return fail("rs_fill_urls() is missing or its shape changed")
+    for leak in ("password", "read_password"):
+        if leak in urls.group(1):
+            return fail(
+                "rs_fill_urls() mentions the password. Those URLs are shown on "
+                "screen, copied to the clipboard and opened via the shell -- a "
+                "credential in them is a credential published."
+            )
+
+    # ...nor the ffmpeg command line.
+    argv = re.search(r"static void rs_build_argv\(char \*argv\[\],(.*?)\n\}", stream, re.S)
+    if not argv:
+        return fail("rs_build_argv() is missing or its shape changed")
+    for leak in ("password", "read_password"):
+        if leak in argv.group(1):
+            return fail(
+                "rs_build_argv() mentions the password. argv is readable from "
+                "/proc/<pid>/cmdline by any local user and lands in ffmpeg's log."
+            )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -2350,6 +2421,7 @@ def main() -> int:
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
+        ("stream password is strong and unleaked", lambda: check_stream_password_is_strong_and_unleaked(repo_root)),
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
         ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),

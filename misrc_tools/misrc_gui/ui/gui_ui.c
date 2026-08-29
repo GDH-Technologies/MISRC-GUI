@@ -268,6 +268,7 @@ static void gui_ui_toggle_rtsp_stream(gui_app_t *app)
         opts.ports.rtsp = (uint16_t)app->settings.rtsp_stream_port;
     }
     opts.reader_host = "";
+    opts.want_password = app->settings.rtsp_stream_password;
 
     char err[192] = {0};
     if (gui_rtsp_stream_start(&opts, err, sizeof(err)) != 0) {
@@ -3157,6 +3158,38 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
                     }
+                    /* Require a password to watch. Off by default, and only
+                     * meaningful in LAN mode -- on loopback the only things that
+                     * can reach the stream are already on this machine. The
+                     * password itself is generated fresh each time the stream
+                     * starts and is never written to settings. */
+                    CLAY(CLAY_ID("ToggleRowRtspPassword"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                        Color pw_bg = app->settings.rtsp_stream_password ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        if (!mtx_ok) pw_bg = ui_disabled_color(pw_bg);
+                        Color pw_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                        CLAY(CLAY_ID("ToggleRtspPassword"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(pw_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(app->settings.rtsp_stream_password ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(pw_fg) }));
+                        }
+                        CLAY_TEXT(CLAY_STRING("Password"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(pw_fg) }));
+
+                        /* Read back from the RUNNING server, not from settings, so
+                         * the panel can never show a password that is not the one
+                         * actually being enforced. Fixed width for the same reason
+                         * as the bitrate box. */
+                        static char rs_pw[48];
+                        const char *live_pw = gui_mediamtx_read_password();
+                        snprintf(rs_pw, sizeof(rs_pw), "%s", live_pw[0] ? live_pw : "");
+                        CLAY(CLAY_ID("RtspPasswordBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(190), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(rs_pw[0] ? (Color){25,25,30,255} : COLOR_PANEL_BG), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(rs_pw), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                        if (rs_pw[0]) {
+                            CLAY(CLAY_ID("RtspPasswordCopy"), { .layout = { .sizing = { CLAY_SIZING_FIXED(62), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(Clay_PointerOver(CLAY_ID("RtspPasswordCopy")) ? COLOR_BUTTON_HOVER : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(CLAY_STRING("Copy"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                        }
+                    }
+
                     // The URLs a viewer actually types, one per row: at a size
                     // worth reading, three of them will not sit side by side.
                     // Clicking copies, Ctrl+click hands the URL to whatever the
@@ -8015,6 +8048,24 @@ void gui_handle_interactions(gui_app_t *app) {
                  * does not match what is being sent. */
                 app->settings.rtsp_stream_encoder = (app->settings.rtsp_stream_encoder + 1) % 3;
                 gui_settings_save(&app->settings);
+            }
+            if (Clay_PointerOver(CLAY_ID("ToggleRtspPassword")) && !gui_rtsp_stream_is_running() &&
+                !gui_rtsp_stream_get_status().starting) {
+                /* Only while stopped: the credential is baked into mediamtx's
+                 * config at startup, so changing it mid-stream would show a
+                 * password the server is not enforcing. */
+                app->settings.rtsp_stream_password = !app->settings.rtsp_stream_password;
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, app->settings.rtsp_stream_password
+                    ? "Viewers will need a password; it appears when the stream starts"
+                    : "The stream will be open to anyone who can reach it");
+            }
+            if (Clay_PointerOver(CLAY_ID("RtspPasswordCopy"))) {
+                const char *pw = gui_mediamtx_read_password();
+                if (pw[0]) {
+                    SetClipboardText(pw);
+                    gui_app_set_status(app, "Stream password copied");
+                }
             }
             if (Clay_PointerOver(CLAY_ID("RtspBindBox")) && !gui_rtsp_stream_is_running() &&
                 !gui_rtsp_stream_get_status().starting) {
