@@ -530,6 +530,9 @@ static char s_rtlsdr_freq_str[32] = {0};
 static bool s_record_limit_window_open = false;
 // Version info popup state (toolbar "i" badge button)
 static bool s_version_info_window_open = false;
+/* Asks once, the first time the stream is pointed at the network. After the
+ * answer is remembered in settings this stays false forever. */
+static bool s_rtsp_lan_confirm_open = false;
 // Metadata popup state (toolbar scroll badge button)
 static bool s_metadata_window_open = false;
 static bool s_record_limit_armed = false;
@@ -3659,6 +3662,89 @@ static const char *gui_ui_device_type_name(device_type_t type) {
 }
 
 // Version info popup (opened by clicking the toolbar "i" badge)
+/* Putting a tape on the network is a different kind of act from the toggles
+ * around it, so it is worth one deliberate answer. Only ever shown once: after
+ * that rtsp_lan_acknowledged is set and the bind box behaves like any other
+ * toggle. Floats above the settings panel it is launched from -- that panel
+ * sits at the implicit zIndex 0, and the gear popover already uses 20, so this
+ * takes 30 to clear both. */
+static void render_rtsp_lan_confirm(gui_app_t *app)
+{
+    (void)app;
+    if (!s_rtsp_lan_confirm_open) return;
+
+    CLAY(CLAY_ID("RtspLanConfirmBackdrop"), {
+        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
+            .zIndex = 30
+        },
+        .backgroundColor = (Clay_Color){0, 0, 0, 170}
+    }) {}
+
+    CLAY(CLAY_ID("RtspLanConfirmWindow"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(.min = 420, .max = 520), CLAY_SIZING_FIT(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .padding = { 18, 18, 16, 16 },
+            .childGap = 10
+        },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
+            .zIndex = 31
+        },
+        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+        .cornerRadius = CLAY_CORNER_RADIUS(8)
+    }) {
+        CLAY_TEXT(CLAY_STRING("Share this stream on the network?"),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
+
+        CLAY(CLAY_ID("RtspLanConfirmBody"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM, .childGap = 6 }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Anyone on this network will be able to watch the tape you are capturing."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            CLAY_TEXT(CLAY_STRING("The video is not encrypted, and by default there is no password."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            CLAY_TEXT(CLAY_STRING("Customers' tapes are private. Only do this on a network you trust."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_SYNC_RED) }));
+            CLAY_TEXT(CLAY_STRING("You will only be asked once."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        CLAY(CLAY_ID("RtspLanConfirmButtons"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+        }) {
+            CLAY(CLAY_ID("RtspLanConfirmSpacer"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
+            }) {}
+            CLAY(CLAY_ID("RtspLanConfirmCancel"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(32) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(COLOR_BUTTON),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("Keep private"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            CLAY(CLAY_ID("RtspLanConfirmAccept"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(130), CLAY_SIZING_FIXED(32) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(COLOR_BUTTON_ACTIVE),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("Share on LAN"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+    }
+}
+
 static void render_version_info_window(gui_app_t *app)
 {
     if (!s_version_info_window_open) return;
@@ -6148,6 +6234,9 @@ void gui_render_layout(gui_app_t *app) {
     render_version_info_window(app);
     // Metadata popup overlay (if open)
     render_metadata_window(app);
+    // LAN confirmation, above everything including the settings panel it is
+    // launched from.
+    render_rtsp_lan_confirm(app);
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
@@ -6578,6 +6667,11 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && !s_record_limit_timecode_edit && IsKeyPressed(KEY_ESCAPE)) {
         s_record_limit_window_open = false;
     }
+    if (s_rtsp_lan_confirm_open && IsKeyPressed(KEY_ESCAPE)) {
+        /* Same as declining: escape is not consent. */
+        s_rtsp_lan_confirm_open = false;
+        return;
+    }
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_version_info_window_open = false;
     }
@@ -6729,7 +6823,8 @@ void gui_handle_interactions(gui_app_t *app) {
     // other modals (which sit at the implicit 0), so it would paint over them.
     // Close it whenever one of them opens rather than trying to interleave.
     if (app->settings_panel_open || s_record_limit_window_open ||
-        s_version_info_window_open || s_metadata_window_open || gui_popup_is_open()) {
+        s_version_info_window_open || s_metadata_window_open ||
+        s_rtsp_lan_confirm_open || gui_popup_is_open()) {
         if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
             gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)) {
             gui_dropdown_close_all();
@@ -6750,6 +6845,26 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_set_click_consumed();
             return;
         }
+        /* Answered before anything else: while this is up it is the only thing
+         * on screen that may be clicked. */
+        if (s_rtsp_lan_confirm_open) {
+            if (Clay_PointerOver(CLAY_ID("RtspLanConfirmAccept"))) {
+                app->settings.rtsp_lan_acknowledged = true;
+                app->settings.rtsp_stream_lan = true;
+                gui_settings_save(&app->settings);
+                s_rtsp_lan_confirm_open = false;
+                gui_app_set_status(app, "The stream will be shared on the network");
+            } else if (Clay_PointerOver(CLAY_ID("RtspLanConfirmCancel"))) {
+                /* Deliberately does NOT set rtsp_lan_acknowledged: declining is
+                 * not an answer worth remembering, and the warning should come
+                 * back if they change their mind later. */
+                s_rtsp_lan_confirm_open = false;
+                gui_app_set_status(app, "The stream stays on this machine");
+            }
+            gui_ui_set_click_consumed();
+            return;
+        }
+
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
@@ -7865,8 +7980,15 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("RtspBindBox")) && !gui_rtsp_stream_is_running() &&
                 !gui_rtsp_stream_get_status().starting) {
-                app->settings.rtsp_stream_lan = !app->settings.rtsp_stream_lan;
-                gui_settings_save(&app->settings);
+                if (!app->settings.rtsp_stream_lan && !app->settings.rtsp_lan_acknowledged) {
+                    /* Going off-box for the first time. Ask rather than flip:
+                     * the toggle is one click away from putting a customer's
+                     * tape on the network. */
+                    s_rtsp_lan_confirm_open = true;
+                } else {
+                    app->settings.rtsp_stream_lan = !app->settings.rtsp_stream_lan;
+                    gui_settings_save(&app->settings);
+                }
             }
             {
                 /* Read the status once: three rows asking separately could see
