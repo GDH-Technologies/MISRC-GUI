@@ -1415,6 +1415,60 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     return 0
 
 
+def check_lan_requires_acknowledgement(repo_root: Path) -> int:
+    """Switching the stream to LAN puts the tape being captured in front of
+    everyone on the network. That is a different kind of act from the toggles
+    beside it, so the first one asks. The failure this guards against is someone
+    later simplifying the handler back to an unconditional flip -- which reads
+    like a tidy-up and silently removes the only thing standing between a click
+    and a customer's tape on the network.
+
+    Also asserts the shape of the answer: accepting records consent, declining
+    does not. Remembering a "no" would mean the warning never returns."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+
+    m = re.search(r'Clay_PointerOver\(CLAY_ID\("RtspBindBox"\)\)', ui)
+    if not m:
+        return fail("the RtspBindBox handler is gone; this guard must move with it")
+    handler = ui[m.start():m.start() + 700]
+
+    if "rtsp_lan_acknowledged" not in handler:
+        return fail(
+            "the LAN toggle flips without consulting rtsp_lan_acknowledged, so the "
+            "first switch to LAN no longer asks before putting a tape on the network"
+        )
+    if "s_rtsp_lan_confirm_open" not in handler:
+        return fail("the LAN toggle never opens the confirmation")
+
+    # Accepting must set both the consent and the mode.
+    accept = re.search(
+        r'Clay_PointerOver\(CLAY_ID\("RtspLanConfirmAccept"\)\)\s*\)\s*\{(.*?)\}\s*else',
+        ui, re.S)
+    if not accept:
+        return fail("the confirmation has no Accept branch")
+    body = accept.group(1)
+    for needed in ("rtsp_lan_acknowledged = true", "rtsp_stream_lan = true",
+                   "gui_settings_save"):
+        if needed not in body:
+            return fail(f"the Accept branch does not do `{needed}`")
+
+    # Declining must not be remembered as an answer.
+    cancel = re.search(
+        r'Clay_PointerOver\(CLAY_ID\("RtspLanConfirmCancel"\)\)\s*\)\s*\{(.*?)\n\s*\}',
+        ui, re.S)
+    if not cancel:
+        return fail("the confirmation has no Cancel branch")
+    if "rtsp_lan_acknowledged" in cancel.group(1):
+        return fail(
+            "declining the LAN warning writes rtsp_lan_acknowledged. A refusal is not "
+            "consent, and recording it means the warning never comes back."
+        )
+    if "rtsp_stream_lan = true" in cancel.group(1):
+        return fail("declining the LAN warning still switches to LAN")
+
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1985,6 +2039,7 @@ def main() -> int:
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
+        ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),

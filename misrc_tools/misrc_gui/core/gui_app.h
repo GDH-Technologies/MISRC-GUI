@@ -287,6 +287,9 @@ typedef struct {
     int  rtsp_stream_encoder;                // 0 auto, 1 NVENC, 2 software
     int  rtsp_stream_bitrate_kbps;           // software encoder only; 0 = 2000
     bool rtsp_stream_deinterlace;            // bwdif; costs latency, off by default
+    // Set once the LAN warning has been read and accepted. Putting a tape on
+    // the network is a deliberate act; after the first time, it is a toggle.
+    bool rtsp_lan_acknowledged;              // false = ask before the first LAN switch
     char mediamtx_path[512];                 // empty = bundled copy, then PATH
     char rtsp_audio_device[96];              // empty = resolve from the video device
     // Ingest metadata (saved to settings and written to capture log at record start)
