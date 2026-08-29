@@ -51,10 +51,16 @@ def strip_shell_comments(source: str) -> str:
 
 
 def strip_c_comments(source: str) -> str:
-    """Blank out /* */ and // comments, preserving line structure."""
+    """Blank out /* */ and // comments, preserving line structure.
+
+    String and character literals are copied through untouched. Without that a
+    literal like "rtsp://" reads as the start of a line comment and silently
+    blanks the rest of the line, so a guard searching for it finds nothing and
+    reports the code missing when it is right there."""
     out = []
     i, n = 0, len(source)
     while i < n:
+        ch = source[i]
         if source.startswith("/*", i):
             end = source.find("*/", i + 2)
             end = n if end < 0 else end + 2
@@ -65,8 +71,23 @@ def strip_c_comments(source: str) -> str:
             end = n if end < 0 else end
             out.append(" " * (end - i))
             i = end
+        elif ch in ('"', "'"):
+            # Copy the literal verbatim, honouring backslash escapes so that an
+            # escaped quote does not end it early.
+            out.append(ch)
+            i += 1
+            while i < n:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append(source[i:i + 2])
+                    i += 2
+                    continue
+                out.append(source[i])
+                if source[i] == ch or source[i] == "\n":
+                    i += 1
+                    break
+                i += 1
         else:
-            out.append(source[i])
+            out.append(ch)
             i += 1
     return "".join(out)
 
@@ -1415,6 +1436,83 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     return 0
 
 
+def check_url_open_is_whitelisted(repo_root: Path) -> int:
+    """raylib's OpenURL() builds a shell command and runs it through system(),
+    rejecting only the single quote. Ctrl+click on a reader URL reaches it, and in
+    LAN mode part of that URL is gethostname(), with reader_host a public field a
+    future caller could wire to a hand-edited settings string. So every call site
+    must sit behind the whitelist rather than trusting one blacklisted character.
+    A second, unguarded OpenURL() added later is the regression this exists to
+    catch."""
+    gui_root = repo_root / "misrc_tools"
+    call_sites = []
+    for path in sorted(gui_root.rglob("*.c")) + sorted(gui_root.rglob("*.h")):
+        if ".deps" in path.parts or "build" in path.parts:
+            continue
+        code = strip_c_comments(read_text(path))
+        for m in re.finditer(r"\bOpenURL\s*\(", code):
+            call_sites.append((path, code[: m.start()].count("\n") + 1, code, m.start()))
+
+    if not call_sites:
+        return fail(
+            "no OpenURL() call site found; the Ctrl+click-to-open affordance is gone "
+            "and this guard is guarding nothing"
+        )
+    if len(call_sites) != 1:
+        where = ", ".join(f"{p.name}:{n}" for p, n, _, _ in call_sites)
+        return fail(
+            f"expected exactly one OpenURL() call site, found {len(call_sites)}: {where}. "
+            "Each one hands a string to a shell; route them all through "
+            "rtsp_url_is_safe_to_open() and update this guard deliberately."
+        )
+
+    path, lineno, code, offset = call_sites[0]
+    # The whitelist must be the branch condition guarding this call, not merely
+    # present somewhere in the file.
+    window = code[max(0, offset - 400):offset]
+    if "rtsp_url_is_safe_to_open" not in window:
+        return fail(
+            f"{path.name}:{lineno}: OpenURL() is not guarded by rtsp_url_is_safe_to_open(). "
+            "Unvalidated text reaching OpenURL() reaches system()."
+        )
+
+    checker = strip_c_comments(read_text(path))
+    m = re.search(r"static bool rtsp_url_is_safe_to_open\(const char \*url\)\s*\{(.*?)\n\}",
+                  checker, re.S)
+    if not m:
+        return fail(f"{path.name}: rtsp_url_is_safe_to_open() is missing or its shape changed")
+    body = m.group(1)
+    for required, why in (
+        ('"rtsp://"', "must require a scheme it built"),
+        ('"http://"', "must require a scheme it built"),
+        ("return false", "must reject by default rather than allow by default"),
+    ):
+        if required not in body:
+            return fail(f"rtsp_url_is_safe_to_open() {why}; missing {required}")
+    # Enumerate what the whitelist actually permits, rather than hunting for
+    # specific bad characters. Blacklisting misses what it was not told about --
+    # an earlier version of this guard looked for "*p == '\''" and sailed past
+    # the escaped form the compiler actually sees.
+    ALLOWED_PUNCTUATION = set(".-_:/")
+    permitted = re.findall(r"\*p == '(\\.|[^'])'", body)
+    if not permitted:
+        return fail(
+            "rtsp_url_is_safe_to_open() no longer names the punctuation it allows; "
+            "this guard can no longer tell a URL from a shell command"
+        )
+    for ch in permitted:
+        if ch not in ALLOWED_PUNCTUATION:
+            return fail(
+                f"rtsp_url_is_safe_to_open() permits {ch!r} in a URL that OpenURL() "
+                f"hands to system(); only {''.join(sorted(ALLOWED_PUNCTUATION))} are safe there"
+            )
+    # The alphanumeric ranges carry the rest of the hostname and path.
+    for rng in ("'a'", "'z'", "'A'", "'Z'", "'0'", "'9'"):
+        if rng not in body:
+            return fail(f"rtsp_url_is_safe_to_open() no longer bounds its {rng} range")
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1987,6 +2085,7 @@ def main() -> int:
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
+        ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
