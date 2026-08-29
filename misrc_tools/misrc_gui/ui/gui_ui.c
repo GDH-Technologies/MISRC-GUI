@@ -148,6 +148,79 @@ static void gui_ui_remember_preview_device(gui_app_t *app)
     gui_settings_save(&app->settings);
 }
 
+/* The three ways to watch the stream, in the order the panel lists them. One
+ * place to ask which row is which, so the layout, the click handler and the
+ * clipboard cannot drift apart. */
+#define RTSP_URL_COUNT 3
+
+static const char *rtsp_url_kind_label(int kind)
+{
+    switch (kind) {
+        case 0:  return "RTSP";
+        case 1:  return "WebRTC";
+        default: return "HLS";
+    }
+}
+
+static const char *rtsp_url_for_kind(const gui_rtsp_stream_status_t *st, int kind)
+{
+    if (!st) return "";
+    switch (kind) {
+        case 0:  return st->url_rtsp;
+        case 1:  return st->url_webrtc;
+        default: return st->url_hls;
+    }
+}
+
+/* raylib's OpenURL() pastes the string into a shell command and runs it through
+ * system(), guarding only against a single quote. These URLs are ours -- a
+ * fixed scheme, a fixed path, a port number -- but the host is gethostname() in
+ * LAN mode, and gui_rtsp_stream_opts_t::reader_host is a public field a future
+ * caller could wire to a settings string a user edits by hand. Stating what a
+ * URL may contain is a sounder contract than trusting one blacklisted
+ * character, so nothing reaches the shell that is not plainly a URL we built. */
+static bool rtsp_url_is_safe_to_open(const char *url)
+{
+    if (!url || !url[0] || strlen(url) >= 256) return false;
+
+    size_t off;
+    if      (strncmp(url, "rtsp://", 7) == 0) off = 7;
+    else if (strncmp(url, "http://", 7) == 0) off = 7;
+    else return false;
+    if (!url[off]) return false;   /* a scheme with no host is not openable */
+
+    for (const char *p = url + off; *p; p++) {
+        const bool ok = (*p >= 'a' && *p <= 'z') ||
+                        (*p >= 'A' && *p <= 'Z') ||
+                        (*p >= '0' && *p <= '9') ||
+                        *p == '.' || *p == '-' || *p == '_' ||
+                        *p == ':' || *p == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* Control on Linux and Windows, Command on macOS -- the same modifier the text
+ * fields already treat as primary. */
+static bool gui_ui_primary_mod_down(void)
+{
+    bool down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    down = down || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#endif
+    return down;
+}
+
+/* Copy one reader URL and say which one, so the status line is not a bare
+ * "copied" that leaves you guessing which of the three you got. */
+static void rtsp_url_copy(gui_app_t *app, int kind, const char *url)
+{
+    char msg[64];
+    SetClipboardText(url);
+    snprintf(msg, sizeof(msg), "%s URL copied", rtsp_url_kind_label(kind));
+    gui_app_set_status(app, msg);
+}
+
 /* Start or stop the stream from the panel toggle.
  *
  * Acts immediately rather than arming a flag the way the reference-recording
@@ -2309,10 +2382,7 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
 
     bool changed = false;
     bool shift_down = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-    bool primary_mod_down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-#if defined(__APPLE__)
-    primary_mod_down = primary_mod_down || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
-#endif
+    bool primary_mod_down = gui_ui_primary_mod_down();
 
     if (s_active_text_drag_selecting && IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
         int drag_cursor = gui_ui_text_cursor_from_click(app, s_active_text_field, s_active_text_element_id, dst, s_active_text_left_padding, s_active_text_right_padding);
@@ -3058,9 +3128,13 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                         }
                     }
-                    // The URLs a viewer actually types. Click one to copy it --
-                    // reading a port off a screen and retyping it is how people
-                    // end up on capture-node's stream by accident.
+                    // The URLs a viewer actually types, one per row: at a size
+                    // worth reading, three of them will not sit side by side.
+                    // Clicking copies, Ctrl+click hands the URL to whatever the
+                    // desktop registered for the scheme -- VLC for rtsp://, the
+                    // browser for http:// -- so a tape can be watched without
+                    // anyone retyping a port and landing on capture-node's
+                    // stream by accident.
                     if (rs_st.running && !rs_st.starting) {
                         // rs_st is a copy on this frame's stack, and Clay does not
                         // copy the text it is handed -- it keeps the pointer and
@@ -3069,22 +3143,34 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // of exactly the right width, because layout measured a
                         // live string, holding '?' -- raylib's stand-in for
                         // whatever bytes had since landed on that stack slot.
-                        static char rs_url_rtsp[256];
-                        static char rs_url_webrtc[256];
-                        static char rs_url_hls[256];
-                        snprintf(rs_url_rtsp, sizeof(rs_url_rtsp), "%s", rs_st.url_rtsp);
-                        snprintf(rs_url_webrtc, sizeof(rs_url_webrtc), "%s", rs_st.url_webrtc);
-                        snprintf(rs_url_hls, sizeof(rs_url_hls), "%s", rs_st.url_hls);
-                        CLAY(CLAY_ID("RtspUrlRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
-                            CLAY(CLAY_ID("RtspUrlRtsp"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_url_rtsp), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                        static char rs_urls[RTSP_URL_COUNT][256];
+                        for (int u = 0; u < RTSP_URL_COUNT; u++) {
+                            snprintf(rs_urls[u], sizeof(rs_urls[u]), "%s",
+                                     rtsp_url_for_kind(&rs_st, u));
+                            // Reads last frame's boxes, so the tint trails the
+                            // pointer by a frame. For "this responds to a click"
+                            // that is imperceptible.
+                            bool u_hot = Clay_PointerOver(CLAY_IDI("RtspUrlBox", u));
+                            CLAY(CLAY_IDI("RtspUrlRow", u), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+                                CLAY(CLAY_IDI("RtspUrlLabel", u), { .layout = { .sizing = { CLAY_SIZING_FIXED(58), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                                    CLAY_TEXT(make_string(rtsp_url_kind_label(u)), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                                }
+                                CLAY(CLAY_IDI("RtspUrlBox", u), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(u_hot ? COLOR_BUTTON : (Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                    CLAY_TEXT(make_string(rs_urls[u]), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                                }
+                                CLAY(CLAY_IDI("RtspUrlCopy", u), { .layout = { .sizing = { CLAY_SIZING_FIXED(62), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(Clay_PointerOver(CLAY_IDI("RtspUrlCopy", u)) ? COLOR_BUTTON_HOVER : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                    CLAY_TEXT(CLAY_STRING("Copy"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                                }
                             }
-                            CLAY(CLAY_ID("RtspUrlWebrtc"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_url_webrtc), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                            CLAY(CLAY_ID("RtspUrlHls"), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIXED(24) }, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(rs_url_hls), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
+                        }
+                        // Neither gesture is discoverable on its own, so say both.
+                        CLAY(CLAY_ID("RtspUrlHelpRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+#if defined(__APPLE__)
+                            CLAY_TEXT(CLAY_STRING("click a URL to copy it, Cmd+click to open it"),
+#else
+                            CLAY_TEXT(CLAY_STRING("click a URL to copy it, Ctrl+click to open it"),
+#endif
+                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                         }
                     }
                     // One line that says what is wrong, or what is about to be
@@ -7904,17 +7990,31 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_settings_save(&app->settings);
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("RtspUrlRtsp"))) {
-                SetClipboardText(gui_rtsp_stream_get_status().url_rtsp);
-                gui_app_set_status(app, "RTSP URL copied");
-            }
-            if (Clay_PointerOver(CLAY_ID("RtspUrlWebrtc"))) {
-                SetClipboardText(gui_rtsp_stream_get_status().url_webrtc);
-                gui_app_set_status(app, "WebRTC URL copied");
-            }
-            if (Clay_PointerOver(CLAY_ID("RtspUrlHls"))) {
-                SetClipboardText(gui_rtsp_stream_get_status().url_hls);
-                gui_app_set_status(app, "HLS URL copied");
+            {
+                /* Read the status once: three rows asking separately could see
+                 * three different frames if the stream stopped mid-loop. */
+                gui_rtsp_stream_status_t url_st = gui_rtsp_stream_get_status();
+                for (int u = 0; u < RTSP_URL_COUNT; u++) {
+                    const char *url = rtsp_url_for_kind(&url_st, u);
+                    if (Clay_PointerOver(CLAY_IDI("RtspUrlCopy", u))) {
+                        rtsp_url_copy(app, u, url);
+                    } else if (Clay_PointerOver(CLAY_IDI("RtspUrlBox", u))) {
+                        if (!gui_ui_primary_mod_down()) {
+                            rtsp_url_copy(app, u, url);
+                        } else if (rtsp_url_is_safe_to_open(url)) {
+                            char msg[80];
+                            OpenURL(url);
+                            snprintf(msg, sizeof(msg), "Opening the %s URL...",
+                                     rtsp_url_kind_label(u));
+                            gui_app_set_status(app, msg);
+                        } else {
+                            /* Copying still works: the clipboard is not a shell. */
+                            gui_app_set_status(app,
+                                "That URL will not be opened - it is not a plain "
+                                "rtsp:// or http:// address");
+                        }
+                    }
+                }
             }
             if (Clay_PointerOver(CLAY_ID("VideoCodecBox"))) {
                 if (gui_video_record_probe()) {

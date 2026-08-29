@@ -47,6 +47,14 @@ static void yb_addf(yaml_buf_t *b, const char *fmt, ...)
     b->len += (size_t)n;
 }
 
+/* Every reader costs bandwidth and CPU on the machine whose RF ingest we go out
+ * of our way to protect with nice(+5), so the stream does not get to be an
+ * unbounded fan-out. Far above any realistic number of people watching one tape
+ * conversion, far below anything that could starve capture. Deliberately not a
+ * setting: mediamtx reads 0 as "no limit", so an exposed value is a way for this
+ * cap to be switched off by accident. */
+#define MTX_MAX_READERS 8
+
 int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size_t cap)
 {
     if (cfg == NULL || out == NULL || cap == 0) {
@@ -105,8 +113,53 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "srt: no\n"
         "moq: no\n"
         "\n"
-        "# api/metrics/pprof/playback default to no; left unset so we bind nothing\n"
-        "# on their ports.\n"
+        "# These four default to no. So did rtmp/srt/moq -- except those default to\n"
+        "# YES, which is the whole reason this file is generated rather than assumed.\n"
+        "# A default is not a guarantee, and pprof reachable on a LAN interface\n"
+        "# would be a genuine leak, so they are stated.\n"
+        "api: no\n"
+        "metrics: no\n"
+        "pprof: no\n"
+        "playback: no\n"
+        "\n");
+
+    /* Who may do what.
+     *
+     * Without this block mediamtx applies its shipped default -- `user: any`
+     * with publish, read AND playback on every path. In LAN mode that let any
+     * machine on the network publish to misrc-preview and, with
+     * overridePublisher on, displace our ffmpeg: the operator monitoring a
+     * customer's tape would have been shown someone else's video.
+     *
+     * Publishing is pinned to loopback in BOTH bind modes. Our publisher always
+     * connects to rtsp://127.0.0.1 whatever the bind mode (gui_rtsp_stream.c),
+     * so this costs nothing and needs no credential -- which matters, because a
+     * credential in ffmpeg's argv would be readable from /proc/<pid>/cmdline by
+     * any local user, and would land in its stderr log besides.
+     *
+     * Reading stays open: passwordless is the documented default, and LAN mode
+     * exists precisely so that people can watch. */
+    yb_addf(&b,
+        "authInternalUsers:\n"
+        "  # Our own ffmpeg. Nothing off-box may publish, credential or not.\n"
+        "  - user: any\n"
+        "    pass:\n"
+        /* Quoted deliberately: ::1 is not a valid plain scalar inside a YAML
+         * flow sequence, and the unquoted form makes the entire file fail to
+         * parse -- mediamtx would refuse to start rather than misbehave, but
+         * the stream would simply never come up. mediamtx quotes these in its
+         * own shipped config for the same reason. */
+        "    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "    permissions:\n"
+        "      - action: publish\n"
+        "        path: misrc-preview\n"
+        "  # Viewers, from anywhere the bind mode allows.\n"
+        "  - user: any\n"
+        "    pass:\n"
+        "    ips: []\n"
+        "    permissions:\n"
+        "      - action: read\n"
+        "        path: misrc-preview\n"
         "\n");
 
     /* Deliberately outside capture-node's naming, so the two are never
@@ -116,9 +169,10 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "  misrc-preview:\n"
         "    source: publisher\n"
         "    sourceOnDemand: no\n"
-        "    overridePublisher: yes\n"
-        "    # mediamtx reads 0 as \"no limit\", not \"no readers\".\n"
-        "    maxReaders: 0\n");
+        "    # Nothing takes this path out from under the publisher that owns it,\n"
+        "    # not even from loopback.\n"
+        "    overridePublisher: no\n");
+    yb_addf(&b, "    maxReaders: %d\n", MTX_MAX_READERS);
 
     if (b.overflow) {
         /* Never hand back a truncated config: mediamtx would start on its own
@@ -303,6 +357,30 @@ bool gui_mediamtx_probe(void)
 const char *gui_mediamtx_binary_path(void) { return mtx_bin.found ? mtx_bin.path : ""; }
 const char *gui_mediamtx_version(void)     { return mtx_bin.version; }
 
+/* The directory must be ours and private before anything is written into it.
+ *
+ * mkdir() tolerating EEXIST is not the same as owning what already exists, and
+ * the last fallback below is /tmp, which is world-writable: another user can
+ * pre-create /tmp/misrc-gui and then read -- or replace -- everything we put
+ * there. Once the config carries a stream password that stops being untidy and
+ * starts being a leak, so it is checked here rather than assumed.
+ *
+ * lstat rather than stat: a symlink is not a directory we own, and following it
+ * is exactly the trick being guarded against. */
+static bool mtx_dir_is_private(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return false; }
+    if (st.st_uid != geteuid()) { errno = EPERM;  return false; }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        /* Ours, but looser than it should be. Tighten rather than refuse -- an
+         * older build, or a stray umask, should not wedge the feature. */
+        if (chmod(path, 0700) != 0) return false;
+    }
+    return true;
+}
+
 /* $XDG_RUNTIME_DIR is cleaned on reboot and is per-user; $TMPDIR is the
  * fallback for a session that has none. */
 static bool mtx_config_dir(char *out, size_t cap)
@@ -312,7 +390,7 @@ static bool mtx_config_dir(char *out, size_t cap)
     if (!base || !base[0]) base = "/tmp";
     snprintf(out, cap, "%s/misrc-gui", base);
     if (mkdir(out, 0700) != 0 && errno != EEXIST) return false;
-    return true;
+    return mtx_dir_is_private(out);
 }
 
 static int mtx_write_config(const gui_mediamtx_config_t *cfg, char *err, size_t err_cap)
@@ -334,9 +412,28 @@ static int mtx_write_config(const gui_mediamtx_config_t *cfg, char *err, size_t 
         snprintf(err, err_cap, "mediamtx config did not fit its buffer");
         return -1;
     }
-    FILE *f = fopen(mtx.config_path, "w");
+    /* 0600 at creation rather than after the fact, so there is no window in
+     * which the file exists and is readable. O_NOFOLLOW because the path may sit
+     * under /tmp on a session with no XDG_RUNTIME_DIR, where a symlink planted
+     * at our filename would redirect the write somewhere we can reach but did
+     * not intend. */
+    int fd = open(mtx.config_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        snprintf(err, err_cap, "cannot write %s: %s", mtx.config_path, strerror(errno));
+        return -1;
+    }
+    /* O_CREAT leaves an existing file's mode alone, so a config written by an
+     * older build stays 0644 unless this is said explicitly. */
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        snprintf(err, err_cap, "cannot restrict %s: %s", mtx.config_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "w");
     if (!f) {
         snprintf(err, err_cap, "cannot write %s: %s", mtx.config_path, strerror(errno));
+        close(fd);
         return -1;
     }
     size_t wrote = fwrite(body, 1, (size_t)n, f);
