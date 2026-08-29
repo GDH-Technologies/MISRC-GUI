@@ -26,6 +26,7 @@
 #include "../input/gui_preview_v4l2.h"
 #include "../output/gui_video_record.h"
 #include "../streaming/gui_mediamtx.h"
+#include "../streaming/gui_rtsp_stream.h"
 #include "../processing/gui_extract.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
@@ -91,6 +92,7 @@ static void print_usage(const char *program_name) {
             "  --video-probe | --video-settings-test | --video-name-test\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
             "  --mediamtx-test [seconds]\n"
+            "  --rtsp-stream-test <device> [seconds]\n"
             "  --video-tap-test <device> [seconds]\n"
             "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
             "\n"
@@ -473,6 +475,11 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
+        }
+        if (strcmp(argv[i], "--rtsp-stream-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 10;
+            return gui_rtsp_stream_test_main(dev, secs);
         }
         if (strcmp(argv[i], "--mediamtx-test") == 0) {
             int secs = (i + 1 < argc) ? atoi(argv[i + 1]) : 2;

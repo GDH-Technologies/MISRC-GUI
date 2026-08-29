@@ -414,6 +414,8 @@ if raylib_dep.found()
     'misrc_gui/input/gui_preview_v4l2.c',
     'misrc_gui/streaming/gui_preview_tap_mux.c',
     'misrc_gui/streaming/gui_mediamtx.c',
+    'misrc_gui/streaming/gui_alsa_device.c',
+    'misrc_gui/streaming/gui_rtsp_stream.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
