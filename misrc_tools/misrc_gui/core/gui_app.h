@@ -277,6 +277,10 @@ typedef struct {
     // RTSP stream: publishes the preview picture and the dongle's own audio so
     // a tape can be watched from another machine. Monitoring only -- the RF
     // stays the archival master and the MKV stays the QC artifact.
+    // The USB preview device last connected, remembered so the app can open it
+    // again at launch. Stored by path rather than index: /dev/videoN survives a
+    // reboot, an enumeration order does not.
+    char preview_device_path[40];
     bool rtsp_stream_enabled;
     bool rtsp_stream_lan;                    // false = loopback only (default)
     int  rtsp_stream_port;                   // 0 = the built-in default (8654)
