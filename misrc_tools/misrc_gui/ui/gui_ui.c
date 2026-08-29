@@ -1064,10 +1064,14 @@ static char stat_rec_raw[2][32];
 static char stat_rec_flac[2][32];
 static char stat_rec_ratio[2][24];
 static char stat_rec_duration[2][24];
+#if !defined(_WIN32)
 // CXADC gain, per channel. Clay stores the pointer it is handed and reads it
 // back after Clay_EndLayout, so this cannot be a stack buffer -- see the note
-// at its use site in render_channel_stats.
+// at its use site in render_channel_stats. Guarded to match that use site,
+// which is itself #if !defined(_WIN32): cxadc-win exposes no gain control, so
+// an unguarded definition would be an unused-variable warning on Windows.
 static char stat_cx_level[2][16];
+#endif
 
 // Playback file display buffers
 static char playback_file_a_display[64];
