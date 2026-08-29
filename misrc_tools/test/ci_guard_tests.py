@@ -45,6 +45,11 @@ WM_CLASS_VERSION_TOKENS = (
 )
 
 
+def strip_shell_comments(source: str) -> str:
+    """Drop whole-line # comments so a comment may discuss what it forbids."""
+    return "\n".join(l for l in source.splitlines() if not l.lstrip().startswith("#"))
+
+
 def strip_c_comments(source: str) -> str:
     """Blank out /* */ and // comments, preserving line structure."""
     out = []
@@ -1247,6 +1252,47 @@ def check_preview_tap_single_slot_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_bundled_mediamtx_contract(repo_root: Path) -> int:
+    """A bundled binary is a supply-chain dependency of every release, so the
+    version and hashes are pinned in the repo and the download is verified
+    against them. Verifying against a checksums file fetched from the same
+    release proves only that the transfer worked. Both AppImage paths -- CI and
+    scripts/build-appimage-local.sh -- must go through the one script, or a
+    locally built AppImage ends up carrying a different server."""
+    fetch = repo_root / "scripts/fetch-mediamtx.sh"
+    if not fetch.exists():
+        return fail("scripts/fetch-mediamtx.sh is missing; the AppImage cannot bundle mediamtx")
+    text = read_text(fetch)
+
+    version = re.search(r'^MEDIAMTX_VERSION="(v[0-9]+\.[0-9]+\.[0-9]+)"', text, re.M)
+    if not version:
+        return fail("fetch-mediamtx.sh must pin an exact MEDIAMTX_VERSION (vX.Y.Z)")
+
+    for arch in ("x86_64", "aarch64"):
+        m = re.search(rf'^SHA256_{arch}="([0-9a-f]{{64}})"', text, re.M)
+        if not m:
+            return fail(f"fetch-mediamtx.sh must pin a 64-hex sha256 for {arch}")
+
+    if "sha256sum --check" not in text:
+        return fail("fetch-mediamtx.sh must verify the download against its pinned sha256")
+    if "exit 1" not in text:
+        return fail("fetch-mediamtx.sh must refuse to stage on a checksum mismatch")
+    # The upstream checksums file is not an acceptable substitute for the pin.
+    if "checksums.sha256" in strip_shell_comments(text):
+        return fail(
+            "fetch-mediamtx.sh verifies against the release's own checksums file; "
+            "pin the hashes in this repo instead"
+        )
+
+    for consumer, label in (
+        (repo_root / ".github/workflows/build.yml", "the release AppImage"),
+        (repo_root / "scripts/build-appimage-local.sh", "the local AppImage"),
+    ):
+        if "fetch-mediamtx.sh" not in read_text(consumer):
+            return fail(f"{label} does not stage mediamtx via scripts/fetch-mediamtx.sh")
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1815,6 +1861,7 @@ def main() -> int:
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("preview tap single-slot contract", lambda: check_preview_tap_single_slot_contract(repo_root)),
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
+        ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
