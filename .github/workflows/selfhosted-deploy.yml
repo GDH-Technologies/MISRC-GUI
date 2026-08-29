@@ -1,0 +1,154 @@
+# Fork-only CI for GDH-Technologies/MISRC-GUI.
+#
+# Upstream's .github/workflows/build.yml is left byte-identical to harrypm/MISRC-GUI
+# and is DISABLED on this fork as a repository setting (`gh workflow disable`), not by
+# editing the file -- misrc_tools/test/ci_guard_tests.py is a raw substring matcher over
+# that file, so editing it risks the guards and guarantees merge conflicts on every
+# upstream sync. Because that disable is invisible in the tree, it is written down in
+# docs/gdh-selfhosted-ci.md. Re-enable with:
+#   gh workflow enable "Build and release binary" --repo GDH-Technologies/MISRC-GUI
+#
+# Everything here runs on the org's own `workflow-master` machine (label `wm`). Pushes to
+# main additionally install the built binaries into ~/.local/bin, so the app launched from
+# the GNOME shortcut is always main.
+name: Self-hosted build and deploy (GDH fork)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref. Without this, two quick merges could race the install step and leave
+# ~/.local/bin holding a binary from the older commit.
+concurrency:
+  group: selfhosted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build, test and install (wm)
+    # Strict pin: this fork builds only on workflow-master, never on GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64, wm]
+    env:
+      BUILD_DIR: build-ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # misrc_tools/git-version.sh needs tags + history to resolve a version rather
+          # than falling back to dev-<date>-nogit.
+          fetch-depth: 0
+
+      - name: Resolve deps prefix
+        # Deliberately OUTSIDE the runner workspace: actions/checkout defaults to
+        # clean:true (git clean -ffdx), which would delete a workspace-local .deps every
+        # run -- rebuilding hsdaoh+raylib each merge, and worse, leaving the installed
+        # binary's RUNPATH pointing at a directory the next checkout deletes.
+        #
+        # The path must still contain the literal ".deps/install": ci_guard_tests.py's
+        # check_built_gui_links_vendored_hsdaoh asserts that substring in ldd output.
+        run: echo "MISRC_DEPS_PREFIX=$HOME/.cache/misrc/.deps/install" >> "$GITHUB_ENV"
+
+      - name: Build vendored deps (hsdaoh + raylib)
+        # Stamp-gated (build-deps-unix.sh:54) -- a warm cache exits immediately with
+        # "deps already built (stamp matches)". Invoked via `bash` because the script is
+        # tracked mode 100644, not 100755; scripts/build-local.sh:85 does the same.
+        run: DEPS_PREFIX="$MISRC_DEPS_PREFIX" bash scripts/build-deps-unix.sh
+
+      - name: Build misrc_gui + CLI tools
+        run: bash scripts/build-local.sh --all
+
+      - name: Guard tests
+        # Full suite (not --static-only): cc, pkg-config and bash are present on wm, so the
+        # runtime checks actually run instead of hard-failing.
+        run: python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui"
+
+      - name: Smoke test
+        # Headless -- the runner service has no DISPLAY, so the GUI is never opened.
+        run: "\"$BUILD_DIR/misrc_gui\" --smoke-test"
+
+      - name: Report build version
+        run: |
+          set -euo pipefail
+          version="$("$BUILD_DIR/misrc_gui" --version)"
+          echo "Built version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        id: built
+
+      # ----------------------------------------------------------------------------
+      # Install. Only on a real merge to main -- PRs build and test but never touch
+      # the machine's installed app.
+      # ----------------------------------------------------------------------------
+      - name: Install to ~/.local
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          bin_dir="$HOME/.local/bin"
+          app_dir="$HOME/.local/share/applications"
+          icon_dir="$HOME/.local/share/icons/hicolor/512x512/apps"
+          install -d "$bin_dir" "$app_dir" "$icon_dir"
+
+          # Replace via a temp name + mv: rename is atomic, so an install cannot fail with
+          # ETXTBSY if the GUI happens to be running, and a reader never sees a half file.
+          for b in misrc_gui misrc_capture misrc_extract; do
+            install -m 755 "$BUILD_DIR/$b" "$bin_dir/.$b.incoming"
+            mv -f "$bin_dir/.$b.incoming" "$bin_dir/$b"
+            echo "installed $bin_dir/$b"
+          done
+
+          # Icon, only if absent (nothing here should churn it on every merge).
+          if [ ! -f "$icon_dir/misrc.png" ] && [ -f assets/Icons/MISRC_Icon.png ]; then
+            magick assets/Icons/MISRC_Icon.png -resize '512x512!' "$icon_dir/misrc.png"
+            echo "installed icon"
+          fi
+
+          # Desktop entry, rewritten idempotently.
+          #
+          # RESOURCE_NAME is load-bearing: GLFW derives WM_CLASS from the window title,
+          # which embeds the version string, so a literal StartupWMClass would stop
+          # matching on every rebuild and orphan the icon in the GNOME dash. Setting
+          # RESOURCE_NAME pins a stable WM_CLASS instance name instead.
+          cat > "$app_dir/misrc_gui.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=MISRC GUI
+          Comment=Local Fedora build, installed by CI from main
+          Exec=env RESOURCE_NAME=misrc_gui $bin_dir/misrc_gui %U
+          Icon=misrc
+          Categories=Utility;
+          StartupWMClass=misrc_gui
+          X-GNOME-WMClass=misrc_gui
+          Terminal=false
+          StartupNotify=true
+          EOF
+          update-desktop-database "$app_dir" || true
+
+      - name: Verify install
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # Passed through env rather than interpolated into the script: ${{ }} expansion
+        # happens before the shell sees the line, so a value containing shell syntax
+        # would execute. The version derives from a tag name, so treat it as untrusted.
+        env:
+          BUILT_VERSION: ${{ steps.built.outputs.version }}
+        run: |
+          set -euo pipefail
+          installed="$("$HOME/.local/bin/misrc_gui" --version)"
+          built="$BUILT_VERSION"
+          if [ "$installed" != "$built" ]; then
+            echo "::error::installed version ($installed) does not match built version ($built)"
+            exit 1
+          fi
+          "$HOME/.local/bin/misrc_gui" --smoke-test
+          echo "Installed and verified: $installed"
+          {
+            echo "### Deployed to \`wm\`"
+            echo
+            echo "- version: \`$installed\`"
+            echo "- binaries: \`misrc_gui\`, \`misrc_capture\`, \`misrc_extract\` in \`~/.local/bin\`"
+          } >> "$GITHUB_STEP_SUMMARY"
