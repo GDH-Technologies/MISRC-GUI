@@ -119,4 +119,8 @@ void gui_rtsp_stream_set_inject(rs_inject_t what);
  * flowed and the stream was readable. */
 int gui_rtsp_stream_test_main(const char *device, int seconds);
 
+/* Runs the recorder and the stream against the same tap, injects one fault, and
+ * asserts the documented behaviour AND that the recorder never noticed. */
+int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int seconds);
+
 #endif /* GUI_RTSP_STREAM_H */
