@@ -163,9 +163,20 @@ int gui_mediamtx_render_config(const gui_mediamtx_config_t *cfg, char *out, size
         "    permissions:\n"
         "      - action: publish\n"
         "        path: misrc-preview\n"
-        "  # Viewers, from anywhere the bind mode allows.\n"
-        "  - user: any\n"
-        "    pass:\n"
+        "  # Viewers, from anywhere the bind mode allows.\n");
+    if (cfg->read_password[0]) {
+        /* Quoted: the alphabet is alphanumeric and safe unquoted, but a password
+         * is exactly the sort of value that should not depend on that staying
+         * true. VLC and browsers both prompt for these. */
+        yb_addf(&b,
+            "  - user: viewer\n"
+            "    pass: \"%s\"\n", cfg->read_password);
+    } else {
+        yb_addf(&b,
+            "  - user: any\n"
+            "    pass:\n");
+    }
+    yb_addf(&b,
         "    ips: []\n"
         "    permissions:\n"
         "      - action: read\n"
@@ -220,6 +231,7 @@ void gui_mediamtx_stop(void) { }
 void gui_mediamtx_shutdown(void) { }
 void gui_mediamtx_poll(void) { }
 uint32_t gui_mediamtx_stream_kbps(void) { return 0; }
+const char *gui_mediamtx_read_password(void) { return ""; }
 gui_mediamtx_status_t gui_mediamtx_get_status(void)
 {
     gui_mediamtx_status_t st = {0};
@@ -262,6 +274,7 @@ static struct {
      * once it has been checked. See gui_mediamtx_start(). */
     double verify_at;
     uint16_t metrics_port;
+    char read_password[40];   /* what the RUNNING server is enforcing */
 } mtx;
 
 /* Reading the bitrate back out of mediamtx.
@@ -499,7 +512,17 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
         if (err) snprintf(err, err_cap, "no mediamtx config supplied");
         return -1;
     }
-    if (mtx.running) return 0;   /* idempotent */
+    /* Idempotent, with one exception. mediamtx is deliberately left running
+     * across streams -- restarting it per stream would drop every viewer that
+     * was reconnecting -- but the credential lives in its config file, which is
+     * only written at startup. So a changed password is the one thing worth a
+     * restart: without this the panel would show a new password that the server
+     * was not actually enforcing, which is worse than having no password at all.
+     * Nothing is watching a stream that has stopped, so nobody is dropped. */
+    if (mtx.running) {
+        if (strcmp(mtx.read_password, cfg->read_password) == 0) return 0;
+        gui_mediamtx_stop();
+    }
 
     if (!gui_mediamtx_probe()) {
         if (err) snprintf(err, err_cap,
@@ -527,6 +550,7 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
         /* Not worth refusing to stream over. */
     }
 
+    snprintf(mtx.read_password, sizeof(mtx.read_password), "%s", cfg->read_password);
     mtx.child_pid = (int)pid;
     mtx.running = true;
     mtx.err_text[0] = '\0';
@@ -710,6 +734,10 @@ static void met_step(void)
 }
 
 uint32_t gui_mediamtx_stream_kbps(void) { return met.kbps; }
+const char *gui_mediamtx_read_password(void)
+{
+    return mtx.running ? mtx.read_password : "";
+}
 
 void gui_mediamtx_poll(void)
 {

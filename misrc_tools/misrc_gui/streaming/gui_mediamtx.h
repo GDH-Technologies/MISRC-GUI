@@ -45,6 +45,10 @@ typedef struct {
      * how the panel learns the stream's real bitrate, and it is nobody else's
      * business. mediamtx canonical 9998 + 100. */
     uint16_t metrics;       /* TCP, loopback only */
+    /* Credential viewers must present to READ the stream. Empty means the
+     * stream is open, which is the default: a password is opt-in. Publishing
+     * is never affected -- that is restricted by address, not by secret. */
+    char     read_password[40];
 } gui_mediamtx_config_t;
 
 typedef struct {
@@ -95,6 +99,11 @@ void gui_mediamtx_poll(void);
  * total_size and bitrate as N/A, and /proc/<pid>/io counts only write(2), not
  * the send(2) family a socket uses -- both measured, not assumed. */
 uint32_t gui_mediamtx_stream_kbps(void);
+
+/* The credential the RUNNING server is enforcing, or "" when the stream is
+ * open. Read from here rather than from the settings so the panel can never
+ * show a password that is not the one actually in force. */
+const char *gui_mediamtx_read_password(void);
 
 gui_mediamtx_status_t gui_mediamtx_get_status(void);
 bool gui_mediamtx_is_running(void);
