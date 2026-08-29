@@ -191,6 +191,11 @@ build_native() {
   cp "$REPO_ROOT/$BUILD_DIR/misrc_capture" "$appdir/usr/bin/"
   cp "$REPO_ROOT/$BUILD_DIR/misrc_extract" "$appdir/usr/bin/"
 
+  # Same pinned, checksummed mediamtx the CI AppImage gets. Without this a
+  # locally built AppImage would silently lack the streaming server.
+  bash "$REPO_ROOT/scripts/fetch-mediamtx.sh" "$(uname -m)" \
+    "$appdir/usr/bin" "$appdir/usr/share/doc/mediamtx"
+
   cat > "$appdir/AppRun" <<'EOF'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"

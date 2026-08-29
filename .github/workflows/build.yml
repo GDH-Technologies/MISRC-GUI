@@ -291,6 +291,16 @@ jobs:
           cp "$BUILD_DIR/misrc_capture" AppDir/usr/bin/
           cp "$BUILD_DIR/misrc_extract" AppDir/usr/bin/
 
+          # Bundle the RTSP server. Pinned and checksummed in the script, which
+          # scripts/build-appimage-local.sh calls too, so a locally built
+          # AppImage carries the same server as a released one.
+          # gui_mediamtx.c looks beside its own binary before PATH, so this copy
+          # is the one the app uses, and the feature works with nothing installed.
+          bash scripts/fetch-mediamtx.sh "$LINUXDEPLOY_ARCH" \
+            AppDir/usr/bin AppDir/usr/share/doc/mediamtx
+          test -x AppDir/usr/bin/mediamtx
+          test -s AppDir/usr/share/doc/mediamtx/LICENSE
+
           cat > AppDir/AppRun <<'EOF'
           #!/usr/bin/env bash
           HERE="$(dirname "$(readlink -f "$0")")"
