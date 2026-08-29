@@ -1109,6 +1109,58 @@ def check_preview_tap_mux_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_mediamtx_config_runtime(repo_root: Path) -> int:
+    """The generated mediamtx.yml carries the design's hard requirement: this
+    instance must not disturb capture-node's three on the same host. Two ways to
+    break it, both silent -- drift onto one of its ports, or forget to disable a
+    listener, since mediamtx defaults rtmp/srt/moq to ON and would quietly claim
+    1935/8890/8892. Renders the config for both bind modes and asserts neither."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: mediamtx config runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the mediamtx config runtime guard")
+        print("SKIP: mediamtx config runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/mediamtx_config_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/streaming/gui_mediamtx.c"
+    include_dir = repo_root / "misrc_tools/misrc_gui/streaming"
+
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"mediamtx config guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_mediamtx_guard_") as temp_root:
+        exe_path = Path(temp_root) / "mediamtx_config_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(module_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"mediamtx config harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "mediamtx config harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_preview_tap_single_slot_contract(repo_root: Path) -> int:
     """Application code must register through the mux, never install the raw tap
     directly -- a direct install displaces whatever the mux published and takes
@@ -1724,6 +1776,7 @@ def main() -> int:
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(10, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
+        checks.insert(11, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode

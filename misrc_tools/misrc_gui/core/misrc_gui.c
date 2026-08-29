@@ -25,6 +25,7 @@
 #include "../input/gui_capture.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../output/gui_video_record.h"
+#include "../streaming/gui_mediamtx.h"
 #include "../processing/gui_extract.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
@@ -89,6 +90,7 @@ static void print_usage(const char *program_name) {
             "  --preview-dump-frame <device> <out.ppm>\n"
             "  --video-probe | --video-settings-test | --video-name-test\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
+            "  --mediamtx-test [seconds]\n"
             "  --video-tap-test <device> [seconds]\n"
             "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
             "\n"
@@ -471,6 +473,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
+        }
+        if (strcmp(argv[i], "--mediamtx-test") == 0) {
+            int secs = (i + 1 < argc) ? atoi(argv[i + 1]) : 2;
+            return gui_mediamtx_test_main(secs);
         }
         if (strcmp(argv[i], "--video-record-test") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
