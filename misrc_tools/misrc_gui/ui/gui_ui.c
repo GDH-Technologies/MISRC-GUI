@@ -3119,14 +3119,31 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("RtspBindBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(84), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.rtsp_stream_lan ? CLAY_STRING("LAN") : CLAY_STRING("Loopback"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
                         }
+                    /* A FIXED box, always present, whatever it says.
+                     *
+                     * The settings panel is CLAY_SIZING_FIT, so it measures itself
+                     * from its contents: an unconstrained label that changes every
+                     * frame re-measures the whole panel, and because the panel is
+                     * centre-attached it grows and shrinks around the middle. That
+                     * is what made the window breathe. A fixed box cannot influence
+                     * the layout however long its text gets, and keeping it present
+                     * while stopped means starting the stream does not resize the
+                     * row either.
+                     *
+                     * Monospaced for the same reason at a smaller scale: in a
+                     * proportional face "1111" and "8888" are not the same width. */
+                    {
+                        static char rs_live[32];
                         if (rs_st.running && !rs_st.starting) {
-                            static char rs_live[96];
-                            snprintf(rs_live, sizeof(rs_live), "%llu sent  %llu dropped%s",
-                                     (unsigned long long)rs_st.frames_written,
-                                     (unsigned long long)rs_st.frames_dropped,
-                                     rs_st.audio_active ? "  +audio" : "  video only");
-                            CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            snprintf(rs_live, sizeof(rs_live), "%llu sent",
+                                     (unsigned long long)rs_st.frames_written);
+                        } else {
+                            rs_live[0] = '\0';
                         }
+                        CLAY(CLAY_ID("RtspLiveBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(104), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                            CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+                    }
                     }
                     // The URLs a viewer actually types, one per row: at a size
                     // worth reading, three of them will not sit side by side.
@@ -3187,6 +3204,15 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             hint_fg = COLOR_SYNC_RED;
                         } else if (rs_st.starting) {
                             snprintf(rs_hint, sizeof(rs_hint), "starting the stream...");
+                        } else if (rs_st.running && rs_st.frames_dropped > 0) {
+                            /* The dropped counter used to sit in the row above and
+                             * was half of why it jittered. It still matters -- it is
+                             * the only sign the encoder cannot keep up -- so it
+                             * moves here, deliberately WITHOUT the number: a live
+                             * count in this line would just move the jitter. */
+                            snprintf(rs_hint, sizeof(rs_hint),
+                                     "frames are being dropped - the encoder is not keeping up");
+                            hint_fg = COLOR_SYNC_RED;
                         } else if (rs_st.running && !rs_st.audio_active) {
                             snprintf(rs_hint, sizeof(rs_hint), "video only - %s",
                                      rs_st.audio_note[0] ? rs_st.audio_note : "no audio device");

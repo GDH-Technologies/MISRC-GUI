@@ -1717,6 +1717,40 @@ def check_url_open_is_whitelisted(repo_root: Path) -> int:
     return 0
 
 
+def check_live_stream_readout_cannot_resize_the_panel(repo_root: Path) -> int:
+    """The settings panel is CLAY_SIZING_FIT, so it measures itself from its
+    contents. A label that changes every frame therefore re-measures the whole
+    panel, and since the panel is centre-attached it grows and shrinks around the
+    middle -- the window visibly breathes while a stream runs.
+
+    The fix is that the live readout sits in a FIXED box. This pins that, because
+    the regression is invisible in a diff: dropping the wrapper leaves working,
+    correct-looking code that just happens to make the window pulse."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+
+    m = re.search(r'CLAY\(CLAY_ID\("RtspLiveBox"\),\s*\{(.*?)\}\)\s*\{', ui, re.S)
+    if not m:
+        return fail(
+            "the RtspLiveBox wrapper is gone; the live stream readout is free to "
+            "resize the settings panel again"
+        )
+    # The WIDTH specifically. The height is always fixed, so searching the whole
+    # sizing clause for CLAY_SIZING_FIXED passes even when the width has been
+    # loosened to FIT -- which is the only axis that matters here, and which
+    # mutation testing caught this check sailing past.
+    sizing = re.search(r"\.sizing\s*=\s*\{\s*([^,]+),", m.group(1))
+    if not sizing:
+        return fail("RtspLiveBox no longer states a sizing clause this guard can read")
+    width = sizing.group(1).strip()
+    if not width.startswith("CLAY_SIZING_FIXED"):
+        return fail(
+            f"RtspLiveBox width is {width}, not CLAY_SIZING_FIXED. Its text width "
+            "then feeds back into a CLAY_SIZING_FIT panel and the window breathes "
+            "as the numbers change."
+        )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -2288,6 +2322,7 @@ def main() -> int:
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
+        ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
