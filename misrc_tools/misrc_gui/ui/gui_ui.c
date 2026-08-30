@@ -534,6 +534,17 @@ static bool s_version_info_window_open = false;
 /* Asks once, the first time the stream is pointed at the network. After the
  * answer is remembered in settings this stays false forever. */
 static bool s_rtsp_lan_confirm_open = false;
+/* The stream's video encoder settings, which are too many for the row they
+ * belong to and are all baked in when ffmpeg is spawned. */
+static bool s_rtsp_codec_window_open = false;
+
+/* Bitrate stepper bounds. Kept inside the range gui_settings.c will accept on
+ * reload (0, or 100..100000) so a value set here survives a restart, and well
+ * inside what is sensible for a 720x576 preview. */
+#define RTSP_BITRATE_DEFAULT_KBPS 2000
+#define RTSP_BITRATE_MIN_KBPS      500
+#define RTSP_BITRATE_MAX_KBPS    20000
+#define RTSP_BITRATE_STEP_KBPS     250
 // Metadata popup state (toolbar scroll badge button)
 static bool s_metadata_window_open = false;
 static bool s_record_limit_armed = false;
@@ -3110,9 +3121,12 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                                       CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
                         }
                         CLAY_TEXT(CLAY_STRING("RTSP Stream"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
+                        /* Opens the codec submenu rather than cycling. It still
+                         * shows which encoder is in force, so the row loses no
+                         * information by gaining a place to put the rest. */
                         CLAY(CLAY_ID("RtspEncoderBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(76), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *enc_label = app->settings.rtsp_stream_encoder == 1 ? "NVENC"
-                                                  : app->settings.rtsp_stream_encoder == 2 ? "x264" : "Auto";
+                            const char *enc_label = app->settings.rtsp_stream_encoder == 1 ? "NVENC..."
+                                                  : app->settings.rtsp_stream_encoder == 2 ? "x264..." : "Auto...";
                             CLAY_TEXT(make_string(enc_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
                         }
                         // Loopback vs LAN. There is no auth either way, so the
@@ -3739,6 +3753,137 @@ static const char *gui_ui_device_type_name(device_type_t type) {
  * toggle. Floats above the settings panel it is launched from -- that panel
  * sits at the implicit zIndex 0, and the gear popover already uses 20, so this
  * takes 30 to clear both. */
+/* Everything about how the picture is encoded, in one place.
+ *
+ * These are all read when ffmpeg is spawned, so they are editable only while the
+ * stream is stopped -- offering a control that silently would not apply until
+ * the next start is worse than greying it out. */
+static void render_rtsp_codec_window(gui_app_t *app)
+{
+    if (!s_rtsp_codec_window_open) return;
+
+    gui_rtsp_stream_status_t cs = gui_rtsp_stream_get_status();
+    bool locked = cs.running || cs.starting;
+    bool nvenc_ok = gui_rtsp_stream_has_nvenc();
+
+    CLAY(CLAY_ID("RtspCodecBackdrop"), {
+        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
+            .zIndex = 30
+        },
+        .backgroundColor = (Clay_Color){0, 0, 0, 150}
+    }) {}
+
+    CLAY(CLAY_ID("RtspCodecWindow"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(.min = 460, .max = 560), CLAY_SIZING_FIT(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .padding = { 18, 18, 16, 16 },
+            .childGap = 10
+        },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
+            .zIndex = 31
+        },
+        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+        .cornerRadius = CLAY_CORNER_RADIUS(8)
+    }) {
+        CLAY(CLAY_ID("RtspCodecHeader"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Stream video codec"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
+            CLAY(CLAY_ID("RtspCodecHeaderSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } } }) {}
+            CLAY(CLAY_ID("RtspCodecClose"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+
+        /* Encoder: three explicit choices rather than a cycling box, so the one
+         * in force is visible without clicking through the others. */
+        CLAY(CLAY_ID("RtspCodecEncRow"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
+        }) {
+            CLAY(CLAY_ID("RtspCodecEncLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                CLAY_TEXT(CLAY_STRING("Encoder"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            for (int e = 0; e < 3; e++) {
+                bool avail = (e != 1) || nvenc_ok;
+                bool on = (app->settings.rtsp_stream_encoder == e);
+                Color bg = on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                if (locked || !avail) bg = ui_disabled_color(bg);
+                CLAY(CLAY_IDI("RtspCodecEnc", e), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(86), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(e == 0 ? "Auto" : (e == 1 ? "NVENC" : "x264")),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color((locked || !avail) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+                }
+            }
+        }
+        if (!nvenc_ok) {
+            CLAY_TEXT(CLAY_STRING("NVENC is unavailable in this ffmpeg build"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        /* Bitrate: software encoder only, which the hint below says plainly
+         * rather than leaving it to be discovered. */
+        CLAY(CLAY_ID("RtspCodecRateRow"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
+        }) {
+            CLAY(CLAY_ID("RtspCodecRateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                CLAY_TEXT(CLAY_STRING("Bitrate"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            Color step_bg = locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+            CLAY(CLAY_ID("RtspCodecRateMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            /* Fixed width, like every other number in this panel. */
+            static char rate_buf[32];
+            int eff = app->settings.rtsp_stream_bitrate_kbps > 0
+                    ? app->settings.rtsp_stream_bitrate_kbps : RTSP_BITRATE_DEFAULT_KBPS;
+            snprintf(rate_buf, sizeof(rate_buf), "%d kbit/s%s", eff,
+                     app->settings.rtsp_stream_bitrate_kbps > 0 ? "" : " (default)");
+            CLAY(CLAY_ID("RtspCodecRateValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(160), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                CLAY_TEXT(make_string(rate_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            CLAY(CLAY_ID("RtspCodecRatePlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+        CLAY_TEXT(CLAY_STRING("Bitrate applies to x264 only; NVENC is driven by quality, not a target."),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
+        /* Deinterlace */
+        CLAY(CLAY_ID("RtspCodecDeintRow"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
+        }) {
+            CLAY(CLAY_ID("RtspCodecDeintLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                CLAY_TEXT(CLAY_STRING("Deinterlace"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            Color d_bg = app->settings.rtsp_stream_deinterlace ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            if (locked) d_bg = ui_disabled_color(d_bg);
+            CLAY(CLAY_ID("RtspCodecDeint"), { .layout = { .sizing = { CLAY_SIZING_FIXED(86), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(d_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                CLAY_TEXT(app->settings.rtsp_stream_deinterlace ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            CLAY_TEXT(CLAY_STRING("bwdif - smoother motion, more latency"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        CLAY_TEXT(locked
+                    ? CLAY_STRING("These are fixed while the stream runs. Stop it to change them.")
+                    : CLAY_STRING("These take effect the next time the stream starts."),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(locked ? COLOR_SYNC_RED : COLOR_TEXT_DIM) }));
+    }
+}
+
 static void render_rtsp_lan_confirm(gui_app_t *app)
 {
     (void)app;
@@ -6308,6 +6453,8 @@ void gui_render_layout(gui_app_t *app) {
     // LAN confirmation, above everything including the settings panel it is
     // launched from.
     render_rtsp_lan_confirm(app);
+    // Stream codec settings, same layer as the LAN confirmation.
+    render_rtsp_codec_window(app);
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
@@ -6738,6 +6885,10 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && !s_record_limit_timecode_edit && IsKeyPressed(KEY_ESCAPE)) {
         s_record_limit_window_open = false;
     }
+    if (s_rtsp_codec_window_open && IsKeyPressed(KEY_ESCAPE)) {
+        s_rtsp_codec_window_open = false;
+        return;
+    }
     if (s_rtsp_lan_confirm_open && IsKeyPressed(KEY_ESCAPE)) {
         /* Same as declining: escape is not consent. */
         s_rtsp_lan_confirm_open = false;
@@ -6895,7 +7046,7 @@ void gui_handle_interactions(gui_app_t *app) {
     // Close it whenever one of them opens rather than trying to interleave.
     if (app->settings_panel_open || s_record_limit_window_open ||
         s_version_info_window_open || s_metadata_window_open ||
-        s_rtsp_lan_confirm_open || gui_popup_is_open()) {
+        s_rtsp_lan_confirm_open || s_rtsp_codec_window_open || gui_popup_is_open()) {
         if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
             gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)) {
             gui_dropdown_close_all();
@@ -6916,6 +7067,45 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_set_click_consumed();
             return;
         }
+        if (s_rtsp_codec_window_open) {
+            gui_rtsp_stream_status_t cw = gui_rtsp_stream_get_status();
+            bool cw_locked = cw.running || cw.starting;
+            if (Clay_PointerOver(CLAY_ID("RtspCodecClose"))) {
+                s_rtsp_codec_window_open = false;
+            } else if (!cw_locked) {
+                /* Everything here is read when ffmpeg is spawned, so none of it
+                 * may move while a stream is up. */
+                for (int e = 0; e < 3; e++) {
+                    if (!Clay_PointerOver(CLAY_IDI("RtspCodecEnc", e))) continue;
+                    if (e == 1 && !gui_rtsp_stream_has_nvenc()) {
+                        gui_app_set_status(app, "This ffmpeg cannot encode with NVENC");
+                        break;
+                    }
+                    app->settings.rtsp_stream_encoder = e;
+                    gui_settings_save(&app->settings);
+                    break;
+                }
+                if (Clay_PointerOver(CLAY_ID("RtspCodecRateMinus")) ||
+                    Clay_PointerOver(CLAY_ID("RtspCodecRatePlus"))) {
+                    int cur = app->settings.rtsp_stream_bitrate_kbps > 0
+                            ? app->settings.rtsp_stream_bitrate_kbps
+                            : RTSP_BITRATE_DEFAULT_KBPS;
+                    cur += Clay_PointerOver(CLAY_ID("RtspCodecRatePlus"))
+                         ? RTSP_BITRATE_STEP_KBPS : -RTSP_BITRATE_STEP_KBPS;
+                    if (cur < RTSP_BITRATE_MIN_KBPS) cur = RTSP_BITRATE_MIN_KBPS;
+                    if (cur > RTSP_BITRATE_MAX_KBPS) cur = RTSP_BITRATE_MAX_KBPS;
+                    app->settings.rtsp_stream_bitrate_kbps = cur;
+                    gui_settings_save(&app->settings);
+                }
+                if (Clay_PointerOver(CLAY_ID("RtspCodecDeint"))) {
+                    app->settings.rtsp_stream_deinterlace = !app->settings.rtsp_stream_deinterlace;
+                    gui_settings_save(&app->settings);
+                }
+            }
+            gui_ui_set_click_consumed();
+            return;
+        }
+
         /* Answered before anything else: while this is up it is the only thing
          * on screen that may be clicked. */
         if (s_rtsp_lan_confirm_open) {
@@ -8041,13 +8231,13 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_ui_toggle_rtsp_stream(app);
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("RtspEncoderBox")) && !gui_rtsp_stream_is_running() &&
-                !gui_rtsp_stream_get_status().starting) {
-                /* Only while stopped: the encoder is chosen when ffmpeg is
-                 * spawned, so changing it mid-stream would show a setting that
-                 * does not match what is being sent. */
-                app->settings.rtsp_stream_encoder = (app->settings.rtsp_stream_encoder + 1) % 3;
-                gui_settings_save(&app->settings);
+            if (Clay_PointerOver(CLAY_ID("RtspEncoderBox"))) {
+                /* Opens even while streaming: the window shows the settings in
+                 * force and greys them out, which is more use than a button that
+                 * does nothing. */
+                s_rtsp_codec_window_open = true;
+                gui_ui_set_click_consumed();
+                return;
             }
             if (Clay_PointerOver(CLAY_ID("ToggleRtspPassword")) && !gui_rtsp_stream_is_running() &&
                 !gui_rtsp_stream_get_status().starting) {
