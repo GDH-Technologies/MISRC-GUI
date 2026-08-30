@@ -1851,6 +1851,56 @@ def check_stream_password_is_strong_and_unleaked(repo_root: Path) -> int:
     return 0
 
 
+def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
+    """The codec window's bitrate stepper and gui_settings.c's parser have to
+    agree on what a legal value is, and they are written five hundred lines apart
+    in different files.
+
+    If the stepper can reach a value the parser rejects, the parser quietly
+    substitutes the default -- so the setting appears to work, survives until the
+    app is restarted, and then is silently something else. That is the same
+    failure check_rtsp_settings_roundtrip exists for, one level down: not a
+    missing site, but two sites that disagree."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    settings = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c"))
+
+    bounds = {}
+    for name in ("RTSP_BITRATE_MIN_KBPS", "RTSP_BITRATE_MAX_KBPS",
+                 "RTSP_BITRATE_STEP_KBPS", "RTSP_BITRATE_DEFAULT_KBPS"):
+        m = re.search(rf"#define\s+{name}\s+(\d+)", ui)
+        if not m:
+            return fail(f"gui_ui.c no longer defines {name}")
+        bounds[name] = int(m.group(1))
+
+    m = re.search(
+        r"rtsp_stream_bitrate_kbps\s*=\s*\(b == 0 \|\| \(b >= (\d+) && b <= (\d+)\)\)",
+        settings)
+    if not m:
+        return fail("could not read the bitrate clamp in gui_settings.c; if its shape "
+                    "changed, this guard must be updated with it")
+    lo, hi = int(m.group(1)), int(m.group(2))
+
+    if bounds["RTSP_BITRATE_MIN_KBPS"] < lo or bounds["RTSP_BITRATE_MAX_KBPS"] > hi:
+        return fail(
+            f"the bitrate stepper spans {bounds['RTSP_BITRATE_MIN_KBPS']}..."
+            f"{bounds['RTSP_BITRATE_MAX_KBPS']} kbit/s but gui_settings.c only accepts "
+            f"{lo}...{hi} on reload. A value outside that range is replaced by the "
+            "default when the app restarts, so the setting appears to work and then "
+            "silently is not what was chosen."
+        )
+    if bounds["RTSP_BITRATE_MIN_KBPS"] >= bounds["RTSP_BITRATE_MAX_KBPS"]:
+        return fail("the bitrate stepper's minimum is not below its maximum")
+    if bounds["RTSP_BITRATE_STEP_KBPS"] <= 0:
+        return fail("the bitrate step is not positive; the stepper would not move")
+    if not (bounds["RTSP_BITRATE_MIN_KBPS"] <= bounds["RTSP_BITRATE_DEFAULT_KBPS"]
+            <= bounds["RTSP_BITRATE_MAX_KBPS"]):
+        return fail(
+            f"the default bitrate ({bounds['RTSP_BITRATE_DEFAULT_KBPS']}) is outside "
+            "the stepper's own range, so the first click would jump rather than step"
+        )
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -2421,6 +2471,7 @@ def main() -> int:
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
+        ("bitrate stepper survives a reload", lambda: check_bitrate_stepper_survives_a_reload(repo_root)),
         ("stream password is strong and unleaked", lambda: check_stream_password_is_strong_and_unleaked(repo_root)),
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
         ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
