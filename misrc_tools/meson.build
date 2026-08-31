@@ -262,6 +262,7 @@ if libusb_common_dep.found()
     libusb_common_dep_added = true
   endif
   cflags += ['-DENABLE_DDD=1']
+  sources_capture += 'common/ddd_protocol.c'
   ddd_enabled = true
   message('libusb-1.0 found, building with DdD support')
 else
@@ -432,6 +433,7 @@ if raylib_dep.found()
 
   # Add DdD support to GUI if available
   if ddd_enabled
+    sources_gui += 'common/ddd_protocol.c'
     sources_gui += 'misrc_gui/input/gui_ddd.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
