@@ -2473,7 +2473,6 @@ static void render_settings_panel(gui_app_t *app) {
     bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
     bool settings_ddd_mode = false;
-    bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
     bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -6913,7 +6912,6 @@ void gui_handle_interactions(gui_app_t *app) {
             bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
             bool settings_ddd_mode = false;
-            bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
             bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -6922,11 +6920,16 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
             bool settings_b_disabled = settings_ddd_mode || settings_fx3_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
             bool settings_b_controls_disabled = settings_b_disabled || !app->settings.capture_b;
+            float settings_non_cxadc_base_rate_a_khz = 40000.0f;
+#ifdef ENABLE_DDD
+            if (settings_ddd_v1_mode) {
+                settings_non_cxadc_base_rate_a_khz =
+                    (float)ddd_sample_rate_khz(app->settings.ddd_decimation);
+            }
+#endif
             float settings_base_rate_a_khz = settings_cxadc_mode
                 ? gui_ui_cxadc_base_rate_khz(app, 0)
-                : (settings_ddd_v1_mode
-                    ? (float)ddd_sample_rate_khz(app->settings.ddd_decimation)
-                    : 40000.0f);
+                : settings_non_cxadc_base_rate_a_khz;
             float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
             if (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton"))) {
                 app->settings_panel_open = false;
