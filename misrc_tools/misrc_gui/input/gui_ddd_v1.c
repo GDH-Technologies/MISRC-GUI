@@ -275,7 +275,11 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
     size_t match_count = 0;
     int result;
 
-    if (!app || !stable_usb_path || !stable_usb_path[0]) return -1;
+    if (!app) return -1;
+    if (!stable_usb_path || !stable_usb_path[0]) {
+        gui_app_set_status(app, "Selected DdD USB path is unavailable");
+        return -1;
+    }
     if (gui_ddd_async_global_quarantine_active()) {
         gui_app_set_status(app, "DdD USB safety lock active; restart MISRC");
         return -1;
@@ -289,9 +293,13 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
 #else
     result = libusb_init(&s_context);
 #endif
-    if (result != 0) return -1;
+    if (result != 0) {
+        gui_app_set_status(app, "Failed to initialize DdD USB access");
+        return -1;
+    }
     device_count = libusb_get_device_list(s_context, &devices);
     if (device_count < 0) {
+        gui_app_set_status(app, "Failed to enumerate DdD USB devices");
         ddd_v1_close();
         return -1;
     }
@@ -313,6 +321,8 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
     if (match_count != 1 || !selected) {
         fprintf(stderr, "[DdD 3.1] Exact USB path match count was %zu\n",
                 match_count);
+        gui_app_set_status(app,
+                           "Selected DdD device is no longer at its USB path");
         libusb_free_device_list(devices, 1);
         ddd_v1_close();
         return -1;
@@ -321,14 +331,14 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
         enum libusb_speed speed = libusb_get_device_speed(selected);
         if (!ddd_v1_link_speed_allowed(speed != LIBUSB_SPEED_UNKNOWN,
                                        speed >= LIBUSB_SPEED_SUPER)) {
-            gui_app_set_status(app, "DdD 3.1 requires USB 3 SuperSpeed");
+            gui_app_set_status(app, "DdD requires USB 3 SuperSpeed");
             libusb_free_device_list(devices, 1);
             ddd_v1_close();
             return -1;
         }
     }
     if (!ddd_v1_find_exact_endpoint(selected)) {
-        gui_app_set_status(app, "DdD 3.1 USB stream descriptor mismatch");
+        gui_app_set_status(app, "DdD USB stream descriptor mismatch");
         libusb_free_device_list(devices, 1);
         ddd_v1_close();
         return -1;
@@ -336,7 +346,7 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
     result = libusb_open(selected, &s_handle);
     libusb_free_device_list(devices, 1);
     if (result != 0 || !s_handle) {
-        gui_app_set_status(app, "Failed to open DdD 3.1 device");
+        gui_app_set_status(app, "Failed to open DdD device");
         ddd_v1_close();
         return -1;
     }
@@ -345,7 +355,7 @@ int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
 #endif
     result = libusb_claim_interface(s_handle, DDD_STREAM_INTERFACE_NUMBER);
     if (result != 0) {
-        gui_app_set_status(app, "Failed to claim DdD 3.1 USB interface");
+        gui_app_set_status(app, "Failed to claim DdD USB interface");
         ddd_v1_close();
         return -1;
     }
@@ -513,7 +523,15 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     bool display_started = false;
     thrd_t thread;
 
-    if (!app || !s_handle || !ddd_decimation_is_supported(decimation)) return -1;
+    if (!app) return -1;
+    if (!s_handle) {
+        gui_app_set_status(app, "DdD device is not open");
+        return -1;
+    }
+    if (!ddd_decimation_is_supported(decimation)) {
+        gui_app_set_status(app, "Invalid DdD hardware rate");
+        return -1;
+    }
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
     atomic_store(&app->total_samples, 0);
     atomic_store(&app->samples_a, 0);
@@ -544,6 +562,7 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     app->display_samples_available_a = 0;
     app->display_samples_available_b = 0;
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF) != 0) {
+        gui_app_set_status(app, "Failed to initialize DdD capture buffer");
         ddd_v1_close();
         return -1;
     }
@@ -551,6 +570,7 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     app->is_capturing = true;
     if (gui_extract_start(app) < 0) {
         app->is_capturing = false;
+        gui_app_set_status(app, "Failed to start DdD extraction");
         ddd_v1_close();
         return -1;
     }
@@ -571,8 +591,8 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
         ddd_v1_stop_workers(app, display_started);
         ddd_v1_close();
         gui_app_set_status(app, unsafe
-            ? "DdD 3.1 rollback failed; unplug and reconnect it"
-            : "DdD 3.1 configuration/readback failed");
+            ? "DdD rollback failed; unplug and reconnect it"
+            : "DdD configuration/readback failed");
         return -1;
     }
     ddd_sequence_validator_init(&s_sequence);
@@ -581,13 +601,19 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     atomic_store(&app->ddd_running, true);
     if (thrd_create_with_priority(&thread, ddd_v1_capture_thread, app,
                                   THRD_PRIORITY_CRITICAL) != thrd_success) {
+        bool rollback_failed;
         atomic_store(&app->ddd_running, false);
         app->is_capturing = false;
         ddd_v1_stop_workers(app, display_started);
-        if (ddd_collection_rollback_v1(&ops, &s_collection) != DDD_PROTOCOL_OK) {
+        rollback_failed = ddd_collection_rollback_v1(
+            &ops, &s_collection) != DDD_PROTOCOL_OK;
+        if (rollback_failed) {
             ddd_v1_lock_active_path("thread-start rollback failed");
         }
         ddd_v1_close();
+        gui_app_set_status(app, rollback_failed
+            ? "DdD thread-start rollback failed; unplug and reconnect it"
+            : "Failed to start DdD capture thread");
         return -1;
     }
     app->ddd_thread = (void *)(uintptr_t)thread;
@@ -603,12 +629,12 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
                 s_collection.identity, sizeof(s_collection.identity),
                 commit, sizeof(commit));
             snprintf(message, sizeof(message),
-                     "DdD 3.1 capture started (path=%s, %u MSPS, test=%s, gateware=%s)",
+                     "DdD protocol v1 capture started (path=%s, %u MSPS, test=%s, gateware=%s)",
                      s_usb_path, (unsigned)(s_sample_rate_hz / 1000000u),
                      test_mode ? "on" : "off", commit[0] ? commit : "n/a");
             gui_record_log_capture_event(app, "INFO", message,
                                          GUI_ERROR_CLASS_NONE, 0);
-            gui_app_set_status(app, "DdD 3.1 capture running");
+            gui_app_set_status(app, "DdD capture running");
             return 0;
         }
         if (atomic_load(&s_startup_failed) ||
@@ -620,14 +646,24 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     thrd_join(thread, NULL);
     app->ddd_thread = NULL;
     ddd_v1_stop_workers(app, display_started);
+    bool restart_required = false;
+    bool replug_required = false;
     if (!ddd_v1_sync_control_allowed()) {
+        restart_required = true;
         ddd_v1_lock_active_path("startup callbacks remained unreaped");
     } else if (ddd_collection_rollback_v1(&ops, &s_collection) !=
                DDD_PROTOCOL_OK) {
+        replug_required = true;
         ddd_v1_lock_active_path("readiness rollback failed");
     }
     ddd_v1_close();
-    gui_app_set_status(app, "DdD 3.1 stream did not become ready");
+    if (restart_required || gui_ddd_async_global_quarantine_active()) {
+        gui_app_set_status(app, "DdD USB callbacks unverified; restart MISRC");
+    } else {
+        gui_app_set_status(app, replug_required
+            ? "DdD stream cleanup failed; unplug and reconnect it"
+            : "DdD stream did not become ready");
+    }
     return -1;
 }
 
@@ -663,9 +699,13 @@ void gui_ddd_v1_stop(gui_app_t *app)
             ddd_v1_result_name(s_result));
     ddd_v1_close();
     atomic_store(&app->stream_synced, false);
-    gui_app_set_status(app, unsafe
-        ? "DdD 3.1 stop unverified; unplug and reconnect it"
-        : "DdD 3.1 capture stopped");
+    if (gui_ddd_async_global_quarantine_active()) {
+        gui_app_set_status(app, "DdD USB callbacks unverified; restart MISRC");
+    } else {
+        gui_app_set_status(app, unsafe
+            ? "DdD stop unverified; unplug and reconnect it"
+            : "DdD capture stopped");
+    }
 }
 
 bool gui_ddd_v1_is_active(void)

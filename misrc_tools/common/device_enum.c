@@ -323,7 +323,7 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
                              "Domesday Duplicator (legacy firmware)");
                 } else if (profile == DDD_DEVICE_PROTOCOL_V1) {
                     snprintf(dev->name, sizeof(dev->name),
-                             "Domesday Duplicator (firmware 3.1)");
+                             "Domesday Duplicator");
                 } else {
                     snprintf(dev->name, sizeof(dev->name),
                              "Domesday Duplicator (unsupported protocol %u)",

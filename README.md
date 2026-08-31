@@ -13,7 +13,7 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 - CXADC (single cards and Clockgen Mod with sound)
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
-- DdD (DomesDay Duplicator; legacy firmware and firmware 3.1 profiles)
+- DdD (DomesDay Duplicator; legacy and protocol-v1 firmware profiles)
 - FX3ADC (100mhz MUSE capture device)
 
 ## Downloads
@@ -29,11 +29,12 @@ x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported an
 
 Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
-DdD firmware 3.1 is shown as a separate device profile from legacy DdD
-firmware. Its RF rate selector uses the native 40 and 20 MSPS hardware paths;
-lower output rates use the 20 MSPS hardware stream as the source for the
-existing software resampler. This routing applies only to the protocol-v1 DdD
-profile. Other capture devices keep their existing rate controls and behavior.
+DdD protocol-v1 firmware, introduced in firmware 3.1, is shown as a separate
+device profile from legacy DdD firmware. Its RF rate selector uses the native
+40 and 20 MSPS hardware paths; lower output rates use the 20 MSPS hardware
+stream as the source for the existing software resampler. This routing applies
+only to the protocol-v1 DdD profile. Other capture devices keep their existing
+rate controls and behavior.
 
 
 ## Setup With Devices

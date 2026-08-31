@@ -1958,7 +1958,9 @@ int gui_app_start_capture(gui_app_t *app) {
             ? gui_ddd_v1_open(app, dev->ddd_usb_path)
             : gui_ddd_open(app, dev->index);
         if (r < 0) {
-            gui_app_set_status(app, "Failed to open DdD device");
+            if (dev->ddd_profile != DDD_DEVICE_PROTOCOL_V1) {
+                gui_app_set_status(app, "Failed to open DdD device");
+            }
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
