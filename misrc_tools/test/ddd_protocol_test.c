@@ -84,6 +84,9 @@ static bool test_profiles_and_rates(void)
     CHECK(!ddd_profile_supports_decimation(DDD_DEVICE_LEGACY, 2));
     CHECK(ddd_profile_supports_decimation(DDD_DEVICE_PROTOCOL_V1, 1));
     CHECK(ddd_profile_supports_decimation(DDD_DEVICE_PROTOCOL_V1, 2));
+    CHECK(!ddd_profile_requires_usb_path(DDD_DEVICE_LEGACY));
+    CHECK(ddd_profile_requires_usb_path(DDD_DEVICE_PROTOCOL_V1));
+    CHECK(!ddd_profile_requires_usb_path(DDD_DEVICE_UNSUPPORTED));
     CHECK(ddd_sample_rate_hz(1) == 40000000u);
     CHECK(ddd_sample_rate_hz(2) == 20000000u);
     CHECK(ddd_sample_rate_hz(3) == 0);

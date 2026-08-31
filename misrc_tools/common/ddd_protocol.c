@@ -84,6 +84,11 @@ bool ddd_profile_can_capture(ddd_device_profile_t profile)
            profile == DDD_DEVICE_PROTOCOL_V1;
 }
 
+bool ddd_profile_requires_usb_path(ddd_device_profile_t profile)
+{
+    return profile == DDD_DEVICE_PROTOCOL_V1;
+}
+
 void ddd_profile_index_state_init(ddd_profile_index_state_t *state)
 {
     if (state) memset(state, 0, sizeof(*state));

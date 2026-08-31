@@ -339,8 +339,10 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
                             port_count, dev->ddd_usb_path,
                             sizeof(dev->ddd_usb_path))) {
                         dev->ddd_usb_path[0] = '\0';
-                        dev->ddd_capture_supported = false;
-                        enumeration_complete = false;
+                        if (ddd_profile_requires_usb_path(profile)) {
+                            dev->ddd_capture_supported = false;
+                            enumeration_complete = false;
+                        }
                     }
                 }
 

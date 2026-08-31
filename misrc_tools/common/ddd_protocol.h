@@ -70,6 +70,7 @@ ddd_device_profile_t ddd_classify_device(uint16_t vendor_id,
                                          uint16_t product_id,
                                          uint16_t bcd_device);
 bool ddd_profile_can_capture(ddd_device_profile_t profile);
+bool ddd_profile_requires_usb_path(ddd_device_profile_t profile);
 
 typedef struct ddd_profile_index_state {
     int legacy_count;
