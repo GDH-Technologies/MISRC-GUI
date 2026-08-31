@@ -597,6 +597,12 @@ void gui_app_set_status(gui_app_t *app, const char *message);
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
+// Override the settings file path (e.g. from --config <path>). When set,
+// gui_settings_load/save use this path instead of the platform default.
+void gui_settings_set_override_path(const char *path);
+// True when a --config override path is active (so startup logic can
+// respect the config instead of forcing defaults like Local mode).
+bool gui_settings_override_active(void);
 const char* gui_settings_get_desktop_path(void);
 
 // Best-effort folder picker for output_path. Returns true if changed.

@@ -81,10 +81,12 @@ static void print_usage(const char *program_name) {
     fprintf(stdout,
             "MISRC GUI %s\n"
             "Usage:\n"
-            "  %s [--help] [--version] [--smoke-test] [--debug-view]\n"
+            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>]\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
+            "--config <path> loads settings from <path> instead of the default\n"
+            "           location (useful for automated GUI testing).\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -393,6 +395,7 @@ int main(int argc, char **argv) {
     bool show_version = false;
     bool smoke_test = false;
     bool has_capture_arg = false;
+    const char *config_path = NULL;  /* --config <path> override */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
@@ -413,6 +416,16 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--debug-view") == 0) {
             debug_view = true;
+            continue;
+        }
+        if (strcmp(a, "--config") == 0) {
+            // --config <path>: load settings from <path> instead of the
+            // platform default. Consumes the next arg. Recognized as a GUI
+            // flag so it is NOT treated as a capture arg (which would route
+            // the process into headless CLI capture mode).
+            if (i + 1 < argc) {
+                config_path = argv[++i];
+            }
             continue;
         }
         has_capture_arg = true;
@@ -468,7 +481,10 @@ int main(int argc, char **argv) {
     // Initialize sample rate early (before any capture/rendering can occur)
     atomic_store(&app.sample_rate, DEFAULT_SAMPLE_RATE);
 
-    // Load persistent settings (includes desktop path defaults)
+    // Load persistent settings (includes desktop path defaults). If --config
+    // <path> was passed, load from that file instead of the platform default
+    // so automated tests can launch the GUI with a pre-written config.
+    gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
 

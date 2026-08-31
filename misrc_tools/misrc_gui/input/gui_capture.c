@@ -1210,8 +1210,22 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->net_connected, false);
     atomic_store(&app->net_error, false);
     gui_net_init_globals();
-    app->settings.net_mode = GUI_NET_MODE_LOCAL;
-    gui_settings_save(&app->settings);
+    // Stock loadup is always Local (net_mode is a per-session setting, NOT
+    // resumed from saved settings) so a restart never auto-resumes a
+    // server/client state that may be stale or broken. The user re-enables
+    // Server/Client from the info page each session.
+    // EXCEPTION: when launched with --config <path> (automated testing),
+    // respect the config's net_mode instead of forcing Local.
+    if (!gui_settings_override_active()) {
+        app->settings.net_mode = GUI_NET_MODE_LOCAL;
+        gui_settings_save(&app->settings);
+    }
+    // If the loaded config requests Server or Client mode (e.g. via --config
+    // for automated testing), start that mode now. Normal stock loadup is Local
+    // (handled above) so this is a no-op for the default case.
+    if (app->settings.net_mode != GUI_NET_MODE_LOCAL) {
+        (void)gui_net_apply_mode(app);
+    }
 
     // Set app for text rendering
     gui_text_set_app(app);

@@ -82,11 +82,31 @@ static bool gui_settings_ensure_parent_dirs(const char *file_path) {
     return true;
 }
 
+// Optional override path for the settings file, set via --config <path> on
+// the GUI command line. When non-NULL, gui_settings_load/save use this path
+// instead of the platform-default location. This makes automated GUI testing
+// easy: launch the GUI with a pre-written config (e.g. Server mode + port)
+// without touching the user's real settings.
+static const char *s_override_settings_path = NULL;
+
+void gui_settings_set_override_path(const char *path) {
+    s_override_settings_path = (path && path[0]) ? path : NULL;
+}
+
+bool gui_settings_override_active(void) {
+    return s_override_settings_path != NULL;
+}
+
 // Settings file location
 static const char* get_settings_file_path(void) {
     static char settings_path[512];
     static bool initialized = false;
     
+    if (s_override_settings_path && s_override_settings_path[0]) {
+        // --config <path> override: use it directly (no platform logic).
+        snprintf(settings_path, sizeof(settings_path), "%s", s_override_settings_path);
+        return settings_path;
+    }
     if (!initialized) {
 #if defined(__ANDROID__)
         // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
