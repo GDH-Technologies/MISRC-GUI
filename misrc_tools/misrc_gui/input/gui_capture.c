@@ -42,6 +42,7 @@
 #endif
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
+#include "../net/gui_net.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
 #if defined(_WIN32)
@@ -987,6 +988,13 @@ void gui_capture_callback(void *data_info_ptr) {
     // Signal that new data is available (data events are managed by buffer manager)
     bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
 
+    // Server-mode data tap: fan out raw RF (+ audio) to any connected clients.
+    // No-op (cheap early-out) when not running the network server or no clients.
+    gui_net_tap_rf(app, buf_out, result.stream0_bytes);
+    if (buf_out_audio) {
+        gui_net_tap_audio(app, buf_out_audio, result.stream1_bytes);
+    }
+
     if (s_callback_count <= 3 && misrc_debug_enabled()) {
         fprintf(stderr, "[CB] Wrote %zu bytes to ringbuffer\n", result.stream0_bytes);
     }
@@ -1186,12 +1194,35 @@ void gui_app_init(gui_app_t *app) {
         }
     }
 
+    // Server/Client networking: init globals (WSAStartup/SIGPIPE). Stock
+    // loadup is always Local (net_mode is a per-session setting, NOT resumed
+    // from saved settings) so a restart never auto-resumes a server/client
+    // state that may be stale or broken. The user re-enables Server/Client
+    // from the info page each session.
+    // Net control atomics are zero-init by the {0} app initializer; explicit
+    // stores here keep intent clear.
+    atomic_store(&app->net_cmd_start, false);
+    atomic_store(&app->net_cmd_stop, false);
+    atomic_store(&app->net_cmd_record_on, false);
+    atomic_store(&app->net_cmd_record_off, false);
+    atomic_store(&app->net_cmd_select_device, false);
+    atomic_store(&app->net_cmd_device_index, 0);
+    atomic_store(&app->net_connected, false);
+    atomic_store(&app->net_error, false);
+    gui_net_init_globals();
+    app->settings.net_mode = GUI_NET_MODE_LOCAL;
+    gui_settings_save(&app->settings);
+
     // Set app for text rendering
     gui_text_set_app(app);
 }
 
 // Cleanup application
 void gui_app_cleanup(gui_app_t *app) {
+    // Stop any active server/client networking first (joins worker/pump threads).
+    gui_net_stop(app);
+    gui_net_cleanup_globals();
+
     if (app->is_capturing) {
         gui_app_stop_capture(app);
     }
@@ -1726,6 +1757,15 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 // Start capture (+60ln from orig adding upstream callbk)
 int gui_app_start_capture(gui_app_t *app) {
     fprintf(stderr, "[GUI] gui_app_start_capture called\n");
+
+    // Client mode (network slave): forward the request to the server instead
+    // of opening local hardware. The worker thread drains the flag and sends
+    // GET /start; the client ingest then mirrors the server's capture state.
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_start(app);
+        gui_net_set_status(app, "Requested capture start on server");
+        return 0;
+    }
 
     if (app->is_capturing) {
         fprintf(stderr, "[GUI] Already capturing\n");
@@ -2379,6 +2419,14 @@ int gui_app_capture_busy(void)
 
 // Stop capture
 void gui_app_stop_capture(gui_app_t *app) {
+    // Client mode: forward stop to the server. The client ingest stops itself
+    // when the server reports idle, so we do not tear down locally here.
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_stop(app);
+        gui_net_set_status(app, "Requested capture stop on server");
+        return;
+    }
+
     if (!app->is_capturing) {
         return;
     }
@@ -2530,10 +2578,22 @@ void gui_app_stop_capture(gui_app_t *app) {
 
 // Recording wrappers - delegate to gui_record module
 int gui_app_start_recording(gui_app_t *app) {
+    // Client mode: forward record-on to the server (master controls recording).
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_record(app, true);
+        gui_net_set_status(app, "Requested record start on server");
+        return 0;
+    }
     return gui_record_start(app);
 }
 
 void gui_app_stop_recording(gui_app_t *app) {
+    // Client mode: forward record-off to the server.
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_record(app, false);
+        gui_net_set_status(app, "Requested record stop on server");
+        return;
+    }
     gui_record_stop(app);
 }
 

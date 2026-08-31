@@ -12,6 +12,7 @@
 #include "gui_ui.h"
 #include "../signal/gui_cvbs.h"
 #include "../output/gui_record.h"
+#include "../net/gui_net.h"
 #include <string.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -103,17 +104,27 @@ static bool handle_device_dropdown(gui_app_t *app) {
         for (int i = 0; i < app->device_count; i++) {
             if (Clay_PointerOver(CLAY_IDI("DeviceOption", i))) {
                 if (i != app->selected_device) {
-                    // Switch to a different device - stop current and start new
-                    bool was_capturing = app->is_capturing;
-                    if (was_capturing) {
-                        gui_app_stop_capture(app);
-                    }
-                    app->selected_device = i;
-                    gui_ui_sync_capture_mode_state(app);
-                    app->reconnect_pending = false;
-                    app->reconnect_attempts = 0;
-                    if (was_capturing) {
-                        gui_app_start_capture(app);
+                    // Client mode: the dropdown lists the server's (mirrored)
+                    // devices. Forward the selection to the server; the client
+                    // never opens local hardware. The server's resulting state
+                    // is mirrored back via /stats.
+                    if (gui_net_is_client(app)) {
+                        app->selected_device = i;
+                        gui_net_client_request_device(app, i);
+                        gui_net_set_status(app, "Requested device change on server");
+                    } else {
+                        // Switch to a different device - stop current and start new
+                        bool was_capturing = app->is_capturing;
+                        if (was_capturing) {
+                            gui_app_stop_capture(app);
+                        }
+                        app->selected_device = i;
+                        gui_ui_sync_capture_mode_state(app);
+                        app->reconnect_pending = false;
+                        app->reconnect_attempts = 0;
+                        if (was_capturing) {
+                            gui_app_start_capture(app);
+                        }
                     }
                 }
                 gui_dropdown_close_all();

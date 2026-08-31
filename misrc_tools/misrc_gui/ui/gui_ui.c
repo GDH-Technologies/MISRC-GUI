@@ -18,6 +18,7 @@
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
+#include "../net/gui_net.h"
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
@@ -423,6 +424,9 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
     UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
+    UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
+    UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
+    UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
 } ui_text_field_t;
 
 // Unified cursor-based text editing state (settings panel)
@@ -1868,6 +1872,18 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.ingest_notes;
             *cap = sizeof(app->settings.ingest_notes);
             return true;
+        case UI_TEXT_FIELD_NET_SERVER_PORT:
+            *dst = app->settings.net_server_port_str;
+            *cap = sizeof(app->settings.net_server_port_str);
+            return true;
+        case UI_TEXT_FIELD_NET_CLIENT_HOST:
+            *dst = app->settings.net_client_host;
+            *cap = sizeof(app->settings.net_client_host);
+            return true;
+        case UI_TEXT_FIELD_NET_CLIENT_PORT:
+            *dst = app->settings.net_client_port_str;
+            *cap = sizeof(app->settings.net_client_port_str);
+            return true;
         default:
             return false;
     }
@@ -1893,6 +1909,13 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_INGEST_LOCATION ||
         field == UI_TEXT_FIELD_INGEST_NOTES) {
         return s_metadata_window_open;
+    }
+    // Network fields live in the info ("About") window and are editable while
+    // that window is open, independent of the settings panel / recording lock.
+    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+        field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+        return s_version_info_window_open;
     }
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
@@ -1955,6 +1978,15 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
     if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
         // Frequency in Hz: digits only (parsed to uint64 on commit).
         return (ch >= '0' && ch <= '9');
+    }
+    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+        // TCP port: digits only.
+        return (ch >= '0' && ch <= '9');
+    }
+    if (field == UI_TEXT_FIELD_NET_CLIENT_HOST) {
+        // Hostname or IP: allow printable ASCII except quote (JSON-safe).
+        return (ch >= 32 && ch < 127 && ch != '\"');
     }
     if (ch < 32 || ch >= 127) {
         return false;
@@ -3508,9 +3540,12 @@ static void render_version_info_window(gui_app_t *app)
 {
     if (!s_version_info_window_open) return;
 
-    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 460);
-    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 380);
-    int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
+    // Widened from 460/380 to fit the Network (Server/Client) section without
+    // clipping the discovered-server rows / helper text. Kept moderate so the
+    // header Download button stays in place.
+    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 560);
+    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 460);
+    int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 820);
 
     static char vi_version[64];
     static char vi_state[24];
@@ -3848,6 +3883,192 @@ static void render_version_info_window(gui_app_t *app)
                 }
                 CLAY_TEXT(CLAY_STRING("max buffer RAM (1/2/4/8/16 GB; applies when idle)"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Network (Server/Client) section. Stock mode is Local (no networking).
+        // Server hosts the HTTP control + RF/audio stream; Client connects to a
+        // host and mirrors its device list/controls/capture state (master/slave).
+        // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
+        CLAY_TEXT(CLAY_STRING("Network (Server/Client):"),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
+
+        {
+            int mode = app->settings.net_mode;
+            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_CLIENT) mode = GUI_NET_MODE_LOCAL;
+            const char *mode_label = gui_net_mode_name(mode);
+            Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
+            CLAY(CLAY_ID("VersionInfoNetModeRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetModeLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Mode:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(mode_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(mode_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY_TEXT(CLAY_STRING("click to cycle Local / Server / Client"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Server: port field.
+        if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
+            CLAY(CLAY_ID("VersionInfoNetServerPortRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetServerPortLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Port:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoNetServerPortField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 6, 6, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *pv = app->settings.net_server_port_str[0] ? app->settings.net_server_port_str : "8080";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_SERVER_PORT)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_SERVER_PORT, pv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(pv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING("TCP port to listen on (LAN only, no auth)"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Client: discovered-server list (primary) + compact manual host:port fallback.
+        if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+            CLAY_TEXT(CLAY_STRING("Discovered servers:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            {
+                int disc_n = gui_net_discovered_count();
+                if (disc_n <= 0) {
+                    CLAY_TEXT(CLAY_STRING("Scanning for servers on the LAN..."),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                } else {
+                    for (int i = 0; i < disc_n; i++) {
+                        char dhost[64] = {0};
+                        uint16_t dport = 0;
+                        char dname[64] = {0};
+                        if (!gui_net_get_discovered(i, dhost, sizeof(dhost), &dport, dname, sizeof(dname))) break;
+                        static char disc_label[160];
+                        if (dname[0]) {
+                            snprintf(disc_label, sizeof(disc_label), "%s:%u  (%s)", dhost, (unsigned)dport, dname);
+                        } else {
+                            snprintf(disc_label, sizeof(disc_label), "%s:%u", dhost, (unsigned)dport);
+                        }
+                        bool sel = (strcmp(app->settings.net_client_host, dhost) == 0 &&
+                                    app->settings.net_client_port == dport);
+                        Color item_bg = sel ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        /* Compact row: fit the "ip:port (name)" text width (capped)
+                         * instead of growing to the full window width, so the
+                         * list reads as a normal IPv4+port line of info. */
+                        CLAY(CLAY_IDI("VersionInfoNetDiscItem", i), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 320), CLAY_SIZING_FIXED(26) },
+                                .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                                .padding = { 8, 8, 0, 0 }
+                            },
+                            .backgroundColor = to_clay_color(item_bg),
+                            .cornerRadius = CLAY_CORNER_RADIUS(4)
+                        }) {
+                            CLAY_TEXT(make_string(disc_label),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+                    CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+            }
+            // Compact manual host:port fallback (fixed widths so the window stays narrow).
+            CLAY(CLAY_ID("VersionInfoNetClientManualRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetClientHostField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 8, 8, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *hv = app->settings.net_client_host[0] ? app->settings.net_client_host : "host";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_CLIENT_HOST)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_CLIENT_HOST, hv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(hv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(hv[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING(":"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                CLAY(CLAY_ID("VersionInfoNetClientPortField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 6, 6, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *pv = app->settings.net_client_port_str[0] ? app->settings.net_client_port_str : "8080";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_CLIENT_PORT)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_CLIENT_PORT, pv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(pv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+                // Connect button: (re)applies client mode with the current
+                // host:port, giving explicit control instead of only connecting
+                // on mode-cycle / discovered-server click.
+                bool net_connected = gui_net_active(app);
+                Color connect_bg = net_connected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                const char *connect_label = net_connected ? "Reconnect" : "Connect";
+                CLAY(CLAY_ID("VersionInfoNetConnectButton"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(connect_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(connect_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+            }
+        }
+
+        // Network status line.
+        {
+            static char net_status[160];
+            gui_net_status_string(app, net_status, sizeof(net_status));
+            CLAY(CLAY_ID("VersionInfoNetStatusRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetStatusLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Status:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY_TEXT(make_string(net_status),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
             }
         }
 
@@ -6149,8 +6370,19 @@ void gui_handle_interactions(gui_app_t *app) {
          s_active_text_field == UI_TEXT_FIELD_INGEST_OPERATOR ||
          s_active_text_field == UI_TEXT_FIELD_INGEST_LOCATION ||
          s_active_text_field == UI_TEXT_FIELD_INGEST_NOTES);
+    // Network (Server/Client) fields live in the info ("About") window.
+    bool net_text_field_active =
+        (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+         s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+         s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT);
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
+    } else if (net_text_field_active && s_version_info_window_open &&
+               !s_record_limit_window_open && !s_metadata_window_open) {
+        gui_ui_handle_active_text_edit(app);
+        // Persist on each edit so the port/host survives a mode apply triggered
+        // elsewhere; the string mirror is the source of truth while editing.
+        gui_settings_save(&app->settings);
     } else if (metadata_text_field_active && s_metadata_window_open &&
                !s_record_limit_window_open && !s_version_info_window_open) {
         gui_ui_handle_active_text_edit(app);
@@ -6435,8 +6667,80 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            // Network (Server/Client) mode cycle: Local -> Server -> Client -> Local.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
+                int cur = app->settings.net_mode;
+                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
+                int next = (cur == GUI_NET_MODE_LOCAL) ? GUI_NET_MODE_SERVER
+                         : (cur == GUI_NET_MODE_SERVER) ? GUI_NET_MODE_CLIENT
+                         : GUI_NET_MODE_LOCAL;
+                app->settings.net_mode = next;
+                gui_ui_clear_text_edit();
+                gui_settings_save(&app->settings);
+                (void)gui_net_apply_mode(app);
+                // Returning to Local restores the local hardware device list
+                // (client mode had replaced it with the server's mirrored list).
+                if (next == GUI_NET_MODE_LOCAL) {
+                    gui_app_enumerate_devices(app);
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click a discovered server to connect to it (client mode).
+            if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                int disc_n = gui_net_discovered_count();
+                for (int i = 0; i < disc_n; i++) {
+                    if (Clay_PointerOver(CLAY_IDI("VersionInfoNetDiscItem", i))) {
+                        gui_ui_clear_text_edit();
+                        gui_net_select_discovered(app, i);
+                        gui_ui_set_click_consumed();
+                        return;
+                    }
+                }
+            }
+            // Connect button: (re)apply client mode with the current host:port.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetConnectButton")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_clear_text_edit();
+                gui_settings_save(&app->settings);
+                (void)gui_net_apply_mode(app);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the server port field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetServerPortField")) &&
+                app->settings.net_mode == GUI_NET_MODE_SERVER) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_SERVER_PORT,
+                                       CLAY_ID("VersionInfoNetServerPortField"), 6.0f, 6.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the client host field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientHostField")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_HOST,
+                                       CLAY_ID("VersionInfoNetClientHostField"), 8.0f, 8.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the client port field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientPortField")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_PORT,
+                                       CLAY_ID("VersionInfoNetClientPortField"), 6.0f, 6.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCloseButton"))) {
                 s_version_info_window_open = false;
+                // Commit any in-progress net field edit on close.
+                if (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+                    s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+                    s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+                    gui_ui_clear_text_edit();
+                    gui_settings_save(&app->settings);
+                    (void)gui_net_apply_mode(app);
+                }
                 gui_ui_set_click_consumed();
                 return;
             }

@@ -336,6 +336,16 @@ typedef struct {
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
     char playback_file_b[MAX_FILENAME_LEN];   // FLAC file for channel B playback
+
+    // Server/Client networking (cxadc_vhs_server-style peer mode).
+    // net_mode: 0=Local (default, no networking), 1=Server (host/master),
+    // 2=Client (connect to a host server, slave).
+    int  net_mode;
+    uint16_t net_server_port;                 // Port to listen on when Server.
+    char net_server_port_str[16];             // Editable string mirror of net_server_port.
+    char net_client_host[128];                // Host to connect to when Client.
+    char net_client_port_str[16];             // Editable string mirror of net_client_port.
+    uint16_t net_client_port;                 // Port to connect to when Client.
 } gui_settings_t;
 
 typedef enum {
@@ -507,6 +517,39 @@ typedef struct gui_app {
     // between UI interactions and the display thread.
     atomic_flag panel_config_lock;
 
+    // Server/Client networking state (opaque; implemented in net/gui_net.c).
+    // NULL when net_mode == Local. Owned by gui_app_t; created/destroyed by
+    // gui_net_apply_mode(). Accessed from the UI/main thread only for control;
+    // the server/client worker threads read gui_app_t atomics + this handle.
+    void *net_state;
+
+    // Net control command queue: HTTP endpoints (server) and the client mirror
+    // thread set these atomic flags; the main loop polls them and executes the
+    // corresponding control action on the main thread (safe, like
+    // dropout_stop_requested). Pending integer arguments follow each flag.
+    atomic_bool net_cmd_start;          // /start requested
+    atomic_bool net_cmd_stop;           // /stop requested
+    atomic_bool net_cmd_record_on;      // /record?on=1 requested
+    atomic_bool net_cmd_record_off;     // /record?on=0 requested
+    atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
+    atomic_int  net_cmd_device_index;   // Device index argument for select_device.
+
+    // Net mirrored state snapshot (written by client mirror thread, read by UI).
+    // Server mode also writes these so the local UI reflects remote-driven state.
+    atomic_int  net_peer_state;         // 0=idle,1=capturing,2=recording
+    atomic_int  net_peer_sample_rate;   // Hz reported by peer /stats.
+    atomic_int  net_peer_device_count;  // device count from peer /devices.
+    atomic_int  net_peer_selected;      // selected_device from peer.
+    atomic_bool net_connected;          // server listening / client connected.
+    atomic_bool net_error;              // last operation failed (see net_status).
+
+    // Dedicated network status line, shown ONLY in the info window's Network
+    // section. Net code writes this via gui_net_set_status() and must NEVER
+    // touch the bottom status bar (app->status_message), which is owned by the
+    // capture/record/device path. This keeps server/client activity from
+    // clobbering the bottom bar.
+    char net_status[160];
+    double net_status_time;  // unused placeholder (mirrors status_message pattern)
 } gui_app_t;
 
 static inline void gui_app_count_parser_errors(gui_app_t *app, uint32_t count) {

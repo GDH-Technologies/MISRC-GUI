@@ -29,6 +29,7 @@
 #include "../ui/gui_popup.h"
 #include "../output/gui_record.h"
 #include "../output/gui_audio.h"
+#include "../net/gui_net.h"
 #include "../../common/threading.h"
 #include "version.h"
 
@@ -755,6 +756,12 @@ int main(int argc, char **argv) {
             ui_zoom_result.passthrough_y * 20.0f
         }, dt);
 
+        // Server/Client networking: execute queued control commands on the
+        // main thread (server), and apply mirrored peer state (client). Both
+        // are no-ops when net_mode == Local.
+        gui_net_poll_commands(&app);
+        gui_net_poll_mirror(&app);
+
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
         if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
             gui_dropout_reason_t reason =
@@ -823,7 +830,10 @@ int main(int argc, char **argv) {
             // starts so the MS2130 has time to complete its initial HDMI/USB sync
             // and deliver the first data callback (first-connect on Windows can
             // take 3-4 seconds before any data arrives).
-            if (app.is_capturing && (now - app.capture_start_time) > 5.0
+            // Client ingest mode is excluded: its data source is the network pump,
+            // not a local hsdaoh device, so the hsdaoh-callback watchdog does not
+            // apply (and must not tear down the ingest or re-enumerate devices).
+            if (app.is_capturing && !gui_net_is_client(&app) && (now - app.capture_start_time) > 5.0
                 && gui_capture_device_timeout(&app, 2000)) {
                 // Device was disconnected unexpectedly - clean up properly
                 fprintf(stderr, "[GUI] Device timeout detected, disconnecting...\n");
