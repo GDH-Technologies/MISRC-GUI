@@ -365,6 +365,21 @@ static inline uint32_t gui_capture_normalize_sample_rate_hz(uint32_t raw_srate)
     return (uint32_t)hz;
 }
 
+#ifdef ENABLE_DDD
+static uint32_t gui_capture_ddd_resample_setting_khz(const gui_app_t *app)
+{
+    float rate_khz;
+    if (!app) return 0;
+    rate_khz = app->settings.resample_rate_a;
+    if (!isfinite(rate_khz) || rate_khz <= 0.0f ||
+        rate_khz > (float)ddd_sample_rate_khz(
+            DDD_DECIMATION_FULL_RATE) + 0.5f) {
+        return 0;
+    }
+    return (uint32_t)lroundf(rate_khz);
+}
+#endif
+
 static inline void gui_capture_update_backpressure_counters(gui_app_t *app)
 {
     if (!app) return;
@@ -1912,6 +1927,7 @@ int gui_app_start_capture(gui_app_t *app) {
 #ifdef ENABLE_DDD
     // Handle DdD device
     if (dev->type == DEVICE_TYPE_DDD) {
+        ddd_v1_rate_plan_t v1_rate_plan = {0};
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
         // gui_ddd_start() launches extraction internally; declare A-only mode
@@ -1922,6 +1938,19 @@ int gui_app_start_capture(gui_app_t *app) {
             gui_app_set_status(app, "Selected DdD firmware is unsupported");
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
+        }
+        if (dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1) {
+            uint32_t output_rate_khz =
+                ddd_v1_effective_output_rate_khz(
+                    app->settings.enable_resample_a,
+                    gui_capture_ddd_resample_setting_khz(app),
+                    app->settings.ddd_decimation);
+            if (!ddd_v1_plan_output_rate_khz(
+                    output_rate_khz, &v1_rate_plan)) {
+                gui_app_set_status(app, "Invalid DdD RF rate settings");
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+                return -1;
+            }
         }
         // Legacy and firmware 3.1 deliberately use separate backends. Only
         // the firmware-3.1 profile sees B5/B7/B8 or the async queue.
@@ -1934,7 +1963,7 @@ int gui_app_start_capture(gui_app_t *app) {
             return -1;
         }
         int ddd_rc = dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1
-            ? gui_ddd_v1_start(app, app->settings.ddd_decimation,
+            ? gui_ddd_v1_start(app, v1_rate_plan.decimation_factor,
                                gui_ddd_get_test_mode())
             : gui_ddd_start(app);
         if (ddd_rc == 0) {

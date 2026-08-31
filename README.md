@@ -30,10 +30,10 @@ x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported an
 Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
 DdD firmware 3.1 is shown as a separate device profile from legacy DdD
-firmware. Its ADC rate control selects the native 40 or 20 MSPS hardware rate;
-the existing RF resampler remains an independent optional output setting and
-is limited to the selected native rate. Other capture devices keep their
-existing rate controls and behavior.
+firmware. Its RF rate selector uses the native 40 and 20 MSPS hardware paths;
+lower output rates use the 20 MSPS hardware stream as the source for the
+existing software resampler. This routing applies only to the protocol-v1 DdD
+profile. Other capture devices keep their existing rate controls and behavior.
 
 
 ## Setup With Devices

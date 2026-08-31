@@ -1148,9 +1148,6 @@ static char settings_flac_level_display[64];
 static char settings_flac_threads_display[64];
 static char settings_resample_a_display[32];
 static char settings_resample_b_display[32];
-#ifdef ENABLE_DDD
-static char settings_ddd_rate_display[32];
-#endif
 static char status_sample_rate_display[32];
 static char status_samples_display[32];
 static char status_frames_display[32];
@@ -1678,6 +1675,64 @@ static float cycle_resample_khz(float current_khz, float max_khz) {
     if (idx < 0) return allowed[0];
     return allowed[(idx + 1) % allowed_count];
 }
+
+#ifdef ENABLE_DDD
+static uint32_t gui_ui_ddd_v1_resample_setting_khz(const gui_app_t *app)
+{
+    float rate_khz;
+    if (!app) return 0;
+    rate_khz = app->settings.resample_rate_a;
+    if (!isfinite(rate_khz) || rate_khz <= 0.0f ||
+        rate_khz > (float)ddd_sample_rate_khz(
+            DDD_DECIMATION_FULL_RATE) + 0.5f) {
+        return 0;
+    }
+    return (uint32_t)lroundf(rate_khz);
+}
+
+static bool gui_ui_ddd_v1_rate_plan(const gui_app_t *app,
+                                    ddd_v1_rate_plan_t *plan)
+{
+    uint32_t output_rate_khz;
+    if (!app || !plan) return false;
+    output_rate_khz = ddd_v1_effective_output_rate_khz(
+        app->settings.enable_resample_a,
+        gui_ui_ddd_v1_resample_setting_khz(app),
+        app->settings.ddd_decimation);
+    return ddd_v1_plan_output_rate_khz(output_rate_khz, plan);
+}
+
+static bool gui_ui_set_ddd_v1_output_rate(gui_app_t *app,
+                                          uint32_t output_rate_khz)
+{
+    ddd_v1_rate_plan_t plan;
+    char hardware_label[32];
+    char output_label[32];
+    char message[96];
+
+    if (!app || !ddd_v1_plan_output_rate_khz(output_rate_khz, &plan)) {
+        return false;
+    }
+
+    app->settings.ddd_decimation = plan.decimation_factor;
+    app->settings.enable_resample_a = plan.software_resample;
+    app->settings.resample_rate_a = (float)plan.output_rate_khz;
+    gui_settings_save(&app->settings);
+
+    format_msps_label(hardware_label, sizeof(hardware_label),
+                      (float)plan.hardware_rate_khz);
+    format_msps_label(output_label, sizeof(output_label),
+                      (float)plan.output_rate_khz);
+    if (plan.software_resample) {
+        snprintf(message, sizeof(message), "%s HW -> %s SW",
+                 hardware_label, output_label);
+    } else {
+        snprintf(message, sizeof(message), "DdD: %s HW", output_label);
+    }
+    gui_app_set_status(app, message);
+    return true;
+}
+#endif
 
 static bool gui_ui_flac_affinity_supported(void) {
 #if defined(__linux__)
@@ -2473,6 +2528,7 @@ static void render_settings_panel(gui_app_t *app) {
     bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
     bool settings_ddd_mode = false;
+    bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
     bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -2891,47 +2947,58 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
-                    // Firmware 3.1 exposes its ADC decimation independently
-                    // from the existing optional output resampler. No other
-                    // device sees or reads this control.
-#ifdef ENABLE_DDD
                     if (settings_ddd_v1_mode) {
-                        snprintf(settings_ddd_rate_display,
-                                 sizeof(settings_ddd_rate_display),
-                                 "%u MSPS (native)",
-                                 app->settings.ddd_decimation ==
-                                     DDD_DECIMATION_HALF_RATE ? 20u : 40u);
+                        CLAY_TEXT(CLAY_STRING("RF sample rate:"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+#ifdef ENABLE_DDD
+                        ddd_v1_rate_plan_t rate_plan;
+                        if (!gui_ui_ddd_v1_rate_plan(app, &rate_plan)) {
+                            (void)ddd_v1_plan_output_rate_khz(
+                                ddd_sample_rate_khz(DDD_DECIMATION_FULL_RATE),
+                                &rate_plan);
+                        }
+                        format_msps_label(settings_resample_a_display,
+                                          sizeof(settings_resample_a_display),
+                                          (float)rate_plan.output_rate_khz);
+                        Color ddd_mode_bg = app->is_capturing
+                            ? ui_disabled_color(COLOR_BUTTON_ACTIVE)
+                            : COLOR_BUTTON_ACTIVE;
                         Color ddd_rate_bg = app->is_capturing
                             ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
                         Color ddd_rate_fg = app->is_capturing
                             ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("DddHardwareRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("DdD ADC rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
-                            CLAY(CLAY_ID("DddHardwareRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ddd_rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(settings_ddd_rate_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_rate_fg) }));
+                        Color ddd_path_fg = app->is_capturing
+                            ? ui_disabled_color(COLOR_TEXT_DIM) : COLOR_TEXT_DIM;
+                        CLAY(CLAY_ID("ToggleRowResampleA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY(CLAY_ID("DddRateModeBadge"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ddd_mode_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(rate_plan.software_resample ? CLAY_STRING("SW") : CLAY_STRING("HW"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
                             }
+                            CLAY_TEXT(CLAY_STRING("Output A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
+                            CLAY(CLAY_ID("ResampleRateABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ddd_rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(settings_resample_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_rate_fg) }));
+                            }
+                            CLAY_TEXT(rate_plan.software_resample ? CLAY_STRING("from 20 MSPS HW") : CLAY_STRING("hardware"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_path_fg) }));
                         }
-                    }
 #endif
+                    } else {
+                        CLAY_TEXT(CLAY_STRING("Resample (RF):"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
-                    // Resample section
-                    CLAY_TEXT(CLAY_STRING("Resample (RF):"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY(CLAY_ID("ToggleRowResampleA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color resample_a_toggle_bg = app->settings.enable_resample_a ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            Color resample_a_toggle_fg = COLOR_TEXT;
+                            CLAY(CLAY_ID("ToggleResampleA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(resample_a_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.enable_resample_a ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("Resample A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
 
-                    CLAY(CLAY_ID("ToggleRowResampleA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color resample_a_toggle_bg = app->settings.enable_resample_a ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        Color resample_a_toggle_fg = COLOR_TEXT;
-                        CLAY(CLAY_ID("ToggleResampleA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(resample_a_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.enable_resample_a ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("Resample A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
-
-                        // Rate selector (kHz stored; display MSPS)
-                        format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
-                        Color rate_bg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rate_fg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("ResampleRateABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(settings_resample_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
+                            // Rate selector (kHz stored; display MSPS)
+                            format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
+                            Color rate_bg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                            Color rate_fg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            CLAY(CLAY_ID("ResampleRateABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(settings_resample_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
+                            }
                         }
                     }
 
@@ -6912,6 +6979,7 @@ void gui_handle_interactions(gui_app_t *app) {
             bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
             bool settings_ddd_mode = false;
+            bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
             bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -7014,7 +7082,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_FLAC_AFFINITY, CLAY_ID("FlacAffinityListField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
             }
-            if (Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
+            if (!settings_ddd_v1_mode &&
+                Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
                 bool enable = !app->settings.enable_resample_a;
                 app->settings.enable_resample_a = enable;
                 if (!enable) {
@@ -7022,37 +7091,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
                 gui_settings_save(&app->settings);
             }
-#ifdef ENABLE_DDD
-            if (settings_ddd_v1_mode &&
-                Clay_PointerOver(CLAY_ID("DddHardwareRateBox"))) {
-                if (app->is_capturing) {
-                    gui_app_set_status(app,
-                        "Stop capture before changing the DdD ADC rate");
-                } else {
-                    app->settings.ddd_decimation =
-                        app->settings.ddd_decimation ==
-                            DDD_DECIMATION_FULL_RATE
-                            ? DDD_DECIMATION_HALF_RATE
-                            : DDD_DECIMATION_FULL_RATE;
-                    settings_base_rate_a_khz = (float)ddd_sample_rate_khz(
-                        app->settings.ddd_decimation);
-                    if (app->settings.resample_rate_a >
-                        settings_base_rate_a_khz) {
-                        app->settings.resample_rate_a =
-                            settings_base_rate_a_khz;
-                    }
-                    gui_settings_save(&app->settings);
-                    gui_app_set_status(app,
-                        app->settings.ddd_decimation ==
-                            DDD_DECIMATION_HALF_RATE
-                            ? "DdD 3.1 native ADC rate set to 20 MSPS"
-                            : "DdD 3.1 native ADC rate set to 40 MSPS");
-                }
-            }
-#endif
             if (Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
-                app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
-                gui_settings_save(&app->settings);
+#ifdef ENABLE_DDD
+                if (settings_ddd_v1_mode) {
+                    ddd_v1_rate_plan_t current_plan;
+                    if (app->is_capturing) {
+                        gui_app_set_status(app,
+                            "Stop capture before changing the DdD RF rate");
+                    } else if (!gui_ui_ddd_v1_rate_plan(
+                                   app, &current_plan)) {
+                        gui_app_set_status(app,
+                            "Invalid DdD RF rate settings");
+                    } else {
+                        float next_rate_khz = cycle_resample_khz(
+                            (float)current_plan.output_rate_khz,
+                            (float)ddd_sample_rate_khz(
+                                DDD_DECIMATION_FULL_RATE));
+                        if (!gui_ui_set_ddd_v1_output_rate(
+                                app, (uint32_t)lroundf(next_rate_khz))) {
+                            gui_app_set_status(app,
+                                "Invalid DdD RF rate selection");
+                        }
+                    }
+                } else
+#endif
+                {
+                    app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
+                    gui_settings_save(&app->settings);
+                }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
                 if (settings_b_controls_disabled) {
