@@ -69,6 +69,7 @@ static int mock_transfer(void *context,
 
 static bool test_profiles_and_rates(void)
 {
+    ddd_profile_index_state_t indices;
     CHECK(ddd_classify_device(DDD_LEGACY_VENDOR_ID,
                               DDD_LEGACY_PRODUCT_ID, 0) ==
           DDD_DEVICE_LEGACY);
@@ -89,6 +90,14 @@ static bool test_profiles_and_rates(void)
     CHECK(ddd_v1_link_speed_allowed(false, false));
     CHECK(!ddd_v1_link_speed_allowed(true, false));
     CHECK(ddd_v1_link_speed_allowed(true, true));
+
+    ddd_profile_index_state_init(&indices);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_PROTOCOL_V1) == 0);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_LEGACY) == 0);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_UNSUPPORTED) == 0);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_PROTOCOL_V1) == 1);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_LEGACY) == 1);
+    CHECK(ddd_profile_index_take(&indices, DDD_DEVICE_NOT_DDD) == -1);
     return true;
 }
 

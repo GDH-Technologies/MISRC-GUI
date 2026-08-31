@@ -70,6 +70,17 @@ ddd_device_profile_t ddd_classify_device(uint16_t vendor_id,
                                          uint16_t product_id,
                                          uint16_t bcd_device);
 bool ddd_profile_can_capture(ddd_device_profile_t profile);
+
+typedef struct ddd_profile_index_state {
+    int legacy_count;
+    int protocol_v1_count;
+    int unsupported_count;
+} ddd_profile_index_state_t;
+
+void ddd_profile_index_state_init(ddd_profile_index_state_t *state);
+int ddd_profile_index_take(ddd_profile_index_state_t *state,
+                           ddd_device_profile_t profile);
+
 bool ddd_v1_link_speed_allowed(bool speed_known, bool at_least_superspeed);
 bool ddd_decimation_is_supported(uint8_t factor);
 bool ddd_profile_supports_decimation(ddd_device_profile_t profile,

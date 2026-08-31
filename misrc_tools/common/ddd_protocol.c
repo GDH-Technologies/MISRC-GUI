@@ -84,6 +84,24 @@ bool ddd_profile_can_capture(ddd_device_profile_t profile)
            profile == DDD_DEVICE_PROTOCOL_V1;
 }
 
+void ddd_profile_index_state_init(ddd_profile_index_state_t *state)
+{
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+int ddd_profile_index_take(ddd_profile_index_state_t *state,
+                           ddd_device_profile_t profile)
+{
+    if (!state) return -1;
+    switch (profile) {
+        case DDD_DEVICE_LEGACY: return state->legacy_count++;
+        case DDD_DEVICE_PROTOCOL_V1: return state->protocol_v1_count++;
+        case DDD_DEVICE_UNSUPPORTED: return state->unsupported_count++;
+        case DDD_DEVICE_NOT_DDD: return -1;
+    }
+    return -1;
+}
+
 bool ddd_v1_link_speed_allowed(bool speed_known, bool at_least_superspeed)
 {
     return !speed_known || at_least_superspeed;

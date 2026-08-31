@@ -290,8 +290,9 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
         return (int)list->count;
     }
 
-    int ddd_index = 0;
+    ddd_profile_index_state_t ddd_indices;
     bool enumeration_complete = true;
+    ddd_profile_index_state_init(&ddd_indices);
     for (ssize_t i = 0; i < num_devices; i++) {
         struct libusb_device_descriptor desc;
         int descriptor_result = libusb_get_device_descriptor(devlist[i], &desc);
@@ -307,7 +308,10 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
                 }
 
                 dev->type = MISRC_DEVICE_TYPE_DDD;
-                dev->index = ddd_index++;
+                /* The legacy opener counts only legacy VID/PID rows. Keep
+                 * indices profile-local so a preceding v3.1/unsupported row
+                 * cannot shift the selected legacy physical device. */
+                dev->index = ddd_profile_index_take(&ddd_indices, profile);
                 dev->ddd_profile = profile;
                 dev->ddd_vendor_id = desc.idVendor;
                 dev->ddd_product_id = desc.idProduct;
