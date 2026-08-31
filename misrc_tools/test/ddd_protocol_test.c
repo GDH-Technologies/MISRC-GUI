@@ -104,6 +104,57 @@ static bool test_profiles_and_rates(void)
     return true;
 }
 
+static int select_clockgen_candidate(
+    const ddd_device_profile_t *profiles,
+    const bool *capture_supported,
+    size_t count)
+{
+    bool selection_present = false;
+    ddd_device_profile_t selected_profile = DDD_DEVICE_NOT_DDD;
+    int selected_index = -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (ddd_clockgen_candidate_is_preferred(
+                selection_present, selected_profile, profiles[i],
+                capture_supported[i])) {
+            selection_present = true;
+            selected_profile = profiles[i];
+            selected_index = (int)i;
+        }
+    }
+    return selected_index;
+}
+
+static bool test_clockgen_profile_selection(void)
+{
+    static const ddd_device_profile_t legacy_then_v1[] = {
+        DDD_DEVICE_LEGACY, DDD_DEVICE_PROTOCOL_V1
+    };
+    static const ddd_device_profile_t v1_then_legacy[] = {
+        DDD_DEVICE_PROTOCOL_V1, DDD_DEVICE_LEGACY
+    };
+    static const ddd_device_profile_t only_v1[] = {
+        DDD_DEVICE_PROTOCOL_V1
+    };
+    static const ddd_device_profile_t unavailable_then_legacy[] = {
+        DDD_DEVICE_PROTOCOL_V1, DDD_DEVICE_LEGACY
+    };
+    static const ddd_device_profile_t unsupported[] = {
+        DDD_DEVICE_UNSUPPORTED
+    };
+    static const bool both_supported[] = {true, true};
+    static const bool one_supported[] = {true};
+    static const bool second_supported[] = {false, true};
+    static const bool none_supported[] = {false};
+
+    CHECK(select_clockgen_candidate(legacy_then_v1, both_supported, 2) == 0);
+    CHECK(select_clockgen_candidate(v1_then_legacy, both_supported, 2) == 1);
+    CHECK(select_clockgen_candidate(only_v1, one_supported, 1) == 0);
+    CHECK(select_clockgen_candidate(
+              unavailable_then_legacy, second_supported, 2) == 1);
+    CHECK(select_clockgen_candidate(unsupported, none_supported, 1) == -1);
+    return true;
+}
+
 static bool test_topology_and_endpoint(void)
 {
     uint8_t ports[] = {3, 2, 7};
@@ -218,6 +269,7 @@ static bool test_validators(void)
 int main(void)
 {
     if (!test_profiles_and_rates() ||
+        !test_clockgen_profile_selection() ||
         !test_topology_and_endpoint() ||
         !test_lifecycle() ||
         !test_validators()) {

@@ -1289,9 +1289,14 @@ void gui_app_enumerate_devices(gui_app_t *app) {
                      src->ddd_usb_path);
             dst->ddd_capture_supported = src->ddd_capture_supported;
             dst->ddd_clockgen = false;
-            // Remember the first DdD device so the synthetic "[DdD] Clockgen"
-            // entry below can target the same physical device for its RF path.
-            if (!ddd_device_added && src->ddd_capture_supported) {
+            // Preserve the legacy Clockgen RF path when legacy and protocol-v1
+            // devices coexist. Protocol-v1 remains available when it is the
+            // only supported DdD profile.
+            if (ddd_clockgen_candidate_is_preferred(
+                    ddd_device_added,
+                    first_ddd_device.ddd_profile,
+                    src->ddd_profile,
+                    src->ddd_capture_supported)) {
                 ddd_device_added = true;
                 first_ddd_src_index = src->index;
                 first_ddd_device = *dst;

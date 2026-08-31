@@ -71,6 +71,11 @@ ddd_device_profile_t ddd_classify_device(uint16_t vendor_id,
                                          uint16_t bcd_device);
 bool ddd_profile_can_capture(ddd_device_profile_t profile);
 bool ddd_profile_requires_usb_path(ddd_device_profile_t profile);
+bool ddd_clockgen_candidate_is_preferred(
+    bool selection_present,
+    ddd_device_profile_t selected_profile,
+    ddd_device_profile_t candidate_profile,
+    bool candidate_capture_supported);
 
 typedef struct ddd_profile_index_state {
     int legacy_count;

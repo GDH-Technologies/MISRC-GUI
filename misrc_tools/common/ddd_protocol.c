@@ -89,6 +89,21 @@ bool ddd_profile_requires_usb_path(ddd_device_profile_t profile)
     return profile == DDD_DEVICE_PROTOCOL_V1;
 }
 
+bool ddd_clockgen_candidate_is_preferred(
+    bool selection_present,
+    ddd_device_profile_t selected_profile,
+    ddd_device_profile_t candidate_profile,
+    bool candidate_capture_supported)
+{
+    if (!candidate_capture_supported ||
+        !ddd_profile_can_capture(candidate_profile)) {
+        return false;
+    }
+    if (!selection_present) return true;
+    return selected_profile == DDD_DEVICE_PROTOCOL_V1 &&
+           candidate_profile == DDD_DEVICE_LEGACY;
+}
+
 void ddd_profile_index_state_init(ddd_profile_index_state_t *state)
 {
     if (state) memset(state, 0, sizeof(*state));
