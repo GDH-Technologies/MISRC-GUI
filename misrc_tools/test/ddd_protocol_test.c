@@ -155,6 +155,62 @@ static bool test_clockgen_profile_selection(void)
     return true;
 }
 
+static int select_reconnect_candidate(
+    ddd_device_profile_t target_profile,
+    const char *target_usb_path,
+    const ddd_device_profile_t *candidate_profiles,
+    const char *const *candidate_usb_paths,
+    size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (ddd_reconnect_path_matches(
+                target_profile, target_usb_path,
+                candidate_profiles[i], candidate_usb_paths[i])) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static bool test_reconnect_path_selection(void)
+{
+    static const ddd_device_profile_t two_v1[] = {
+        DDD_DEVICE_PROTOCOL_V1, DDD_DEVICE_PROTOCOL_V1
+    };
+    static const char *const path_b_then_a[] = {
+        "usb:1-4", "usb:1-3"
+    };
+    static const char *const path_a_then_b[] = {
+        "usb:1-3", "usb:1-4"
+    };
+    static const char *const other_paths[] = {
+        "usb:1-4", "usb:1-5"
+    };
+
+    CHECK(select_reconnect_candidate(
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-4", two_v1,
+              path_b_then_a, 2) == 0);
+    CHECK(select_reconnect_candidate(
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-4", two_v1,
+              path_a_then_b, 2) == 1);
+    CHECK(select_reconnect_candidate(
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-3", two_v1,
+              other_paths, 2) == -1);
+    CHECK(!ddd_reconnect_path_matches(
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-3",
+              DDD_DEVICE_LEGACY, "usb:1-3"));
+    CHECK(!ddd_reconnect_path_matches(
+              DDD_DEVICE_PROTOCOL_V1, "",
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-3"));
+    CHECK(!ddd_reconnect_path_matches(
+              DDD_DEVICE_PROTOCOL_V1, NULL,
+              DDD_DEVICE_PROTOCOL_V1, "usb:1-3"));
+    CHECK(!ddd_reconnect_path_matches(
+              DDD_DEVICE_LEGACY, "usb:1-3",
+              DDD_DEVICE_LEGACY, "usb:1-3"));
+    return true;
+}
+
 static bool test_topology_and_endpoint(void)
 {
     uint8_t ports[] = {3, 2, 7};
@@ -270,6 +326,7 @@ int main(void)
 {
     if (!test_profiles_and_rates() ||
         !test_clockgen_profile_selection() ||
+        !test_reconnect_path_selection() ||
         !test_topology_and_endpoint() ||
         !test_lifecycle() ||
         !test_validators()) {

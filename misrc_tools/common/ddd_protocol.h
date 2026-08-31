@@ -76,6 +76,11 @@ bool ddd_clockgen_candidate_is_preferred(
     ddd_device_profile_t selected_profile,
     ddd_device_profile_t candidate_profile,
     bool candidate_capture_supported);
+bool ddd_reconnect_path_matches(
+    ddd_device_profile_t target_profile,
+    const char *target_usb_path,
+    ddd_device_profile_t candidate_profile,
+    const char *candidate_usb_path);
 
 typedef struct ddd_profile_index_state {
     int legacy_count;

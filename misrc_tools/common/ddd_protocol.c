@@ -104,6 +104,19 @@ bool ddd_clockgen_candidate_is_preferred(
            candidate_profile == DDD_DEVICE_LEGACY;
 }
 
+bool ddd_reconnect_path_matches(
+    ddd_device_profile_t target_profile,
+    const char *target_usb_path,
+    ddd_device_profile_t candidate_profile,
+    const char *candidate_usb_path)
+{
+    return ddd_profile_requires_usb_path(target_profile) &&
+           target_profile == candidate_profile &&
+           target_usb_path != NULL && target_usb_path[0] != '\0' &&
+           candidate_usb_path != NULL && candidate_usb_path[0] != '\0' &&
+           strcmp(target_usb_path, candidate_usb_path) == 0;
+}
+
 void ddd_profile_index_state_init(ddd_profile_index_state_t *state)
 {
     if (state) memset(state, 0, sizeof(*state));
