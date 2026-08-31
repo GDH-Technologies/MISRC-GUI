@@ -2906,7 +2906,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         Color ddd_rate_fg = app->is_capturing
                             ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("DddHardwareRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("DDD ADC rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
+                            CLAY_TEXT(CLAY_STRING("DdD ADC rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
                             CLAY(CLAY_ID("DddHardwareRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ddd_rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(settings_ddd_rate_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_rate_fg) }));
                             }
@@ -7027,7 +7027,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 Clay_PointerOver(CLAY_ID("DddHardwareRateBox"))) {
                 if (app->is_capturing) {
                     gui_app_set_status(app,
-                        "Stop capture before changing the DDD ADC rate");
+                        "Stop capture before changing the DdD ADC rate");
                 } else {
                     app->settings.ddd_decimation =
                         app->settings.ddd_decimation ==
@@ -7045,8 +7045,8 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_app_set_status(app,
                         app->settings.ddd_decimation ==
                             DDD_DECIMATION_HALF_RATE
-                            ? "DDD 3.1 native ADC rate set to 20 MSPS"
-                            : "DDD 3.1 native ADC rate set to 40 MSPS");
+                            ? "DdD 3.1 native ADC rate set to 20 MSPS"
+                            : "DdD 3.1 native ADC rate set to 40 MSPS");
                 }
             }
 #endif
