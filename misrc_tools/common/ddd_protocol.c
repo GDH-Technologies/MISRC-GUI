@@ -173,6 +173,45 @@ uint32_t ddd_sample_rate_khz(uint8_t factor)
     return ddd_sample_rate_hz(factor) / UINT32_C(1000);
 }
 
+uint32_t ddd_v1_effective_output_rate_khz(
+    bool resample_enabled,
+    uint32_t resample_rate_khz,
+    uint8_t stored_decimation_factor)
+{
+    uint32_t hardware_rate_khz = ddd_sample_rate_khz(
+        stored_decimation_factor);
+    if (hardware_rate_khz == 0) return 0;
+    if (!resample_enabled || resample_rate_khz == 0 ||
+        resample_rate_khz >= hardware_rate_khz) {
+        return hardware_rate_khz;
+    }
+    return resample_rate_khz;
+}
+
+bool ddd_v1_plan_output_rate_khz(uint32_t output_rate_khz,
+                                 ddd_v1_rate_plan_t *plan)
+{
+    uint8_t factor;
+    uint32_t hardware_rate_khz;
+
+    if (!plan || output_rate_khz == 0 ||
+        output_rate_khz > ddd_sample_rate_khz(
+            DDD_DECIMATION_FULL_RATE)) {
+        return false;
+    }
+
+    factor = output_rate_khz <= ddd_sample_rate_khz(
+        DDD_DECIMATION_HALF_RATE)
+        ? DDD_DECIMATION_HALF_RATE
+        : DDD_DECIMATION_FULL_RATE;
+    hardware_rate_khz = ddd_sample_rate_khz(factor);
+    plan->decimation_factor = factor;
+    plan->hardware_rate_khz = hardware_rate_khz;
+    plan->output_rate_khz = output_rate_khz;
+    plan->software_resample = output_rate_khz < hardware_rate_khz;
+    return true;
+}
+
 bool ddd_identity_is_supported(const uint8_t *identity, size_t length)
 {
     return identity != NULL && length >= DDD_IDENTITY_LENGTH &&

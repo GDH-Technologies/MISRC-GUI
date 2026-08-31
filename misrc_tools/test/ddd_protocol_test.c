@@ -104,6 +104,62 @@ static bool test_profiles_and_rates(void)
     return true;
 }
 
+static bool test_v1_rate_plans(void)
+{
+    ddd_v1_rate_plan_t plan;
+    static const uint32_t software_rates_khz[] = {
+        5000u, 10000u, 14300u, 17900u
+    };
+
+    CHECK(ddd_v1_plan_output_rate_khz(40000u, &plan));
+    CHECK(plan.decimation_factor == DDD_DECIMATION_FULL_RATE);
+    CHECK(plan.hardware_rate_khz == 40000u);
+    CHECK(plan.output_rate_khz == 40000u);
+    CHECK(!plan.software_resample);
+
+    CHECK(ddd_v1_plan_output_rate_khz(20000u, &plan));
+    CHECK(plan.decimation_factor == DDD_DECIMATION_HALF_RATE);
+    CHECK(plan.hardware_rate_khz == 20000u);
+    CHECK(plan.output_rate_khz == 20000u);
+    CHECK(!plan.software_resample);
+
+    for (size_t i = 0;
+         i < sizeof(software_rates_khz) / sizeof(software_rates_khz[0]);
+         ++i) {
+        CHECK(ddd_v1_plan_output_rate_khz(
+            software_rates_khz[i], &plan));
+        CHECK(plan.decimation_factor == DDD_DECIMATION_HALF_RATE);
+        CHECK(plan.hardware_rate_khz == 20000u);
+        CHECK(plan.output_rate_khz == software_rates_khz[i]);
+        CHECK(plan.software_resample);
+    }
+
+    /* Preserve hand-edited intermediate rates without ever upsampling. */
+    CHECK(ddd_v1_plan_output_rate_khz(30000u, &plan));
+    CHECK(plan.decimation_factor == DDD_DECIMATION_FULL_RATE);
+    CHECK(plan.hardware_rate_khz == 40000u);
+    CHECK(plan.output_rate_khz == 30000u);
+    CHECK(plan.software_resample);
+
+    CHECK(!ddd_v1_plan_output_rate_khz(0, &plan));
+    CHECK(!ddd_v1_plan_output_rate_khz(40001u, &plan));
+    CHECK(!ddd_v1_plan_output_rate_khz(20000u, NULL));
+
+    CHECK(ddd_v1_effective_output_rate_khz(
+              false, 5000u, DDD_DECIMATION_FULL_RATE) == 40000u);
+    CHECK(ddd_v1_effective_output_rate_khz(
+              false, 5000u, DDD_DECIMATION_HALF_RATE) == 20000u);
+    CHECK(ddd_v1_effective_output_rate_khz(
+              true, 10000u, DDD_DECIMATION_FULL_RATE) == 10000u);
+    CHECK(ddd_v1_effective_output_rate_khz(
+              true, 30000u, DDD_DECIMATION_HALF_RATE) == 20000u);
+    CHECK(ddd_v1_effective_output_rate_khz(
+              true, 20000u, DDD_DECIMATION_HALF_RATE) == 20000u);
+    CHECK(ddd_v1_effective_output_rate_khz(
+              true, 10000u, 3) == 0);
+    return true;
+}
+
 static int select_clockgen_candidate(
     const ddd_device_profile_t *profiles,
     const bool *capture_supported,
@@ -325,6 +381,7 @@ static bool test_validators(void)
 int main(void)
 {
     if (!test_profiles_and_rates() ||
+        !test_v1_rate_plans() ||
         !test_clockgen_profile_selection() ||
         !test_reconnect_path_selection() ||
         !test_topology_and_endpoint() ||

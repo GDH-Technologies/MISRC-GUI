@@ -99,6 +99,26 @@ bool ddd_profile_supports_decimation(ddd_device_profile_t profile,
 uint16_t ddd_make_register_write(uint8_t address, uint8_t value);
 uint32_t ddd_sample_rate_hz(uint8_t factor);
 uint32_t ddd_sample_rate_khz(uint8_t factor);
+
+typedef struct ddd_v1_rate_plan {
+    uint8_t decimation_factor;
+    uint32_t hardware_rate_khz;
+    uint32_t output_rate_khz;
+    bool software_resample;
+} ddd_v1_rate_plan_t;
+
+/* Resolve the output rate represented by the pre-unified settings. With the
+ * resampler disabled, the stored hardware decimation remains authoritative. */
+uint32_t ddd_v1_effective_output_rate_khz(
+    bool resample_enabled,
+    uint32_t resample_rate_khz,
+    uint8_t stored_decimation_factor);
+
+/* Protocol-v1 routes 20 MSPS directly through the FPGA half-rate path. Lower
+ * output rates use that 20 MSPS hardware stream as the software source. */
+bool ddd_v1_plan_output_rate_khz(uint32_t output_rate_khz,
+                                 ddd_v1_rate_plan_t *plan);
+
 bool ddd_identity_is_supported(const uint8_t *identity, size_t length);
 bool ddd_format_gateware_commit(const uint8_t *identity,
                                 size_t identity_length,
