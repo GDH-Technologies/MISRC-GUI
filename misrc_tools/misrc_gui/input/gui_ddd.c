@@ -72,13 +72,13 @@ static int s_ddd_interface = 0;
 static uint8_t s_ddd_bulk_ep = DDD_EP_BULK_IN;
 static atomic_bool s_ddd_transfer_ready = false;
 
-typedef struct ddd_stream_path {
+typedef struct ddd_legacy_stream_path {
     int interface_number;
     int alternate_setting;
     uint8_t endpoint_address;
     uint16_t max_packet_size;
     bool found;
-} ddd_stream_path_t;
+} ddd_legacy_stream_path_t;
 
 // Sequence-number validation state (capture thread only). The DdD sequence
 // number is constant for 65536 samples then advances by 1 (mod 64). We only
@@ -150,8 +150,8 @@ static void gui_ddd_usb_exit(void) {
     }
 }
 
-static ddd_stream_path_t gui_ddd_find_stream_path(libusb_device *device) {
-    ddd_stream_path_t best = {
+static ddd_legacy_stream_path_t gui_ddd_find_stream_path(libusb_device *device) {
+    ddd_legacy_stream_path_t best = {
         .interface_number = 0,
         .alternate_setting = 0,
         .endpoint_address = DDD_EP_BULK_IN,
@@ -376,7 +376,7 @@ int gui_ddd_open(gui_app_t *app, int device_index) {
                     "not SuperSpeed. DdD requires USB 3.0 for full 40 MSPS.\n");
         }
         // Determine the streaming interface/endpoint from descriptors
-        ddd_stream_path_t stream_path = gui_ddd_find_stream_path(devlist[i]);
+        ddd_legacy_stream_path_t stream_path = gui_ddd_find_stream_path(devlist[i]);
         s_ddd_interface = stream_path.interface_number;
         s_ddd_bulk_ep = stream_path.endpoint_address;
         if (stream_path.found) {

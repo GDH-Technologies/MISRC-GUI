@@ -435,6 +435,8 @@ if raylib_dep.found()
   if ddd_enabled
     sources_gui += 'common/ddd_protocol.c'
     sources_gui += 'misrc_gui/input/gui_ddd.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_v1.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
 
