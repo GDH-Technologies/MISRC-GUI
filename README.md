@@ -13,7 +13,7 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 - CXADC (single cards and Clockgen Mod with sound)
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
-- DdD (DomesDay Duplicator)
+- DdD (DomesDay Duplicator; legacy firmware and firmware 3.1 profiles)
 - FX3ADC (100mhz MUSE capture device)
 
 ## Downloads
@@ -28,6 +28,12 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
 
 Building from source? See [INSTALLATION.md](INSTALLATION.md).
+
+DdD firmware 3.1 is shown as a separate device profile from legacy DdD
+firmware. Its ADC rate control selects the native 40 or 20 MSPS hardware rate;
+the existing RF resampler remains an independent optional output setting and
+is limited to the selected native rate. Other capture devices keep their
+existing rate controls and behavior.
 
 
 ## Setup With Devices

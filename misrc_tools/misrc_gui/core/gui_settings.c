@@ -431,6 +431,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->resample_quality_b = 3;     // High quality
     settings->resample_gain_a = 0.0f;     // No gain
     settings->resample_gain_b = 0.0f;     // No gain
+#ifdef ENABLE_DDD
+    settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
+#endif
     
     // FLAC defaults
     settings->use_flac = true;
@@ -586,6 +589,9 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"resample_quality_b\": %d,\n", settings->resample_quality_b);
     fprintf(f, "  \"resample_gain_a\": %.1f,\n", settings->resample_gain_a);
     fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
+#ifdef ENABLE_DDD
+    fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
+#endif
     fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
     fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
     fprintf(f, "  \"flac_level\": %d,\n", settings->flac_level);
@@ -1015,6 +1021,15 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "resample_gain_a")) != NULL) {
         settings->resample_gain_a = (float)atof(value);
     }
+
+#ifdef ENABLE_DDD
+    if ((value = find_value(content, "ddd_decimation")) != NULL) {
+        uint8_t factor = (uint8_t)atoi(value);
+        if (ddd_decimation_is_supported(factor)) {
+            settings->ddd_decimation = factor;
+        }
+    }
+#endif
 
     if ((value = find_value(content, "resample_gain_b")) != NULL) {
         settings->resample_gain_b = (float)atof(value);

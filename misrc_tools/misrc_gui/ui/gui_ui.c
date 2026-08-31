@@ -286,6 +286,13 @@ static bool gui_ui_selected_device_is_ddd(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_DDD;
 }
 
+static bool gui_ui_selected_device_is_ddd_v1(const gui_app_t *app)
+{
+    if (!gui_ui_selected_device_is_ddd(app)) return false;
+    return app->devices[app->selected_device].ddd_profile ==
+           DDD_DEVICE_PROTOCOL_V1;
+}
+
 // True iff the selected device is the synthetic "[DdD] Clockgen" entry.
 static bool gui_ui_selected_device_is_ddd_clockgen(const gui_app_t *app)
 {
@@ -1141,6 +1148,9 @@ static char settings_flac_level_display[64];
 static char settings_flac_threads_display[64];
 static char settings_resample_a_display[32];
 static char settings_resample_b_display[32];
+#ifdef ENABLE_DDD
+static char settings_ddd_rate_display[32];
+#endif
 static char status_sample_rate_display[32];
 static char status_samples_display[32];
 static char status_frames_display[32];
@@ -2460,8 +2470,10 @@ static void render_settings_panel(gui_app_t *app) {
     bool settings_cxadc_mode = gui_ui_selected_device_is_cxadc(app, &settings_cxadc_has_channel_b);
 #ifdef ENABLE_DDD
     bool settings_ddd_mode = gui_ui_selected_device_is_ddd(app);
+    bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
     bool settings_ddd_mode = false;
+    bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
     bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -2879,6 +2891,29 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(flac_affinity_supported ? CLAY_STRING("e.g. 10-17,20") : CLAY_STRING("Linux only"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                         }
                     }
+
+                    // Firmware 3.1 exposes its ADC decimation independently
+                    // from the existing optional output resampler. No other
+                    // device sees or reads this control.
+#ifdef ENABLE_DDD
+                    if (settings_ddd_v1_mode) {
+                        snprintf(settings_ddd_rate_display,
+                                 sizeof(settings_ddd_rate_display),
+                                 "%u MSPS (native)",
+                                 app->settings.ddd_decimation ==
+                                     DDD_DECIMATION_HALF_RATE ? 20u : 40u);
+                        Color ddd_rate_bg = app->is_capturing
+                            ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color ddd_rate_fg = app->is_capturing
+                            ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        CLAY(CLAY_ID("DddHardwareRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY_TEXT(CLAY_STRING("DDD ADC rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ddd_rate_fg) }));
+                            CLAY(CLAY_ID("DddHardwareRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ddd_rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(settings_ddd_rate_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_rate_fg) }));
+                            }
+                        }
+                    }
+#endif
 
                     // Resample section
                     CLAY_TEXT(CLAY_STRING("Resample (RF):"),
@@ -6875,8 +6910,10 @@ void gui_handle_interactions(gui_app_t *app) {
             bool settings_cxadc_mode = gui_ui_selected_device_is_cxadc(app, &settings_cxadc_has_channel_b);
 #ifdef ENABLE_DDD
             bool settings_ddd_mode = gui_ui_selected_device_is_ddd(app);
+            bool settings_ddd_v1_mode = gui_ui_selected_device_is_ddd_v1(app);
 #else
             bool settings_ddd_mode = false;
+            bool settings_ddd_v1_mode = false;
 #endif
 #ifdef ENABLE_FX3
             bool settings_fx3_mode = gui_ui_selected_device_is_fx3(app);
@@ -6885,7 +6922,11 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
             bool settings_b_disabled = settings_ddd_mode || settings_fx3_mode || (settings_cxadc_mode && !settings_cxadc_has_channel_b);
             bool settings_b_controls_disabled = settings_b_disabled || !app->settings.capture_b;
-            float settings_base_rate_a_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, 0) : 40000.0f;
+            float settings_base_rate_a_khz = settings_cxadc_mode
+                ? gui_ui_cxadc_base_rate_khz(app, 0)
+                : (settings_ddd_v1_mode
+                    ? (float)ddd_sample_rate_khz(app->settings.ddd_decimation)
+                    : 40000.0f);
             float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
             if (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton"))) {
                 app->settings_panel_open = false;
@@ -6978,6 +7019,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
                 gui_settings_save(&app->settings);
             }
+#ifdef ENABLE_DDD
+            if (settings_ddd_v1_mode &&
+                Clay_PointerOver(CLAY_ID("DddHardwareRateBox"))) {
+                if (app->is_capturing) {
+                    gui_app_set_status(app,
+                        "Stop capture before changing the DDD ADC rate");
+                } else {
+                    app->settings.ddd_decimation =
+                        app->settings.ddd_decimation ==
+                            DDD_DECIMATION_FULL_RATE
+                            ? DDD_DECIMATION_HALF_RATE
+                            : DDD_DECIMATION_FULL_RATE;
+                    settings_base_rate_a_khz = (float)ddd_sample_rate_khz(
+                        app->settings.ddd_decimation);
+                    if (app->settings.resample_rate_a >
+                        settings_base_rate_a_khz) {
+                        app->settings.resample_rate_a =
+                            settings_base_rate_a_khz;
+                    }
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app,
+                        app->settings.ddd_decimation ==
+                            DDD_DECIMATION_HALF_RATE
+                            ? "DDD 3.1 native ADC rate set to 20 MSPS"
+                            : "DDD 3.1 native ADC rate set to 40 MSPS");
+                }
+            }
+#endif
             if (Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
                 app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                 gui_settings_save(&app->settings);
