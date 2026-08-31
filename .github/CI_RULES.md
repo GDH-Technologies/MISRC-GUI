@@ -95,15 +95,15 @@ MUST resolve through `misrc_tools/git-version.sh`. Do not re-implement
 
 ## Artifact naming convention
 
-Every release artifact filename MUST follow `<Platform>_MISRC_<version>_<arch>.<ext>`
+Every release artifact filename MUST follow `<Platform>_MISRC_GUI_<version>_<arch>.<ext>`
 with the platform name capitalized (Linux, Windows, macOS, Android):
 
 | Artifact | Pattern |
 |---|---|
-| Linux AppImage/zip | `Linux_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
-| Windows zip | `Windows_MISRC_${VERSION}_x86.zip` / `_arm64.zip` |
-| macOS DMG | `macOS_MISRC_${VERSION}_universal.dmg` |
-| Android APK | `Android_MISRC_${VERSION}_arm64.apk` |
+| Linux AppImage/zip | `Linux_MISRC_GUI_${VERSION}_x86.zip` / `_arm64.zip` |
+| Windows zip | `Windows_MISRC_GUI_${VERSION}_x86.zip` / `_arm64.zip` |
+| macOS DMG | `macOS_MISRC_GUI_${VERSION}_universal.dmg` |
+| Android APK | `Android_MISRC_GUI_${VERSION}_arm64.apk` |
 
 Rules:
 - Do NOT use the legacy `misrc_gui-<version>-<platform>-<arch>.<ext>` shape for
@@ -142,7 +142,7 @@ always yields `dev-...` (versionCode 1) on the `--no-tags --depth=1` shallow
 checkout — the v1.1.7 APK regression.
 
 Last line of defense: the `release` job has a pre-upload assertion that scans
-`release-assets/` and fails if any `*_MISRC_*` artifact is dev-named or does
+`release-assets/` and fails if any `*_MISRC_GUI_*` artifact is dev-named or does
 not contain the resolved tag, so no future build-job misbehavior can leak a
 dev-named artifact into a published release. `ci_guard_tests.py
 check_release_version_resolution_contract` asserts the resolver, its

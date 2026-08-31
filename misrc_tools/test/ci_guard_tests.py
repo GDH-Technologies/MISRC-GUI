@@ -902,7 +902,7 @@ def check_windows_packaging_assertions(workflow_path: Path) -> int:
         "test \"$(objdump -p dist/MISRC.exe | awk '/^Subsystem[[:space:]]/ {print $2; exit}')\" = \"00000002\"",
         "assert_no_nonsystem_dlls()",
         "assert_no_nonsystem_dlls \"dist/MISRC.exe\"",
-        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
+        "$ZipPath = \"Windows_MISRC_GUI_${{ steps.version.outputs.version }}_x86.zip\"",
         "Compress-Archive -Path @(\"dist/MISRC.exe\")",
         "if ($zip.Entries.Count -ne 1)",
         "$entry.FullName.Contains('/') -or $entry.FullName.Contains('\\')",
@@ -949,7 +949,7 @@ def check_android_packaging_assertions(workflow_path: Path) -> int:
 
 def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path) -> int:
     """Assert every release artifact filename follows
-    <Platform>_MISRC_<version>_<arch>.<ext> with the platform name capitalized
+    <Platform>_MISRC_GUI_<version>_<arch>.<ext> with the platform name capitalized
     (Linux, Windows, macOS, Android), and that the lowercase v1.1.7 malform
     cannot regress.
 
@@ -964,22 +964,22 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
         "workflow_dispatch:",
         "artifact_suffix: x86",
         "artifact_suffix: arm64",
-        "APPIMAGE_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
-        "ZIP_NAME=\"Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
-        "path: Linux_MISRC_*_${{ matrix.artifact_suffix }}.zip",
-        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip\"",
-        "path: Windows_MISRC_*_x86.zip",
-        "$ZipPath = \"Windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip\"",
-        "path: Windows_MISRC_*_arm64.zip",
-        "DMG_NAME=\"macOS_MISRC_${BUILD_VERSION}_universal.dmg\"",
-        "path: macOS_MISRC_*_universal.dmg",
-        "release-assets/**/Linux_MISRC_*_x86.zip",
-        "release-assets/**/Linux_MISRC_*_arm64.zip",
-        "release-assets/**/Windows_MISRC_*_x86.zip",
-        "release-assets/**/Windows_MISRC_*_arm64.zip",
-        "release-assets/**/macOS_MISRC_*_universal.dmg",
-        "APK_ARM64=\"Android_MISRC_${TAG}_arm64.apk\"",
-        "release-assets/**/Android_MISRC_*_arm64.apk",
+        "APPIMAGE_NAME=\"Linux_MISRC_GUI_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage\"",
+        "ZIP_NAME=\"Linux_MISRC_GUI_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip\"",
+        "path: Linux_MISRC_GUI_*_${{ matrix.artifact_suffix }}.zip",
+        "$ZipPath = \"Windows_MISRC_GUI_${{ steps.version.outputs.version }}_x86.zip\"",
+        "path: Windows_MISRC_GUI_*_x86.zip",
+        "$ZipPath = \"Windows_MISRC_GUI_${{ steps.version.outputs.version }}_arm64.zip\"",
+        "path: Windows_MISRC_GUI_*_arm64.zip",
+        "DMG_NAME=\"macOS_MISRC_GUI_${BUILD_VERSION}_universal.dmg\"",
+        "path: macOS_MISRC_GUI_*_universal.dmg",
+        "release-assets/**/Linux_MISRC_GUI_*_x86.zip",
+        "release-assets/**/Linux_MISRC_GUI_*_arm64.zip",
+        "release-assets/**/Windows_MISRC_GUI_*_x86.zip",
+        "release-assets/**/Windows_MISRC_GUI_*_arm64.zip",
+        "release-assets/**/macOS_MISRC_GUI_*_universal.dmg",
+        "APK_ARM64=\"Android_MISRC_GUI_${TAG}_arm64.apk\"",
+        "release-assets/**/Android_MISRC_GUI_*_arm64.apk",
     ]
     forbidden_snippets = [
         # Legacy pre-convention APK/shapes.
@@ -999,6 +999,12 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
         "release-assets/**/MISRC_*_linux_arm64.zip",
         "release-assets/**/MISRC_*_windows_x86.zip",
         "release-assets/**/MISRC_*_macos_universal.dmg",
+        "release-assets/**/Linux_MISRC_*_x86.zip",
+        "release-assets/**/Linux_MISRC_*_arm64.zip",
+        "release-assets/**/Windows_MISRC_*_x86.zip",
+        "release-assets/**/Windows_MISRC_*_arm64.zip",
+        "release-assets/**/macOS_MISRC_*_universal.dmg",
+        "release-assets/**/Android_MISRC_*_arm64.apk",
         # Lowercase platform prefixes on release artifacts (v1.1.7 malform).
         "linux_MISRC_${BUILD_VERSION}",
         "windows_MISRC_${{ steps.version.outputs.version }}",
@@ -1023,9 +1029,9 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
     if not apk_script.exists():
         return fail(f"android/build-apk.sh is missing: {apk_script}")
     apk_text = read_text(apk_script)
-    if "Android_MISRC_${VERSION}_arm64.apk" not in apk_text:
+    if "Android_MISRC_GUI_${VERSION}_arm64.apk" not in apk_text:
         return fail(
-            "android/build-apk.sh must name the APK Android_MISRC_${VERSION}_arm64.apk "
+            "android/build-apk.sh must name the APK Android_MISRC_GUI_${VERSION}_arm64.apk "
             "(capitalized platform prefix, matching the release convention)."
         )
     if "android_MISRC_${VERSION}_arm64.apk" in apk_text:
@@ -1109,8 +1115,8 @@ def check_release_version_resolution_contract(repo_root: Path, workflow_path: Pa
             "Release job is missing the pre-upload 'Assert release assets are "
             "tag-named (no dev leak)' step."
         )
-    if "*_MISRC_dev-*" not in wf:
-        return fail("Release pre-upload assertion must match '*_MISRC_dev-*' dev-named artifacts.")
+    if "*_MISRC_GUI_dev-*" not in wf:
+        return fail("Release pre-upload assertion must match '*_MISRC_GUI_dev-*' dev-named artifacts.")
     return 0
 
 

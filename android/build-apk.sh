@@ -159,7 +159,7 @@ log "verifying signature..."
 
 # --- 9. Output ---
 mkdir -p "$OUT_DIR"
-OUTPUT="$OUT_DIR/Android_MISRC_${VERSION}_arm64.apk"
+OUTPUT="$OUT_DIR/Android_MISRC_GUI_${VERSION}_arm64.apk"
 cp "$WORK/signed.apk" "$OUTPUT"
 chmod +x "$OUTPUT"
 

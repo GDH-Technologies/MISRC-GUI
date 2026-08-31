@@ -413,7 +413,7 @@ jobs:
             -i AppDir/misrc.png \
             --output appimage
 
-          APPIMAGE_NAME="Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage"
+          APPIMAGE_NAME="Linux_MISRC_GUI_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage"
           mv ./*.AppImage "$APPIMAGE_NAME"
           test -f "$APPIMAGE_NAME"
 
@@ -428,7 +428,7 @@ jobs:
           test "$RC_EXTRACT" -eq 1
           grep -qi "Usage" /tmp/appimage_capture_help.txt
           grep -qi "Usage" /tmp/appimage_extract_help.txt
-          ZIP_NAME="Linux_MISRC_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
+          ZIP_NAME="Linux_MISRC_GUI_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
           zip -j "$ZIP_NAME" "$APPIMAGE_NAME"
           test -f "$ZIP_NAME"
           test "$(unzip -Z1 "$ZIP_NAME" | wc -l)" -eq 1
@@ -437,7 +437,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: linux-zip-${{ matrix.arch }}
-          path: Linux_MISRC_*_${{ matrix.artifact_suffix }}.zip
+          path: Linux_MISRC_GUI_*_${{ matrix.artifact_suffix }}.zip
           if-no-files-found: error
 
   android-apk:
@@ -735,7 +735,7 @@ jobs:
       - name: Create ZIP artifact
         shell: pwsh
         run: |
-          $ZipPath = "Windows_MISRC_${{ steps.version.outputs.version }}_x86.zip"
+          $ZipPath = "Windows_MISRC_GUI_${{ steps.version.outputs.version }}_x86.zip"
           Compress-Archive -Path @("dist/MISRC.exe") -DestinationPath $ZipPath -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipPath))
@@ -756,7 +756,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-exe
-          path: Windows_MISRC_*_x86.zip
+          path: Windows_MISRC_GUI_*_x86.zip
           if-no-files-found: error
   windows-exe-arm64:
     name: Windows EXE build (arm64)
@@ -934,7 +934,7 @@ jobs:
       - name: Create ZIP artifact
         shell: pwsh
         run: |
-          $ZipPath = "Windows_MISRC_${{ steps.version.outputs.version }}_arm64.zip"
+          $ZipPath = "Windows_MISRC_GUI_${{ steps.version.outputs.version }}_arm64.zip"
           Compress-Archive -Path @("dist/MISRC.exe") -DestinationPath $ZipPath -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipPath))
@@ -955,7 +955,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-exe-arm64
-          path: Windows_MISRC_*_arm64.zip
+          path: Windows_MISRC_GUI_*_arm64.zip
           if-no-files-found: error
 
   macos-app-build:
@@ -1325,7 +1325,7 @@ jobs:
           mkdir -p "$DMG_STAGE_DIR"
           cp -R dist/MISRC.app "$DMG_STAGE_DIR/MISRC.app"
           ln -s /Applications "$DMG_STAGE_DIR/Applications"
-          DMG_NAME="macOS_MISRC_${BUILD_VERSION}_universal.dmg"
+          DMG_NAME="macOS_MISRC_GUI_${BUILD_VERSION}_universal.dmg"
           hdiutil create \
             -volname "MISRC" \
             -srcfolder "$DMG_STAGE_DIR" \
@@ -1338,7 +1338,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: macos-app
-          path: macOS_MISRC_*_universal.dmg
+          path: macOS_MISRC_GUI_*_universal.dmg
           if-no-files-found: error
 
   release:
@@ -1391,9 +1391,9 @@ jobs:
           TAG="${{ steps.tag.outputs.tag }}"
           shopt -s globstar nullglob
           artifacts=(
-            release-assets/**/*_MISRC_*.zip
-            release-assets/**/*_MISRC_*.dmg
-            release-assets/**/*_MISRC_*.apk
+            release-assets/**/*_MISRC_GUI_*.zip
+            release-assets/**/*_MISRC_GUI_*.dmg
+            release-assets/**/*_MISRC_GUI_*.apk
           )
           if [[ "${#artifacts[@]}" -eq 0 ]]; then
             echo "ERROR: no release artifacts found in release-assets/" >&2
@@ -1402,7 +1402,7 @@ jobs:
           for f in "${artifacts[@]}"; do
             base="$(basename "$f")"
             case "$base" in
-              *_MISRC_dev-*)
+              *_MISRC_GUI_dev-*)
                 echo "ERROR: release artifact '$base' is dev-named; refusing to publish under tag $TAG" >&2
                 exit 1
                 ;;
@@ -1481,12 +1481,12 @@ jobs:
           printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) | Android (arm64-v8a APK) |\n' >> "$BODY_FILE"
           printf '|---|---|---|---|\n' >> "$BODY_FILE"
           DL_BASE="https://github.com/harrypm/MISRC-GUI/releases/download/${TAG}"
-          WIN_X86="Windows_MISRC_${TAG}_x86.zip"
-          WIN_ARM="Windows_MISRC_${TAG}_arm64.zip"
-          MAC_DMG="macOS_MISRC_${TAG}_universal.dmg"
-          LIN_X86="Linux_MISRC_${TAG}_x86.zip"
-          LIN_ARM="Linux_MISRC_${TAG}_arm64.zip"
-          APK_ARM64="Android_MISRC_${TAG}_arm64.apk"
+          WIN_X86="Windows_MISRC_GUI_${TAG}_x86.zip"
+          WIN_ARM="Windows_MISRC_GUI_${TAG}_arm64.zip"
+          MAC_DMG="macOS_MISRC_GUI_${TAG}_universal.dmg"
+          LIN_X86="Linux_MISRC_GUI_${TAG}_x86.zip"
+          LIN_ARM="Linux_MISRC_GUI_${TAG}_arm64.zip"
+          APK_ARM64="Android_MISRC_GUI_${TAG}_arm64.apk"
           printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
           printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
           printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) | - |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
@@ -1510,13 +1510,13 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
+          name: MISRC GUI ${{ steps.tag.outputs.tag }}
           body: ${{ steps.summary.outputs.body }}
           generate_release_notes: true
           files: |
-            release-assets/**/Linux_MISRC_*_x86.zip
-            release-assets/**/Linux_MISRC_*_arm64.zip
-            release-assets/**/Windows_MISRC_*_x86.zip
-            release-assets/**/Windows_MISRC_*_arm64.zip
-            release-assets/**/macOS_MISRC_*_universal.dmg
-            release-assets/**/Android_MISRC_*_arm64.apk
+            release-assets/**/Linux_MISRC_GUI_*_x86.zip
+            release-assets/**/Linux_MISRC_GUI_*_arm64.zip
+            release-assets/**/Windows_MISRC_GUI_*_x86.zip
+            release-assets/**/Windows_MISRC_GUI_*_arm64.zip
+            release-assets/**/macOS_MISRC_GUI_*_universal.dmg
+            release-assets/**/Android_MISRC_GUI_*_arm64.apk
