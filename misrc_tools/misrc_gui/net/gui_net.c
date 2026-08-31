@@ -1218,7 +1218,10 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     /* Reset the capture/audio buffers' head/tail (not just stats) so a stale
      * fill level from a previous capture session doesn't pin RF Buffer at
      * ~99% on the client readout. bufmgr_reset_stats only clears stats;
-     * bufmgr_reset also rewinds head/tail to 0. */
+     * bufmgr_reset also rewinds head/tail to 0. BUT bufmgr_reset is a no-op
+     * if the buffer isn't initialized yet (lazy init), so ensure_init first. */
+    (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF);
+    (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_RF);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_AUDIO);
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);

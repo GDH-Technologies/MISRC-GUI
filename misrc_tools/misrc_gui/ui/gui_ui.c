@@ -5689,7 +5689,7 @@ static void render_status_bar(gui_app_t *app) {
     int status_message_max_chars = status_is_error
         ? (status_tiny ? 30 : (status_two_rows ? 64 : 36))
         : (status_narrow ? 16 : (status_compact ? 20 : 30));
-    int status_font_size = FONT_SIZE_STATUS - 1;
+    int status_font_size = FONT_SIZE_STATUS;
     const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
     const char *audio_buffer_label = status_compact ? "Aud:" : "Audio Buffer:";
     const char *samples_label = status_tiny ? "S:" : (status_compact ? "Samp:" : "Samples:");
