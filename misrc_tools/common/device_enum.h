@@ -12,6 +12,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifdef ENABLE_DDD
+#include "ddd_protocol.h"
+#endif
+
 /*-----------------------------------------------------------------------------
  * Device Information
  *-----------------------------------------------------------------------------*/
@@ -36,6 +40,14 @@ typedef struct {
     char name[DEVICE_NAME_MAX];         /* Human-readable device name */
     char device_id[DEVICE_ID_MAX];      /* Device ID (for simple_capture) */
     bool supports_1080p60;              /* True if device supports 1920x1080 @ 60fps YUYV */
+#ifdef ENABLE_DDD
+    ddd_device_profile_t ddd_profile;    /* Firmware/protocol profile for DDD rows */
+    uint16_t ddd_vendor_id;
+    uint16_t ddd_product_id;
+    uint16_t ddd_bcd_device;
+    char ddd_usb_path[DDD_STABLE_ID_MAX]; /* Stable bus/port topology path */
+    bool ddd_capture_supported;
+#endif
 } misrc_device_info_t;
 
 /*-----------------------------------------------------------------------------
@@ -46,6 +58,9 @@ typedef struct {
     misrc_device_info_t *devices;     /* Array of device info */
     size_t count;                     /* Number of devices */
     size_t capacity;                  /* Allocated capacity */
+#ifdef ENABLE_DDD
+    bool ddd_enumeration_complete;    /* Safe basis for unplug/replug observation */
+#endif
 } misrc_device_list_t;
 
 /* Initialize device list

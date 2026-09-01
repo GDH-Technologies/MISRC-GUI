@@ -26,10 +26,6 @@
 
 #ifdef ENABLE_DDD
 #include "libusb_compat.h"
-
-// DdD USB VID/PID (Domesday Duplicator)
-#define DDD_VID              0x1D50
-#define DDD_PID              0x603B
 #endif
 
 
@@ -42,6 +38,9 @@ void misrc_device_list_init(misrc_device_list_t *list)
     list->devices = NULL;
     list->count = 0;
     list->capacity = 0;
+#ifdef ENABLE_DDD
+    list->ddd_enumeration_complete = false;
+#endif
 }
 
 void misrc_device_list_free(misrc_device_list_t *list)
@@ -52,6 +51,9 @@ void misrc_device_list_free(misrc_device_list_t *list)
     }
     list->count = 0;
     list->capacity = 0;
+#ifdef ENABLE_DDD
+    list->ddd_enumeration_complete = false;
+#endif
 }
 
 static bool device_list_grow(misrc_device_list_t *list)
@@ -264,6 +266,7 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
     }
 
     if (!include_ddd) {
+        list->ddd_enumeration_complete = true;
         return (int)list->count;
     }
 
@@ -282,11 +285,21 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
     libusb_device **devlist;
     ssize_t num_devices = libusb_get_device_list(ctx, &devlist);
 
-    int ddd_index = 0;
+    if (num_devices < 0) {
+        libusb_exit(ctx);
+        return (int)list->count;
+    }
+
+    ddd_profile_index_state_t ddd_indices;
+    bool enumeration_complete = true;
+    ddd_profile_index_state_init(&ddd_indices);
     for (ssize_t i = 0; i < num_devices; i++) {
         struct libusb_device_descriptor desc;
-        if (libusb_get_device_descriptor(devlist[i], &desc) == 0) {
-            if (desc.idVendor == DDD_VID && desc.idProduct == DDD_PID) {
+        int descriptor_result = libusb_get_device_descriptor(devlist[i], &desc);
+        if (descriptor_result == 0) {
+            ddd_device_profile_t profile = ddd_classify_device(
+                desc.idVendor, desc.idProduct, desc.bcdDevice);
+            if (profile != DDD_DEVICE_NOT_DDD) {
                 misrc_device_info_t *dev = device_list_add(list);
                 if (!dev) {
                     libusb_free_device_list(devlist, 1);
@@ -295,9 +308,43 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
                 }
 
                 dev->type = MISRC_DEVICE_TYPE_DDD;
-                dev->index = ddd_index++;
+                /* The legacy opener counts only legacy VID/PID rows. Keep
+                 * indices profile-local so a preceding v3.1/unsupported row
+                 * cannot shift the selected legacy physical device. */
+                dev->index = ddd_profile_index_take(&ddd_indices, profile);
+                dev->ddd_profile = profile;
+                dev->ddd_vendor_id = desc.idVendor;
+                dev->ddd_product_id = desc.idProduct;
+                dev->ddd_bcd_device = desc.bcdDevice;
+                dev->ddd_capture_supported = ddd_profile_can_capture(profile);
 
-                snprintf(dev->name, sizeof(dev->name), "Domesday Duplicator");
+                if (profile == DDD_DEVICE_LEGACY) {
+                    snprintf(dev->name, sizeof(dev->name),
+                             "Domesday Duplicator (legacy firmware)");
+                } else if (profile == DDD_DEVICE_PROTOCOL_V1) {
+                    snprintf(dev->name, sizeof(dev->name),
+                             "Domesday Duplicator");
+                } else {
+                    snprintf(dev->name, sizeof(dev->name),
+                             "Domesday Duplicator (unsupported protocol %u)",
+                             (unsigned)(desc.bcdDevice >> 8));
+                }
+
+                {
+                    uint8_t ports[8];
+                    int port_count = libusb_get_port_numbers(
+                        devlist[i], ports, (int)sizeof(ports));
+                    if (!ddd_format_usb_topology_path(
+                            libusb_get_bus_number(devlist[i]), ports,
+                            port_count, dev->ddd_usb_path,
+                            sizeof(dev->ddd_usb_path))) {
+                        dev->ddd_usb_path[0] = '\0';
+                        if (ddd_profile_requires_usb_path(profile)) {
+                            dev->ddd_capture_supported = false;
+                            enumeration_complete = false;
+                        }
+                    }
+                }
 
                 /* Try to get serial number */
                 dev->device_id[0] = '\0';
@@ -315,11 +362,14 @@ int misrc_device_enumerate_ddd(misrc_device_list_t *list, bool include_hsdaoh,
 
                 dev->supports_1080p60 = false;  /* N/A for DdD */
             }
+        } else {
+            enumeration_complete = false;
         }
     }
 
     libusb_free_device_list(devlist, 1);
     libusb_exit(ctx);
+    list->ddd_enumeration_complete = enumeration_complete;
 
     return (int)list->count;
 }

@@ -144,6 +144,10 @@ typedef struct {
     int index;
     char name[64];
     char serial[64];
+#ifdef ENABLE_DDD
+    ddd_device_profile_t ddd_profile;
+    char ddd_usb_path[DDD_STABLE_ID_MAX];
+#endif
 } gui_reconnect_target_t;
 static int gui_find_first_device_of_type(const gui_app_t *app, device_type_t type) {
     if (!app) return -1;
@@ -161,6 +165,10 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = -1;
     target->name[0] = '\0';
     target->serial[0] = '\0';
+#ifdef ENABLE_DDD
+    target->ddd_profile = DDD_DEVICE_NOT_DDD;
+    target->ddd_usb_path[0] = '\0';
+#endif
     if (!app) return;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return;
     const device_info_t *dev = &app->devices[app->selected_device];
@@ -169,6 +177,13 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = dev->index;
     snprintf(target->name, sizeof(target->name), "%s", dev->name);
     snprintf(target->serial, sizeof(target->serial), "%s", dev->serial);
+#ifdef ENABLE_DDD
+    if (dev->type == DEVICE_TYPE_DDD) {
+        target->ddd_profile = dev->ddd_profile;
+        snprintf(target->ddd_usb_path, sizeof(target->ddd_usb_path), "%s",
+                 dev->ddd_usb_path);
+    }
+#endif
 }
 static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_target_t *target) {
     if (!app || !target || !target->valid) return -1;
@@ -220,10 +235,17 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
         }
 #ifdef ENABLE_DDD
         else if (target->type == DEVICE_TYPE_DDD) {
-            // Match by name so the synthetic "[DdD] Clockgen" entry reconnects
-            // to itself rather than the plain "[DdD] Domesday Duplicator" entry
-            // (both share DEVICE_TYPE_DDD; the name disambiguates them).
-            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+            // The name keeps the synthetic Clockgen variant separate. A
+            // protocol-v1 device must also retain its exact USB topology path;
+            // never switch to another same-name DdD during auto-reconnect.
+            if (!target->name[0] || strcmp(dev->name, target->name) != 0 ||
+                dev->ddd_profile != target->ddd_profile) {
+                continue;
+            }
+            if (!ddd_profile_requires_usb_path(target->ddd_profile) ||
+                ddd_reconnect_path_matches(
+                    target->ddd_profile, target->ddd_usb_path,
+                    dev->ddd_profile, dev->ddd_usb_path)) {
                 return i;
             }
         }
@@ -232,6 +254,11 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
             return i;
         }
     }
+#ifdef ENABLE_DDD
+    // DdD profiles are not interchangeable. If the selected profile/path is
+    // absent, wait for it instead of falling back to another DdD device.
+    if (target->type == DEVICE_TYPE_DDD) return -1;
+#endif
     return fallback_same_type;
 }
 

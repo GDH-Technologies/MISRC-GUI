@@ -28,6 +28,7 @@
 #endif
 #ifdef ENABLE_DDD
 #include "gui_ddd.h"
+#include "gui_ddd_v1.h"
 #include "gui_ddd_clockgen.h"
 #endif
 #include "../visualization/gui_panel.h"
@@ -363,6 +364,21 @@ static inline uint32_t gui_capture_normalize_sample_rate_hz(uint32_t raw_srate)
 
     return (uint32_t)hz;
 }
+
+#ifdef ENABLE_DDD
+static uint32_t gui_capture_ddd_resample_setting_khz(const gui_app_t *app)
+{
+    float rate_khz;
+    if (!app) return 0;
+    rate_khz = app->settings.resample_rate_a;
+    if (!isfinite(rate_khz) || rate_khz <= 0.0f ||
+        rate_khz > (float)ddd_sample_rate_khz(
+            DDD_DECIMATION_FULL_RATE) + 0.5f) {
+        return 0;
+    }
+    return (uint32_t)lroundf(rate_khz);
+}
+#endif
 
 static inline void gui_capture_update_backpressure_counters(gui_app_t *app)
 {
@@ -1249,6 +1265,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
 #ifdef ENABLE_DDD
     bool ddd_device_added = false;
     int first_ddd_src_index = -1;
+    device_info_t first_ddd_device = {0};
 #endif
 
     // Copy devices to GUI format
@@ -1279,11 +1296,25 @@ void gui_app_enumerate_devices(gui_app_t *app) {
             dst->type = DEVICE_TYPE_DDD;
             dst->index = src->index;
             snprintf(dst->serial, sizeof(dst->serial), "%s", src->device_id);
-            // Remember the first DdD device so the synthetic "[DdD] Clockgen"
-            // entry below can target the same physical device for its RF path.
-            if (!ddd_device_added) {
+            dst->ddd_profile = src->ddd_profile;
+            dst->ddd_vendor_id = src->ddd_vendor_id;
+            dst->ddd_product_id = src->ddd_product_id;
+            dst->ddd_bcd_device = src->ddd_bcd_device;
+            snprintf(dst->ddd_usb_path, sizeof(dst->ddd_usb_path), "%s",
+                     src->ddd_usb_path);
+            dst->ddd_capture_supported = src->ddd_capture_supported;
+            dst->ddd_clockgen = false;
+            // Preserve the legacy Clockgen RF path when legacy and protocol-v1
+            // devices coexist. Protocol-v1 remains available when it is the
+            // only supported DdD profile.
+            if (ddd_clockgen_candidate_is_preferred(
+                    ddd_device_added,
+                    first_ddd_device.ddd_profile,
+                    src->ddd_profile,
+                    src->ddd_capture_supported)) {
                 ddd_device_added = true;
                 first_ddd_src_index = src->index;
+                first_ddd_device = *dst;
             }
         }
 #endif
@@ -1309,6 +1340,9 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         app->device_count++;
     }
 
+#ifdef ENABLE_DDD
+    gui_ddd_v1_observe_enumeration(&devices);
+#endif
     misrc_device_list_free(&devices);
 
     int cxadc_card_count = gui_cxadc_detect_cards();
@@ -1326,6 +1360,14 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         snprintf(dst->serial, sizeof(dst->serial), "%s", DDD_CLOCKGEN_MARKER_SERIAL);
         dst->type = DEVICE_TYPE_DDD;
         dst->index = first_ddd_src_index;
+        dst->ddd_profile = first_ddd_device.ddd_profile;
+        dst->ddd_vendor_id = first_ddd_device.ddd_vendor_id;
+        dst->ddd_product_id = first_ddd_device.ddd_product_id;
+        dst->ddd_bcd_device = first_ddd_device.ddd_bcd_device;
+        snprintf(dst->ddd_usb_path, sizeof(dst->ddd_usb_path), "%s",
+                 first_ddd_device.ddd_usb_path);
+        dst->ddd_capture_supported = first_ddd_device.ddd_capture_supported;
+        dst->ddd_clockgen = true;
         app->device_count++;
     }
 #endif
@@ -1885,20 +1927,47 @@ int gui_app_start_capture(gui_app_t *app) {
 #ifdef ENABLE_DDD
     // Handle DdD device
     if (dev->type == DEVICE_TYPE_DDD) {
+        ddd_v1_rate_plan_t v1_rate_plan = {0};
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
         // gui_ddd_start() launches extraction internally; declare A-only mode
         // before startup so channel mapping is correct from first frame.
         app->capture_backend_upstream = false;
         app->capture_has_channel_b = false;
-        // Open DdD device first
-        int r = gui_ddd_open(app, dev->index);
-        if (r < 0) {
-            gui_app_set_status(app, "Failed to open DdD device");
+        if (!dev->ddd_capture_supported) {
+            gui_app_set_status(app, "Selected DdD firmware is unsupported");
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
-        int ddd_rc = gui_ddd_start(app);
+        if (dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1) {
+            uint32_t output_rate_khz =
+                ddd_v1_effective_output_rate_khz(
+                    app->settings.enable_resample_a,
+                    gui_capture_ddd_resample_setting_khz(app),
+                    app->settings.ddd_decimation);
+            if (!ddd_v1_plan_output_rate_khz(
+                    output_rate_khz, &v1_rate_plan)) {
+                gui_app_set_status(app, "Invalid DdD RF rate settings");
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+                return -1;
+            }
+        }
+        // Legacy and firmware 3.1 deliberately use separate backends. Only
+        // the firmware-3.1 profile sees B5/B7/B8 or the async queue.
+        int r = dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1
+            ? gui_ddd_v1_open(app, dev->ddd_usb_path)
+            : gui_ddd_open(app, dev->index);
+        if (r < 0) {
+            if (dev->ddd_profile != DDD_DEVICE_PROTOCOL_V1) {
+                gui_app_set_status(app, "Failed to open DdD device");
+            }
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+            return -1;
+        }
+        int ddd_rc = dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1
+            ? gui_ddd_v1_start(app, v1_rate_plan.decimation_factor,
+                               gui_ddd_get_test_mode())
+            : gui_ddd_start(app);
         if (ddd_rc == 0) {
             // Same watchdog fix as FX3: capture_start_time must be set here or
             // the auto-reconnect watchdog fires within 2s (DdD streams
@@ -2363,7 +2432,12 @@ void gui_app_stop_capture(gui_app_t *app) {
 #ifdef ENABLE_DDD
     if (dev->type == DEVICE_TYPE_DDD) {
         bool was_clockgen = gui_ddd_clockgen_device_mode(dev);
-        gui_ddd_stop(app);
+        if (gui_ddd_v1_is_active() ||
+            dev->ddd_profile == DDD_DEVICE_PROTOCOL_V1) {
+            gui_ddd_v1_stop(app);
+        } else {
+            gui_ddd_stop(app);
+        }
         if (was_clockgen) {
             // Stop the Clockgen Lite audio capture that ran in parallel with
             // the DdD RF capture. gui_ddd_stop already set is_capturing=false,

@@ -262,6 +262,7 @@ if libusb_common_dep.found()
     libusb_common_dep_added = true
   endif
   cflags += ['-DENABLE_DDD=1']
+  sources_capture += 'common/ddd_protocol.c'
   ddd_enabled = true
   message('libusb-1.0 found, building with DdD support')
 else
@@ -432,7 +433,10 @@ if raylib_dep.found()
 
   # Add DdD support to GUI if available
   if ddd_enabled
+    sources_gui += 'common/ddd_protocol.c'
     sources_gui += 'misrc_gui/input/gui_ddd.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_v1.c'
+    sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
   endif
 
@@ -554,4 +558,30 @@ if raylib_dep.found()
   message('raylib found, building GUI application')
 else
   message('raylib not found, skipping GUI application')
+endif
+
+# Dependency-free DDD protocol/policy tests run even when libusb or raylib is
+# unavailable, so the firmware contract remains covered on lean CI hosts.
+ddd_protocol_test = executable('ddd_protocol_test',
+  ['test/ddd_protocol_test.c', 'common/ddd_protocol.c'],
+  dependencies: [],
+  c_args: cflags,
+)
+test('ddd_protocol', ddd_protocol_test)
+
+ddd_async_policy_test = executable('gui_ddd_async_policy_test',
+  'test/gui_ddd_async_policy_test.c',
+  dependencies: [],
+  c_args: cflags,
+)
+test('gui_ddd_async_policy', ddd_async_policy_test)
+
+if ddd_enabled
+  ddd_async_fault_test = executable('gui_ddd_async_fault_test',
+    ['test/gui_ddd_async_fault_test.c',
+     'misrc_gui/input/gui_ddd_async.c'],
+    dependencies: [libusb_common_dep],
+    c_args: cflags,
+  )
+  test('gui_ddd_async_fault', ddd_async_fault_test)
 endif
