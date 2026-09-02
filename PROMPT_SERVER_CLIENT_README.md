@@ -177,6 +177,106 @@ HTTP/1.0, GET-only, socket→bind→listen→accept→per-client pthread. Endpoi
   not by the server/client work) but violated the rule that standard scaling =
   full readouts. Smoke + CI pass.
 
+### Follow-up fixes (round 9: connect visibility + status clarity)
+- **Info window widened moderately again**: updated the About panel sizing to
+  max/min 680/560 so Network controls are readable without clipping while
+  keeping the modal bounded by screen margins.
+- **Discovery list capped for usability**: in Client mode, render at most 6
+  discovered server rows and show a compact `N more server(s) not shown`
+  indicator when additional beacons exist. This prevents the list from pushing
+  key controls out of view.
+- **Connect action made explicit and always visible**: moved the
+  `VersionInfoNetConnectButton` to its own `Action:` row below the host:port
+  fields so it remains visible even when discovery entries are present.
+- **Status fallback hardened**: `gui_net_status_string()` now falls back by
+  configured mode (`Server mode: not active` / `Client mode: starting
+  discovery...`) before the final Local fallback, and `gui_net_apply_mode()`
+  explicitly sets `Local (no network)` when Local mode is selected.
+- **Debug noise cleanup**: removed temporary first-contact `/devices` and
+  staged-device mirror debug prints from `gui_net.c` after the body-read fix
+  was validated.
+
+### Verification (round 9)
+- `bash /home/harry/MISRC-GUI/scripts/build-local.sh`  
+  PASS: build completed and smoke test passed, output binary
+  `/home/harry/MISRC-GUI/build-local/misrc_gui`.
+- `python3 /home/harry/MISRC-GUI/misrc_tools/test/ci_guard_tests.py --static-only`  
+  PASS: all static guard checks passed.
+
+### Auto-load visual hold test session (round 10)
+- Rebuilt against the rebased branch before launch:
+  - `meson compile -C /home/harry/MISRC-GUI/build-local`
+  - `/home/harry/MISRC-GUI/build-local/misrc_gui --smoke-test`
+- Created temporary auto-load configs:
+  - `/tmp/misrc-net-tests/server_config.json` (net_mode=1, port=8095)
+  - `/tmp/misrc-net-tests/client_config.json` (net_mode=2, host=127.0.0.1, port=8095)
+- Launched held GUI sessions with `nohup`:
+  - server pid file: `/tmp/misrc-net-tests/server.pid` -> `62726`
+  - client pid file: `/tmp/misrc-net-tests/client.pid` -> `62749`
+  - server logs: `/tmp/misrc-net-tests/server.stdout.log`, `/tmp/misrc-net-tests/server.stderr.log`
+  - client logs: `/tmp/misrc-net-tests/client.stdout.log`, `/tmp/misrc-net-tests/client.stderr.log`
+- Runtime checks:
+  - process check: both `misrc_gui --config ...server_config.json` and `...client_config.json` running
+  - socket check: `LISTEN 0.0.0.0:8095` present
+  - server stderr highlights: `[NET] server listening on :8095`
+  - client stderr highlights:
+    - `[NET] client worker started -> 127.0.0.1:8095`
+    - `[NET] client pump /rf streaming (frame=4)`
+    - `[NET] client pump /baseband streaming (frame=12)`
+    - `[NET] discovery: found server 192.168.8.245:8095 (decode)`
+
+### Follow-up fixes (round 11: connect/disconnect cycle + live status)
+- **Action button cycle logic corrected**:
+  - previous behavior toggled based on worker-running state, which could leave
+    the button stuck showing `Disconnect`.
+  - updated behavior now toggles by real connection state:
+    - if connected -> disconnect (stop worker + ingest, keep discovery active)
+    - if disconnected -> connect/reconnect using current host:port
+- **Live status behavior corrected**:
+  - `gui_net_status_string()` now prioritizes computed runtime state for
+    server/client and shows real-time `Connecting...` / `Connected...` /
+    `Client idle ... (press Connect)` transitions instead of sticking on a
+    stale cached status message.
+- **UI labeling corrected**:
+  - Action button label is now driven by `gui_net_active(app)` so it reflects
+    actual connection state in real time (`Connect` vs `Disconnect`).
+- **Build validation**:
+  - `meson compile -C /home/harry/MISRC-GUI/build-local`
+  - `/home/harry/MISRC-GUI/build-local/misrc_gui --smoke-test`
+  - both completed successfully.
+
+### Launch-hold refresh (round 12)
+- Relaunched clean held instances for continued manual GUI testing:
+  - server: `/home/harry/MISRC-GUI/build-local/misrc_gui --config /tmp/misrc-net-tests/server_config.json`
+  - client: `/home/harry/MISRC-GUI/build-local/misrc_gui --config /tmp/misrc-net-tests/client_config.json`
+- Current PIDs:
+  - server: `72412`
+  - client: `72426`
+- Verification:
+  - both processes present via `pgrep -af`
+  - server listen socket present on `0.0.0.0:8095`
+
+### Follow-up fixes (round 13: toolbar reflect/set server capture state)
+- Root cause for \"Disconnect stuck\" in the top toolbar: that button was using
+  `app->is_capturing`, which in client mode tracks local ingest runtime rather
+  than the peer server's capture state.
+- Fixes:
+  - added `gui_net_client_peer_capturing()` in `gui_net.{h,c}` to expose
+    whether the connected peer reports `/stats state >= 1`.
+  - toolbar `ConnectButton` label/color now uses peer capture state in client
+    mode (still uses local capture state for non-client mode).
+  - toolbar click handler now decides start/stop by peer capture state in
+    client mode, so clicking the toolbar button sends `/start` or `/stop`
+    against the actual server state.
+  - hardened stale-state cleanup by forcing `peer_state=0` when the client
+    worker disconnects or reaches failure cutoff.
+- Validation:
+  - `meson compile -C /home/harry/MISRC-GUI/build-local`
+  - `/home/harry/MISRC-GUI/build-local/misrc_gui --smoke-test`
+  - relaunch held server/client instances and verify:
+    - both processes present (`79279`, `79296`)
+    - server listening on `0.0.0.0:8095`
+
 ### Known v1 limits
 - LAN-only, no auth/encryption (mirrors the reference cxadc-capture-server warning).
 - Client audio ingest uses the server-reported `audio_frame_bytes` for re-framing; correct for the common 24-bit/4ch (12-byte) case.

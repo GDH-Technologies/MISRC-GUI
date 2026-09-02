@@ -106,5 +106,13 @@ int  gui_net_discovered_count(void);
 bool gui_net_get_discovered(int index, char *host, size_t host_cap,
                             uint16_t *port, char *name, size_t name_cap);
 void gui_net_select_discovered(gui_app_t *app, int index);
+/* Client-mode connection toggles for the info-window Action button.
+ * "connection running" means the client worker is active (connected or trying).
+ * toggle_connection starts/stops that worker while keeping discovery active. */
+bool gui_net_client_connection_running(const gui_app_t *app);
+void gui_net_client_toggle_connection(gui_app_t *app);
+/* True when client mode is connected and the peer server reports capture/record
+ * state active (peer /stats state >= 1). */
+bool gui_net_client_peer_capturing(const gui_app_t *app);
 
 #endif /* GUI_NET_H */

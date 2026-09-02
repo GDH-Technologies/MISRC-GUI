@@ -471,6 +471,7 @@ static bool s_android_keyboard_visible = false;
 #define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
 #define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
 #define GUI_UI_RELEASES_DOWNLOAD_BASE_URL "https://github.com/harrypm/MISRC-GUI/releases/download"
+#define VERSION_INFO_NET_DISCOVERY_MAX_ROWS 6
 
 typedef struct {
     bool manual;
@@ -3540,11 +3541,10 @@ static void render_version_info_window(gui_app_t *app)
 {
     if (!s_version_info_window_open) return;
 
-    // Widened from 460/380 to fit the Network (Server/Client) section without
-    // clipping the discovered-server rows / helper text. Kept moderate so the
-    // header Download button stays in place.
-    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 560);
-    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 460);
+    // Slightly wider so network controls stay readable and the client Connect
+    // action remains visible without clipping on common desktop sizes.
+    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 680);
+    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 560);
     int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 820);
 
     static char vi_version[64];
@@ -3962,16 +3962,21 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(CLAY_STRING("Scanning for servers on the LAN..."),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 } else {
-                    for (int i = 0; i < disc_n; i++) {
+                    int disc_visible = disc_n;
+                    if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
+                        disc_visible = VERSION_INFO_NET_DISCOVERY_MAX_ROWS;
+                    }
+                    static char disc_labels[VERSION_INFO_NET_DISCOVERY_MAX_ROWS][160];
+                    for (int i = 0; i < disc_visible; i++) {
                         char dhost[64] = {0};
                         uint16_t dport = 0;
                         char dname[64] = {0};
                         if (!gui_net_get_discovered(i, dhost, sizeof(dhost), &dport, dname, sizeof(dname))) break;
-                        static char disc_label[160];
+                        char *disc_label = disc_labels[i];
                         if (dname[0]) {
-                            snprintf(disc_label, sizeof(disc_label), "%s:%u  (%s)", dhost, (unsigned)dport, dname);
+                            snprintf(disc_label, sizeof(disc_labels[i]), "%s:%u  (%s)", dhost, (unsigned)dport, dname);
                         } else {
-                            snprintf(disc_label, sizeof(disc_label), "%s:%u", dhost, (unsigned)dport);
+                            snprintf(disc_label, sizeof(disc_labels[i]), "%s:%u", dhost, (unsigned)dport);
                         }
                         bool sel = (strcmp(app->settings.net_client_host, dhost) == 0 &&
                                     app->settings.net_client_port == dport);
@@ -3981,7 +3986,7 @@ static void render_version_info_window(gui_app_t *app)
                          * list reads as a normal IPv4+port line of info. */
                         CLAY(CLAY_IDI("VersionInfoNetDiscItem", i), {
                             .layout = {
-                                .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 320), CLAY_SIZING_FIXED(26) },
+                                .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 420), CLAY_SIZING_FIXED(26) },
                                 .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
                                 .padding = { 8, 8, 0, 0 }
                             },
@@ -3991,6 +3996,13 @@ static void render_version_info_window(gui_app_t *app)
                             CLAY_TEXT(make_string(disc_label),
                                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
+                    }
+                    if (disc_n > disc_visible) {
+                        static char disc_more_label[96];
+                        snprintf(disc_more_label, sizeof(disc_more_label),
+                                 "%d more server(s) not shown", disc_n - disc_visible);
+                        CLAY_TEXT(make_string(disc_more_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
                     CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
@@ -4036,12 +4048,19 @@ static void render_version_info_window(gui_app_t *app)
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
                     }
                 }
-                // Connect button: (re)applies client mode with the current
-                // host:port, giving explicit control instead of only connecting
-                // on mode-cycle / discovered-server click.
+            }
+            // Connect button on its own row so it remains visible even when the
+            // discovery list has multiple entries.
+            CLAY(CLAY_ID("VersionInfoNetClientConnectRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetClientConnectLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Action:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
                 bool net_connected = gui_net_active(app);
                 Color connect_bg = net_connected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                const char *connect_label = net_connected ? "Reconnect" : "Connect";
+                const char *connect_label = net_connected ? "Disconnect" : "Connect";
                 CLAY(CLAY_ID("VersionInfoNetConnectButton"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(28) },
@@ -4053,6 +4072,8 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(connect_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
+                CLAY_TEXT(CLAY_STRING("toggle client connection"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
         }
 
@@ -4567,8 +4588,12 @@ static void render_toolbar_connection_group(gui_app_t *app,
             .childGap = toolbar_gap
         }
     }) {
-        Color connect_color = app->is_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
-        const char *connect_label = app->is_capturing
+        bool control_capturing = app->is_capturing;
+        if (gui_net_is_client(app)) {
+            control_capturing = gui_net_client_peer_capturing(app);
+        }
+        Color connect_color = control_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
+        const char *connect_label = control_capturing
             ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
             : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
         CLAY(CLAY_ID("ConnectButton"), {
@@ -6689,7 +6714,11 @@ void gui_handle_interactions(gui_app_t *app) {
             // Click a discovered server to connect to it (client mode).
             if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
                 int disc_n = gui_net_discovered_count();
-                for (int i = 0; i < disc_n; i++) {
+                int disc_visible = disc_n;
+                if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
+                    disc_visible = VERSION_INFO_NET_DISCOVERY_MAX_ROWS;
+                }
+                for (int i = 0; i < disc_visible; i++) {
                     if (Clay_PointerOver(CLAY_IDI("VersionInfoNetDiscItem", i))) {
                         gui_ui_clear_text_edit();
                         gui_net_select_discovered(app, i);
@@ -6698,12 +6727,13 @@ void gui_handle_interactions(gui_app_t *app) {
                     }
                 }
             }
-            // Connect button: (re)apply client mode with the current host:port.
+            // Connect/Disconnect button: toggles the client worker while
+            // staying in Client mode (discovery remains active when disconnected).
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetConnectButton")) &&
                 app->settings.net_mode == GUI_NET_MODE_CLIENT) {
                 gui_ui_clear_text_edit();
                 gui_settings_save(&app->settings);
-                (void)gui_net_apply_mode(app);
+                gui_net_client_toggle_connection(app);
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -7021,7 +7051,11 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
-            if (app->is_capturing) {
+            bool control_capturing = app->is_capturing;
+            if (gui_net_is_client(app)) {
+                control_capturing = gui_net_client_peer_capturing(app);
+            }
+            if (control_capturing) {
 #if defined(__ANDROID__)
                 /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
                  * hang joining libusb/libuvc threads; never block the render

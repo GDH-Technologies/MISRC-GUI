@@ -507,13 +507,6 @@ void gui_net_set_status(gui_app_t *app, const char *msg) {
 
 void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     if (!buf || len == 0) return;
-    /* Prefer the dedicated net_status buffer (written via gui_net_set_status).
-     * Fall back to a computed string only if net_status is empty (e.g. the
-     * app just started in Local mode and nothing has written it yet). */
-    if (app->net_status[0]) {
-        snprintf(buf, len, "%s", app->net_status);
-        return;
-    }
     if (s_server) {
         if (atomic_load(&s_server->running)) {
             snprintf(buf, len, "Listening on :%u", (unsigned)s_server->port);
@@ -525,10 +518,12 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     if (s_client) {
         if (atomic_load(&s_client->connected)) {
             snprintf(buf, len, "Connected to %s:%u", s_client->host, (unsigned)s_client->port);
-        } else if (atomic_load(&s_client->error)) {
-            snprintf(buf, len, "Connection error: %s:%u", s_client->host, (unsigned)s_client->port);
-        } else if (s_client->host[0]) {
+        } else if (atomic_load(&s_client->worker_started) && s_client->host[0]) {
             snprintf(buf, len, "Connecting to %s:%u ...", s_client->host, (unsigned)s_client->port);
+        } else if (atomic_load(&s_client->error)) {
+            snprintf(buf, len, "Disconnected from %s:%u", s_client->host, (unsigned)s_client->port);
+        } else if (s_client->host[0]) {
+            snprintf(buf, len, "Client idle: %s:%u (press Connect)", s_client->host, (unsigned)s_client->port);
         } else {
             int n = 0;
             net_mutex_lock(&s_client->disc_mtx);
@@ -541,6 +536,20 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
             }
         }
         return;
+    }
+    if (app && app->net_status[0]) {
+        snprintf(buf, len, "%s", app->net_status);
+        return;
+    }
+    if (app) {
+        if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
+            snprintf(buf, len, "Server mode: not active");
+            return;
+        }
+        if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+            snprintf(buf, len, "Client mode: starting discovery...");
+            return;
+        }
     }
     snprintf(buf, len, "Local (no network)");
 }
@@ -997,10 +1006,11 @@ static net_sock_t client_connect(const char *host, uint16_t port) {
     return fd;
 }
 
-/* Send "GET <path> HTTP/1.0\r\n\r\n", read headers, return the body starting
- * offset in *body_off and leave the rest of the header buffer in buf. Copies
- * any body bytes already read into body_out (up to body_cap). Returns 0 on
- * success, -1 on error. */
+/* Send "GET <path> HTTP/1.0\r\n\r\n", read headers + full body into body_out
+ * (up to body_cap). HTTP/1.0 closes the connection at EOF, so keep reading
+ * until recv returns 0 (EOF) or the body buffer is full. Returns 0 on
+ * success, -1 on error. body_len receives the number of body bytes stored
+ * (excluding the NUL terminator). */
 static int client_get(const char *host, uint16_t port, const char *path,
                       char *body_out, size_t body_cap, size_t *body_len) {
     net_sock_t fd = client_connect(host, port);
@@ -1008,7 +1018,7 @@ static int client_get(const char *host, uint16_t port, const char *path,
     char req[512];
     snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n", path, host);
     if (net_send_str(fd, req) != 0) { net_close(fd); return -1; }
-    /* Read headers + any body that arrives in the same recv loop. */
+    /* Read into a header buffer until we find the end-of-headers marker. */
     char hbuf[2048];
     size_t total = 0;
     int got_headers = 0;
@@ -1024,28 +1034,42 @@ static int client_get(const char *host, uint16_t port, const char *path,
         total += (size_t)n;
 #endif
         hbuf[total] = '\0';
-        if (!got_headers) {
-            char *eoh = strstr(hbuf, "\r\n\r\n");
-            if (eoh) {
-                got_headers = 1;
-                body_off = (size_t)(eoh + 4 - hbuf);
-                break;
-            }
+        char *eoh = strstr(hbuf, "\r\n\r\n");
+        if (eoh) {
+            got_headers = 1;
+            body_off = (size_t)(eoh + 4 - hbuf);
+            break;
         }
     }
     int rc = -1;
-    if (got_headers) {
-        /* Verify 200 status. */
-        if (strncmp(hbuf, "HTTP/1.0 200", 12) == 0 || strncmp(hbuf, "HTTP/1.1 200", 12) == 0) {
-            size_t have = total - body_off;
-            if (body_out && body_cap) {
-                size_t copy = (have < body_cap) ? have : body_cap - 1;
-                memcpy(body_out, hbuf + body_off, copy);
-                body_out[copy] = '\0';
-                if (body_len) *body_len = copy;
+    if (got_headers &&
+        (strncmp(hbuf, "HTTP/1.0 200", 12) == 0 || strncmp(hbuf, "HTTP/1.1 200", 12) == 0)) {
+        /* Copy any body bytes that arrived with the headers, then keep
+         * reading until EOF (HTTP/1.0 closes the socket) so the full body
+         * is captured - a small JSON body often arrives in a later TCP
+         * packet than the headers, and the old code returned an empty
+         * body in that case. */
+        size_t have = total - body_off;
+        if (body_out && body_cap) {
+            size_t copy = (have < body_cap) ? have : body_cap - 1;
+            memcpy(body_out, hbuf + body_off, copy);
+            size_t body_total = copy;
+            while (body_total < body_cap - 1) {
+#ifdef _WIN32
+                int n = recv(fd, body_out + body_total, (int)(body_cap - 1 - body_total), 0);
+                if (n == SOCKET_ERROR) break;
+                if (n == 0) break;  /* EOF: full body received */
+                body_total += (size_t)n;
+#else
+                ssize_t n = recv(fd, body_out + body_total, body_cap - 1 - body_total, 0);
+                if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; }
+                body_total += (size_t)n;
+#endif
             }
-            rc = 0;
+            body_out[body_total] = '\0';
+            if (body_len) *body_len = body_total;
         }
+        rc = 0;
     }
     net_close(fd);
     return rc;
@@ -1325,6 +1349,7 @@ static int client_worker_thread(void *arg) {
             if (miss_streak >= 5) {
                 atomic_store(&cli->connected, false);
                 atomic_store(&cli->error, true);
+                atomic_store(&cli->peer_state, 0);
                 last_peer_state = -1;
                 atomic_store(&cli->ingest_want, false);
                 first_contact = false;  /* re-fetch /devices on reconnect */
@@ -1344,8 +1369,8 @@ static int client_worker_thread(void *arg) {
         if (!first_contact) {
             first_contact = true;
             char *dj0 = (char *)malloc(16384);
-            size_t blen0 = 0;
-            if (dj0 && client_get(cli->host, cli->port, "/devices", dj0, 16384, &blen0) == 0) {
+            int drc = dj0 ? client_get(cli->host, cli->port, "/devices", dj0, 16384, NULL) : -1;
+            if (drc == 0) {
                 int count = json_int(dj0, "count", 0);
                 int selected = json_int(dj0, "selected", -1);
                 if (count < 0) count = 0;
@@ -1622,6 +1647,7 @@ static void client_stop_worker(net_client_t *cli) {
     }
     atomic_store(&cli->connected, false);
     atomic_store(&cli->error, false);
+    atomic_store(&cli->peer_state, 0);
     atomic_store(&cli->stop_flag, false);
 }
 
@@ -1790,6 +1816,7 @@ int gui_net_apply_mode(gui_app_t *app) {
         if (!s_server && !s_client) {
             atomic_store(&app->net_connected, false);
         }
+        gui_net_set_status(app, "Local (no network)");
     }
     return 0;
 }
@@ -1949,5 +1976,73 @@ void gui_net_select_discovered(gui_app_t *app, int index) {
     (void)gui_net_apply_mode(app);
     char msg[160];
     snprintf(msg, sizeof(msg), "Connecting to discovered server %s:%u (%s)", host, (unsigned)port, name);
+    gui_net_set_status(app, msg);
+}
+
+/* True when client connection is active at the worker level (connected or
+ * currently trying). Used by the UI Action button label/state. */
+bool gui_net_client_connection_running(const gui_app_t *app) {
+    (void)app;
+    if (!s_client) return false;
+    return atomic_load(&s_client->worker_started);
+}
+
+bool gui_net_client_peer_capturing(const gui_app_t *app) {
+    (void)app;
+    if (!s_client) return false;
+    if (!atomic_load(&s_client->connected)) return false;
+    return atomic_load(&s_client->peer_state) >= 1;
+}
+
+/* Toggle client connect/disconnect while remaining in Client mode:
+ * - if currently connected, stop worker (disconnect; keep discovery alive)
+ * - if disconnected, (re)start worker using current host:port settings. */
+void gui_net_client_toggle_connection(gui_app_t *app) {
+    if (!app) return;
+    if (app->settings.net_mode != GUI_NET_MODE_CLIENT) {
+        return;
+    }
+    gui_net_init_globals();
+
+    long p = atol(app->settings.net_client_port_str);
+    if (p < 1 || p > 65535) p = (long)app->settings.net_client_port;
+    if (p < 1 || p > 65535) p = 8080;
+    app->settings.net_client_port = (uint16_t)p;
+    const char *h = app->settings.net_client_host;
+
+    if (!s_client) {
+        (void)gui_net_apply_mode(app);
+        return;
+    }
+
+    bool connected_now = atomic_load(&s_client->connected);
+    if (connected_now) {
+        client_stop_worker(s_client);
+        if (h && h[0]) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Client disconnected from %s:%u", h, (unsigned)p);
+            gui_net_set_status(app, msg);
+        } else {
+            gui_net_set_status(app, "Client disconnected (discovery still active)");
+        }
+        return;
+    }
+
+    if (!h || !h[0]) {
+        gui_net_set_status(app, "Client mode: select a discovered server or enter host:port");
+        return;
+    }
+
+    snprintf(s_client->host, sizeof(s_client->host), "%s", h);
+    s_client->port = (uint16_t)p;
+    if (atomic_load(&s_client->worker_started)) {
+        client_stop_worker(s_client);
+    }
+    if (client_start_worker(s_client) != 0) {
+        gui_net_set_status(app, "Failed to start client worker");
+        return;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Network client connecting to %s:%u", h, (unsigned)p);
     gui_net_set_status(app, msg);
 }
