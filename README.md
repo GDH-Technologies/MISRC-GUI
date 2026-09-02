@@ -34,6 +34,14 @@ Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
 
 <details closed>
+<summary>DdD Setup</summary>
+<br>
+
+MISRC GUI supports both legacy DdD firmware and the protocol-v1 firmware family introduced in 3.1. They appear as separate device profiles in the device list.
+
+</details>
+
+<details closed>
 <summary>Install Windows</summary>
 <br>
 

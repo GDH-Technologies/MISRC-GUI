@@ -242,7 +242,7 @@ static bool handle_right_view_dropdown(gui_app_t *app, int ch) {
 
 bool gui_dropdown_handle_click(gui_app_t *app) {
     bool dropdown_clicked = false;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
 
     // Device dropdown (global)
     if (handle_device_dropdown(app)) {

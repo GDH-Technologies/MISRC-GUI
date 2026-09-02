@@ -10,6 +10,7 @@
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
 #include "../visualization/gui_text.h"
+#include "../ui/gui_ui.h"
 #include "../../common/threading.h"
 #include <stdlib.h>
 #include <string.h>
@@ -2106,7 +2107,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
             decoder->overlay.system_options_rect[i] = opt_rect;
 
             bool is_selected = (sys == sys_values[i]);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
 
             Color opt_bg = gui_dropdown_option_color(is_selected, hover);
@@ -2141,7 +2142,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
             decoder->overlay.tape_options_rect[i] = opt_rect;
 
             bool is_selected = (decoder->tape_format == values[i]);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
 
             Color opt_bg = gui_dropdown_option_color(is_selected, hover);
@@ -2169,7 +2170,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
             decoder->overlay.tape_format_options_rect[i] = opt_rect;
 
             bool is_selected = (tape_fmt == i);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
 
             Color opt_bg = gui_dropdown_option_color(is_selected, hover);

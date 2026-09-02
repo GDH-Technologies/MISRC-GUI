@@ -708,7 +708,7 @@ static void demod_render_overlay(demod_state_t *s, gui_app_t *app, Rectangle bou
             Rectangle opt_rect = {mode_btn_x, opt_y + i * opt_h, mode_btn_w, opt_h};
             s->overlay.mode_options_rect[i] = opt_rect;
             bool is_sel = (i == (int)s->mode);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
             Color opt_bg = gui_dropdown_option_color(is_sel, hover);
             DrawRectangleRec(opt_rect, opt_bg);
@@ -727,7 +727,7 @@ static void demod_render_overlay(demod_state_t *s, gui_app_t *app, Rectangle bou
             Rectangle opt_rect = {bw_btn_x, opt_y + i * opt_h, bw_btn_w, opt_h};
             s->overlay.bw_options_rect[i] = opt_rect;
             bool is_sel = (i == bw_cur);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
             Color opt_bg = gui_dropdown_option_color(is_sel, hover);
             DrawRectangleRec(opt_rect, opt_bg);
@@ -747,7 +747,7 @@ static void demod_render_overlay(demod_state_t *s, gui_app_t *app, Rectangle bou
             Rectangle opt_rect = {out_btn_x, opt_y + i * opt_h, out_btn_w, opt_h};
             s->overlay.out_options_rect[i] = opt_rect;
             bool is_sel = (i == out_val);
-            Vector2 mouse = GetMousePosition();
+            Vector2 mouse = gui_ui_get_mouse_position();
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
             Color opt_bg = gui_dropdown_option_color(is_sel, hover);
             DrawRectangleRec(opt_rect, opt_bg);

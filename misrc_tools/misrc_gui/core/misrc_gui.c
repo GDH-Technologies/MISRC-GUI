@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <limits.h>
@@ -72,6 +73,7 @@ volatile atomic_int do_exit = 0;
 // Font array for Clay
 // Index 0: Inter (general UI), Index 1: Space Mono (monospace sections)
 #define FONT_COUNT 2
+#define UI_FONT_ATLAS_SIZE 64
 static Font fonts[FONT_COUNT];
 
 // Clay error handler
@@ -118,34 +120,21 @@ static void print_usage(const char *program_name) {
     fprintf(stdout, "(Headless CLI capture mode is not available in the Android build.)\n");
 #endif
 }
-static int gui_layout_width(void) {
-#if defined(__APPLE__)
-    int width = GetScreenWidth();
-#else
-    int width = GetRenderWidth();
-    if (width <= 0) {
-        width = GetScreenWidth();
-    }
-#endif
-    return (width > 0) ? width : 1;
-}
-static int gui_layout_height(void) {
-#if defined(__APPLE__)
-    int height = GetScreenHeight();
-#else
-    int height = GetRenderHeight();
-    if (height <= 0) {
-        height = GetScreenHeight();
-    }
-#endif
-    return (height > 0) ? height : 1;
-}
 static bool gui_status_is_permission_denied(const gui_app_t *app) {
     if (!app) return false;
     return strstr(app->status_message, "Permission denied") != NULL ||
            strstr(app->status_message, "permission denied") != NULL ||
            strstr(app->status_message, "device not granted") != NULL ||
            strstr(app->status_message, "USB open failed") != NULL;
+}
+
+static bool gui_primary_modifier_down(void)
+{
+    bool down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    down = down || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#endif
+    return down;
 }
 static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
     switch (reason) {
@@ -176,6 +165,10 @@ typedef struct {
     int index;
     char name[64];
     char serial[64];
+#ifdef ENABLE_DDD
+    ddd_device_profile_t ddd_profile;
+    char ddd_usb_path[DDD_STABLE_ID_MAX];
+#endif
 } gui_reconnect_target_t;
 static int gui_find_first_device_of_type(const gui_app_t *app, device_type_t type) {
     if (!app) return -1;
@@ -193,6 +186,10 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = -1;
     target->name[0] = '\0';
     target->serial[0] = '\0';
+#ifdef ENABLE_DDD
+    target->ddd_profile = DDD_DEVICE_NOT_DDD;
+    target->ddd_usb_path[0] = '\0';
+#endif
     if (!app) return;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return;
     const device_info_t *dev = &app->devices[app->selected_device];
@@ -201,6 +198,13 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = dev->index;
     snprintf(target->name, sizeof(target->name), "%s", dev->name);
     snprintf(target->serial, sizeof(target->serial), "%s", dev->serial);
+#ifdef ENABLE_DDD
+    if (dev->type == DEVICE_TYPE_DDD) {
+        target->ddd_profile = dev->ddd_profile;
+        snprintf(target->ddd_usb_path, sizeof(target->ddd_usb_path), "%s",
+                 dev->ddd_usb_path);
+    }
+#endif
 }
 static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_target_t *target) {
     if (!app || !target || !target->valid) return -1;
@@ -252,10 +256,17 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
         }
 #ifdef ENABLE_DDD
         else if (target->type == DEVICE_TYPE_DDD) {
-            // Match by name so the synthetic "[DdD] Clockgen" entry reconnects
-            // to itself rather than the plain "[DdD] Domesday Duplicator" entry
-            // (both share DEVICE_TYPE_DDD; the name disambiguates them).
-            if (target->name[0] && strcmp(dev->name, target->name) == 0) {
+            // The name keeps the synthetic Clockgen variant separate. A
+            // protocol-v1 device must also retain its exact USB topology path;
+            // never switch to another same-name DdD during auto-reconnect.
+            if (!target->name[0] || strcmp(dev->name, target->name) != 0 ||
+                dev->ddd_profile != target->ddd_profile) {
+                continue;
+            }
+            if (!ddd_profile_requires_usb_path(target->ddd_profile) ||
+                ddd_reconnect_path_matches(
+                    target->ddd_profile, target->ddd_usb_path,
+                    dev->ddd_profile, dev->ddd_usb_path)) {
                 return i;
             }
         }
@@ -264,6 +275,11 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
             return i;
         }
     }
+#ifdef ENABLE_DDD
+    // DdD profiles are not interchangeable. If the selected profile/path is
+    // absent, wait for it instead of falling back to another DdD device.
+    if (target->type == DEVICE_TYPE_DDD) return -1;
+#endif
     return fallback_same_type;
 }
 
@@ -589,6 +605,7 @@ int main(int argc, char **argv) {
 
     // Load persistent settings (includes desktop path defaults)
     gui_settings_load(&app.settings);
+    gui_ui_set_scale_percent(app.settings.ui_scale_percent);
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;
@@ -622,7 +639,8 @@ int main(int argc, char **argv) {
 
     // Load embedded Inter font directly from memory (Apache 2.0 licensed)
     // Font data is ~342KB and embedded as a C array for complete portability
-    fonts[0] = LoadFontFromMemory(".ttf", inter_font_data, inter_font_data_size, 32, NULL, 256);
+    fonts[0] = LoadFontFromMemory(".ttf", inter_font_data, inter_font_data_size,
+                                  UI_FONT_ATLAS_SIZE, NULL, 256);
     if (fonts[0].texture.id == 0) {
         fprintf(stderr, "Error: Failed to load embedded Inter font data\n");
         CloseWindow();
@@ -632,7 +650,8 @@ int main(int argc, char **argv) {
 
     // Load embedded Space Mono font directly from memory (SIL Open Font License)
     // Font data is embedded as a C array for complete portability
-    fonts[1] = LoadFontFromMemory(".ttf", space_mono_font_data, space_mono_font_data_size, 32, NULL, 256);
+    fonts[1] = LoadFontFromMemory(".ttf", space_mono_font_data, space_mono_font_data_size,
+                                  UI_FONT_ATLAS_SIZE, NULL, 256);
     if (fonts[1].texture.id == 0) {
         fprintf(stderr, "Error: Failed to load embedded Space Mono font data\n");
         CloseWindow();
@@ -650,7 +669,9 @@ int main(int argc, char **argv) {
     }
 
     Clay_Arena clay_arena = Clay_CreateArenaWithCapacityAndMemory(clay_memory_size, clay_memory);
-    Clay_Initialize(clay_arena, (Clay_Dimensions){ (float)gui_layout_width(), (float)gui_layout_height() },
+    Clay_Initialize(clay_arena,
+                    (Clay_Dimensions){ (float)gui_ui_get_layout_width(),
+                                       (float)gui_ui_get_layout_height() },
                     (Clay_ErrorHandler){
                         .errorHandlerFunction = clay_error_handler,
                         .userData = NULL,
@@ -759,6 +780,9 @@ int main(int argc, char **argv) {
     int last_layout_width = -1;
     int last_layout_height = -1;
     bool recording_fps_throttle = false;
+    gui_ui_zoom_state_t ui_zoom_state = {0};
+    bool ui_scale_save_pending = false;
+    double ui_scale_save_deadline = 0.0;
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     double last_thread_promotion_time = 0.0;
     const double thread_promotion_interval_s = 0.25;
@@ -788,6 +812,58 @@ int main(int argc, char **argv) {
             recording_fps_throttle = false;
         }
         float dt = GetFrameTime();
+        Vector2 wheel_delta = GetMouseWheelMoveV();
+        bool primary_modifier_down = gui_primary_modifier_down();
+        gui_ui_zoom_result_t ui_zoom_result =
+            gui_ui_zoom_process(&ui_zoom_state,
+                                app.settings.ui_scale_percent,
+                                primary_modifier_down,
+                                wheel_delta.x,
+                                wheel_delta.y);
+
+        bool zoom_reset_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0));
+        bool zoom_in_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD));
+        bool zoom_out_pressed = primary_modifier_down &&
+            (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT));
+        bool keyboard_step_pressed = zoom_in_pressed != zoom_out_pressed;
+        bool keyboard_zoom_pressed = zoom_reset_pressed || keyboard_step_pressed;
+        bool show_ui_scale_hud =
+            ui_zoom_result.step_attempted || keyboard_zoom_pressed;
+
+        if (keyboard_zoom_pressed) {
+            ui_zoom_state.wheel_remainder = 0.0f;
+            if (zoom_reset_pressed) {
+                ui_zoom_result.percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+            } else {
+                int direction = zoom_in_pressed ? 1 : -1;
+                ui_zoom_result.percent =
+                    gui_ui_scale_step_percent(app.settings.ui_scale_percent,
+                                              direction);
+            }
+        }
+
+        ui_zoom_result.changed =
+            ui_zoom_result.percent != app.settings.ui_scale_percent;
+
+        if (ui_zoom_result.changed) {
+            app.settings.ui_scale_percent = ui_zoom_result.percent;
+            gui_ui_set_scale_percent(ui_zoom_result.percent);
+            last_layout_width = -1;
+            last_layout_height = -1;
+            ui_scale_save_pending = true;
+            ui_scale_save_deadline = GetTime() + 0.4;
+        }
+
+        if (show_ui_scale_hud) {
+            gui_ui_show_scale_hud(ui_zoom_result.percent);
+        }
+
+        if (ui_scale_save_pending && GetTime() >= ui_scale_save_deadline) {
+            gui_settings_save(&app.settings);
+            ui_scale_save_pending = false;
+        }
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
         if (app.is_capturing) {
             double now = GetTime();
@@ -801,8 +877,8 @@ int main(int argc, char **argv) {
             last_thread_promotion_time = 0.0;
         }
 #endif
-        int current_layout_width = gui_layout_width();
-        int current_layout_height = gui_layout_height();
+        int current_layout_width = gui_ui_get_layout_width();
+        int current_layout_height = gui_ui_get_layout_height();
         if (current_layout_width != last_layout_width || current_layout_height != last_layout_height) {
             Clay_SetLayoutDimensions((Clay_Dimensions){
                 (float)current_layout_width, (float)current_layout_height
@@ -859,12 +935,12 @@ int main(int argc, char **argv) {
         }
 
         // Update Clay mouse state
-        Vector2 mouse_pos = GetMousePosition();
+        Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
         Clay_UpdateScrollContainers(true, (Clay_Vector2){
-            GetMouseWheelMoveV().x * 20.0f,
-            GetMouseWheelMoveV().y * 20.0f
+            ui_zoom_result.passthrough_x * 20.0f,
+            ui_zoom_result.passthrough_y * 20.0f
         }, dt);
 
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
@@ -1073,7 +1149,10 @@ int main(int argc, char **argv) {
         }
 
         // Handle panel scroll events (e.g., waveform/FFT zoom)
-        float wheel = GetMouseWheelMove();
+        float wheel = fabsf(ui_zoom_result.passthrough_x) >
+                              fabsf(ui_zoom_result.passthrough_y)
+                          ? ui_zoom_result.passthrough_x
+                          : ui_zoom_result.passthrough_y;
         if (wheel != 0.0f) {
             panel_handle_all_scrolls(&app, wheel);
         }

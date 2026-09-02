@@ -309,7 +309,7 @@ bool panel_handle_all_clicks(gui_app_t *app, Vector2 mouse_pos) {
 static bool try_panel_scroll(panel_view_type_t type, void *state,
                               Rectangle bounds, float delta) {
     // First check if mouse is within bounds
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = gui_ui_get_mouse_position();
     if (!CheckCollisionPointRec(mouse, bounds)) {
         return false;
     }

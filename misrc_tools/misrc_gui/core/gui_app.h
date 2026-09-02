@@ -9,6 +9,9 @@
 #include <time.h>
 #include "raylib.h"
 #include "../../common/buffer_manager.h"
+#ifdef ENABLE_DDD
+#include "../../common/ddd_protocol.h"
+#endif
 
 // Forward declarations
 typedef struct hsdaoh_dev hsdaoh_dev_t;
@@ -163,6 +166,15 @@ typedef struct {
     char serial[64];
     device_type_t type;
     int index;
+#ifdef ENABLE_DDD
+    ddd_device_profile_t ddd_profile;
+    uint16_t ddd_vendor_id;
+    uint16_t ddd_product_id;
+    uint16_t ddd_bcd_device;
+    char ddd_usb_path[DDD_STABLE_ID_MAX];
+    bool ddd_capture_supported;
+    bool ddd_clockgen;
+#endif
 } device_info_t;
 
 // GUI settings (bound to UI controls) - mirrors all CLI options
@@ -234,6 +246,9 @@ typedef struct {
     int resample_quality_b;                    // 0-4
     float resample_gain_a;                     // dB
     float resample_gain_b;                     // dB
+#ifdef ENABLE_DDD
+    uint8_t ddd_decimation;                    // Firmware 3.1 only: 1=40, 2=20 MSPS
+#endif
 
     // FLAC compression
     bool use_flac;
@@ -311,6 +326,7 @@ typedef struct {
     bool show_grid;
     float time_scale;         // Time per division (ms)
     float amplitude_scale;    // Amplitude scale factor
+    int ui_scale_percent;     // Ctrl/Cmd+wheel or +/- UI zoom, persisted as 75-200
 
     // Device discovery: V4L2/simple_capture device enumeration is opt-in.
     // Disabled by default since most users use hsdaoh/CXADC/DdD/FX3 backends;

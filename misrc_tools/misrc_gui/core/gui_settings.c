@@ -5,6 +5,7 @@
  */
 
 #include "../core/gui_app.h"
+#include "../ui/gui_ui_scale.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -443,6 +444,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->resample_quality_b = 3;     // High quality
     settings->resample_gain_a = 0.0f;     // No gain
     settings->resample_gain_b = 0.0f;     // No gain
+#ifdef ENABLE_DDD
+    settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
+#endif
     
     // FLAC defaults
     settings->use_flac = true;
@@ -493,6 +497,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->show_grid = true;
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
+    settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 
     // V4L2/simple_capture device discovery is opt-in (disabled by default).
     settings->discover_simple_capture = false;
@@ -628,6 +633,9 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"resample_quality_b\": %d,\n", settings->resample_quality_b);
     fprintf(f, "  \"resample_gain_a\": %.1f,\n", settings->resample_gain_a);
     fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
+#ifdef ENABLE_DDD
+    fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
+#endif
     fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
     fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
     fprintf(f, "  \"flac_level\": %d,\n", settings->flac_level);
@@ -647,6 +655,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"show_grid\": %s,\n", settings->show_grid ? "true" : "false");
     fprintf(f, "  \"time_scale\": %.2f,\n", settings->time_scale);
     fprintf(f, "  \"amplitude_scale\": %.2f,\n", settings->amplitude_scale);
+    fprintf(f, "  \"ui_scale_percent\": %d,\n", settings->ui_scale_percent);
     fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
     fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
@@ -1057,6 +1066,15 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->resample_gain_a = (float)atof(value);
     }
 
+#ifdef ENABLE_DDD
+    if ((value = find_value(content, "ddd_decimation")) != NULL) {
+        uint8_t factor = (uint8_t)atoi(value);
+        if (ddd_decimation_is_supported(factor)) {
+            settings->ddd_decimation = factor;
+        }
+    }
+#endif
+
     if ((value = find_value(content, "resample_gain_b")) != NULL) {
         settings->resample_gain_b = (float)atof(value);
     }
@@ -1075,6 +1093,9 @@ void gui_settings_load(gui_settings_t *settings) {
     
     if ((value = find_value(content, "amplitude_scale")) != NULL) {
         settings->amplitude_scale = (float)atof(value);
+    }
+    if ((value = find_value(content, "ui_scale_percent")) != NULL) {
+        settings->ui_scale_percent = gui_ui_scale_parse_percent(value);
     }
     if ((value = find_value(content, "discover_simple_capture")) != NULL) {
         settings->discover_simple_capture = (strcmp(value, "true") == 0);

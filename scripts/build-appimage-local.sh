@@ -261,7 +261,7 @@ EOF
   produced_appimage="$(find "$package_dir" -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
   [[ -n "$produced_appimage" ]] || fail "AppImage was not produced by linuxdeploy."
 
-  local output_name="misrc_gui-${version}-linux-${ARTIFACT_SUFFIX}.AppImage"
+  local output_name="Linux_MISRC_GUI_${version}_${ARTIFACT_SUFFIX}.AppImage"
   local output_path="$OUT_DIR/$output_name"
   cp "$produced_appimage" "$output_path"
   chmod +x "$output_path"
