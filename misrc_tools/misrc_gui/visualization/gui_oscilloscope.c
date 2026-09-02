@@ -102,20 +102,102 @@ typedef struct {
     int16_t cvbs_threshold;     // Detection threshold (midpoint)
     bool cvbs_levels_valid;     // True if levels were successfully detected
 
+    // Protects shared state accessed by both display and render threads.
+    atomic_flag data_lock;
+
     // Initialization flag
     bool initialized;
     bool trigger_source_defaulted_by_channel;
 } waveform_panel_state_t;
 
+typedef struct {
+    bool trigger_enabled;
+    int16_t trigger_level;
+    trigger_mode_t trigger_mode;
+    trigger_source_t trigger_source;
+    float zoom_scale;
+} waveform_runtime_cfg_t;
+
+typedef struct {
+    bool trigger_enabled;
+    int16_t trigger_level;
+    trigger_mode_t trigger_mode;
+    int trigger_display_pos;
+    int16_t cvbs_sync_level;
+    int16_t cvbs_blank_level;
+    int16_t cvbs_threshold;
+    bool cvbs_levels_valid;
+    float zoom_scale;
+    size_t samples_available;
+} waveform_render_snapshot_t;
+
 // Forward declarations for static helper functions
 static void waveform_cleanup_resampler(waveform_panel_state_t *state);
 static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
+                                           waveform_sample_t *dest,
                                            const int16_t *buf, size_t num_samples,
                                            size_t start_idx, float decimation,
                                            size_t target_width);
 static bool waveform_process_display(waveform_panel_state_t *state,
+                                      const waveform_runtime_cfg_t *cfg,
                                       const int16_t *buf, size_t num_samples,
-                                      uint32_t sample_rate_hz);
+                                      uint32_t sample_rate_hz,
+                                      waveform_sample_t *out_samples,
+                                      size_t *out_available,
+                                      int *out_trigger_display_pos);
+
+static inline void waveform_state_lock(waveform_panel_state_t *state)
+{
+    while (atomic_flag_test_and_set(&state->data_lock)) {
+        /* spin */
+    }
+}
+
+static inline void waveform_state_unlock(waveform_panel_state_t *state)
+{
+    atomic_flag_clear(&state->data_lock);
+}
+
+static waveform_runtime_cfg_t waveform_capture_runtime_cfg(waveform_panel_state_t *state)
+{
+    waveform_runtime_cfg_t cfg;
+    waveform_state_lock(state);
+    cfg.trigger_enabled = state->trigger_enabled;
+    cfg.trigger_level = state->trigger_level;
+    cfg.trigger_mode = state->trigger_mode;
+    cfg.trigger_source = state->trigger_source;
+    cfg.zoom_scale = state->zoom_scale;
+    waveform_state_unlock(state);
+    return cfg;
+}
+
+static void waveform_capture_render_snapshot(waveform_panel_state_t *state,
+                                             waveform_render_snapshot_t *snap,
+                                             waveform_sample_t *samples_out)
+{
+    if (!state || !snap || !samples_out) return;
+
+    waveform_state_lock(state);
+    snap->trigger_enabled = state->trigger_enabled;
+    snap->trigger_level = state->trigger_level;
+    snap->trigger_mode = state->trigger_mode;
+    snap->trigger_display_pos = state->trigger_display_pos;
+    snap->cvbs_sync_level = state->cvbs_sync_level;
+    snap->cvbs_blank_level = state->cvbs_blank_level;
+    snap->cvbs_threshold = state->cvbs_threshold;
+    snap->cvbs_levels_valid = state->cvbs_levels_valid;
+    snap->zoom_scale = state->zoom_scale;
+    snap->samples_available = state->display_samples_available;
+    if (snap->samples_available > DISPLAY_BUFFER_SIZE) {
+        snap->samples_available = DISPLAY_BUFFER_SIZE;
+    }
+    if (snap->samples_available > 0) {
+        memcpy(samples_out,
+               state->display_samples,
+               snap->samples_available * sizeof(waveform_sample_t));
+    }
+    waveform_state_unlock(state);
+}
 
 //-----------------------------------------------------------------------------
 // Grid Settings
@@ -153,9 +235,13 @@ static inline trigger_source_t waveform_default_trigger_source_for_channel(int c
 
 static void waveform_apply_channel_trigger_source_default(waveform_panel_state_t *state, int channel)
 {
-    if (!state || state->trigger_source_defaulted_by_channel) return;
-    state->trigger_source = waveform_default_trigger_source_for_channel(channel);
-    state->trigger_source_defaulted_by_channel = true;
+    if (!state) return;
+    waveform_state_lock(state);
+    if (!state->trigger_source_defaulted_by_channel) {
+        state->trigger_source = waveform_default_trigger_source_for_channel(channel);
+        state->trigger_source_defaulted_by_channel = true;
+    }
+    waveform_state_unlock(state);
 }
 
 //-----------------------------------------------------------------------------
@@ -333,16 +419,16 @@ static void draw_dashed_hline(float x, float y, float w, Color color, float dash
 }
 
 static void draw_panel_trigger_markers(float x, float y, float w, float h,
-                                        const waveform_panel_state_t *state,
+                                        const waveform_render_snapshot_t *snap,
                                         float amplitude_scale, Color color) {
-    if (!state->trigger_enabled) return;
+    if (!snap || !snap->trigger_enabled) return;
 
     float center_y = y + h / 2.0f;
     float scale = (h / 2.0f) * amplitude_scale;
 
     // CVBS mode: draw detected sync, blanking, and threshold levels
-    if (state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
-        if (!state->cvbs_levels_valid) return;
+    if (snap->trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
+        if (!snap->cvbs_levels_valid) return;
 
         // Colors for CVBS levels
         Color sync_color = { 255, 100, 100, 140 };    // Red-ish for sync tip
@@ -350,9 +436,9 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
         Color thresh_color = { color.r, color.g, color.b, 180 };  // Channel color for threshold
 
         // Convert levels to Y positions (levels are -2048 to +2047)
-        float sync_y = center_y - (state->cvbs_sync_level / 2048.0f) * scale;
-        float blank_y = center_y - (state->cvbs_blank_level / 2048.0f) * scale;
-        float thresh_y = center_y - (state->cvbs_threshold / 2048.0f) * scale;
+        float sync_y = center_y - (snap->cvbs_sync_level / 2048.0f) * scale;
+        float blank_y = center_y - (snap->cvbs_blank_level / 2048.0f) * scale;
+        float thresh_y = center_y - (snap->cvbs_threshold / 2048.0f) * scale;
 
         // Clamp to bounds
         if (sync_y < y) sync_y = y;
@@ -377,8 +463,8 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
         gui_text_draw_mono("T", x + w - 12, thresh_y - 6, FONT_SIZE_OSC_SCALE, thresh_color);
 
         // Draw vertical trigger position marker at actual trigger position (if triggered)
-        if (state->trigger_display_pos >= 0 && state->trigger_display_pos < (int)w) {
-            float trigger_x = x + (float)state->trigger_display_pos;
+        if (snap->trigger_display_pos >= 0 && snap->trigger_display_pos < (int)w) {
+            float trigger_x = x + (float)snap->trigger_display_pos;
             Color marker_color = { color.r, color.g, color.b, 80 };
             DrawLineEx((Vector2){trigger_x, y}, (Vector2){trigger_x, y + h}, 1.0f, marker_color);
         }
@@ -386,9 +472,9 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
     }
 
     // Sync mode: phase-lock marker only (no manual trigger-level line).
-    if (state->trigger_mode == TRIGGER_MODE_SYNC) {
-        if (state->trigger_display_pos >= 0 && state->trigger_display_pos < (int)w) {
-            float trigger_x = x + (float)state->trigger_display_pos;
+    if (snap->trigger_mode == TRIGGER_MODE_SYNC) {
+        if (snap->trigger_display_pos >= 0 && snap->trigger_display_pos < (int)w) {
+            float trigger_x = x + (float)snap->trigger_display_pos;
             Color marker_color = { color.r, color.g, color.b, 120 };
             DrawLineEx((Vector2){trigger_x, y}, (Vector2){trigger_x, y + h}, 1.0f, marker_color);
         }
@@ -396,7 +482,7 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
     }
 
     // Normal trigger mode: draw single trigger level line
-    float level_norm = state->trigger_level / 2048.0f;
+    float level_norm = snap->trigger_level / 2048.0f;
     float level_y = center_y - level_norm * scale;
 
     // Clamp to panel bounds
@@ -415,8 +501,8 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
     DrawTriangle(arrow_tip, arrow_bot, arrow_top, trig_color);
 
     // Draw vertical trigger position marker at actual trigger position (if triggered)
-    if (state->trigger_display_pos >= 0 && state->trigger_display_pos < (int)w) {
-        float trigger_x = x + (float)state->trigger_display_pos;
+    if (snap->trigger_display_pos >= 0 && snap->trigger_display_pos < (int)w) {
+        float trigger_x = x + (float)snap->trigger_display_pos;
 
         Color marker_color = { color.r, color.g, color.b, 80 };
         DrawLineEx((Vector2){trigger_x, y}, (Vector2){trigger_x, y + h}, 1.0f, marker_color);
@@ -439,6 +525,9 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
                                            Rectangle bounds, Color color) {
     float x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height;
     const char *label = (channel == 0) ? "CH A" : "CH B";
+    waveform_render_snapshot_t snap = {0};
+    waveform_sample_t render_samples[DISPLAY_BUFFER_SIZE];
+    waveform_capture_render_snapshot(state, &snap, render_samples);
 
     // Update display width for processing thread
     int new_display_width = (int)w;
@@ -449,22 +538,17 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
-                      state->zoom_scale, sample_rate,
-                      state->trigger_enabled, state->trigger_display_pos);
+                      snap.zoom_scale, sample_rate,
+                      snap.trigger_enabled, snap.trigger_display_pos);
 
     // Draw trigger level and position markers
-    draw_panel_trigger_markers(x, y, w, h, state, app->settings.amplitude_scale, color);
-
-    // Get display samples from panel state
-    waveform_sample_t *samples = state->display_samples;
-    size_t samples_available = state->display_samples_available;
-
-    if (samples_available == 0) return;
+    draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
+    if (snap.samples_available == 0) return;
 
     int display_width = (int)w;
     if (display_width > DISPLAY_BUFFER_SIZE) display_width = DISPLAY_BUFFER_SIZE;
-    int samples_to_draw = (samples_available < (size_t)display_width) ?
-                          (int)samples_available : display_width;
+    int samples_to_draw = (snap.samples_available < (size_t)display_width) ?
+                          (int)snap.samples_available : display_width;
 
     float center_y = y + h / 2.0f;
     float scale = (h / 2.0f) * app->settings.amplitude_scale;
@@ -473,7 +557,7 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
     float prev_py = center_y;
     for (int px = 0; px < samples_to_draw; px++) {
         float px_x = x + px;
-        float py = center_y - samples[px].value * scale;
+        float py = center_y - render_samples[px].value * scale;
 
         // Clamp to bounds
         if (py < y) py = y;
@@ -492,6 +576,9 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
                                                Rectangle bounds, Color color) {
     float x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height;
     const char *label = (channel == 0) ? "CH A" : "CH B";
+    waveform_render_snapshot_t snap = {0};
+    waveform_sample_t render_samples[DISPLAY_BUFFER_SIZE];
+    waveform_capture_render_snapshot(state, &snap, render_samples);
 
     // Update display width for processing thread
     int new_display_width = (int)w;
@@ -502,24 +589,19 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
-                      state->zoom_scale, sample_rate,
-                      state->trigger_enabled, state->trigger_display_pos);
+                      snap.zoom_scale, sample_rate,
+                      snap.trigger_enabled, snap.trigger_display_pos);
 
     // Draw trigger level and position markers
-    draw_panel_trigger_markers(x, y, w, h, state, app->settings.amplitude_scale, color);
-
-    // Get display samples from panel state
-    waveform_sample_t *samples = state->display_samples;
-    size_t samples_available = state->display_samples_available;
-
-    if (samples_available == 0) return;
+    draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
+    if (snap.samples_available == 0) return;
 
     int buf_width = (int)w;
     int buf_height = (int)h;
     if (buf_width <= 0 || buf_height <= 0) return;
 
-    int samples_to_draw = (samples_available < (size_t)buf_width) ?
-                          (int)samples_available : buf_width;
+    int samples_to_draw = (snap.samples_available < (size_t)buf_width) ?
+                          (int)snap.samples_available : buf_width;
 
     // Get phosphor state from panel
     phosphor_rt_t *prt = state->phosphor;
@@ -531,7 +613,7 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
 
         // Update phosphor
         phosphor_rt_begin_frame(prt);
-        phosphor_rt_draw_waveform(prt, samples, samples_to_draw, app->settings.amplitude_scale);
+        phosphor_rt_draw_waveform(prt, render_samples, samples_to_draw, app->settings.amplitude_scale);
         phosphor_rt_end_frame(prt);
 
         // Render phosphor to screen
@@ -550,7 +632,7 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
 
     for (int px = 0; px < samples_to_draw; px++) {
         float px_x = x + px;
-        float py = center_y - samples[px].value * scale;
+        float py = center_y - render_samples[px].value * scale;
 
         if (py < y) py = y;
         if (py > y + h) py = y + h;
@@ -639,6 +721,7 @@ static void waveform_cleanup_resampler(waveform_panel_state_t *state) {
 //-----------------------------------------------------------------------------
 
 static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
+                                           waveform_sample_t *dest,
                                            const int16_t *buf, size_t num_samples,
                                            size_t start_idx, float decimation,
                                            size_t target_width) {
@@ -661,7 +744,6 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
     size_t source_samples_needed = (size_t)ceilf((float)display_count * decimation);
     if (source_samples_needed > available) source_samples_needed = available;
 
-    waveform_sample_t *dest = state->display_samples;
 
 #if LIBSOXR_ENABLED
     // Bypass soxr for 1:1 ratio
@@ -731,18 +813,18 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
 
 // Find trigger point using panel's trigger configuration
 static ssize_t waveform_find_trigger_from(const int16_t *buf, size_t count,
-                                           const waveform_panel_state_t *state,
+                                           const waveform_runtime_cfg_t *cfg,
                                            size_t min_index,
                                            uint32_t sample_rate_hz) {
-    if (!state->trigger_enabled) return -1;
+    if (!cfg || !cfg->trigger_enabled) return -1;
     if (count < 2 || min_index >= count) return -1;
 
     // Use the gui_trigger module for source-aware trigger detection.
     channel_trigger_t temp_trig = {
-        .enabled = state->trigger_enabled,
-        .level = state->trigger_level,
-        .trigger_mode = state->trigger_mode,
-        .trigger_source = state->trigger_source,
+        .enabled = cfg->trigger_enabled,
+        .level = cfg->trigger_level,
+        .trigger_mode = cfg->trigger_mode,
+        .trigger_source = cfg->trigger_source,
     };
     const int16_t *src_ch1 = s_trigger_src_ch1 ? s_trigger_src_ch1 : buf;
     const int16_t *src_ch2 = s_trigger_src_ch2 ? s_trigger_src_ch2 : buf;
@@ -757,9 +839,14 @@ static ssize_t waveform_find_trigger_from(const int16_t *buf, size_t count,
 
 // Process raw samples and update panel's display buffer
 static bool waveform_process_display(waveform_panel_state_t *state,
+                                      const waveform_runtime_cfg_t *cfg,
                                       const int16_t *buf, size_t num_samples,
-                                      uint32_t sample_rate_hz) {
-    if (!state || !buf || num_samples == 0) return false;
+                                      uint32_t sample_rate_hz,
+                                      waveform_sample_t *out_samples,
+                                      size_t *out_available,
+                                      int *out_trigger_display_pos) {
+    if (!state || !cfg || !buf || num_samples == 0 ||
+        !out_samples || !out_available || !out_trigger_display_pos) return false;
 
     // Get display width (set by renderer, defaults to DISPLAY_BUFFER_SIZE)
     size_t display_width = (size_t)atomic_load(&state->display_width);
@@ -768,7 +855,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     }
 
     // Get decimation factor from zoom_scale
-    float decimation = state->zoom_scale;
+    float decimation = cfg->zoom_scale;
     if (decimation < ZOOM_SCALE_MIN) decimation = ZOOM_SCALE_MIN;
     if (decimation > ZOOM_SCALE_MAX) decimation = ZOOM_SCALE_MAX;
 
@@ -776,19 +863,19 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     float display_window = (float)display_width * decimation;
 
     // If trigger is disabled, just show the start of the buffer
-    if (!state->trigger_enabled) {
-        state->trigger_display_pos = -1;
-        state->display_samples_available = waveform_resample_to_buffer(
-            state, buf, num_samples, 0, decimation, display_width);
+    if (!cfg->trigger_enabled) {
+        *out_trigger_display_pos = -1;
+        *out_available = waveform_resample_to_buffer(
+            state, out_samples, buf, num_samples, 0, decimation, display_width);
         return true;
     }
 
     // When zoomed out so far that display_window >= 90% of buffer,
     // there's no room for trigger positioning - just show from start
     if (display_window >= (float)num_samples * 0.9f) {
-        state->trigger_display_pos = -1;
-        state->display_samples_available = waveform_resample_to_buffer(
-            state, buf, num_samples, 0, decimation, display_width);
+        *out_trigger_display_pos = -1;
+        *out_available = waveform_resample_to_buffer(
+            state, out_samples, buf, num_samples, 0, decimation, display_width);
         return true;
     }
 
@@ -803,14 +890,14 @@ static bool waveform_process_display(waveform_panel_state_t *state,
 
     // Check if there's a valid search range
     if (min_trig_pos >= max_trig_pos) {
-        state->trigger_display_pos = -1;
-        state->display_samples_available = waveform_resample_to_buffer(
-            state, buf, num_samples, 0, decimation, display_width);
+        *out_trigger_display_pos = -1;
+        *out_available = waveform_resample_to_buffer(
+            state, out_samples, buf, num_samples, 0, decimation, display_width);
         return true;
     }
 
     // Find trigger point starting from minimum valid position
-    ssize_t trig_pos = waveform_find_trigger_from(buf, max_trig_pos, state,
+    ssize_t trig_pos = waveform_find_trigger_from(buf, max_trig_pos, cfg,
                                                   min_trig_pos, sample_rate_hz);
 
     if (trig_pos < 0) {
@@ -820,9 +907,9 @@ static bool waveform_process_display(waveform_panel_state_t *state,
 
     // Trigger found - place it at desired position
     size_t start_pos = (size_t)((float)trig_pos - pre_trigger_raw_samples);
-    state->trigger_display_pos = (int)trigger_display_pos;
-    state->display_samples_available = waveform_resample_to_buffer(
-        state, buf, num_samples, start_pos, decimation, display_width);
+    *out_trigger_display_pos = (int)trigger_display_pos;
+    *out_available = waveform_resample_to_buffer(
+        state, out_samples, buf, num_samples, start_pos, decimation, display_width);
     return true;
 }
 
@@ -832,24 +919,54 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
     if (!state_ptr || !samples || count == 0) return;
 
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    waveform_runtime_cfg_t cfg = waveform_capture_runtime_cfg(state);
+    waveform_sample_t new_samples[DISPLAY_BUFFER_SIZE];
+    size_t new_available = 0;
+    int new_trigger_display_pos = -1;
+    int16_t cvbs_sync = 0;
+    int16_t cvbs_blank = 0;
+    int16_t cvbs_threshold = 0;
+    bool cvbs_valid = false;
 
     // Update CVBS levels when in CVBS trigger mode
-    if (state->trigger_enabled && state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
+    if (cfg.trigger_enabled && cfg.trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
         cvbs_levels_t levels;
         trigger_analyze_cvbs_levels(samples, count, &levels);
         if (levels.range >= 100) {
-            state->cvbs_sync_level = levels.sig_min;
-            state->cvbs_blank_level = levels.black_level;
-            state->cvbs_threshold = levels.sync_threshold;
-            state->cvbs_levels_valid = true;
-        } else {
-            state->cvbs_levels_valid = false;
+            cvbs_sync = levels.sig_min;
+            cvbs_blank = levels.black_level;
+            cvbs_threshold = levels.sync_threshold;
+            cvbs_valid = true;
         }
-    } else {
-        state->cvbs_levels_valid = false;
     }
-
-    waveform_process_display(state, samples, count, sample_rate);
+    bool updated = waveform_process_display(state,
+                                            &cfg,
+                                            samples,
+                                            count,
+                                            sample_rate,
+                                            new_samples,
+                                            &new_available,
+                                            &new_trigger_display_pos);
+    waveform_state_lock(state);
+    state->cvbs_levels_valid = cvbs_valid;
+    if (cvbs_valid) {
+        state->cvbs_sync_level = cvbs_sync;
+        state->cvbs_blank_level = cvbs_blank;
+        state->cvbs_threshold = cvbs_threshold;
+    }
+    if (updated) {
+        if (new_available > DISPLAY_BUFFER_SIZE) {
+            new_available = DISPLAY_BUFFER_SIZE;
+        }
+        if (new_available > 0) {
+            memcpy(state->display_samples,
+                   new_samples,
+                   new_available * sizeof(waveform_sample_t));
+        }
+        state->display_samples_available = new_available;
+        state->trigger_display_pos = new_trigger_display_pos;
+    }
+    waveform_state_unlock(state);
 }
 
 //-----------------------------------------------------------------------------
@@ -891,6 +1008,7 @@ static void *waveform_create(void) {
     state->render_mode_dropdown_open = false;
     state->trigger_dropdown_open = false;
     state->dragging = false;
+    atomic_flag_clear(&state->data_lock);
 
     state->initialized = true;
     state->trigger_source_defaulted_by_channel = false;
@@ -916,9 +1034,11 @@ static void waveform_destroy(void *state_ptr) {
 static void waveform_clear(void *state_ptr) {
     if (!state_ptr) return;
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    waveform_state_lock(state);
 
     state->display_samples_available = 0;
     state->trigger_display_pos = -1;
+    waveform_state_unlock(state);
 
     // Clear phosphor persistence if in phosphor mode
     if (state->phosphor) {
@@ -1159,7 +1279,9 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         // Check \"Off\" option
         Rectangle off_rect = state->trigger_mode_opts_rect[0];
         if (CheckCollisionPointRec(click, off_rect)) {
+            waveform_state_lock(state);
             state->trigger_enabled = false;
+            waveform_state_unlock(state);
             state->trigger_dropdown_open = false;
             return true;
         }
@@ -1168,12 +1290,14 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
             Rectangle opt_rect = state->trigger_mode_opts_rect[i + 1];
             if (CheckCollisionPointRec(click, opt_rect)) {
+                waveform_state_lock(state);
                 bool was_enabled = state->trigger_enabled;
                 state->trigger_enabled = true;
                 if (!was_enabled) {
                     state->trigger_source = waveform_default_trigger_source_for_channel(channel);
                 }
                 state->trigger_mode = (trigger_mode_t)i;
+                waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
             }
@@ -1183,7 +1307,9 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         for (int i = 0; i < TRIGGER_SOURCE_COUNT; i++) {
             Rectangle src_rect = state->trigger_source_opts_rect[i];
             if (CheckCollisionPointRec(click, src_rect)) {
+                waveform_state_lock(state);
                 state->trigger_source = (trigger_source_t)i;
+                waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
             }
@@ -1216,7 +1342,9 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 
     // Start dragging on mouse press
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        waveform_state_lock(state);
         state->dragging = true;
+        waveform_state_unlock(state);
 
         // Calculate trigger level from click position
         float center_y = bounds.y + bounds.height / 2.0f;
@@ -1226,7 +1354,9 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         if (level_norm > 1.0f) level_norm = 1.0f;
         if (level_norm < -1.0f) level_norm = -1.0f;
 
+        waveform_state_lock(state);
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        waveform_state_unlock(state);
 
         return true;
     }
@@ -1239,7 +1369,11 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 //-----------------------------------------------------------------------------
 
 static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t *app, Rectangle bounds) {
-    if (!state || !app || !state->dragging) return;
+    if (!state || !app) return;
+    waveform_state_lock(state);
+    bool dragging = state->dragging;
+    waveform_state_unlock(state);
+    if (!dragging) return;
 
     if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
         Vector2 mouse = gui_ui_get_mouse_position();
@@ -1251,11 +1385,15 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
         float level_norm = (center_y - mouse.y) / half_height;
         if (level_norm > 1.0f) level_norm = 1.0f;
         if (level_norm < -1.0f) level_norm = -1.0f;
+        waveform_state_lock(state);
 
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        waveform_state_unlock(state);
     } else {
         // Mouse released - stop dragging
+        waveform_state_lock(state);
         state->dragging = false;
+        waveform_state_unlock(state);
     }
 }
 
@@ -1276,16 +1414,20 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
 
     if (delta > 0.0f) {
         // Scroll up = zoom in (fewer samples per pixel)
+        waveform_state_lock(state);
         state->zoom_scale /= zoom_factor;
         if (state->zoom_scale < ZOOM_SCALE_MIN) {
             state->zoom_scale = ZOOM_SCALE_MIN;
         }
+        waveform_state_unlock(state);
     } else {
         // Scroll down = zoom out (more samples per pixel)
+        waveform_state_lock(state);
         state->zoom_scale *= zoom_factor;
         if (state->zoom_scale > ZOOM_SCALE_MAX) {
             state->zoom_scale = ZOOM_SCALE_MAX;
         }
+        waveform_state_unlock(state);
     }
 
     return true;
