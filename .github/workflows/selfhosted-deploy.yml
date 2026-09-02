@@ -26,8 +26,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# contents: write is required by the tag bump below, which pushes the release tag it
+# creates. Nothing else here writes to the repository.
 permissions:
-  contents: read
+  contents: write
 
 # One run per ref. Without this, two quick merges could race the install step and leave
 # ~/.local/bin holding a binary from the older commit.
@@ -60,6 +62,58 @@ jobs:
           # misrc_tools/git-version.sh needs tags + history to resolve a version rather
           # than falling back to dev-<date>-nogit.
           fetch-depth: 0
+
+      # ----------------------------------------------------------------------------
+      # Bump the GDH release tag, so a merge to main produces a real version instead of
+      # dev-<date>-<sha>. misrc_tools/git-version.sh resolves a version only from an
+      # EXACT tag at HEAD, so the tag is created before the build step below and the
+      # build then picks it up with no further plumbing.
+      #
+      # Pushing with the checkout-provided GITHUB_TOKEN deliberately does NOT start
+      # another workflow run -- GitHub suppresses that to prevent recursion -- so this
+      # does not re-trigger the tags: ['v*'] trigger and there is no double build. A tag
+      # pushed by a human still triggers it, which is what that trigger is for.
+      # ----------------------------------------------------------------------------
+      - name: Bump GDH release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+
+          # Already tagged (a re-run of the same commit, or a merge that a human tagged
+          # first): leave it alone rather than minting a second tag for one commit.
+          existing="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            echo "HEAD is already $existing; not bumping"
+            exit 0
+          fi
+
+          # Nearest reachable release tag decides the base. After an upstream sync that
+          # lands a plain vX.Y.Z, the next fork tag correctly restarts at -gdh.1 on the
+          # new upstream version instead of continuing the old one's numbering.
+          latest="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          case "$latest" in
+            *-gdh.*) base="${latest%-gdh.*}"; n="${latest##*-gdh.}" ;;
+            v[0-9]*) base="$latest";          n=0 ;;
+            *)
+              echo "::error::no reachable vX.Y.Z tag to base a GDH release tag on"
+              exit 1
+              ;;
+          esac
+          case "$n" in
+            ''|*[!0-9]*) echo "::error::unparsable -gdh suffix in tag '$latest'"; exit 1 ;;
+          esac
+
+          n=$((n + 1))
+          while git rev-parse -q --verify "refs/tags/${base}-gdh.${n}" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          next="${base}-gdh.${n}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "auto: ${GITHUB_SHA}"
+          git push origin "$next"
+          echo "tagged $next"
 
       - name: Resolve deps prefix
         # Deliberately OUTSIDE the runner workspace: actions/checkout defaults to
