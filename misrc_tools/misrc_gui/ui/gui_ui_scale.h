@@ -10,11 +10,10 @@
 #define GUI_UI_SCALE_HUD_DURATION_S 1.5
 #define GUI_UI_SCALE_HUD_FADE_S 0.3
 #define GUI_UI_MODAL_MARGIN 12
-// Compact (short-label) readouts kick in below this width. Kept just under
-// the default 1425px window so that at standard (100%) UI scaling the
-// status bar shows the full/long readouts ("Samples:", "Frames:", ...)
-// instead of the short ones ("Samp:", "F:", ...). 1425 > 1400 -> FULL.
-#define GUI_UI_STATUS_COMPACT_BREAKPOINT 1400
+// Compact (short-label) readouts kick in below this width. Keep this just
+// above the default 1425px window so standard (100%) default-width layouts
+// choose the compact status profile before labels/counters overflow.
+#define GUI_UI_STATUS_COMPACT_BREAKPOINT 1426
 #define GUI_UI_STATUS_RECORDING_FULL_BREAKPOINT 1500
 #define GUI_UI_STATUS_RECORDING_MINIMAL_BREAKPOINT 920
 #define GUI_UI_STATUS_NARROW_BREAKPOINT 960
