@@ -277,6 +277,33 @@ HTTP/1.0, GET-only, socket→bind→listen→accept→per-client pthread. Endpoi
     - both processes present (`79279`, `79296`)
     - server listening on `0.0.0.0:8095`
 
+### Quick fix (round 14: About tab Download Latest alignment)
+- Request: move `Download Latest` left so it is visually uniform under the
+  update controls.
+- Change made in `render_version_info_window`:
+  - in `VersionInfoUpdateRow`, moved `VersionInfoDownloadButton` to render
+    immediately after `VersionInfoUpdateLabel` and before
+    `VersionInfoUpdateStatus`.
+  - this removes the prior right-shift caused by status-first grow layout and
+    keeps the button left-aligned with the update control cluster.
+- Verification:
+  - `meson compile -C /home/harry/MISRC-GUI/build-local`
+  - `/home/harry/MISRC-GUI/build-local/misrc_gui --smoke-test`
+
+### Quick fix (round 15: align with status, not left-offset)
+- Follow-up request: aligned, not offset left of the `Available` message.
+- Adjustment:
+  - in `VersionInfoUpdateRow`, restored order to:
+    - `VersionInfoUpdateLabel`
+    - `VersionInfoUpdateStatus`
+    - `VersionInfoDownloadButton`
+  - constrained status width to a bounded fit
+    (`CLAY_SIZING_FIT(.min = 0, .max = 260)`) so the button sits to the right
+    of the availability text without drifting to the far edge.
+- Rebuild verification:
+  - `bash /home/harry/MISRC-GUI/scripts/build-local.sh`
+  - pass: build + smoke test succeeded.
+
 ### Known v1 limits
 - LAN-only, no auth/encryption (mirrors the reference cxadc-capture-server warning).
 - Client audio ingest uses the server-reported `audio_frame_bytes` for re-framing; correct for the common 24-bit/4ch (12-byte) case.
