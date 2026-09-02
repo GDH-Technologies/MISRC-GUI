@@ -14,6 +14,16 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
 
+## 2026-09-02 Status bar dynamic scaling/spacing regression (OPEN)
+
+- Report: bottom status bar dynamic scaling does not correctly preserve variable spacing once UI scale/window constraints tighten.
+- Observed breakage:
+  - the gap between `status_message` and `free space` readout is not being treated as adjustable free space;
+  - the gap between `free space` and `Sync` status indicator is similarly ignored;
+  - inter-counter spacing is not constrained before scaling pressure, so counters encroach into each other/available layout space.
+- Impact: status row readability degrades under tighter real-world layout conditions (higher UI scale and/or constrained width).
+- Status: reported and tracked; fix not implemented yet.
+
 ## 2026-08-21 Windows WASAPI clockgen audio — PARKED (firmware-side issue)
 
 - Problem: clockgen audio (PCM1802 2ch + headswitch CH3) captured via WASAPI shared mode is distorted on Windows. Ch3/Ch4 showed red/clipping (now fixed: CH3/Ch4 peaks disabled for MISRC Clockgen, CH4 always zero). Recorded audio is still unusable due to resampling distortion.
