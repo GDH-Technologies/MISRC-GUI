@@ -3721,7 +3721,7 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
             CLAY(CLAY_ID("VersionInfoUpdateStatus"), {
-                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) } }
+                .layout = { .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 260), CLAY_SIZING_FIT(0) } }
             }) {
                 CLAY_TEXT(make_string(vi_update_status),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
@@ -4092,10 +4092,10 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
             }
         }
-
-        // Copyright
-        CLAY_TEXT(CLAY_STRING(MIRSC_TOOLS_COPYRIGHT),
+        // Credits (without license/year text).
+        CLAY_TEXT(CLAY_STRING("(c) Harry Munday, AlessandroAU, Stefan O, Vrunk11, machcnz"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
     }
 }
 // Metadata popup (opened by clicking the toolbar scroll badge)
