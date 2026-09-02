@@ -11,6 +11,11 @@
 # Everything here runs on the org's own `workflow-master` machine (label `wm`). Pushes to
 # main additionally install the built binaries into ~/.local/bin, so the app launched from
 # the GNOME shortcut is always main.
+#
+# Release tags (v*) build and install too. misrc_tools/git-version.sh only resolves a real
+# version when HEAD is at an *exact* tag, so a tag has to be built as a tag: without this
+# trigger, pushing v1.1.8-gdh.2 ran nothing at all and main builds stayed dev-<date>-<sha>
+# until a commit happened to coincide with a tag.
 name: Self-hosted build and deploy (GDH fork)
 
 on:
@@ -18,6 +23,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -25,8 +31,18 @@ permissions:
 
 # One run per ref. Without this, two quick merges could race the install step and leave
 # ~/.local/bin holding a binary from the older commit.
+#
+# Every ref that INSTALLS (main and release tags) shares one group, because they all write
+# the same ~/.local/bin. A tag pushed right after its merge is a different ref, so with a
+# per-ref group it would race the main run and leave the machine holding whichever finished
+# last. Sharing the group makes the later run cancel the earlier one, so the tag build
+# supersedes the main build of the same commit -- the intended outcome, since the tagged
+# version is what should end up installed.
 concurrency:
-  group: selfhosted-${{ github.ref }}
+  group: >-
+    ${{ (github.event_name == 'push' &&
+         (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+        && 'selfhosted-install' || format('selfhosted-{0}', github.ref) }}
   cancel-in-progress: true
 
 jobs:
@@ -82,11 +98,13 @@ jobs:
         id: built
 
       # ----------------------------------------------------------------------------
-      # Install. Only on a real merge to main -- PRs build and test but never touch
-      # the machine's installed app.
+      # Install. Only on a real merge to main or a release tag -- PRs build and test but
+      # never touch the machine's installed app.
       # ----------------------------------------------------------------------------
       - name: Install to ~/.local
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: >-
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
           set -euo pipefail
           bin_dir="$HOME/.local/bin"
@@ -167,7 +185,9 @@ jobs:
           update-desktop-database "$app_dir" || true
 
       - name: Verify install
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: >-
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         # Passed through env rather than interpolated into the script: ${{ }} expansion
         # happens before the shell sees the line, so a value containing shell syntax
         # would execute. The version derives from a tag name, so treat it as untrusted.
