@@ -1327,6 +1327,34 @@ def check_alsa_never_stores_a_card_index(repo_root: Path) -> int:
     return 0
 
 
+
+def check_cxadc_audio_probe_prefers_stable_card_id(repo_root: Path) -> int:
+    """The clockgen probe must address a card by its stable ALSA id
+    (hw:CARD=wm_cg_audio), not its index. Indices move across reboots and
+    replugs, so an index-built device name points at whatever card inherited
+    the number. Index forms are tolerated only as a last resort, after the
+    id forms have been tried."""
+    module = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+    code = strip_c_comments(module)
+
+    if "snd_ctl_card_info_get_id" not in code:
+        return fail("gui_cxadc.c no longer resolves the card's stable ALSA id")
+
+    marker = "static int cxadc_try_open_card_devices"
+    start = code.find(marker)
+    if start < 0:
+        return fail("gui_cxadc.c no longer has cxadc_try_open_card_devices()")
+    end = code.find("\n}\n", start)
+    body = code[start:end if end > 0 else len(code)]
+
+    id_form = body.find('"%s:CARD=%s"')
+    if id_form < 0:
+        return fail("cxadc_try_open_card_devices() no longer builds a name-based CARD= device")
+    index_form = body.find('"hw:%d"')
+    if index_form >= 0 and index_form < id_form:
+        return fail("cxadc_try_open_card_devices() tries an index-based device before the stable id")
+    return 0
+
 def check_preview_tap_single_slot_contract(repo_root: Path) -> int:
     """Application code must register through the mux, never install the raw tap
     directly -- a direct install displaces whatever the mux published and takes
@@ -2620,6 +2648,8 @@ def main() -> int:
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("preview tap single-slot contract", lambda: check_preview_tap_single_slot_contract(repo_root)),
         ("alsa never stores a card index", lambda: check_alsa_never_stores_a_card_index(repo_root)),
+        ("cxadc audio probe prefers a stable card id",
+         lambda: check_cxadc_audio_probe_prefers_stable_card_id(repo_root)),
         ("bundled mediamtx contract", lambda: check_bundled_mediamtx_contract(repo_root)),
         ("rtsp settings round-trip", lambda: check_rtsp_settings_roundtrip(repo_root)),
         ("bitrate stepper survives a reload", lambda: check_bitrate_stepper_survives_a_reload(repo_root)),
