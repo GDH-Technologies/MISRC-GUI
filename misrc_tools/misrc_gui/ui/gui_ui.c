@@ -1171,6 +1171,17 @@ static double s_status_free_space_last_update_s = 0.0;
 static uint64_t s_status_output_last_bytes = 0;
 static double s_status_output_last_sample_s = 0.0;
 static double s_status_output_rate_bps = 0.0;
+/* Persistent small-readout shortening level (0 full .. 2 shortest) for the
+ * status bar, kept across frames with hysteresis: pressure raises it
+ * immediately, ample slack lowers it one step, so ticking counters at a
+ * boundary width cannot flap the small readouts between full and short
+ * forms every frame. */
+static int s_status_readout_level = 0;
+/* Persisted compact-label state for the status bar right side, with the
+ * same hysteresis as the readout level: the flip is earned by measured
+ * pressure (never a hard width breakpoint) and only relaxes when the full
+ * labels measurably fit again with slack to spare. */
+static bool s_status_labels_compact = false;
 #define STATUS_FREE_SPACE_REFRESH_INTERVAL_S 1.0
 #define STATUS_FREE_SPACE_LOW_BYTES ((uint64_t)10 * 1000 * 1000 * 1000)
 #define STATUS_FREE_SPACE_WARN_BYTES ((uint64_t)25 * 1000 * 1000 * 1000)
@@ -5994,12 +6005,7 @@ static void render_status_bar(gui_app_t *app) {
     bool status_quarter_scale =
         status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
         status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
-    bool status_narrow =
-        !gui_ui_status_shows_extended_counters(status_width,
-                                               app->is_recording);
     bool status_tiny = status_width < GUI_UI_STATUS_TINY_BREAKPOINT;
-    bool status_compact_seed =
-        status_layout != GUI_UI_STATUS_LAYOUT_FULL_SINGLE || status_tiny;
     bool status_minimal = status_layout == GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE;
     bool show_sync_status = !status_tiny;
     bool show_sample_rate = !status_tiny;
@@ -6036,17 +6042,23 @@ static void render_status_bar(gui_app_t *app) {
      * gaps/widths first; only hide it as a last resort. Error status still
      * reserves the left-side for readable failure text. */
     bool show_free_space = !status_is_error;
-    int sample_rate_value_width = status_compact_seed ? 68 : 80;
-    int samples_value_width = status_tiny ? 48 : (status_compact_seed ? 54 : 60);
+    /* Full-quality starting values: the budget loop contracts them only
+     * under measured pressure, so the bar keeps full labels, spacing, and
+     * containers whenever the real space allows it. Only the absolute tiny
+     * floors stay pre-seeded (200% scale at the minimum window cannot fit
+     * anything larger). */
+    int sample_rate_value_width = 80;
+    int samples_value_width = status_tiny ? 48 : 60;
     int frames_value_width = 32;
     int small_counter_width = 32;
-    int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
-    int status_counter_inner_gap = status_tiny ? 2 : (status_compact_seed ? 3 : 4);
-    int status_bar_gap = status_tiny ? 6 : (status_compact_seed ? 10 : 20);
-    int status_right_gap = status_tiny ? 8 : (status_compact_seed ? 10 : 16);
-    int status_left_gap = status_tiny ? 4 : (status_compact_seed ? 5 : 8);
+    int buffer_value_width = status_tiny ? 28 : 35;
+    int status_counter_inner_gap = status_tiny ? 2 : 4;
+    int status_bar_gap = status_tiny ? 6 : 20;
+    int status_right_gap = status_tiny ? 8 : 16;
+    int status_left_gap = status_tiny ? 4 : 8;
     int status_font_size = FONT_SIZE_STATUS;
-    bool status_compact_labels = status_compact_seed;
+    bool status_compact_labels = s_status_labels_compact;
+    bool status_labels_flipped = false;
     const char *rf_buffer_label_full = "RF Buffer:";
     const char *audio_buffer_label_full = "Audio Buffer:";
     const char *samples_label_full = status_tiny ? "S:" : "Samples:";
@@ -6104,6 +6116,14 @@ static void render_status_bar(gui_app_t *app) {
                strstr(raw_status, "Initializing") != NULL) {
         status_color = COLOR_METER_YELLOW;
     }
+    /* Natural rendered width of the status message. The message is a FIT(0)
+     * element: it only ever occupies its actual text width, so the budget
+     * must not reserve the full min_message_width for short statuses like
+     * "Ready" — doing so forced the small readouts to shorten while dead
+     * space was still available on the bar. */
+    int status_message_natural_width = show_status_message
+        ? gui_ui_measure_text_width(app, raw_status, status_font_size, 0)
+        : 0;
 
     char status_free_space_display_full[120] = "";
     char status_free_space_display_compact[120] = "";
@@ -6276,12 +6296,26 @@ static void render_status_bar(gui_app_t *app) {
     int aud_text_width = gui_ui_measure_text_width(app, status_aud_buf_display, status_font_size, 1);
     int free_space_text_width = status_free_space_tier_width[status_free_space_tier];
     int free_space_width_budget = free_space_text_width;
-    int free_space_min_width = status_tiny ? 22 : (status_compact_seed ? 34 : 48);
+    int free_space_min_width = status_tiny ? 22 : 48;
     int status_content_width = status_width - 24; /* horizontal padding */
     if (status_content_width < 1) status_content_width = 1;
-    int min_message_width = status_tiny ? 56 : (status_compact_seed ? 72 : 96);
+    int min_message_width = status_tiny ? 56 : 96;
     int min_message_floor = 24;
     int status_message_width_budget = 0;
+    /* Small-readout hysteresis: start the budget at the level kept from the
+     * previous frame instead of recomputing it from scratch, so ticking
+     * counters at a boundary width cannot flap the small readouts between
+     * full and short forms frame-to-frame. */
+    int readout_level_start = s_status_readout_level;
+    if (readout_level_start < 0) readout_level_start = 0;
+    if (readout_level_start > 2) readout_level_start = 2;
+    int readout_level = readout_level_start;
+    status_sample_rate_tier = readout_level;
+    status_samples_tier = readout_level;
+    status_free_space_tier = readout_level;
+    bool labels_compact_start = s_status_labels_compact;
+    int status_fit_slack = 0;
+    bool status_fit_first_pass = false;
     /* Allow enough passes so the full dynamic chain can run (gaps -> compact
      * labels -> narrowed values/text -> last-resort hides) without stalling
      * midway under 1/4 and other constrained layouts. */
@@ -6383,10 +6417,22 @@ static void render_status_bar(gui_app_t *app) {
 
         int required_without_message = right_required_width + fixed_left_width +
                                        left_gaps_reserved + outer_gaps;
+        /* The message only claims what it actually needs: its natural width
+         * when that is below the readable minimum, otherwise the minimum
+         * (long/error text yields down to the minimum before the readouts
+         * do). This keeps every counter at its full readout whenever the
+         * real space on the bar allows it. */
+        int status_message_required = status_message_natural_width < min_message_width
+            ? status_message_natural_width
+            : min_message_width;
         bool fits_current_budget = show_status_message
-            ? (status_message_width_budget >= min_message_width)
+            ? (status_message_width_budget >= status_message_required)
             : (required_without_message <= status_content_width);
         if (fits_current_budget) {
+            status_fit_slack = show_status_message
+                ? status_message_width_budget - status_message_required
+                : status_content_width - required_without_message;
+            status_fit_first_pass = (pass == 0);
             break;
         }
 
@@ -6410,20 +6456,18 @@ static void render_status_bar(gui_app_t *app) {
         }
         if (!status_compact_labels) {
             status_compact_labels = true;
+            status_labels_flipped = true;
             continue;
         }
-        /* Shorten readout values next instead of removing anything: drop
-         * decimal precision first, then fall back to magnitude-only forms. */
-        if (status_sample_rate_tier < 2) {
-            status_sample_rate_tier++;
-            continue;
-        }
-        if (status_samples_tier < 2) {
-            status_samples_tier++;
-            continue;
-        }
-        if (show_free_space && status_free_space_tier < 2) {
-            status_free_space_tier++;
+        /* Shorten all small readouts together (level-based) instead of
+         * collapsing one readout at a time: fewer discrete states, and the
+         * row shortens in visible lockstep instead of one readout jumping
+         * through all its tiers while the others stay long. */
+        if (readout_level < 2) {
+            readout_level++;
+            status_sample_rate_tier = readout_level;
+            status_samples_tier = readout_level;
+            status_free_space_tier = readout_level;
             continue;
         }
         /* Value containers are FIT(min), so shrinking a minimum below the
@@ -6502,6 +6546,80 @@ static void render_status_bar(gui_app_t *app) {
             continue;
         }
         break;
+    }
+
+    /* Persist the readout level with hysteresis: keep any pressure-raised
+     * level immediately, but relax at most one step and only when the bar
+     * fit on the first pass with ample slack. The extra margin must exceed
+     * the width the lower (longer) tier adds, otherwise the next frame
+     * seeds the longer text, no longer fits, and the level flips right
+     * back — a two-frame flicker band while scaling. With the margin, the
+     * dead band is wider than any counter tick or tier step, so the small
+     * readouts hold steady at boundary widths. */
+    bool readout_level_relaxed = false;
+    if (readout_level > readout_level_start) {
+        s_status_readout_level = readout_level;
+    } else if (readout_level_start > 0 && status_fit_first_pass &&
+               status_fit_slack >= 48) {
+        int readout_level_lower = readout_level_start - 1;
+        int level_step_width = 0;
+        int rate_w_prev = status_sample_rate_tier_width[readout_level_lower];
+        int rate_w_cur = status_sample_rate_tier_width[readout_level_start];
+        int rate_eff_prev = sample_rate_value_width > rate_w_prev ? sample_rate_value_width : rate_w_prev;
+        int rate_eff_cur = sample_rate_value_width > rate_w_cur ? sample_rate_value_width : rate_w_cur;
+        if (show_sample_rate && rate_eff_prev > rate_eff_cur) {
+            level_step_width += rate_eff_prev - rate_eff_cur;
+        }
+        int samp_w_prev = status_samples_tier_width[readout_level_lower];
+        int samp_w_cur = status_samples_tier_width[readout_level_start];
+        int samp_eff_prev = samples_value_width > samp_w_prev ? samples_value_width : samp_w_prev;
+        int samp_eff_cur = samples_value_width > samp_w_cur ? samples_value_width : samp_w_cur;
+        if (samp_eff_prev > samp_eff_cur) {
+            level_step_width += samp_eff_prev - samp_eff_cur;
+        }
+        if (show_free_space) {
+            int free_w_prev = status_free_space_tier_width[readout_level_lower];
+            int free_w_cur = status_free_space_tier_width[readout_level_start];
+            if (free_w_prev > free_w_cur) {
+                level_step_width += free_w_prev - free_w_cur;
+            }
+        }
+        if (status_fit_slack - level_step_width >= 48) {
+            s_status_readout_level = readout_level_lower;
+            readout_level_relaxed = true;
+        }
+    }
+    /* Compact-label flip uses the same hysteresis: keep a pressure flip,
+     * and relax at most one state per frame (relaxing both the labels and
+     * the level in one frame could overshoot the slack and flap back). The
+     * margin is the labels' own measured width step, so the longer forms
+     * are guaranteed to fit before the state relaxes. */
+    if (status_labels_flipped) {
+        s_status_labels_compact = true;
+    } else if (labels_compact_start && !readout_level_relaxed &&
+               status_fit_first_pass && status_fit_slack >= 24) {
+        int labels_step_width = 0;
+        if (samples_label_width_full > samples_label_width_compact) {
+            labels_step_width += samples_label_width_full - samples_label_width_compact;
+        }
+        if (show_frame_count && frames_label_width_full > frames_label_width_compact) {
+            labels_step_width += frames_label_width_full - frames_label_width_compact;
+        }
+        if (show_missed_count && missed_label_width_full > missed_label_width_compact) {
+            labels_step_width += missed_label_width_full - missed_label_width_compact;
+        }
+        if (show_error_count && errors_label_width_full > errors_label_width_compact) {
+            labels_step_width += errors_label_width_full - errors_label_width_compact;
+        }
+        if (rf_label_width_full > rf_label_width_compact) {
+            labels_step_width += rf_label_width_full - rf_label_width_compact;
+        }
+        if (audio_label_width_full > audio_label_width_compact) {
+            labels_step_width += audio_label_width_full - audio_label_width_compact;
+        }
+        if (status_fit_slack - labels_step_width >= 24) {
+            s_status_labels_compact = false;
+        }
     }
 
     /* Materialize the chosen tier text for rendering. */

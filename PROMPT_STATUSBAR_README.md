@@ -49,8 +49,29 @@ User reported Audio Mon does not fall back to "Mon" — it double-stacks "Audio"
 - Validations: `bash scripts/build-local.sh` -> OK build + smoke test; `python3 misrc_tools/test/ci_guard_tests.py` -> all 34 PASS; `meson test -C build-local` -> 3/3 OK.
 - Pending: user GUI confirmation that the button shows a single-line "Audio Mon" or "Mon" at every width (never stacked).
 
+## Follow-up 4 (2026-09-02): committed a552e7e, then status bar readout hysteresis
+User said "good commit and push" — committed `a552e7e` (status bar clipping + toolbar dead-space-first + Audio Mon measured fit, 5 files, incl. PROMPT_STATUSBAR_README.md) and pushed to `origin/capture-server-client-modes` (upstream set). The zip restore point stays untracked (binary artifact).
+Then: make the bottom bar less twitchy for setting the small readouts.
+- Diagnosis (from the budget loop in `render_status_bar`): (1) the three tiered readouts (sample rate, samples, free space) shortened sequentially, so one readout collapsed through all its tiers while the others stayed long; (2) the tier choice was recomputed from scratch every frame from live ticking data (samples/frames counters), so at a boundary width the small readouts flapped between full and short forms frame-to-frame.
+- Fix (`gui_ui.c`):
+  1. New persisted static `s_status_readout_level` (0 full .. 2 shortest) — the budget loop now seeds all three readout tiers from it each frame.
+  2. Level-based shortening: the contraction chain raises the single level (all readouts shorten in lockstep) instead of collapsing one readout at a time.
+  3. Hysteresis: pressure raises the level immediately (kept for next frame); it relaxes at most one step per frame and only when the bar fit on the first pass with >= 48px slack — a dead band wide enough that ticking counters cannot flap the tiers.
+- Validations: `bash scripts/build-local.sh` -> OK build + smoke test; `python3 misrc_tools/test/ci_guard_tests.py` -> all 34 PASS; `meson test -C build-local` -> 3/3 OK.
+- User feedback: "It triggers way too soon on when width is scaled I want it to maintain all counters when space is possible."
+- Follow-up fix (same round):
+  1. Premature trigger: the fit test reserved the full `min_message_width` (96px) for the status message even when the message is short ("Ready" ~35px), forcing readouts to shorten while dead space remained. The message now claims its natural rendered width (measured once, capped at the readable minimum) — counters stay full whenever the real space allows it (`status_message_natural_width` / `status_message_required` in `render_status_bar`).
+  2. Flicker band in the relax path: relaxing the level seeded the longer lower-tier text next frame, which could then not fit, flipping the level back every two frames while scaling. The relax now requires first-pass fit with >= 48px slack PLUS the measured width step between the current and lower tier (from the tier width arrays), so the dead band always exceeds the tier step.
+- Re-validated: build + smoke OK, all 34 guards PASS, meson tests 3/3 OK.
+- User feedback: "Sync / Samples is looking good but the rest gets kicked down to small size far too fast when there is plenty of space to work with."
+- Follow-up fix (same round): `status_compact_seed` (a hard width breakpoint) pre-seeded compact labels ("Frames:"->"F:", "Missed:"->"M:", "Audio Buffer:"->"Aud:"), tighter gaps, and smaller containers for every width below the compact breakpoint — even with dead space available. Sync/Samples looked fine only because their compact forms are mild.
+  1. Removed the compact-seed/narrow pre-seeding: gaps, container minimums, free-space floor, and message minimum all start at their full values and are contracted by the budget loop only under measured pressure (tiny-width absolute floors kept).
+  2. The compact-label flip is now persisted hysteresis state (`s_status_labels_compact`): earned when the loop flips under real pressure, relaxed only on first-pass fit with >= 24px slack beyond the labels' own measured width step; at most one state (labels or level) relaxes per frame so the pair cannot over-relax and flap back.
+- Re-validated: build + smoke OK, all 34 guards PASS, meson tests 3/3 OK.
+- Pending: user GUI confirmation that full labels/spacing hold until the bar genuinely runs out of space, then compact forms engage only as needed.
+
 ## Restore point
-`statusbar-rightside-fix-2026-09-02.zip` (repo root) — go-back-to snapshot containing the changed files (`gui_ui.c`, `gui_ui_scale.h`, `gui_ui_scale_harness.c`, `dev_notes_README.md`), full git diff, and this log. NOTE: snapshot predates Follow-ups 2-3 (toolbar dead-space + Audio Mon measured fit); refresh the zip after user confirmation.
+`statusbar-rightside-fix-2026-09-02.zip` (repo root) — go-back-to snapshot containing the changed files (`gui_ui.c`, `gui_ui_scale.h`, `gui_ui_scale_harness.c`, `dev_notes_README.md`), full git diff, and this log. NOTE: snapshot predates Follow-ups 2-4 (toolbar dead-space, Audio Mon measured fit, readout hysteresis); refresh the zip after user confirmation.
 
 ## Rollback
 Options, newest first:
