@@ -29,6 +29,16 @@
  * ------------------------------------------------------------------------- */
 
 #ifdef _WIN32
+  /* Avoid Win32 API name collisions with raylib symbols (Rectangle, CloseWindow, ShowCursor). */
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOGDI
+  #define NOGDI
+  #endif
+  #ifndef NOUSER
+  #define NOUSER
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
   typedef SOCKET net_sock_t;
@@ -37,14 +47,6 @@
   #define net_errno ((int)WSAGetLastError())
   typedef CRITICAL_SECTION net_mutex_t;
   typedef CONDITION_VARIABLE net_cond_t;
-  /* Forward declare to avoid pulling windows.h into other headers. */
-  extern void __stdcall InitializeCriticalSection(CRITICAL_SECTION*);
-  extern void __stdcall DeleteCriticalSection(CRITICAL_SECTION*);
-  extern void __stdcall EnterCriticalSection(CRITICAL_SECTION*);
-  extern void __stdcall LeaveCriticalSection(CRITICAL_SECTION*);
-  extern void __stdcall InitializeConditionVariable(CONDITION_VARIABLE*);
-  extern int __stdcall SleepConditionVariableCS(CONDITION_VARIABLE*, CRITICAL_SECTION*, unsigned long);
-  extern void __stdcall WakeAllConditionVariable(CONDITION_VARIABLE*);
   #define net_mutex_init(m)   InitializeCriticalSection(m)
   #define net_mutex_destroy(m) DeleteCriticalSection(m)
   #define net_mutex_lock(m)   EnterCriticalSection(m)
@@ -90,7 +92,6 @@ static inline int net_sock_valid(net_sock_t s) {
  * HTTP handlers) need a detach so their handles don't leak. */
 static void net_thread_detach(thrd_t *t) {
 #ifdef _WIN32
-    extern __declspec(dllimport) int __stdcall CloseHandle(void*);
     if (t && *t) { CloseHandle(*t); *t = (thrd_t)0; }
 #else
     if (t) pthread_detach(*t);
@@ -100,7 +101,6 @@ static void net_thread_detach(thrd_t *t) {
 /* Set a socket non-blocking / blocking. */
 static int net_set_nonblocking(net_sock_t fd) {
 #ifdef _WIN32
-    extern __declspec(dllimport) int __stdcall ioctlsocket(net_sock_t, long, unsigned long*);
     unsigned long mode = 1;
     return (ioctlsocket(fd, /* FIONBIO */ 0x8004667CUL, &mode) == 0) ? 0 : -1;
 #else
@@ -112,7 +112,6 @@ static int net_set_nonblocking(net_sock_t fd) {
 
 static int net_set_blocking(net_sock_t fd) {
 #ifdef _WIN32
-    extern __declspec(dllimport) int __stdcall ioctlsocket(net_sock_t, long, unsigned long*);
     unsigned long mode = 0;
     return (ioctlsocket(fd, 0x8004667CUL, &mode) == 0) ? 0 : -1;
 #else
