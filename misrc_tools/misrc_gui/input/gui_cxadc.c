@@ -1033,6 +1033,24 @@ static int cxadc_open_audio_capture(cxadc_ctx_t *ctx)
         }
     }
 
+    /* Shared (dsnoop) PCMs are tried first. Where the host fans the clockgen
+     * out to several readers via /etc/asound.conf (archival arecord + RTSP
+     * preview), the hardware slave is exclusive: a direct hw:/plughw: open
+     * returns EBUSY as soon as any other reader holds it, and the capture
+     * silently degrades to RF-only. Joining the fan-out is the only way to
+     * coexist. On hosts without that config these are simply unknown PCMs and
+     * the probe falls through to the hardware names below.
+     * Override with MISRC_CXADC_ALSA_DEVICE / MISRC_CLOCKGEN_ALSA_DEVICE. */
+    static const char *shared_candidates[] = {
+        "clockgen-dsnoop",
+        NULL
+    };
+    for (size_t i = 0; shared_candidates[i]; i++) {
+        if (cxadc_try_open_audio_device(ctx, shared_candidates[i]) == 0) {
+            return 0;
+        }
+    }
+
     static const char *cxadc_candidates[] = {
         "usbstream:CARD=CXADCADCClockGe",
         "usbstream:CARD=CXADCADCClockGen",
@@ -1859,6 +1877,13 @@ bool gui_cxadc_detect_misrc_clockgen_audio(void)
 #else
     return false;
 #endif
+}
+
+bool gui_cxadc_audio_capture_active(void)
+{
+    /* audio_device_name is set only on a successful open and cleared on close
+     * and at start, on both the ALSA and WASAPI paths. */
+    return s_cxadc.audio_device_name[0] != '\0';
 }
 
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
