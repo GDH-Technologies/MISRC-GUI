@@ -15,6 +15,7 @@
 #include "../ui/gui_popup.h"
 #include "gui_audio.h"
 #include "../input/gui_capture.h"
+#include "../input/gui_cxadc.h"
 
 #include "../../common/ringbuffer.h"
 #include "../../common/rb_event.h"
@@ -2738,6 +2739,25 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     if (is_simulated) {
         gui_extract_init_record_rbs(app);
     }
+
+    /* With both RF channels off the clockgen audio feed is the only data
+     * source. If that device never opened -- it is exclusive, so any other
+     * reader holding it degrades capture to RF-only -- the session would write
+     * a log, no samples, and still report "Session complete". Refuse instead
+     * of handing back an empty capture. */
+    if (!app->settings.capture_a && !app->settings.capture_b &&
+        app->selected_device >= 0 && app->selected_device < app->device_count) {
+        device_type_t dev_type = app->devices[app->selected_device].type;
+        if ((dev_type == DEVICE_TYPE_CXADC || dev_type == DEVICE_TYPE_MISRC_CLOCKGEN) &&
+            !gui_cxadc_audio_capture_active()) {
+            gui_app_set_status(app,
+                "Both RF channels are off and the clockgen audio device is not open - "
+                "nothing would be recorded. Free the clockgen (another reader holds it) "
+                "or enable an RF channel.");
+            return RECORD_ERROR;
+        }
+    }
+
     // Ensure record buffers are initialized in buffer manager for enabled channels
     if ((app->settings.capture_a && bufmgr_ensure_init(&app->buffers, BUF_RECORD_A) < 0) ||
         (app->settings.capture_b && bufmgr_ensure_init(&app->buffers, BUF_RECORD_B) < 0)) {

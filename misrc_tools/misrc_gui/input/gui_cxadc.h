@@ -85,6 +85,10 @@ bool gui_cxadc_is_running(void);
 // set of extraction/display/audio-monitor threads. Returns 0 on success.
 int gui_cxadc_start_clockgen_audio(gui_app_t *app, bool misrc_clockgen_mode);
 
+// True while the clockgen USB-audio capture device is open (ALSA/WASAPI).
+// Lets the record path refuse a session that has no data source at all.
+bool gui_cxadc_audio_capture_active(void);
+
 // Stop/join the clockgen audio thread and close the audio device. Does NOT
 // touch extraction/display/audio-monitor/cards (owned by the caller's RF path).
 void gui_cxadc_stop_clockgen_audio(void);
