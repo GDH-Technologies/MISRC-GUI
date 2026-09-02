@@ -944,6 +944,70 @@ static int cxadc_try_open_audio_device(cxadc_ctx_t *ctx, const char *device_name
     return -1;
 }
 
+/* Resolve a card's stable ALSA id -- the udev ATTR{id} string, e.g.
+ * "wm_cg_audio". Card *indices* move across reboots and replugs, so a device
+ * string built from one points at whatever card inherited the number: it
+ * breaks intermittently, which is the worst failure shape there is. The id
+ * does not move. The control device is used deliberately here -- it stays
+ * openable while the capture PCM is busy, so this works even when the card is
+ * already held by another reader. */
+static bool cxadc_alsa_card_id(int card, char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) return false;
+    dst[0] = '\0';
+
+    char ctl_name[16];
+    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+
+    snd_ctl_t *ctl = NULL;
+    if (snd_ctl_open(&ctl, ctl_name, 0) < 0) return false;
+
+    snd_ctl_card_info_t *info = NULL;
+    snd_ctl_card_info_alloca(&info);
+
+    bool ok = false;
+    if (snd_ctl_card_info(ctl, info) >= 0) {
+        const char *id = snd_ctl_card_info_get_id(info);
+        if (id && id[0]) {
+            snprintf(dst, dst_len, "%s", id);
+            ok = true;
+        }
+    }
+    snd_ctl_close(ctl);
+    return ok;
+}
+
+/* Try every device form for one card, stable id first, index forms only as a
+ * last resort.
+ *
+ * Deliberately NOT tried here: a generic "dsnoop:CARD=<id>". Where a host has
+ * already configured its own dsnoop instance (a different ipc_key), the
+ * generic one opens a second hardware slave and EBUSYs against it, so it does
+ * not solve the shared-card case it looks like it would solve. Configured
+ * shared PCMs are probed by name in cxadc_open_audio_capture() instead. */
+static int cxadc_try_open_card_devices(cxadc_ctx_t *ctx, int card)
+{
+    char dev[80];
+
+    /* Stable id first. */
+    static const char *const id_prefixes[] = { "usbstream", "hw", "plughw" };
+    char card_id[32];
+    if (cxadc_alsa_card_id(card, card_id, sizeof(card_id))) {
+        for (size_t i = 0; i < sizeof(id_prefixes) / sizeof(id_prefixes[0]); i++) {
+            snprintf(dev, sizeof(dev), "%s:CARD=%s", id_prefixes[i], card_id);
+            if (cxadc_try_open_audio_device(ctx, dev) == 0) return 0;
+        }
+    }
+
+    /* Index forms last: only reachable when the id could not be read. */
+    static const char *const index_formats[] = { "usbstream:CARD=%d", "hw:%d", "plughw:%d" };
+    for (size_t i = 0; i < sizeof(index_formats) / sizeof(index_formats[0]); i++) {
+        snprintf(dev, sizeof(dev), index_formats[i], card);
+        if (cxadc_try_open_audio_device(ctx, dev) == 0) return 0;
+    }
+    return -1;
+}
+
 static int cxadc_probe_alsa_cards_for_audio(cxadc_ctx_t *ctx)
 {
     if (!ctx) return -1;
@@ -961,19 +1025,7 @@ static int cxadc_probe_alsa_cards_for_audio(cxadc_ctx_t *ctx)
         bool likely_clockgen = cxadc_alsa_card_name_matches_target(ctx, name, longname);
         if (likely_clockgen) {
             matched_named_clockgen_card = true;
-            char usbstream_dev[32];
-            snprintf(usbstream_dev, sizeof(usbstream_dev), "usbstream:CARD=%d", card);
-            if (cxadc_try_open_audio_device(ctx, usbstream_dev) == 0) {
-                if (name) free(name);
-                if (longname) free(longname);
-                return 0;
-            }
-            char hw_dev[32];
-            char plughw_dev[32];
-            snprintf(hw_dev, sizeof(hw_dev), "hw:%d", card);
-            snprintf(plughw_dev, sizeof(plughw_dev), "plughw:%d", card);
-            if (cxadc_try_open_audio_device(ctx, hw_dev) == 0 ||
-                cxadc_try_open_audio_device(ctx, plughw_dev) == 0) {
+            if (cxadc_try_open_card_devices(ctx, card) == 0) {
                 if (name) free(name);
                 if (longname) free(longname);
                 return 0;
@@ -992,17 +1044,7 @@ static int cxadc_probe_alsa_cards_for_audio(cxadc_ctx_t *ctx)
     card = -1;
     if (snd_card_next(&card) < 0) return -1;
     while (card >= 0) {
-        char usbstream_dev[32];
-        snprintf(usbstream_dev, sizeof(usbstream_dev), "usbstream:CARD=%d", card);
-        if (cxadc_try_open_audio_device(ctx, usbstream_dev) == 0) {
-            return 0;
-        }
-        char hw_dev[32];
-        char plughw_dev[32];
-        snprintf(hw_dev, sizeof(hw_dev), "hw:%d", card);
-        snprintf(plughw_dev, sizeof(plughw_dev), "plughw:%d", card);
-        if (cxadc_try_open_audio_device(ctx, hw_dev) == 0 ||
-            cxadc_try_open_audio_device(ctx, plughw_dev) == 0) {
+        if (cxadc_try_open_card_devices(ctx, card) == 0) {
             return 0;
         }
         if (snd_card_next(&card) < 0) break;
