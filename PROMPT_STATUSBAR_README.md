@@ -70,8 +70,15 @@ Then: make the bottom bar less twitchy for setting the small readouts.
 - Re-validated: build + smoke OK, all 34 guards PASS, meson tests 3/3 OK.
 - Pending: user GUI confirmation that full labels/spacing hold until the bar genuinely runs out of space, then compact forms engage only as needed.
 
+## Follow-up 5 (2026-09-03): committed 42b845c, then connect label + counter spacing
+Committed `42b845c` (status bar measured-fit compaction + hysteresis) and pushed. User then reported: (1) Disconnect button text does not scale smaller; (2) counter spacing wider than needed.
+- Connect/Disconnect: same bug class as Audio Mon — the ultra-narrow tier shrinks the button to 66px without tripping very_narrow, so full-size "Disconnect" overflowed. Label now picked by measured fit: longest of "Disconnect"/"Disc"/"Dis" (or Connect/Conn/Con) that fits the button width (`render_toolbar_connection_group`).
+- Counter spacing tightened at full quality: `status_right_gap` 16 -> 10 between counter groups, `status_counter_inner_gap` 4 -> 3 within a group (tiny floors unchanged).
+- Validations: build + smoke OK, all 34 guards PASS, meson tests 3/3 OK.
+- Pending: user GUI confirmation.
+
 ## Restore point
-`statusbar-rightside-fix-2026-09-02.zip` (repo root) — go-back-to snapshot containing the changed files (`gui_ui.c`, `gui_ui_scale.h`, `gui_ui_scale_harness.c`, `dev_notes_README.md`), full git diff, and this log. NOTE: snapshot predates Follow-ups 2-4 (toolbar dead-space, Audio Mon measured fit, readout hysteresis); refresh the zip after user confirmation.
+`statusbar-rightside-fix-2026-09-02.zip` (repo root) — go-back-to snapshot containing the changed files (`gui_ui.c`, `gui_ui_scale.h`, `gui_ui_scale_harness.c`, `dev_notes_README.md`), full git diff, and this log. NOTE: snapshot predates Follow-ups 2-5; refresh the zip after user confirmation.
 
 ## Rollback
 Options, newest first:

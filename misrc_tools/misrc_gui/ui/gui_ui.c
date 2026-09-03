@@ -4735,9 +4735,24 @@ static void render_toolbar_connection_group(gui_app_t *app,
             control_capturing = gui_net_client_peer_capturing(app);
         }
         Color connect_color = control_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
-        const char *connect_label = control_capturing
-            ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
-            : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
+        /* Pick the longest connect/disconnect label that measurably fits the
+         * fixed-width button (same measured-fit rule as the Audio Mon
+         * label). Tier width steps alone missed the ultra-narrow profile,
+         * which shrank the button without tripping the very_narrow flag and
+         * left the full-size text overflowing a 66px button. */
+        const char *connect_long = control_capturing ? "Disconnect" : "Connect";
+        const char *connect_med = control_capturing ? "Disc" : "Conn";
+        const char *connect_short = control_capturing ? "Dis" : "Con";
+        const char *connect_label;
+        if (gui_ui_measure_text_width(app, connect_long, toolbar_text_size, 0) <= connect_button_width - 4) {
+            connect_label = connect_long;
+        } else if (gui_ui_measure_text_width(app, connect_med, toolbar_text_size, 0) <= connect_button_width - 4) {
+            connect_label = connect_med;
+        } else {
+            connect_label = connect_short;
+        }
+        (void)toolbar_tiny;
+        (void)toolbar_very_narrow;
         CLAY(CLAY_ID("ConnectButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
@@ -6052,9 +6067,9 @@ static void render_status_bar(gui_app_t *app) {
     int frames_value_width = 32;
     int small_counter_width = 32;
     int buffer_value_width = status_tiny ? 28 : 35;
-    int status_counter_inner_gap = status_tiny ? 2 : 4;
+    int status_counter_inner_gap = status_tiny ? 2 : 3;
     int status_bar_gap = status_tiny ? 6 : 20;
-    int status_right_gap = status_tiny ? 8 : 16;
+    int status_right_gap = status_tiny ? 8 : 10;
     int status_left_gap = status_tiny ? 4 : 8;
     int status_font_size = FONT_SIZE_STATUS;
     bool status_compact_labels = s_status_labels_compact;

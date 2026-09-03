@@ -206,3 +206,25 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - `build-local2/misrc_gui --smoke-test` -> passes.
 - Not yet validated: real on-the-fly resample capture (40 MHz -> 20 MHz) with clipped input against live hardware; confirm no `FLAC__STREAM_ENCODER_CLIENT_ERROR` under sustained clipped+resampled capture before shipping a release.
 - Restore point: zip of the patched `gui_record.c` + this note preserved on the host at `~/MISRC-GUI-restore-points/fix-issue-1-flac-resample-clamp/`.
+
+## 2026-09-03 Toolbar + status bar dynamic scaling rework
+
+- Symptoms (user-reported across sessions):
+  - Bottom status bar: right-side readouts clipped off the window edge at constrained widths; tiered short forms flickered frame-to-frame while counters ticked at boundary widths; compact labels/spacing appeared while dead space was still available; Sync/Samples looked fine but other readouts "kicked down" too fast.
+  - Toolbar: a ~1020-1233px window where no breakpoint profile fit made right-side controls vanish/bounce on resize; "Audio Mon" and "Disconnect" buttons kept full-size text inside shrunken buttons (Clay does not clip text -> overflow / double-stack wrap).
+- Root causes:
+  - Status bar budget assumed small fixed container widths while drawn text was wider (Clay FIT/FIXED containers do not clip text children).
+  - Tier/label state was recomputed every frame from live ticking data with no hysteresis, and hard width breakpoints pre-seeded compact forms regardless of actual space.
+  - Toolbar tier flags were incomplete (ultra-narrow profile shrank buttons without tripping the label-shortening flags).
+- Fixes (all in `misrc_tools/misrc_gui/ui/gui_ui.c` unless noted):
+  - Status bar: budget right-side readouts by real measured text widths; value containers FIT(min); tiered shortening (sample rate / samples / free space) in lockstep via a persisted level with hysteresis (immediate step-up under pressure, one-step relax only on first-pass fit with slack beyond the measured tier step).
+  - Status bar: the status message claims its natural rendered width (capped at the readable minimum) instead of a fixed 96px budget; compaction is earned by measured pressure — compact-seed/narrow breakpoint pre-seeding removed; compact-label flip persisted with the same hysteresis (`s_status_readout_level`, `s_status_labels_compact`).
+  - Toolbar: layout tiers selected by measured fit (largest profile whose requirement fits), device dropdown compresses to its floor before a tier steps down and grows back into leftover slack first; two-row only when even tiny cannot fit.
+  - Toolbar: Audio Mon and Connect/Disconnect labels pick the longest form that measurably fits the button (measured-fit fallback instead of tier flags).
+  - Counter group spacing tightened at full quality (right gap 16->10, inner gap 4->3).
+- Contract notes:
+  - `gui_ui_toolbar_uses_two_rows()` signature/semantics unchanged (CI guard "UI scale integration contract").
+  - `gui_ui_get_status_layout_mode()` / `gui_ui_status_*` pure functions in `gui_ui_scale.h` unchanged; harness (`misrc_tools/test/gui_ui_scale_harness.c`) still passes.
+- Validation (local, Linux Mint): `scripts/build-local.sh` build + smoke OK (pre-existing warnings only); `misrc_tools/test/ci_guard_tests.py` 34/34 PASS; `meson test -C build-local` 3/3 OK; user real-world GUI confirmation of the right-side clip fix and general behavior.
+- Commits: `a552e7e` (status bar clipping + toolbar dead-space-first + Audio Mon measured fit), `42b845c` (status bar measured-fit compaction + hysteresis) on `capture-server-client-modes`.
+- Session log: `PROMPT_STATUSBAR_README.md` (repo root); restore-point zip `statusbar-rightside-fix-2026-09-02.zip` on the host (untracked, predates later follow-ups).
