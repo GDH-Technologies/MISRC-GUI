@@ -1348,6 +1348,70 @@ def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_net_fanout_runtime(repo_root: Path) -> int:
+    """The /rf and /baseband streams are fed by the net fanout
+    (misrc_gui/net/gui_net_fanout.c). The original pinned the queue head
+    forever (every wake-up replayed the stream from chunk #1), never released
+    the producer's reference (unbounded growth at RF rate for as long as a
+    client was connected), attached to queued data only after a successful wait
+    (a reader with data already waiting slept until the next push), and
+    reported shutdown as a 0-byte timeout (the handler loop never exited, so
+    server_stop() freed the queue under it). Compiles the real module against a
+    harness that drives it the way the handler does and measures delivered vs
+    pushed vs dropped, ordering, wake-up latency, memory held after a drain and
+    the shutdown hand-off."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: net fanout runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the net fanout runtime guard")
+        print("SKIP: net fanout runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/net_fanout_harness.c"
+    fanout_path = repo_root / "misrc_tools/misrc_gui/net/gui_net_fanout.c"
+    net_include = repo_root / "misrc_tools/misrc_gui/net"
+
+    for required in (harness_path, fanout_path):
+        if not required.exists():
+            return fail(f"Net fanout guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_net_fanout_guard_") as temp_root:
+        exe_path = Path(temp_root) / "net_fanout_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            "-pthread",
+            f"-I{net_include}",
+            str(harness_path),
+            str(fanout_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Net fanout harness failed to compile:\n{built.stderr.strip()}")
+        try:
+            ran = subprocess.run([str(exe_path)], capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            return fail(f"Net fanout harness hung for {exc.timeout}s (a reader never woke up)")
+        if ran.returncode != 0:
+            return fail(
+                "Net fanout harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_ui_scale_policy_runtime(repo_root: Path) -> int:
     cc = shutil.which("cc")
     if cc is None:
@@ -1560,6 +1624,7 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
+        checks.insert(9, ("net fanout runtime", lambda: check_net_fanout_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real

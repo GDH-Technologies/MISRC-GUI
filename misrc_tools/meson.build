@@ -409,6 +409,7 @@ if raylib_dep.found()
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
+    'misrc_gui/net/gui_net_fanout.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_audio.c',
