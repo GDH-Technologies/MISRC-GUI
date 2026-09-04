@@ -274,6 +274,35 @@ typedef struct {
 static net_server_t *s_server = NULL;
 static net_client_t *s_client = NULL;
 
+/* The server the buffer-manager write tap pushes into, and how many pushes
+ * are in flight on the capture thread. server_stop() clears the pointer and
+ * then waits for the count to reach zero before it destroys the fanouts. */
+static _Atomic(net_server_t *) s_tap_server = NULL;
+static atomic_int s_tap_inflight = 0;
+
+/* Runs on the producer's thread from bufmgr_write_end() for every commit to
+ * BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO, whichever backend wrote it. Cheap when
+ * no server is running or no client is streaming. */
+static void server_write_tap(void *ctx, buffer_id_t id, const void *data, size_t bytes) {
+    (void)ctx;
+    atomic_fetch_add(&s_tap_inflight, 1);
+    net_server_t *srv = atomic_load(&s_tap_server);
+    if (srv) {
+        if (id == BUF_CAPTURE_RF) net_fanout_push(&srv->rf, data, bytes);
+        else if (id == BUF_CAPTURE_AUDIO) net_fanout_push(&srv->audio, data, bytes);
+    }
+    atomic_fetch_sub(&s_tap_inflight, 1);
+}
+
+/* Idempotent. Also re-run from gui_net_poll_commands() so a buffer-manager
+ * re-init (memory budget change) cannot silently detach the stream. */
+static void server_install_tap(gui_app_t *app) {
+    if (bufmgr_get_write_tap(&app->buffers, BUF_CAPTURE_RF) != server_write_tap) {
+        bufmgr_set_write_tap(&app->buffers, BUF_CAPTURE_RF, server_write_tap, NULL);
+        bufmgr_set_write_tap(&app->buffers, BUF_CAPTURE_AUDIO, server_write_tap, NULL);
+    }
+}
+
 /* Global init state. */
 static bool s_globals_init = false;
 
@@ -764,12 +793,18 @@ static int server_start(gui_app_t *app, uint16_t port) {
     s_server = srv;
     app->net_state = srv;
     atomic_store(&app->net_connected, true);
+    /* Feed the fanouts from every BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO commit. */
+    server_install_tap(app);
+    atomic_store(&s_tap_server, srv);
     fprintf(stderr, "[NET] server listening on :%u\n", (unsigned)port);
     return 0;
 }
 
 static void server_stop(net_server_t *srv) {
     if (!srv) return;
+    /* Stop the capture-thread tap first; a push already inside it finishes
+     * before the fanouts go away (the in-flight wait below). */
+    atomic_store(&s_tap_server, NULL);
     atomic_store(&srv->stop_flag, true);
     atomic_store(&srv->running, false);
     atomic_store(&srv->beacon_stop, true);
@@ -810,6 +845,9 @@ static void server_stop(net_server_t *srv) {
             fprintf(stderr, "[NET] server: still waiting for %d client thread(s)\n",
                     atomic_load(&srv->client_threads));
         }
+    }
+    while (atomic_load(&s_tap_inflight) > 0) {
+        thrd_sleep_ms(1);
     }
     net_fanout_destroy(&srv->rf);
     net_fanout_destroy(&srv->audio);
@@ -1697,24 +1735,11 @@ int gui_net_apply_mode(gui_app_t *app) {
     return 0;
 }
 
-void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes) {
-    (void)app;
-    if (s_server && s_server->rf.initialized) {
-        net_fanout_push(&s_server->rf, data, bytes);
-    }
-}
-
-void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
-    (void)app;
-    if (s_server && s_server->audio.initialized) {
-        net_fanout_push(&s_server->audio, data, bytes);
-    }
-}
-
 void gui_net_poll_commands(gui_app_t *app) {
     if (!app) return;
     /* Server mode: execute queued commands locally on the main thread. */
     if (s_server) {
+        server_install_tap(app);
         if (atomic_exchange(&app->net_cmd_start, false)) {
             if (!app->is_capturing) {
                 fprintf(stderr, "[NET] server: executing /start\n");

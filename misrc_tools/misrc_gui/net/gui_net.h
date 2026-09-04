@@ -27,6 +27,11 @@
  * same safe pattern already used by app->dropout_stop_requested. No device handles
  * or is_capturing state are mutated from worker threads.
  *
+ * The server feeds /rf and /baseband through a buffer-manager write tap
+ * (bufmgr_set_write_tap) installed by server_start(): every commit to
+ * BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO reaches the fanout on the writer's thread,
+ * whichever capture backend made it. See gui_net_fanout.h for the fanout.
+ *
  * v1 is LAN-only with no authentication or encryption (mirrors the reference
  * server's own warning: do not expose to the public internet).
  */
@@ -64,12 +69,6 @@ bool gui_net_is_client(const gui_app_t *app);
 
 /* True iff the app is running in Server mode (regardless of listen state). */
 bool gui_net_is_server(const gui_app_t *app);
-
-/* Server data tap: called from the capture callback to feed the broadcast fanout
- * so /rf and /baseband clients can stream it. No-op (and cheap) when not in server
- * mode or no clients are connected. Safe to call from the capture thread. */
-void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes);
-void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes);
 
 /* Main-thread pollers: called every frame from the render loop.
  *  - poll_commands: executes queued net_cmd_* control requests on the main thread
