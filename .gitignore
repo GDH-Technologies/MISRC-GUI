@@ -42,3 +42,6 @@ __pycache__/
 # with a build timestamp + the host NDK path. Never commit it for the same
 # reason: regenerating it on CI dirties the tree and tags the version -dirty.
 /android/deps-versions.txt
+
+# Claude worktrees are local scratch, never repo content
+**/.claude/worktrees/
