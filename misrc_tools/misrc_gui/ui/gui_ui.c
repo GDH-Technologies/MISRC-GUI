@@ -24,6 +24,7 @@
 #include "../streaming/gui_rtsp_stream.h"
 #include "../streaming/gui_mediamtx.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
+#include "../net/gui_net.h"
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
@@ -578,6 +579,9 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
     UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
+    UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
+    UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
+    UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
 } ui_text_field_t;
 
 // Above this the CX front end's own noise starts interfering with the signal,
@@ -660,6 +664,7 @@ static bool s_android_keyboard_visible = false;
 #define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
 #define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
 #define GUI_UI_RELEASES_DOWNLOAD_BASE_URL "https://github.com/harrypm/MISRC-GUI/releases/download"
+#define VERSION_INFO_NET_DISCOVERY_MAX_ROWS 6
 
 typedef struct {
     bool manual;
@@ -1363,6 +1368,17 @@ static double s_status_free_space_last_update_s = 0.0;
 static uint64_t s_status_output_last_bytes = 0;
 static double s_status_output_last_sample_s = 0.0;
 static double s_status_output_rate_bps = 0.0;
+/* Persistent small-readout shortening level (0 full .. 2 shortest) for the
+ * status bar, kept across frames with hysteresis: pressure raises it
+ * immediately, ample slack lowers it one step, so ticking counters at a
+ * boundary width cannot flap the small readouts between full and short
+ * forms every frame. */
+static int s_status_readout_level = 0;
+/* Persisted compact-label state for the status bar right side, with the
+ * same hysteresis as the readout level: the flip is earned by measured
+ * pressure (never a hard width breakpoint) and only relaxes when the full
+ * labels measurably fit again with slack to spare. */
+static bool s_status_labels_compact = false;
 #define STATUS_FREE_SPACE_REFRESH_INTERVAL_S 1.0
 #define STATUS_FREE_SPACE_LOW_BYTES ((uint64_t)10 * 1000 * 1000 * 1000)
 #define STATUS_FREE_SPACE_WARN_BYTES ((uint64_t)25 * 1000 * 1000 * 1000)
@@ -1373,6 +1389,18 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
         s_capture_mode_state_misrc = app->settings.misrc_mode;
         s_capture_mode_state_initialized = true;
         gui_ui_trace_capture_mode_state(app, "ui_init_from_settings", true);
+    }
+    /* Client mode mirrors server controls; never let local UI mode state
+     * override the peer-provided mode snapshot. */
+    if (gui_net_is_client(app)) {
+        bool mirrored_mode = app->settings.misrc_mode;
+        s_capture_mode_state_misrc = mirrored_mode;
+        app->user_capture_mode_misrc = mirrored_mode;
+        if (!app->is_recording) {
+            app->capture_mode_runtime_misrc = mirrored_mode;
+        }
+        gui_ui_trace_capture_mode_state(app, "gui_ui_sync_capture_mode_state_client", false);
+        return;
     }
 #ifdef ENABLE_DDD
     bool ddd_mode = gui_ui_selected_device_is_ddd(app);
@@ -1593,6 +1621,19 @@ static void format_status_free_space_label(char *dst, size_t dst_len, uint64_t f
         snprintf(dst, dst_len, "Free: %llu B", (unsigned long long)free_bytes);
     }
 }
+static void format_status_free_space_compact_label(char *dst, size_t dst_len, uint64_t free_bytes)
+{
+    if (!dst || dst_len == 0) return;
+    if (free_bytes >= 1000000000ULL) {
+        snprintf(dst, dst_len, "%.1fG", (double)free_bytes / 1000000000.0);
+    } else if (free_bytes >= 1000000ULL) {
+        snprintf(dst, dst_len, "%.1fM", (double)free_bytes / 1000000.0);
+    } else if (free_bytes >= 1000ULL) {
+        snprintf(dst, dst_len, "%.1fK", (double)free_bytes / 1000.0);
+    } else {
+        snprintf(dst, dst_len, "%lluB", (unsigned long long)free_bytes);
+    }
+}
 
 // Keep growing status counters inside a predictable four-character budget.
 // The detailed panels retain exact values; the footer only needs a compact
@@ -1608,6 +1649,74 @@ static void format_status_counter(char *dst, size_t dst_len, uint32_t value)
         snprintf(dst, dst_len, "%uK", value / 1000U);
     } else {
         snprintf(dst, dst_len, "%u", value);
+    }
+}
+
+// Defined below; tier 0 of the sample-rate readout reuses it verbatim.
+static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_rate_raw);
+
+// Tiered status-bar sample count. Tier 0 is the full readout; higher tiers
+// shorten the text so the width budget can reclaim space on narrow windows
+// without hiding any readout.
+static void format_status_samples_tier(char *dst, size_t dst_len, uint64_t value, int tier)
+{
+    if (!dst || dst_len == 0) return;
+    if (tier <= 0) {
+        if (value >= 1000000000ULL) {
+            snprintf(dst, dst_len, "%.2fG", (double)value / 1000000000.0);
+        } else if (value >= 1000000ULL) {
+            snprintf(dst, dst_len, "%.2fM", (double)value / 1000000.0);
+        } else if (value >= 1000ULL) {
+            snprintf(dst, dst_len, "%.1fK", (double)value / 1000.0);
+        } else {
+            snprintf(dst, dst_len, "%llu", (unsigned long long)value);
+        }
+    } else if (tier == 1) {
+        if (value >= 1000000000ULL) {
+            snprintf(dst, dst_len, "%.1fG", (double)value / 1000000000.0);
+        } else if (value >= 1000000ULL) {
+            snprintf(dst, dst_len, "%.1fM", (double)value / 1000000.0);
+        } else if (value >= 1000ULL) {
+            snprintf(dst, dst_len, "%.0fK", (double)value / 1000.0);
+        } else {
+            snprintf(dst, dst_len, "%llu", (unsigned long long)value);
+        }
+    } else {
+        if (value >= 1000000000ULL) {
+            snprintf(dst, dst_len, "%.0fG", (double)value / 1000000000.0);
+        } else if (value >= 1000000ULL) {
+            snprintf(dst, dst_len, "%.0fM", (double)value / 1000000.0);
+        } else if (value >= 1000ULL) {
+            snprintf(dst, dst_len, "%.0fK", (double)value / 1000.0);
+        } else {
+            snprintf(dst, dst_len, "%llu", (unsigned long long)value);
+        }
+    }
+}
+
+// Tiered status-bar sample-rate readout (tier 0 = full "192.0 MSPS",
+// tier 1 = integer "192 MSPS", tier 2 = magnitude form "192M").
+static void format_status_sample_rate_tier(char *dst, size_t dst_len,
+                                           uint32_t sample_rate_raw, int tier)
+{
+    if (!dst || dst_len == 0) return;
+    if (sample_rate_raw == 0) {
+        dst[0] = '\0';
+        return;
+    }
+    /* Backward compatibility: some paths report kHz-style RF rates (40000=40MSPS),
+     * while others report Hz. Normalize before display. */
+    double hz = (double)sample_rate_raw;
+    if (sample_rate_raw <= 100000U) {
+        hz *= 1000.0;
+    }
+    double msps = hz / 1000000.0;
+    if (tier <= 0) {
+        format_live_msps_label(dst, dst_len, sample_rate_raw);
+    } else if (tier == 1) {
+        snprintf(dst, dst_len, "%d MSPS", (int)lround(msps));
+    } else {
+        snprintf(dst, dst_len, "%dM", (int)lround(msps));
     }
 }
 
@@ -1769,16 +1878,46 @@ static int gui_ui_measure_button_width(const gui_app_t *app,
     return gui_ui_clamp_int(measured_width, min_width, max_width);
 }
 
+static int gui_ui_measure_text_width(const gui_app_t *app,
+                                     const char *text,
+                                     int font_size,
+                                     int font_id)
+{
+    Font font = GetFontDefault();
+    if (app && app->fonts) {
+        if (font_id == 1) {
+            if (app->fonts[1].texture.id != 0) {
+                font = app->fonts[1];
+            }
+        } else if (app->fonts[0].texture.id != 0) {
+            font = app->fonts[0];
+        }
+    }
+    if (!font.glyphs) {
+        font = GetFontDefault();
+    }
+    const char *safe_text = (text && text[0]) ? text : " ";
+    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    return (int)ceilf(m.x);
+}
+
 static void gui_ui_ellipsize_text(const gui_app_t *app,
                                   char *text,
                                   size_t text_capacity,
                                   int font_size,
+                                  int font_id,
                                   int max_text_width)
 {
     if (!text || text_capacity == 0 || text[0] == '\0') return;
     Font font = GetFontDefault();
-    if (app && app->fonts && app->fonts[0].texture.id != 0) {
-        font = app->fonts[0];
+    if (app && app->fonts) {
+        if (font_id == 1) {
+            if (app->fonts[1].texture.id != 0) {
+                font = app->fonts[1];
+            }
+        } else if (app->fonts[0].texture.id != 0) {
+            font = app->fonts[0];
+        }
     }
     if (!font.glyphs) {
         font = GetFontDefault();
@@ -2072,6 +2211,18 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.ingest_notes;
             *cap = sizeof(app->settings.ingest_notes);
             return true;
+        case UI_TEXT_FIELD_NET_SERVER_PORT:
+            *dst = app->settings.net_server_port_str;
+            *cap = sizeof(app->settings.net_server_port_str);
+            return true;
+        case UI_TEXT_FIELD_NET_CLIENT_HOST:
+            *dst = app->settings.net_client_host;
+            *cap = sizeof(app->settings.net_client_host);
+            return true;
+        case UI_TEXT_FIELD_NET_CLIENT_PORT:
+            *dst = app->settings.net_client_port_str;
+            *cap = sizeof(app->settings.net_client_port_str);
+            return true;
         default:
             return false;
     }
@@ -2117,6 +2268,13 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
             }
             return true;
         }
+    }
+    // Network fields live in the info ("About") window and are editable while
+    // that window is open, independent of the settings panel / recording lock.
+    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+        field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+        return s_version_info_window_open;
     }
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
@@ -2180,6 +2338,15 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
     if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
         // Frequency in Hz: digits only (parsed to uint64 on commit).
         return (ch >= '0' && ch <= '9');
+    }
+    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+        // TCP port: digits only.
+        return (ch >= '0' && ch <= '9');
+    }
+    if (field == UI_TEXT_FIELD_NET_CLIENT_HOST) {
+        // Hostname or IP: allow printable ASCII except quote (JSON-safe).
+        return (ch >= 32 && ch < 127 && ch != '\"');
     }
     if (ch < 32 || ch >= 127) {
         return false;
@@ -4226,9 +4393,11 @@ static void render_version_info_window(gui_app_t *app)
 {
     if (!s_version_info_window_open) return;
 
-    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 460);
-    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 380);
-    int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
+    // Slightly wider so network controls stay readable and the client Connect
+    // action remains visible without clipping on common desktop sizes.
+    int version_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 680);
+    int version_min_width = gui_ui_clamp_int(version_max_width, 1, 560);
+    int version_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 820);
 
     static char vi_version[64];
     static char vi_state[24];
@@ -4404,7 +4573,7 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
             CLAY(CLAY_ID("VersionInfoUpdateStatus"), {
-                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) } }
+                .layout = { .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 260), CLAY_SIZING_FIT(0) } }
             }) {
                 CLAY_TEXT(make_string(vi_update_status),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
@@ -4569,9 +4738,216 @@ static void render_version_info_window(gui_app_t *app)
             }
         }
 
-        // Copyright
-        CLAY_TEXT(CLAY_STRING(MIRSC_TOOLS_COPYRIGHT),
+        // Network (Server/Client) section. Stock mode is Local (no networking).
+        // Server hosts the HTTP control + RF/audio stream; Client connects to a
+        // host and mirrors its device list/controls/capture state (master/slave).
+        // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
+        CLAY_TEXT(CLAY_STRING("Network (Server/Client):"),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
+
+        {
+            int mode = app->settings.net_mode;
+            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_CLIENT) mode = GUI_NET_MODE_LOCAL;
+            const char *mode_label = gui_net_mode_name(mode);
+            Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
+            CLAY(CLAY_ID("VersionInfoNetModeRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetModeLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Mode:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(mode_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(mode_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY_TEXT(CLAY_STRING("click to cycle Local / Server / Client"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Server: port field.
+        if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
+            CLAY(CLAY_ID("VersionInfoNetServerPortRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetServerPortLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Port:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoNetServerPortField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 6, 6, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *pv = app->settings.net_server_port_str[0] ? app->settings.net_server_port_str : "8080";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_SERVER_PORT)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_SERVER_PORT, pv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(pv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING("TCP port to listen on (LAN only, no auth)"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Client: discovered-server list (primary) + compact manual host:port fallback.
+        if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+            CLAY_TEXT(CLAY_STRING("Discovered servers:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            {
+                int disc_n = gui_net_discovered_count();
+                if (disc_n <= 0) {
+                    CLAY_TEXT(CLAY_STRING("Scanning for servers on the LAN..."),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                } else {
+                    int disc_visible = disc_n;
+                    if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
+                        disc_visible = VERSION_INFO_NET_DISCOVERY_MAX_ROWS;
+                    }
+                    static char disc_labels[VERSION_INFO_NET_DISCOVERY_MAX_ROWS][160];
+                    for (int i = 0; i < disc_visible; i++) {
+                        char dhost[64] = {0};
+                        uint16_t dport = 0;
+                        char dname[64] = {0};
+                        if (!gui_net_get_discovered(i, dhost, sizeof(dhost), &dport, dname, sizeof(dname))) break;
+                        char *disc_label = disc_labels[i];
+                        if (dname[0]) {
+                            snprintf(disc_label, sizeof(disc_labels[i]), "%s:%u  (%s)", dhost, (unsigned)dport, dname);
+                        } else {
+                            snprintf(disc_label, sizeof(disc_labels[i]), "%s:%u", dhost, (unsigned)dport);
+                        }
+                        bool sel = (strcmp(app->settings.net_client_host, dhost) == 0 &&
+                                    app->settings.net_client_port == dport);
+                        Color item_bg = sel ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        /* Compact row: fit the "ip:port (name)" text width (capped)
+                         * instead of growing to the full window width, so the
+                         * list reads as a normal IPv4+port line of info. */
+                        CLAY(CLAY_IDI("VersionInfoNetDiscItem", i), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 420), CLAY_SIZING_FIXED(26) },
+                                .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                                .padding = { 8, 8, 0, 0 }
+                            },
+                            .backgroundColor = to_clay_color(item_bg),
+                            .cornerRadius = CLAY_CORNER_RADIUS(4)
+                        }) {
+                            CLAY_TEXT(make_string(disc_label),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+                    if (disc_n > disc_visible) {
+                        static char disc_more_label[96];
+                        snprintf(disc_more_label, sizeof(disc_more_label),
+                                 "%d more server(s) not shown", disc_n - disc_visible);
+                        CLAY_TEXT(make_string(disc_more_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    }
+                    CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+            }
+            // Compact manual host:port fallback (fixed widths so the window stays narrow).
+            CLAY(CLAY_ID("VersionInfoNetClientManualRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetClientHostField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 8, 8, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *hv = app->settings.net_client_host[0] ? app->settings.net_client_host : "host";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_CLIENT_HOST)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_CLIENT_HOST, hv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(hv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(hv[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING(":"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                CLAY(CLAY_ID("VersionInfoNetClientPortField"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(32) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 6, 6, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    const char *pv = app->settings.net_client_port_str[0] ? app->settings.net_client_port_str : "8080";
+                    if (gui_ui_is_text_field_active(UI_TEXT_FIELD_NET_CLIENT_PORT)) {
+                        gui_ui_render_active_text(UI_TEXT_FIELD_NET_CLIENT_PORT, pv, FONT_SIZE_STATS, 1, COLOR_TEXT);
+                    } else {
+                        CLAY_TEXT(make_string(pv),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+            }
+            // Connect button on its own row so it remains visible even when the
+            // discovery list has multiple entries.
+            CLAY(CLAY_ID("VersionInfoNetClientConnectRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetClientConnectLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Action:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                bool net_connected = gui_net_active(app);
+                Color connect_bg = net_connected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                const char *connect_label = net_connected ? "Disconnect" : "Connect";
+                CLAY(CLAY_ID("VersionInfoNetConnectButton"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(connect_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(connect_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY_TEXT(CLAY_STRING("toggle client connection"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
+        // Network status line.
+        {
+            static char net_status[160];
+            gui_net_status_string(app, net_status, sizeof(net_status));
+            CLAY(CLAY_ID("VersionInfoNetStatusRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetStatusLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Status:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY_TEXT(make_string(net_status),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+        // Credits (without license/year text).
+        CLAY_TEXT(CLAY_STRING("(c) Harry Munday, AlessandroAU, Stefan O, Vrunk11, machcnz"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
     }
 }
 // Metadata popup (opened by clicking the toolbar scroll badge)
@@ -4949,7 +5325,15 @@ static void render_toolbar_audio_group(gui_app_t *app,
         }
     }) {
         Color mon_bg = app->settings.audio_monitor_playback ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-        const char *audio_mon_label = toolbar_very_narrow ? "Mon" : "Audio Mon";
+        // Fall back to "Mon" whenever the long label measurably cannot fit
+        // the fixed-width button — otherwise Clay wraps "Audio Mon" into two
+        // stacked lines inside the 32px-high box. The tier flags short-circuit
+        // the compact tiers; the measured check covers every width in between.
+        const char *audio_mon_label = "Audio Mon";
+        if (toolbar_very_narrow || toolbar_ultra_narrow ||
+            gui_ui_measure_text_width(app, "Audio Mon", toolbar_text_size, 0) > audio_mon_width - 4) {
+            audio_mon_label = "Mon";
+        }
         CLAY(CLAY_ID("AudioPlaybackToggle"), {
             .layout = { .sizing = { CLAY_SIZING_FIXED(audio_mon_width), CLAY_SIZING_FIXED(32) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
             .backgroundColor = to_clay_color(mon_bg),
@@ -5064,10 +5448,29 @@ static void render_toolbar_connection_group(gui_app_t *app,
             .childGap = toolbar_gap
         }
     }) {
-        Color connect_color = app->is_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
-        const char *connect_label = app->is_capturing
-            ? (toolbar_tiny ? "Dis" : (toolbar_very_narrow ? "Disc" : "Disconnect"))
-            : (toolbar_tiny ? "Con" : (toolbar_very_narrow ? "Conn" : "Connect"));
+        bool control_capturing = app->is_capturing;
+        if (gui_net_is_client(app)) {
+            control_capturing = gui_net_client_peer_capturing(app);
+        }
+        Color connect_color = control_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
+        /* Pick the longest connect/disconnect label that measurably fits the
+         * fixed-width button (same measured-fit rule as the Audio Mon
+         * label). Tier width steps alone missed the ultra-narrow profile,
+         * which shrank the button without tripping the very_narrow flag and
+         * left the full-size text overflowing a 66px button. */
+        const char *connect_long = control_capturing ? "Disconnect" : "Connect";
+        const char *connect_med = control_capturing ? "Disc" : "Conn";
+        const char *connect_short = control_capturing ? "Dis" : "Con";
+        const char *connect_label;
+        if (gui_ui_measure_text_width(app, connect_long, toolbar_text_size, 0) <= connect_button_width - 4) {
+            connect_label = connect_long;
+        } else if (gui_ui_measure_text_width(app, connect_med, toolbar_text_size, 0) <= connect_button_width - 4) {
+            connect_label = connect_med;
+        } else {
+            connect_label = connect_short;
+        }
+        (void)toolbar_tiny;
+        (void)toolbar_very_narrow;
         CLAY(CLAY_ID("ConnectButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
@@ -5104,6 +5507,197 @@ static void render_toolbar_connection_group(gui_app_t *app,
 }
 
 // Render the toolbar
+// Toolbar layout profiles. Tiers mirror the historical breakpoint ternaries
+// exactly, but the active tier is selected by measured fit (largest profile
+// whose single-row requirement fits the current width) instead of raw width
+// ranges. Every chosen profile fits by construction, so there is no width
+// window where the toolbar overflows and clips the right-side controls off
+// the window, and no breakpoint bounce while dragging the window edge.
+enum {
+    GUI_UI_TOOLBAR_TIER_FULL = 0,
+    GUI_UI_TOOLBAR_TIER_NARROW,
+    GUI_UI_TOOLBAR_TIER_VERY_NARROW,
+    GUI_UI_TOOLBAR_TIER_ULTRA_NARROW,
+    GUI_UI_TOOLBAR_TIER_TINY,
+};
+
+typedef struct gui_ui_toolbar_profile {
+    int padding_h;
+    int gap;
+    int text_size;
+    int icon_button_size;
+    int version_icon_size;
+    int metadata_icon_size;
+    int dd_min_width;
+    int dd_max_width;
+    int connect_width;
+    int mode_min_width;
+    int mode_max_width;
+    int audio_mon_width;
+    int audio_ch_width;
+    int bars_panel_width;
+    int meter_col_width;
+    int meter_width;
+    int meter_height;
+    int meter_gap;
+    int record_width;
+    int dropdown_padding;
+    bool tiny;
+    bool ultra_narrow;
+    bool very_narrow;
+    bool show_audio_meter_labels;
+    bool show_version_icon;
+    bool show_device_label;
+} gui_ui_toolbar_profile_t;
+
+static gui_ui_toolbar_profile_t gui_ui_toolbar_profile_for_tier(int tier)
+{
+    gui_ui_toolbar_profile_t p;
+    memset(&p, 0, sizeof(p));
+    switch (tier) {
+    case GUI_UI_TOOLBAR_TIER_NARROW:
+        p = (gui_ui_toolbar_profile_t) {
+            .padding_h = 8, .gap = 12, .text_size = FONT_SIZE_NORMAL,
+            .icon_button_size = 32, .version_icon_size = 20, .metadata_icon_size = 18,
+            .dd_min_width = 160, .dd_max_width = 230, .connect_width = 92,
+            .mode_min_width = 112, .mode_max_width = 178,
+            .audio_mon_width = 90, .audio_ch_width = 70, .bars_panel_width = 240,
+            .meter_col_width = 54, .meter_width = 50, .meter_height = 8,
+            .meter_gap = 4,
+            .record_width = 80, .dropdown_padding = 10,
+            .show_audio_meter_labels = true, .show_version_icon = true,
+            .show_device_label = true,
+        };
+        break;
+    case GUI_UI_TOOLBAR_TIER_VERY_NARROW:
+        p = (gui_ui_toolbar_profile_t) {
+            .padding_h = 8, .gap = 6, .text_size = FONT_SIZE_DROPDOWN,
+            .icon_button_size = 32, .version_icon_size = 20, .metadata_icon_size = 18,
+            .dd_min_width = 138, .dd_max_width = 210, .connect_width = 82,
+            .mode_min_width = 96, .mode_max_width = 156,
+            .audio_mon_width = 68, .audio_ch_width = 64, .bars_panel_width = 200,
+            .meter_col_width = 44, .meter_width = 38, .meter_height = 8,
+            .meter_gap = 4,
+            .record_width = 74, .dropdown_padding = 6,
+            .show_audio_meter_labels = true, .show_version_icon = true,
+            .show_device_label = false,
+        };
+        break;
+    case GUI_UI_TOOLBAR_TIER_ULTRA_NARROW:
+        p = (gui_ui_toolbar_profile_t) {
+            .padding_h = 8, .gap = 4, .text_size = FONT_SIZE_DROPDOWN,
+            .icon_button_size = 32, .version_icon_size = 20, .metadata_icon_size = 18,
+            .dd_min_width = 120, .dd_max_width = 190, .connect_width = 66,
+            .mode_min_width = 78, .mode_max_width = 136,
+            .audio_mon_width = 56, .audio_ch_width = 56, .bars_panel_width = 164,
+            .meter_col_width = 36, .meter_width = 30, .meter_height = 8,
+            .meter_gap = 4,
+            .record_width = 68, .dropdown_padding = 6,
+            .show_audio_meter_labels = true, .show_version_icon = false,
+            .show_device_label = false,
+        };
+        break;
+    case GUI_UI_TOOLBAR_TIER_TINY:
+        p = (gui_ui_toolbar_profile_t) {
+            .padding_h = 4, .gap = 2, .text_size = FONT_SIZE_DROPDOWN,
+            .icon_button_size = 28, .version_icon_size = 16, .metadata_icon_size = 14,
+            .dd_min_width = 100, .dd_max_width = 150, .connect_width = 52,
+            .mode_min_width = 58, .mode_max_width = 76,
+            .audio_mon_width = 44, .audio_ch_width = 46, .bars_panel_width = 82,
+            .meter_col_width = 17, .meter_width = 13, .meter_height = 6,
+            .meter_gap = 2,
+            .record_width = 56, .dropdown_padding = 6,
+            .show_audio_meter_labels = false, .show_version_icon = false,
+            .show_device_label = false,
+            .tiny = true, .ultra_narrow = true, .very_narrow = true,
+        };
+        break;
+    case GUI_UI_TOOLBAR_TIER_FULL:
+    default:
+        p = (gui_ui_toolbar_profile_t) {
+            .padding_h = 8, .gap = 12, .text_size = FONT_SIZE_NORMAL,
+            .icon_button_size = 32, .version_icon_size = 20, .metadata_icon_size = 18,
+            .dd_min_width = 180, .dd_max_width = 280, .connect_width = 100,
+            .mode_min_width = 112, .mode_max_width = 230,
+            .audio_mon_width = 90, .audio_ch_width = 70, .bars_panel_width = 240,
+            .meter_col_width = 54, .meter_width = 50, .meter_height = 8,
+            .record_width = 80, .dropdown_padding = 10,
+            .show_audio_meter_labels = true, .show_version_icon = true,
+            .show_device_label = true,
+        };
+        break;
+    }
+    return p;
+}
+
+static int gui_ui_toolbar_required_width(const gui_ui_toolbar_profile_t *p,
+                                         int device_label_width,
+                                         int dd_width,
+                                         int mode_width)
+{
+    bool show_metadata_icon = true;
+    int child_count = 8 +
+        (p->show_version_icon ? 1 : 0) +
+        (show_metadata_icon ? 1 : 0) +
+        (p->show_device_label ? 1 : 0);
+    return (p->padding_h * 2) +
+        (p->show_version_icon ? p->icon_button_size : 0) +
+        (show_metadata_icon ? p->icon_button_size : 0) +
+        (show_metadata_icon ? 8 : (p->show_version_icon ? 4 : 0)) +
+        device_label_width + dd_width +
+        p->connect_width + mode_width + p->gap +
+        p->audio_mon_width + p->audio_ch_width + p->bars_panel_width +
+        (p->gap * 2) +
+        p->record_width + (p->icon_button_size * 2) +
+        ((child_count - 1) * p->gap) + 8;
+}
+
+static const char *gui_ui_toolbar_mode_label(bool mode_misrc,
+                                             bool cxadc_mode,
+                                             bool cxadc_clockgen_mode,
+                                             bool cxadc_misrc_clockgen_mode,
+                                             bool fx3_mode,
+                                             bool ddd_mode,
+                                             bool ddd_clockgen_mode,
+                                             int tier)
+{
+    if (tier >= GUI_UI_TOOLBAR_TIER_TINY) {
+        if (cxadc_mode) {
+            return cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MiCg" : "CxCg")
+                : "CXA";
+        } else if (fx3_mode) {
+            return "FX3ADC";
+        } else if (ddd_mode) {
+            return ddd_clockgen_mode ? "DdDCg" : "DdD";
+        }
+        return mode_misrc ? "MIS" : "HSD";
+    }
+    if (tier >= GUI_UI_TOOLBAR_TIER_VERY_NARROW) {
+        if (cxadc_mode) {
+            return cxadc_clockgen_mode
+                ? (cxadc_misrc_clockgen_mode ? "MisClk" : "CxClk")
+                : "CXADC";
+        } else if (fx3_mode) {
+            return "FX3ADC";
+        } else if (ddd_mode) {
+            return ddd_clockgen_mode ? "DdDClk" : "DdD";
+        }
+        return mode_misrc ? "MISRC" : "HSDAOH";
+    }
+    if (cxadc_mode) {
+        if (cxadc_clockgen_mode) {
+            return cxadc_misrc_clockgen_mode ? "Mode: MISRC Clockgen" : "Mode: CXADC Clockgen";
+        }
+        return "Mode: CXADC";
+    } else if (fx3_mode) {
+        return "Mode: FX3ADC";
+    } else if (ddd_mode) {
+        return ddd_clockgen_mode ? "Mode: DdD Clockgen" : "Mode: DdD";
+    }
+    return mode_misrc ? "Mode: MISRC" : "Mode: HSDAOH";
+}
+
 static void render_toolbar(gui_app_t *app) {
     s_settings_icon_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON;
     s_record_limit_icon_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON;
@@ -5120,55 +5714,10 @@ static void render_toolbar(gui_app_t *app) {
     }
     s_version_icon_element.customData.version_icon.state = version_icon_state;
     int toolbar_width = gui_ui_get_layout_width();
-    bool toolbar_tiny = toolbar_width < 760;
-    bool toolbar_ultra_narrow = toolbar_width < 900;
-    bool toolbar_very_narrow = toolbar_width < 1020;
-    bool toolbar_narrow = toolbar_width < 1180;
-    int toolbar_padding_h = toolbar_tiny ? 4 : 8;
-    int toolbar_gap = toolbar_tiny ? 2 : (toolbar_ultra_narrow ? 4 : (toolbar_very_narrow ? 6 : 12));
-    int toolbar_text_size = toolbar_very_narrow ? FONT_SIZE_DROPDOWN : FONT_SIZE_NORMAL;
-    int toolbar_icon_button_size = toolbar_tiny ? 28 : 32;
-    int toolbar_version_icon_size = toolbar_tiny ? 16 : 20;
-    int toolbar_metadata_icon_size = toolbar_tiny ? 14 : 18;
-    int device_dropdown_min_width = toolbar_tiny ? 100 : (toolbar_ultra_narrow ? 120 : (toolbar_very_narrow ? 138 : (toolbar_narrow ? 160 : 180)));
-    int device_dropdown_max_width = toolbar_tiny ? 150 : (toolbar_ultra_narrow ? 190 : (toolbar_very_narrow ? 210 : (toolbar_narrow ? 230 : 280)));
-    int device_dropdown_width = 0;
-    int connect_button_width = toolbar_tiny ? 52 : (toolbar_ultra_narrow ? 66 : (toolbar_very_narrow ? 82 : (toolbar_narrow ? 92 : 100)));
-    int mode_toggle_min_width = toolbar_tiny ? 58 : (toolbar_ultra_narrow ? 78 : (toolbar_very_narrow ? 96 : 112));
-    int mode_toggle_max_width = toolbar_tiny ? 76 : (toolbar_ultra_narrow ? 136 : (toolbar_very_narrow ? 156 : (toolbar_narrow ? 178 : 230)));
-    int mode_toggle_width = 0;
-    int audio_mon_width = toolbar_tiny ? 44 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 68 : 90));
-    int audio_ch_width = toolbar_tiny ? 46 : (toolbar_ultra_narrow ? 56 : (toolbar_very_narrow ? 64 : 70));
-    int record_button_width = toolbar_tiny ? 56 : (toolbar_ultra_narrow ? 68 : (toolbar_very_narrow ? 74 : 80));
-    int icon_button_size = toolbar_tiny ? 28 : 32;
-    int dropdown_padding = toolbar_very_narrow ? 6 : 10;
-    // The tiny profile still shows all four meters, but compresses them enough
-    // for the 640px minimum window at 200% scale (320 logical pixels).
-    int audio_bars_panel_width = toolbar_tiny ? 82 : (toolbar_ultra_narrow ? 164 : (toolbar_very_narrow ? 200 : 240));
-    int audio_meter_col_width = toolbar_tiny ? 17 : (toolbar_ultra_narrow ? 36 : (toolbar_very_narrow ? 44 : 54));
-    int audio_meter_width = toolbar_tiny ? 13 : (toolbar_ultra_narrow ? 30 : (toolbar_very_narrow ? 38 : 50));
-    int audio_meter_height = toolbar_tiny ? 6 : 8;
-    int audio_meter_gap = toolbar_tiny ? 2 : 4;
-    bool show_audio_meter_labels = !toolbar_tiny;
-    bool show_version_icon = !toolbar_ultra_narrow;
-    bool show_metadata_icon = true;
-    bool show_device_label = !toolbar_very_narrow;
     const char *device_name = app->device_count > 0
         ? app->devices[app->selected_device].name
         : "No devices";
     snprintf(device_dropdown_buf, sizeof(device_dropdown_buf), "%s", device_name);
-    gui_ui_ellipsize_text(app,
-                          device_dropdown_buf,
-                          sizeof(device_dropdown_buf),
-                          toolbar_text_size,
-                          device_dropdown_max_width - (dropdown_padding * 2) - 16);
-    device_dropdown_width = gui_ui_measure_button_width(app,
-                                                        device_dropdown_buf,
-                                                        toolbar_text_size,
-                                                        dropdown_padding,
-                                                        16,
-                                                        device_dropdown_min_width,
-                                                        device_dropdown_max_width);
     bool cxadc_clockgen_mode = false;
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_mode);
     bool cxadc_misrc_clockgen_mode = gui_ui_selected_device_is_cxadc_misrc_clockgen(app);
@@ -5193,84 +5742,142 @@ static void render_toolbar(gui_app_t *app) {
     gui_ui_trace_capture_mode_render(app, mode_misrc, mode_source_runtime);
     // Toggle is only clickable for hsdaoh/simple_capture backends where
     // the MISRC/HSDAOH A/B-swap is meaningful.
-    bool mode_change_allowed = !app->is_recording && !cxadc_mode && !fx3_mode && !ddd_mode;
+    bool mode_change_allowed = !app->is_recording &&
+                               !cxadc_mode &&
+                               !fx3_mode &&
+                               !ddd_mode &&
+                               !gui_net_is_client(app);
     Color mode_bg = mode_misrc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
     if (!mode_change_allowed) {
         mode_bg = ui_disabled_color(mode_bg);
     }
     Color mode_fg = mode_change_allowed ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-    const char *mode_label = NULL;
-    if (cxadc_mode) {
-        if (cxadc_clockgen_mode) {
-            mode_label = cxadc_misrc_clockgen_mode ? "Mode: MISRC Clockgen" : "Mode: CXADC Clockgen";
-        } else {
-            mode_label = "Mode: CXADC";
+
+    // Choose the most spacious toolbar profile whose minimum single-row
+    // requirement fits the current width. The device dropdown is the row's
+    // only compressible element (it ellipsizes), so the fit check uses its
+    // dd_min floor instead of its natural width: a tier stays active until
+    // the row cannot fit even with the dropdown fully shortened. Every
+    // chosen profile fits by construction, so the row can never overflow and
+    // clip the right-side controls off the window (the old fixed breakpoints
+    // left a ~1020-1233px window where no profile fit and the buttons
+    // vanished), the profile switch is monotonic while dragging so nothing
+    // bounces, and the row consumes its dead space before stepping down.
+    int chosen_tier = -1;
+    int chosen_required_width = 0;
+    int tiny_required_width = 0;
+    gui_ui_toolbar_profile_t prof = gui_ui_toolbar_profile_for_tier(GUI_UI_TOOLBAR_TIER_TINY);
+    {
+        for (int tier = GUI_UI_TOOLBAR_TIER_FULL; tier <= GUI_UI_TOOLBAR_TIER_TINY; tier++) {
+            gui_ui_toolbar_profile_t p = gui_ui_toolbar_profile_for_tier(tier);
+            const char *tier_label = gui_ui_toolbar_mode_label(mode_misrc,
+                                                               cxadc_mode,
+                                                               cxadc_clockgen_mode,
+                                                               cxadc_misrc_clockgen_mode,
+                                                               fx3_mode,
+                                                               ddd_mode,
+                                                               ddd_clockgen_mode,
+                                                               tier);
+            int mode_w = gui_ui_measure_button_width(app,
+                                                     tier_label,
+                                                     p.text_size,
+                                                     6,
+                                                     16,
+                                                     p.mode_min_width,
+                                                     p.mode_max_width);
+            int dev_label_w = p.show_device_label
+                ? gui_ui_measure_button_width(app, "Device:", p.text_size, 0, 0, 0, 200)
+                : 0;
+            int tier_required = gui_ui_toolbar_required_width(&p, dev_label_w, p.dd_min_width, mode_w);
+            if (tier == GUI_UI_TOOLBAR_TIER_TINY) {
+                tiny_required_width = tier_required;
+            }
+            if (tier_required <= toolbar_width) {
+                prof = p;
+                chosen_tier = tier;
+                chosen_required_width = tier_required;
+                break;
+            }
         }
-    } else if (fx3_mode) {
-        mode_label = "Mode: FX3ADC";
-    } else if (ddd_mode) {
-        mode_label = ddd_clockgen_mode ? "Mode: DdD Clockgen" : "Mode: DdD";
-    } else {
-        mode_label = mode_misrc ? "Mode: MISRC" : "Mode: HSDAOH";
     }
-    if (toolbar_tiny) {
-        if (cxadc_mode) {
-            mode_label = cxadc_clockgen_mode
-                ? (cxadc_misrc_clockgen_mode ? "MiCg" : "CxCg")
-                : "CXA";
-        } else if (fx3_mode) {
-            mode_label = "FX3ADC";
-        } else if (ddd_mode) {
-            mode_label = ddd_clockgen_mode ? "DdDCg" : "DdD";
-        } else {
-            mode_label = mode_misrc ? "MIS" : "HSD";
-        }
-    } else if (toolbar_very_narrow) {
-        if (cxadc_mode) {
-            mode_label = cxadc_clockgen_mode
-                ? (cxadc_misrc_clockgen_mode ? "MisClk" : "CxClk")
-                : "CXADC";
-        } else if (fx3_mode) {
-            mode_label = "FX3ADC";
-        } else if (ddd_mode) {
-            mode_label = ddd_clockgen_mode ? "DdDClk" : "DdD";
-        } else {
-            mode_label = mode_misrc ? "MISRC" : "HSDAOH";
-        }
+    // Two-row fallback only when even the tiny profile does not fit (extreme
+    // narrow widths); wrapping keeps every control visible instead of
+    // clipping it off the window.
+    bool toolbar_two_rows = chosen_tier < 0 &&
+        gui_ui_toolbar_uses_two_rows(toolbar_width, tiny_required_width);
+    if (chosen_tier < 0) {
+        chosen_tier = GUI_UI_TOOLBAR_TIER_TINY;
+        chosen_required_width = tiny_required_width;
     }
-    mode_toggle_width = gui_ui_measure_button_width(app,
-                                                    mode_label,
-                                                    toolbar_text_size,
-                                                    6,
-                                                    16,
-                                                    mode_toggle_min_width,
-                                                    mode_toggle_max_width);
-    // Measure the actual current composition instead of using a blanket width
-    // breakpoint. This preserves the original one-row 1425px default layout
-    // when its labels fit, while long device/Clockgen labels wrap early enough
-    // to keep Record, limit, and Settings visible.
-    int device_label_width = show_device_label
-        ? gui_ui_measure_button_width(app, "Device:", toolbar_text_size,
-                                      0, 0, 0, 200)
-        : 0;
-    int toolbar_child_count = 8 +
-        (show_version_icon ? 1 : 0) +
-        (show_metadata_icon ? 1 : 0) +
-        (show_device_label ? 1 : 0);
-    int toolbar_single_row_required_width =
-        (toolbar_padding_h * 2) +
-        (show_version_icon ? toolbar_icon_button_size : 0) +
-        (show_metadata_icon ? toolbar_icon_button_size : 0) +
-        (show_metadata_icon ? 8 : (show_version_icon ? 4 : 0)) +
-        device_label_width + device_dropdown_width +
-        connect_button_width + mode_toggle_width + toolbar_gap +
-        audio_mon_width + audio_ch_width + audio_bars_panel_width +
-        (toolbar_gap * 2) +
-        record_button_width + (icon_button_size * 2) +
-        ((toolbar_child_count - 1) * toolbar_gap) + 8;
-    bool toolbar_two_rows =
-        gui_ui_toolbar_uses_two_rows(toolbar_width,
-                                     toolbar_single_row_required_width);
+
+    bool toolbar_tiny = prof.tiny;
+    bool toolbar_ultra_narrow = prof.ultra_narrow;
+    bool toolbar_very_narrow = prof.very_narrow;
+    int toolbar_padding_h = prof.padding_h;
+    int toolbar_gap = prof.gap;
+    int toolbar_text_size = prof.text_size;
+    int toolbar_icon_button_size = prof.icon_button_size;
+    int toolbar_version_icon_size = prof.version_icon_size;
+    int toolbar_metadata_icon_size = prof.metadata_icon_size;
+    int device_dropdown_min_width = prof.dd_min_width;
+    int device_dropdown_max_width = prof.dd_max_width;
+    int connect_button_width = prof.connect_width;
+    int mode_toggle_min_width = prof.mode_min_width;
+    int mode_toggle_max_width = prof.mode_max_width;
+    int audio_mon_width = prof.audio_mon_width;
+    int audio_ch_width = prof.audio_ch_width;
+    int record_button_width = prof.record_width;
+    int icon_button_size = prof.icon_button_size;
+    int dropdown_padding = prof.dropdown_padding;
+    // The tiny profile still shows all four meters, but compresses them enough
+    // for the 640px minimum window at 200% scale (320 logical pixels).
+    int audio_bars_panel_width = prof.bars_panel_width;
+    int audio_meter_col_width = prof.meter_col_width;
+    int audio_meter_width = prof.meter_width;
+    int audio_meter_height = prof.meter_height;
+    int audio_meter_gap = prof.meter_gap;
+    bool show_audio_meter_labels = prof.show_audio_meter_labels;
+    bool show_version_icon = prof.show_version_icon;
+    bool show_metadata_icon = true;
+    bool show_device_label = prof.show_device_label;
+
+    // Hand the row's dead space to the device dropdown first: grow it from
+    // its dd_min floor toward its natural (capped) width with whatever slack
+    // the chosen tier left, then ellipsize the label to the final width. The
+    // device name un-truncates dynamically as the window widens instead of
+    // leaving a dead gap in the middle of the toolbar.
+    int toolbar_slack = toolbar_width - chosen_required_width;
+    if (toolbar_slack < 0) toolbar_slack = 0;
+    int device_dropdown_width = gui_ui_measure_button_width(app,
+                                                            device_dropdown_buf,
+                                                            toolbar_text_size,
+                                                            dropdown_padding,
+                                                            16,
+                                                            device_dropdown_min_width,
+                                                            device_dropdown_max_width);
+    device_dropdown_width = device_dropdown_min_width +
+        gui_ui_clamp_int(toolbar_slack, 0, device_dropdown_width - device_dropdown_min_width);
+    gui_ui_ellipsize_text(app,
+                          device_dropdown_buf,
+                          sizeof(device_dropdown_buf),
+                          toolbar_text_size,
+                          0,
+                          device_dropdown_width - (dropdown_padding * 2) - 16);
+    const char *mode_label = gui_ui_toolbar_mode_label(mode_misrc,
+                                                       cxadc_mode,
+                                                       cxadc_clockgen_mode,
+                                                       cxadc_misrc_clockgen_mode,
+                                                       fx3_mode,
+                                                       ddd_mode,
+                                                       ddd_clockgen_mode,
+                                                       chosen_tier);
+    int mode_toggle_width = gui_ui_measure_button_width(app,
+                                                        mode_label,
+                                                        toolbar_text_size,
+                                                        6,
+                                                        16,
+                                                        mode_toggle_min_width,
+                                                        mode_toggle_max_width);
     s_toolbar_uses_two_rows = toolbar_two_rows;
     CLAY(CLAY_ID("Toolbar"), {
         .layout = {
@@ -6473,17 +7080,13 @@ static void render_status_bar(gui_app_t *app) {
     bool status_quarter_scale =
         status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
         status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
-    bool status_compact = status_layout != GUI_UI_STATUS_LAYOUT_FULL_SINGLE;
-    bool status_narrow =
-        !gui_ui_status_shows_extended_counters(status_width,
-                                               app->is_recording);
     bool status_tiny = status_width < GUI_UI_STATUS_TINY_BREAKPOINT;
     bool status_minimal = status_layout == GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE;
-    bool show_sync_status = !status_minimal;
-    bool show_sample_rate = !status_minimal;
-    bool show_frame_count = !status_narrow;
-    bool show_missed_count = !status_narrow;
-    bool show_error_count = !status_narrow;
+    bool show_sync_status = !status_tiny;
+    bool show_sample_rate = !status_tiny;
+    bool show_frame_count = !status_tiny;
+    bool show_missed_count = !status_tiny;
+    bool show_error_count = !status_tiny;
     // Detect an error/denied/failed or critical capture-stop status so the bar can
     // yield space to it: when an error is being shown, hide the free-space
     // readout (and widen the message budget) so the actual error text isn't
@@ -6510,41 +7113,614 @@ static void render_status_bar(gui_app_t *app) {
                                                        status_is_error);
     bool show_status_message = status_is_error ||
         (!status_minimal && !app->is_recording);
-    /* Keep free-space visible during normal startup/layout sizes; hide it when
-     * an error/denied status is active so the error text gets the left-side
-     * space, and on very tiny widths where preserving right-side counters
-     * takes priority. */
-    bool show_free_space = !status_tiny && !status_minimal && !status_is_error;
-    int sample_rate_value_width = status_compact ? 68 : 80;
-    int samples_value_width = status_tiny ? 48 : (status_compact ? 54 : 60);
+    /* Keep free-space visible by default and let the dynamic budget contract
+     * gaps/widths first; only hide it as a last resort. Error status still
+     * reserves the left-side for readable failure text. */
+    bool show_free_space = !status_is_error;
+    /* Full-quality starting values: the budget loop contracts them only
+     * under measured pressure, so the bar keeps full labels, spacing, and
+     * containers whenever the real space allows it. Only the absolute tiny
+     * floors stay pre-seeded (200% scale at the minimum window cannot fit
+     * anything larger). */
+    int sample_rate_value_width = 80;
+    int samples_value_width = status_tiny ? 48 : 60;
     int frames_value_width = 32;
     int small_counter_width = 32;
-    int buffer_value_width = status_tiny ? 28 : (status_narrow ? 32 : 35);
-    int status_bar_gap = status_tiny ? 6 : (status_compact ? 8 : 20);
-    int status_right_gap = status_tiny ? 8 : (status_compact ? 8 : 16);
-    int status_left_gap = status_tiny ? 4 : (status_compact ? 6 : 8);
-    // Widen the message budget when free-space is hidden (error case) so the
-    // full error reason fits instead of being ellipsised at the normal width.
-    int status_message_max_chars = status_is_error
-        ? (status_tiny ? 30 : (status_two_rows ? 64 : 36))
-        : (status_narrow ? 16 : (status_compact ? 20 : 30));
-    int status_font_size = FONT_SIZE_STATUS - 1;
-    const char *rf_buffer_label = status_compact ? "RF:" : "RF Buffer:";
-    const char *audio_buffer_label = status_compact ? "Aud:" : "Audio Buffer:";
-    const char *samples_label = status_tiny ? "S:" : (status_compact ? "Samp:" : "Samples:");
-    const char *frames_label = status_compact ? "F:" : "Frames:";
-    const char *missed_label = status_compact ? "M:" : "Missed:";
-    const char *errors_label = status_compact ? "E:" : "Errors:";
-    Clay_SizingAxis status_row_width = status_two_rows
+    int buffer_value_width = status_tiny ? 28 : 35;
+    int status_counter_inner_gap = status_tiny ? 2 : 3;
+    int status_bar_gap = status_tiny ? 6 : 20;
+    int status_right_gap = status_tiny ? 8 : 10;
+    int status_left_gap = status_tiny ? 4 : 8;
+    int status_font_size = FONT_SIZE_STATUS;
+    bool status_compact_labels = s_status_labels_compact;
+    bool status_labels_flipped = false;
+    const char *rf_buffer_label_full = "RF Buffer:";
+    const char *audio_buffer_label_full = "Audio Buffer:";
+    const char *samples_label_full = status_tiny ? "S:" : "Samples:";
+    const char *frames_label_full = "Frames:";
+    const char *missed_label_full = "Missed:";
+    const char *errors_label_full = "Errors:";
+    const char *rf_buffer_label_compact = "RF:";
+    const char *audio_buffer_label_compact = "Aud:";
+    const char *samples_label_compact = status_tiny ? "S:" : "Samp:";
+    const char *frames_label_compact = "F:";
+    const char *missed_label_compact = "M:";
+    const char *errors_label_compact = "E:";
+    const char *rf_buffer_label = status_compact_labels ? rf_buffer_label_compact : rf_buffer_label_full;
+    const char *audio_buffer_label = status_compact_labels ? audio_buffer_label_compact : audio_buffer_label_full;
+    const char *samples_label = status_compact_labels ? samples_label_compact : samples_label_full;
+    const char *frames_label = status_compact_labels ? frames_label_compact : frames_label_full;
+    const char *missed_label = status_compact_labels ? missed_label_compact : missed_label_full;
+    const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
+    Clay_SizingAxis status_left_row_width = status_two_rows
+        ? CLAY_SIZING_GROW(0)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_right_row_width = status_two_rows
         ? CLAY_SIZING_GROW(0)
         : CLAY_SIZING_FIT(0);
     Clay_SizingAxis status_row_height = status_two_rows
         ? CLAY_SIZING_FIXED(22)
         : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_spacer_width = status_two_rows
+        ? CLAY_SIZING_FIXED(0)
+        : CLAY_SIZING_GROW(0);
     Clay_SizingAxis status_spacer_height = status_two_rows
         ? CLAY_SIZING_FIXED(0)
         : CLAY_SIZING_GROW(0);
     update_status_free_space(app);
+
+    bool show_record_indicator = app->is_recording && !status_quarter_scale;
+    if (show_record_indicator) {
+        double rec_duration = GetTime() - app->recording_start_time;
+        int rec_hours = (int)(rec_duration / 3600);
+        int rec_mins  = ((int)(rec_duration / 60)) % 60;
+        int rec_secs  = ((int)rec_duration) % 60;
+        snprintf(status_record_timer_display, sizeof(status_record_timer_display),
+                 "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
+    }
+
+    const char *raw_status = (app->status_message[0] != '\0')
+        ? app->status_message
+        : (app->is_capturing ? "Capturing..." : "Ready");
+    Color status_color = COLOR_TEXT_DIM;
+    if (status_is_error) {
+        status_color = COLOR_CLIP_RED;
+    } else if (strstr(raw_status, "Requesting") != NULL ||
+               strstr(raw_status, "Reconnecting") != NULL ||
+               strstr(raw_status, "Waiting") != NULL ||
+               strstr(raw_status, "Initializing") != NULL) {
+        status_color = COLOR_METER_YELLOW;
+    }
+    /* Natural rendered width of the status message. The message is a FIT(0)
+     * element: it only ever occupies its actual text width, so the budget
+     * must not reserve the full min_message_width for short statuses like
+     * "Ready" — doing so forced the small readouts to shorten while dead
+     * space was still available on the bar. */
+    int status_message_natural_width = show_status_message
+        ? gui_ui_measure_text_width(app, raw_status, status_font_size, 0)
+        : 0;
+
+    char status_free_space_display_full[120] = "";
+    char status_free_space_display_compact[120] = "";
+    char status_free_space_display_short[120] = "";
+    Color free_space_color = COLOR_TEXT_DIM;
+    if (show_free_space) {
+        if (s_status_free_space_valid) {
+            char free_only_full[48];
+            char free_only_compact[24];
+            char runway_hms[24];
+            format_status_free_space_label(free_only_full, sizeof(free_only_full), s_status_free_space_cached_bytes);
+            format_status_free_space_compact_label(free_only_compact, sizeof(free_only_compact), s_status_free_space_cached_bytes);
+            if (app->is_recording) {
+                bool runway_known = s_status_output_rate_bps > 0.0;
+                if (runway_known) {
+                    double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
+                    format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
+                } else {
+                    snprintf(runway_hms, sizeof(runway_hms), "--:--:--");
+                }
+                snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
+                         "%s | Runway %s", free_only_full, runway_hms);
+                if (status_tiny) {
+                    snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                             "Rwy %s", runway_hms);
+                } else {
+                    snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                             "%s | Rwy %s", free_only_compact, runway_hms);
+                }
+                snprintf(status_free_space_display_short, sizeof(status_free_space_display_short),
+                         "Rwy %s", runway_hms);
+            } else {
+                snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
+                         "%s", free_only_full);
+                snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                         "%s", free_only_compact);
+                snprintf(status_free_space_display_short, sizeof(status_free_space_display_short),
+                         "%s", free_only_compact);
+            }
+            if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
+                free_space_color = COLOR_CLIP_RED;
+            } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
+                free_space_color = COLOR_METER_YELLOW;
+            }
+        } else if (app->is_recording) {
+            snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
+                     "Free: N/A | Runway --:--:--");
+            if (status_tiny) {
+                snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                         "Rwy --:--:--");
+            } else {
+                snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                         "N/A | Rwy --:--:--");
+            }
+            snprintf(status_free_space_display_short, sizeof(status_free_space_display_short),
+                     "Rwy --:--:--");
+        } else {
+            snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
+                     "Free: N/A");
+            snprintf(status_free_space_display_compact, sizeof(status_free_space_display_compact),
+                     "N/A");
+            snprintf(status_free_space_display_short, sizeof(status_free_space_display_short),
+                     "N/A");
+        }
+    }
+    /* Tiered free-space text: tier 0 full, tier 1 compact, tier 2 drops the
+     * byte count while recording (runway only). All tiers are measured
+     * up-front so the budget loop can switch tiers without re-measuring. */
+    int status_free_space_tier = 0;
+    char status_free_space_tier_text[3][120];
+    int status_free_space_tier_width[3] = { 0, 0, 0 };
+    snprintf(status_free_space_tier_text[0], sizeof(status_free_space_tier_text[0]),
+             "%s", status_free_space_display_full);
+    snprintf(status_free_space_tier_text[1], sizeof(status_free_space_tier_text[1]),
+             "%s", status_free_space_display_compact);
+    snprintf(status_free_space_tier_text[2], sizeof(status_free_space_tier_text[2]),
+             "%s", status_free_space_display_short);
+    if (show_free_space) {
+        for (int tier = 0; tier < 3; tier++) {
+            status_free_space_tier_width[tier] = gui_ui_measure_text_width(
+                app, status_free_space_tier_text[tier], status_font_size, 1);
+        }
+    }
+
+    uint32_t status_sample_rate_raw = atomic_load(&app->sample_rate);
+    show_sample_rate = show_sample_rate && status_sample_rate_raw > 0;
+    uint64_t status_samples_raw = atomic_load(&app->samples_a);
+
+    /* Tiered right-side value text: tier 0 is the full readout, higher tiers
+     * shorten it under width pressure instead of hiding the readout. All
+     * tiers are formatted and measured up-front. */
+    int status_sample_rate_tier = 0;
+    int status_samples_tier = 0;
+    char status_sample_rate_tier_text[3][32];
+    int status_sample_rate_tier_width[3] = { 0, 0, 0 };
+    char status_samples_tier_text[3][32];
+    int status_samples_tier_width[3] = { 0, 0, 0 };
+    for (int tier = 0; tier < 3; tier++) {
+        format_status_sample_rate_tier(status_sample_rate_tier_text[tier],
+                                       sizeof(status_sample_rate_tier_text[tier]),
+                                       status_sample_rate_raw, tier);
+        status_sample_rate_tier_width[tier] = gui_ui_measure_text_width(
+            app, status_sample_rate_tier_text[tier], status_font_size, 1);
+        format_status_samples_tier(status_samples_tier_text[tier],
+                                   sizeof(status_samples_tier_text[tier]),
+                                   status_samples_raw, tier);
+        status_samples_tier_width[tier] = gui_ui_measure_text_width(
+            app, status_samples_tier_text[tier], status_font_size, 1);
+    }
+
+    int status_rf_pct = 0;
+    int status_aud_pct = 0;
+    /* Format the fixed-form right-side readouts up-front so the width budget
+     * can use their real rendered text widths. These were previously formatted
+     * inline at draw time while the budget assumed small fixed container
+     * widths, so the drawn right edge extended past the accounted width and
+     * the last readouts were pushed off the window instead of the layout
+     * adapting. */
+    {
+        format_status_counter(status_frames_display, sizeof(status_frames_display),
+                              atomic_load(&app->frame_count));
+        format_status_counter(status_missed_display, sizeof(status_missed_display),
+                              app->is_capturing ? atomic_load(&app->missed_frame_count) : 0);
+        format_status_counter(status_errors_display, sizeof(status_errors_display),
+                              app->is_capturing ? atomic_load(&app->error_count) : 0);
+        size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
+        size_t status_rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
+        size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
+        status_rf_pct = status_rf_size > 0
+            ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
+        size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
+        size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
+        size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
+        status_aud_pct = status_aud_size > 0
+            ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
+    }
+
+    int sync_label_width = gui_ui_measure_text_width(app, "Sync:", status_font_size, 0);
+    int sync_value_width = gui_ui_measure_text_width(app, "OK", status_font_size, 0);
+    {
+        int sync_dash_value_width = gui_ui_measure_text_width(app, "--", status_font_size, 0);
+        if (sync_dash_value_width > sync_value_width) sync_value_width = sync_dash_value_width;
+    }
+    int samples_label_width_full = gui_ui_measure_text_width(app, samples_label_full, status_font_size, 0);
+    int frames_label_width_full = gui_ui_measure_text_width(app, frames_label_full, status_font_size, 0);
+    int missed_label_width_full = gui_ui_measure_text_width(app, missed_label_full, status_font_size, 0);
+    int errors_label_width_full = gui_ui_measure_text_width(app, errors_label_full, status_font_size, 0);
+    int rf_label_width_full = gui_ui_measure_text_width(app, rf_buffer_label_full, status_font_size, 0);
+    int audio_label_width_full = gui_ui_measure_text_width(app, audio_buffer_label_full, status_font_size, 0);
+    int samples_label_width_compact = gui_ui_measure_text_width(app, samples_label_compact, status_font_size, 0);
+    int frames_label_width_compact = gui_ui_measure_text_width(app, frames_label_compact, status_font_size, 0);
+    int missed_label_width_compact = gui_ui_measure_text_width(app, missed_label_compact, status_font_size, 0);
+    int errors_label_width_compact = gui_ui_measure_text_width(app, errors_label_compact, status_font_size, 0);
+    int rf_label_width_compact = gui_ui_measure_text_width(app, rf_buffer_label_compact, status_font_size, 0);
+    int audio_label_width_compact = gui_ui_measure_text_width(app, audio_buffer_label_compact, status_font_size, 0);
+    int record_timer_text_width = show_record_indicator
+        ? gui_ui_measure_text_width(app, status_record_timer_display, status_font_size, 1)
+        : 0;
+    /* Real rendered width of each right-side value (font 1). Value containers
+     * use FIT(min) sizing, so their laid-out width is the larger of the stable
+     * minimum and this text width; budgeting anything less lets the drawn
+     * right edge escape the accounted width and get clipped off-window.
+     * Sample-rate and samples widths come from the tier arrays above. */
+    int frames_text_width = gui_ui_measure_text_width(app, status_frames_display, status_font_size, 1);
+    int missed_text_width = gui_ui_measure_text_width(app, status_missed_display, status_font_size, 1);
+    int errors_text_width = gui_ui_measure_text_width(app, status_errors_display, status_font_size, 1);
+    int rf_text_width = gui_ui_measure_text_width(app, status_rf_buf_display, status_font_size, 1);
+    int aud_text_width = gui_ui_measure_text_width(app, status_aud_buf_display, status_font_size, 1);
+    int free_space_text_width = status_free_space_tier_width[status_free_space_tier];
+    int free_space_width_budget = free_space_text_width;
+    int free_space_min_width = status_tiny ? 22 : 48;
+    int status_content_width = status_width - 24; /* horizontal padding */
+    if (status_content_width < 1) status_content_width = 1;
+    int min_message_width = status_tiny ? 56 : 96;
+    int min_message_floor = 24;
+    int status_message_width_budget = 0;
+    /* Small-readout hysteresis: start the budget at the level kept from the
+     * previous frame instead of recomputing it from scratch, so ticking
+     * counters at a boundary width cannot flap the small readouts between
+     * full and short forms frame-to-frame. */
+    int readout_level_start = s_status_readout_level;
+    if (readout_level_start < 0) readout_level_start = 0;
+    if (readout_level_start > 2) readout_level_start = 2;
+    int readout_level = readout_level_start;
+    status_sample_rate_tier = readout_level;
+    status_samples_tier = readout_level;
+    status_free_space_tier = readout_level;
+    bool labels_compact_start = s_status_labels_compact;
+    int status_fit_slack = 0;
+    bool status_fit_first_pass = false;
+    /* Allow enough passes so the full dynamic chain can run (gaps -> compact
+     * labels -> narrowed values/text -> last-resort hides) without stalling
+     * midway under 1/4 and other constrained layouts. */
+    for (int pass = 0; pass < 192; pass++) {
+        rf_buffer_label = status_compact_labels ? rf_buffer_label_compact : rf_buffer_label_full;
+        audio_buffer_label = status_compact_labels ? audio_buffer_label_compact : audio_buffer_label_full;
+        samples_label = status_compact_labels ? samples_label_compact : samples_label_full;
+        frames_label = status_compact_labels ? frames_label_compact : frames_label_full;
+        missed_label = status_compact_labels ? missed_label_compact : missed_label_full;
+        errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
+        if (show_free_space) {
+            free_space_text_width = status_free_space_tier_width[status_free_space_tier];
+            if (free_space_width_budget <= 0 || free_space_width_budget > free_space_text_width) {
+                free_space_width_budget = free_space_text_width;
+            }
+        } else {
+            free_space_text_width = 0;
+            free_space_width_budget = 0;
+        }
+        int samples_label_width = status_compact_labels ? samples_label_width_compact : samples_label_width_full;
+        int frames_label_width = status_compact_labels ? frames_label_width_compact : frames_label_width_full;
+        int missed_label_width = status_compact_labels ? missed_label_width_compact : missed_label_width_full;
+        int errors_label_width = status_compact_labels ? errors_label_width_compact : errors_label_width_full;
+        int rf_label_width = status_compact_labels ? rf_label_width_compact : rf_label_width_full;
+        int audio_label_width = status_compact_labels ? audio_label_width_compact : audio_label_width_full;
+        int samples_tier_width_now = status_samples_tier_width[status_samples_tier];
+        int samples_value_effective = samples_value_width > samples_tier_width_now ? samples_value_width : samples_tier_width_now;
+        int frames_value_effective = frames_value_width > frames_text_width ? frames_value_width : frames_text_width;
+        int missed_value_effective = small_counter_width > missed_text_width ? small_counter_width : missed_text_width;
+        int error_value_effective = small_counter_width > errors_text_width ? small_counter_width : errors_text_width;
+        int rf_value_effective = buffer_value_width > rf_text_width ? buffer_value_width : rf_text_width;
+        int aud_value_effective = buffer_value_width > aud_text_width ? buffer_value_width : aud_text_width;
+        int sample_rate_tier_width_now = status_sample_rate_tier_width[status_sample_rate_tier];
+        int sample_rate_group_width = sample_rate_value_width > sample_rate_tier_width_now
+            ? sample_rate_value_width : sample_rate_tier_width_now;
+        int sync_group_width = sync_label_width + status_counter_inner_gap + sync_value_width;
+        int samples_group_width = samples_label_width + status_counter_inner_gap + samples_value_effective;
+        int frame_group_width = frames_label_width + status_counter_inner_gap + frames_value_effective;
+        int missed_group_width = missed_label_width + status_counter_inner_gap + missed_value_effective;
+        int error_group_width = errors_label_width + status_counter_inner_gap + error_value_effective;
+        int rf_group_width = rf_label_width + status_counter_inner_gap + rf_value_effective;
+        int audio_group_width = audio_label_width + status_counter_inner_gap + aud_value_effective;
+        int right_group_count = 0;
+        int right_required_width = 0;
+        if (show_sync_status) {
+            right_required_width += sync_group_width;
+            right_group_count++;
+        }
+        if (show_sample_rate) {
+            right_required_width += sample_rate_group_width;
+            right_group_count++;
+        }
+        right_required_width += samples_group_width;
+        right_group_count++;
+        if (show_frame_count) {
+            right_required_width += frame_group_width;
+            right_group_count++;
+        }
+        if (show_missed_count) {
+            right_required_width += missed_group_width;
+            right_group_count++;
+        }
+        if (show_error_count) {
+            right_required_width += error_group_width;
+            right_group_count++;
+        }
+        right_required_width += rf_group_width + audio_group_width;
+        right_group_count += 2;
+        if (right_group_count > 1) {
+            right_required_width += status_right_gap * (right_group_count - 1);
+        }
+
+        int fixed_left_width = 0;
+        int fixed_left_items = 0;
+        if (show_record_indicator) {
+            fixed_left_width += 12 + record_timer_text_width;
+            fixed_left_items += 2;
+        }
+        if (show_free_space) {
+            int effective_free_space_width = free_space_text_width;
+            if (free_space_width_budget < effective_free_space_width) {
+                effective_free_space_width = free_space_width_budget;
+            }
+            fixed_left_width += effective_free_space_width;
+            fixed_left_items++;
+        }
+        int left_gaps_reserved = 0;
+        if (show_status_message) {
+            left_gaps_reserved = fixed_left_items * status_left_gap;
+        } else if (fixed_left_items > 1) {
+            left_gaps_reserved = (fixed_left_items - 1) * status_left_gap;
+        }
+        int outer_gaps = status_two_rows ? 0 : (status_bar_gap * 2);
+        int left_available = status_content_width - right_required_width - outer_gaps;
+        if (left_available < 0) left_available = 0;
+        status_message_width_budget = show_status_message
+            ? (left_available - fixed_left_width - left_gaps_reserved)
+            : 0;
+
+        int required_without_message = right_required_width + fixed_left_width +
+                                       left_gaps_reserved + outer_gaps;
+        /* The message only claims what it actually needs: its natural width
+         * when that is below the readable minimum, otherwise the minimum
+         * (long/error text yields down to the minimum before the readouts
+         * do). This keeps every counter at its full readout whenever the
+         * real space on the bar allows it. */
+        int status_message_required = status_message_natural_width < min_message_width
+            ? status_message_natural_width
+            : min_message_width;
+        bool fits_current_budget = show_status_message
+            ? (status_message_width_budget >= status_message_required)
+            : (required_without_message <= status_content_width);
+        if (fits_current_budget) {
+            status_fit_slack = show_status_message
+                ? status_message_width_budget - status_message_required
+                : status_content_width - required_without_message;
+            status_fit_first_pass = (pass == 0);
+            break;
+        }
+
+        /* Constrain from lowest-visibility impact first: close spacing, switch
+         * to compact labels, then squeeze value widths/text budgets. */
+        if (status_right_gap > 0) {
+            status_right_gap -= 1;
+            continue;
+        }
+        if (status_bar_gap > 0) {
+            status_bar_gap -= 1;
+            continue;
+        }
+        if (status_left_gap > 0) {
+            status_left_gap -= 1;
+            continue;
+        }
+        if (status_counter_inner_gap > 0) {
+            status_counter_inner_gap -= 1;
+            continue;
+        }
+        if (!status_compact_labels) {
+            status_compact_labels = true;
+            status_labels_flipped = true;
+            continue;
+        }
+        /* Shorten all small readouts together (level-based) instead of
+         * collapsing one readout at a time: fewer discrete states, and the
+         * row shortens in visible lockstep instead of one readout jumping
+         * through all its tiers while the others stay long. */
+        if (readout_level < 2) {
+            readout_level++;
+            status_sample_rate_tier = readout_level;
+            status_samples_tier = readout_level;
+            status_free_space_tier = readout_level;
+            continue;
+        }
+        /* Value containers are FIT(min), so shrinking a minimum below the
+         * current text width cannot free any space; skip those no-op steps. */
+        if (sample_rate_value_width > 44 &&
+            sample_rate_value_width > status_sample_rate_tier_width[status_sample_rate_tier]) {
+            sample_rate_value_width -= 2;
+            continue;
+        }
+        if (samples_value_width > 34 &&
+            samples_value_width > status_samples_tier_width[status_samples_tier]) {
+            samples_value_width -= 2;
+            continue;
+        }
+        if (frames_value_width > 18 && frames_value_width > frames_text_width) {
+            frames_value_width -= 1;
+            continue;
+        }
+        if (small_counter_width > 18 &&
+            (small_counter_width > missed_text_width ||
+             small_counter_width > errors_text_width)) {
+            small_counter_width -= 1;
+            continue;
+        }
+        if (buffer_value_width > 18 &&
+            (buffer_value_width > rf_text_width ||
+             buffer_value_width > aud_text_width)) {
+            buffer_value_width -= 1;
+            continue;
+        }
+        if (show_free_space && free_space_width_budget > free_space_min_width) {
+            free_space_width_budget -= 6;
+            if (free_space_width_budget < free_space_min_width) {
+                free_space_width_budget = free_space_min_width;
+            }
+            continue;
+        }
+        if (show_status_message && min_message_width > min_message_floor) {
+            min_message_width -= 8;
+            if (min_message_width < min_message_floor) {
+                min_message_width = min_message_floor;
+            }
+            continue;
+        }
+
+        /* Last-resort fallback only after all dynamic contraction paths. */
+        if (show_sample_rate) {
+            show_sample_rate = false;
+            continue;
+        }
+        if (show_sync_status) {
+            show_sync_status = false;
+            continue;
+        }
+        if (show_error_count) {
+            show_error_count = false;
+            continue;
+        }
+        if (show_missed_count) {
+            show_missed_count = false;
+            continue;
+        }
+        if (show_frame_count) {
+            show_frame_count = false;
+            continue;
+        }
+        if (show_free_space) {
+            show_free_space = false;
+            free_space_text_width = 0;
+            free_space_width_budget = 0;
+            continue;
+        }
+        if (show_status_message && !status_is_error) {
+            show_status_message = false;
+            status_message_width_budget = 0;
+            continue;
+        }
+        break;
+    }
+
+    /* Persist the readout level with hysteresis: keep any pressure-raised
+     * level immediately, but relax at most one step and only when the bar
+     * fit on the first pass with ample slack. The extra margin must exceed
+     * the width the lower (longer) tier adds, otherwise the next frame
+     * seeds the longer text, no longer fits, and the level flips right
+     * back — a two-frame flicker band while scaling. With the margin, the
+     * dead band is wider than any counter tick or tier step, so the small
+     * readouts hold steady at boundary widths. */
+    bool readout_level_relaxed = false;
+    if (readout_level > readout_level_start) {
+        s_status_readout_level = readout_level;
+    } else if (readout_level_start > 0 && status_fit_first_pass &&
+               status_fit_slack >= 48) {
+        int readout_level_lower = readout_level_start - 1;
+        int level_step_width = 0;
+        int rate_w_prev = status_sample_rate_tier_width[readout_level_lower];
+        int rate_w_cur = status_sample_rate_tier_width[readout_level_start];
+        int rate_eff_prev = sample_rate_value_width > rate_w_prev ? sample_rate_value_width : rate_w_prev;
+        int rate_eff_cur = sample_rate_value_width > rate_w_cur ? sample_rate_value_width : rate_w_cur;
+        if (show_sample_rate && rate_eff_prev > rate_eff_cur) {
+            level_step_width += rate_eff_prev - rate_eff_cur;
+        }
+        int samp_w_prev = status_samples_tier_width[readout_level_lower];
+        int samp_w_cur = status_samples_tier_width[readout_level_start];
+        int samp_eff_prev = samples_value_width > samp_w_prev ? samples_value_width : samp_w_prev;
+        int samp_eff_cur = samples_value_width > samp_w_cur ? samples_value_width : samp_w_cur;
+        if (samp_eff_prev > samp_eff_cur) {
+            level_step_width += samp_eff_prev - samp_eff_cur;
+        }
+        if (show_free_space) {
+            int free_w_prev = status_free_space_tier_width[readout_level_lower];
+            int free_w_cur = status_free_space_tier_width[readout_level_start];
+            if (free_w_prev > free_w_cur) {
+                level_step_width += free_w_prev - free_w_cur;
+            }
+        }
+        if (status_fit_slack - level_step_width >= 48) {
+            s_status_readout_level = readout_level_lower;
+            readout_level_relaxed = true;
+        }
+    }
+    /* Compact-label flip uses the same hysteresis: keep a pressure flip,
+     * and relax at most one state per frame (relaxing both the labels and
+     * the level in one frame could overshoot the slack and flap back). The
+     * margin is the labels' own measured width step, so the longer forms
+     * are guaranteed to fit before the state relaxes. */
+    if (status_labels_flipped) {
+        s_status_labels_compact = true;
+    } else if (labels_compact_start && !readout_level_relaxed &&
+               status_fit_first_pass && status_fit_slack >= 24) {
+        int labels_step_width = 0;
+        if (samples_label_width_full > samples_label_width_compact) {
+            labels_step_width += samples_label_width_full - samples_label_width_compact;
+        }
+        if (show_frame_count && frames_label_width_full > frames_label_width_compact) {
+            labels_step_width += frames_label_width_full - frames_label_width_compact;
+        }
+        if (show_missed_count && missed_label_width_full > missed_label_width_compact) {
+            labels_step_width += missed_label_width_full - missed_label_width_compact;
+        }
+        if (show_error_count && errors_label_width_full > errors_label_width_compact) {
+            labels_step_width += errors_label_width_full - errors_label_width_compact;
+        }
+        if (rf_label_width_full > rf_label_width_compact) {
+            labels_step_width += rf_label_width_full - rf_label_width_compact;
+        }
+        if (audio_label_width_full > audio_label_width_compact) {
+            labels_step_width += audio_label_width_full - audio_label_width_compact;
+        }
+        if (status_fit_slack - labels_step_width >= 24) {
+            s_status_labels_compact = false;
+        }
+    }
+
+    /* Materialize the chosen tier text for rendering. */
+    snprintf(status_sample_rate_display, sizeof(status_sample_rate_display), "%s",
+             status_sample_rate_tier_text[status_sample_rate_tier]);
+    snprintf(status_samples_display, sizeof(status_samples_display), "%s",
+             status_samples_tier_text[status_samples_tier]);
+    snprintf(status_free_space_display, sizeof(status_free_space_display), "%s",
+             status_free_space_tier_text[show_free_space ? status_free_space_tier : 0]);
+    if (!show_free_space) {
+        status_free_space_display[0] = '\0';
+    }
+    if (show_status_message) {
+        snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+        if (status_message_width_budget < 24) {
+            status_message_width_budget = 24;
+        }
+        gui_ui_ellipsize_text(app, status_message_display, sizeof(status_message_display),
+                              status_font_size, 0, status_message_width_budget);
+    }
+    if (show_free_space && free_space_width_budget > 0 &&
+        free_space_width_budget < free_space_text_width) {
+        gui_ui_ellipsize_text(app, status_free_space_display,
+                              sizeof(status_free_space_display),
+                              status_font_size, 1, free_space_width_budget);
+    }
     CLAY(CLAY_ID("StatusBar"), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(status_two_rows ? 52 : 28) },
@@ -6555,64 +7731,30 @@ static void render_status_bar(gui_app_t *app) {
         },
         .backgroundColor = to_clay_color(COLOR_TOOLBAR_BG)
     }) {
-        // Left side: status + free space/runway
         CLAY(CLAY_ID("StatusLeft"), {
             .layout = {
-                .sizing = { status_row_width, status_row_height },
+                .sizing = { status_left_row_width, status_row_height },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
                 .childGap = status_left_gap
             }
         }) {
-
-            // Recording indicator: red dot + live HH:MM:SS timer (restored
-            // from v1.1.4). Shown whenever recording (hidden in 1/4 compact
-            // mode where bottom-bar space is at a premium), regardless of the
-            // responsive status-message gating below, so the record timer is
-            // always visible in the bottom bar while a recording is active.
-            if (app->is_recording && !status_quarter_scale) {
+            if (show_record_indicator) {
                 CLAY(CLAY_ID("RecIndicator"), {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(12), CLAY_SIZING_FIXED(12) } },
                     .backgroundColor = to_clay_color(COLOR_CLIP_RED),
                     .cornerRadius = CLAY_CORNER_RADIUS(6)
                 }) {}
-
-                double rec_duration = GetTime() - app->recording_start_time;
-                int rec_hours = (int)(rec_duration / 3600);
-                int rec_mins  = ((int)(rec_duration / 60)) % 60;
-                int rec_secs  = ((int)rec_duration) % 60;
-                snprintf(status_record_timer_display, sizeof(status_record_timer_display),
-                         "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
                 CLAY_TEXT(make_string(status_record_timer_display),
                     CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
             }
 
             if (show_status_message) {
-                const char *raw_status = (app->status_message[0] != '\0')
-                    ? app->status_message
-                    : (app->is_capturing ? "Capturing..." : "Ready");
-                size_t max_chars = (size_t)status_message_max_chars;
-                size_t raw_len = strlen(raw_status);
-                if (raw_len > max_chars && max_chars > 3) {
-                    snprintf(status_message_display, sizeof(status_message_display), "%.*s...",
-                             (int)(max_chars - 3), raw_status);
-                } else {
-                    snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
-                }
-                Color status_color = COLOR_TEXT_DIM;
-                if (status_is_error) {
-                    status_color = COLOR_CLIP_RED;
-                } else if (strstr(raw_status, "Requesting") != NULL ||
-                           strstr(raw_status, "Reconnecting") != NULL ||
-                           strstr(raw_status, "Waiting") != NULL ||
-                           strstr(raw_status, "Initializing") != NULL) {
-                    status_color = COLOR_METER_YELLOW;
-                }
                 CLAY(CLAY_ID("ConnectionStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = status_compact ? 2 : 4
+                        .childGap = status_counter_inner_gap
                     }
                 }) {
                     CLAY_TEXT(make_string(status_message_display),
@@ -6620,50 +7762,8 @@ static void render_status_bar(gui_app_t *app) {
                 }
             }
 
+
             if (show_free_space) {
-                Color free_space_color = COLOR_TEXT_DIM;
-                if (s_status_free_space_valid) {
-                    char free_only[48];
-                    char runway_hms[24];
-                    format_status_free_space_label(free_only, sizeof(free_only), s_status_free_space_cached_bytes);
-                    if (app->is_recording) {
-                        bool runway_known = s_status_output_rate_bps > 0.0;
-                        if (runway_known) {
-                            double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
-                            format_status_runway_hhmmss(runway_hms, sizeof(runway_hms), runway_s);
-                        } else {
-                            snprintf(runway_hms, sizeof(runway_hms), "--:--:--");
-                        }
-
-                        if (status_tiny) {
-                            snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                     "Rwy %s", runway_hms);
-                        } else if (status_narrow || status_compact) {
-                            snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                     "%s | Rwy %s", free_only, runway_hms);
-                        } else {
-                            snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                     "%s | Runway %s", free_only, runway_hms);
-                        }
-                    } else {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "%s", free_only);
-                    }
-                    if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_LOW_BYTES) {
-                        free_space_color = COLOR_CLIP_RED;
-                    } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
-                        free_space_color = COLOR_METER_YELLOW;
-                    }
-                } else {
-                    if (app->is_recording) {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "Free: N/A | Runway --:--:--");
-                    } else {
-                        snprintf(status_free_space_display, sizeof(status_free_space_display),
-                                 "Free: N/A");
-                    }
-                }
-
                 CLAY(CLAY_ID("FreeSpaceStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) }
@@ -6675,209 +7775,167 @@ static void render_status_bar(gui_app_t *app) {
             }
         }
 
-        // Flexible spacer between left and right sections.
-        CLAY(CLAY_ID("StatusSpacer"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), status_spacer_height } }
-        }) {}
+        if (!status_two_rows) {
+            CLAY(CLAY_ID("StatusSpacer"), {
+                .layout = { .sizing = { status_spacer_width, status_spacer_height } }
+            }) {}
+        }
 
-        // On minimal layouts a critical stop reason owns the full row; stream
-        // counters are lower priority and would otherwise make it unreadable.
         if (!(status_is_error && status_minimal)) {
-            // Right side: stream/capture counters
             CLAY(CLAY_ID("StatusRight"), {
-            .layout = {
-                .sizing = { status_row_width, status_row_height },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = {
-                    .x = status_two_rows ? CLAY_ALIGN_X_RIGHT : CLAY_ALIGN_X_LEFT,
-                    .y = CLAY_ALIGN_Y_CENTER
-                },
-                .childGap = status_right_gap
-            }
-            }) {
-            if (show_sync_status) {
-                bool synced = atomic_load(&app->stream_synced);
-                Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
-                CLAY(CLAY_ID("SyncStatus"), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
-                    }
-                }) {
-                    CLAY_TEXT(CLAY_STRING("Sync:"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                .layout = {
+                    .sizing = { status_right_row_width, status_row_height },
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .childAlignment = {
+                        .x = status_two_rows ? CLAY_ALIGN_X_RIGHT : CLAY_ALIGN_X_LEFT,
+                        .y = CLAY_ALIGN_Y_CENTER
+                    },
+                    .childGap = status_right_gap
                 }
-            }
-            // Sample rate
-            if (show_sample_rate) {
-                uint32_t srate = atomic_load(&app->sample_rate);
-                if (srate > 0) {
-                    format_live_msps_label(status_sample_rate_display, sizeof(status_sample_rate_display), srate);
+            }) {
+                if (show_sync_status) {
+                    bool synced = atomic_load(&app->stream_synced);
+                    Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
+                    CLAY(CLAY_ID("SyncStatus"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childGap = status_counter_inner_gap
+                        }
+                    }) {
+                        CLAY_TEXT(CLAY_STRING("Sync:"),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY_TEXT(synced ? CLAY_STRING("OK") : CLAY_STRING("--"),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(sync_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                    }
+                }
+
+                if (show_sample_rate) {
                     CLAY(CLAY_ID("SampleRate"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
+                        .layout = { .sizing = { CLAY_SIZING_FIT(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
                             CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
-            }
-
-            
-
-            // Unified Samples (same for both channels)
-            {
-                uint64_t samples_status = atomic_load(&app->samples_a);
-                if (samples_status >= 1000000000ULL) {
-                    snprintf(status_samples_display, sizeof(status_samples_display), "%.2fG", (double)samples_status / 1000000000.0);
-                } else if (samples_status >= 1000000ULL) {
-                    snprintf(status_samples_display, sizeof(status_samples_display), "%.2fM", (double)samples_status / 1000000.0);
-                } else if (samples_status >= 1000ULL) {
-                    snprintf(status_samples_display, sizeof(status_samples_display), "%.1fK", (double)samples_status / 1000.0);
-                } else {
-                    snprintf(status_samples_display, sizeof(status_samples_display), "%llu", (unsigned long long)samples_status);
-                }
-
-                CLAY(CLAY_ID("SamplesStatus"), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
-                    }
-                }) {
-                    CLAY_TEXT(make_string(samples_label),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY(CLAY_ID("SamplesValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
-                    }) {
-                        CLAY_TEXT(make_string(status_samples_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    }
-                }
-                if (show_frame_count) {
-                    // Frames count placed next to Samples
-                    uint32_t frames = atomic_load(&app->frame_count);
-                    format_status_counter(status_frames_display,
-                                          sizeof(status_frames_display),
-                                          frames);
-                    CLAY(CLAY_ID("FrameStatus"), {
+                {
+                    /* samples display formatted before the budget loop so its
+                     * rendered width is accounted; reused verbatim here. */
+                    CLAY(CLAY_ID("SamplesStatus"), {
                         .layout = {
                             .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                             .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                            .childGap = 4
+                            .childGap = status_counter_inner_gap
                         }
                     }) {
-                        CLAY_TEXT(make_string(frames_label),
+                        CLAY_TEXT(make_string(samples_label),
                             CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                        CLAY(CLAY_ID("FrameValue"), {
-                            .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
+                        CLAY(CLAY_ID("SamplesValue"), {
+                            .layout = { .sizing = { CLAY_SIZING_FIT(samples_value_width), CLAY_SIZING_FIT(0) } }
                         }) {
-                            CLAY_TEXT(make_string(status_frames_display),
+                            CLAY_TEXT(make_string(status_samples_display),
                                 CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
+                    if (show_frame_count) {
+                        CLAY(CLAY_ID("FrameStatus"), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childGap = status_counter_inner_gap
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(frames_label),
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY(CLAY_ID("FrameValue"), {
+                                .layout = { .sizing = { CLAY_SIZING_FIT(frames_value_width), CLAY_SIZING_FIT(0) } }
+                            }) {
+                                CLAY_TEXT(make_string(status_frames_display),
+                                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            }
+                        }
+                    }
                 }
-            }
 
-            // Missed frames count
-            uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
-            if (show_missed_count) {
-                format_status_counter(status_missed_display,
-                                      sizeof(status_missed_display),
-                                      missed);
-                CLAY(CLAY_ID("MissedStatus"), {
+                uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
+                if (show_missed_count) {
+                    CLAY(CLAY_ID("MissedStatus"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childGap = status_counter_inner_gap
+                        }
+                    }) {
+                        CLAY_TEXT(make_string(missed_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY(CLAY_ID("MissedValue"), {
+                            .layout = { .sizing = { CLAY_SIZING_FIT(small_counter_width), CLAY_SIZING_FIT(0) } }
+                        }) {
+                            CLAY_TEXT(make_string(status_missed_display),
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+                }
+
+                uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
+                if (show_error_count) {
+                    CLAY(CLAY_ID("ErrorStatus"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childGap = status_counter_inner_gap
+                        }
+                    }) {
+                        CLAY_TEXT(make_string(errors_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY(CLAY_ID("ErrorValue"), {
+                            .layout = { .sizing = { CLAY_SIZING_FIT(small_counter_width), CLAY_SIZING_FIT(0) } }
+                        }) {
+                            CLAY_TEXT(make_string(status_errors_display),
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+                }
+
+                /* RF buffer readout formatted before the budget loop. */
+                int rf_pct = status_rf_pct;
+                CLAY(CLAY_ID("RFBufStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
+                        .childGap = status_counter_inner_gap
                     }
                 }) {
-                    CLAY_TEXT(make_string(missed_label),
+                    CLAY_TEXT(make_string(rf_buffer_label),
                         CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY(CLAY_ID("MissedValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
+                    CLAY(CLAY_ID("RFBufValue"), {
+                        .layout = { .sizing = { CLAY_SIZING_FIT(buffer_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
-                        CLAY_TEXT(make_string(status_missed_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
+                        CLAY_TEXT(make_string(status_rf_buf_display),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
-            }
 
-            // Total errors (single combined counter)
-            uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
-            if (show_error_count) {
-                format_status_counter(status_errors_display,
-                                      sizeof(status_errors_display),
-                                      errors);
-                CLAY(CLAY_ID("ErrorStatus"), {
+                /* Audio buffer readout formatted before the budget loop. */
+                int aud_pct = status_aud_pct;
+                CLAY(CLAY_ID("AudBufStatus"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4
+                        .childGap = status_counter_inner_gap
                     }
                 }) {
-                    CLAY_TEXT(make_string(errors_label),
+                    CLAY_TEXT(make_string(audio_buffer_label),
                         CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY(CLAY_ID("ErrorValue"), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
+                    CLAY(CLAY_ID("AudBufValue"), {
+                        .layout = { .sizing = { CLAY_SIZING_FIT(buffer_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
-                        CLAY_TEXT(make_string(status_errors_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
+                        CLAY_TEXT(make_string(status_aud_buf_display),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
-            }
-
-            // RF Buffer usage
-            size_t rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-            size_t rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-            size_t rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-            size_t rf_used = rf_tail - rf_head;  // Simple subtraction - no wrap handling
-            int rf_pct = rf_size > 0 ? (int)((rf_used * 100) / rf_size) : 0;
-            snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", rf_pct);
-            CLAY(CLAY_ID("RFBufStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .childGap = 4
-                }
-            }) {
-                CLAY_TEXT(make_string(rf_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                CLAY(CLAY_ID("RFBufValue"), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
-                }) {
-                    Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
-                    CLAY_TEXT(make_string(status_rf_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                }
-            }
-
-            // Audio Buffer usage
-            size_t aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-            size_t aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-            size_t aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-            size_t aud_used = aud_tail - aud_head;  // Simple subtraction - no wrap handling  
-            int aud_pct = aud_size > 0 ? (int)((aud_used * 100) / aud_size) : 0;
-            snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", aud_pct);
-            CLAY(CLAY_ID("AudBufStatus"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .childGap = 4
-                }
-            }) {
-                CLAY_TEXT(make_string(audio_buffer_label),
-                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                CLAY(CLAY_ID("AudBufValue"), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(buffer_value_width), CLAY_SIZING_FIT(0) } }
-                }) {
-                    Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
-                    CLAY_TEXT(make_string(status_aud_buf_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                }
-            }
             }
         }
     }
@@ -7469,8 +8527,19 @@ void gui_handle_interactions(gui_app_t *app) {
           gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0)) ||
          (s_active_text_field == UI_TEXT_FIELD_RF_TAG_B &&
           gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)));
+    // Network (Server/Client) fields live in the info ("About") window.
+    bool net_text_field_active =
+        (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+         s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+         s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT);
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
+    } else if (net_text_field_active && s_version_info_window_open &&
+               !s_record_limit_window_open && !s_metadata_window_open) {
+        gui_ui_handle_active_text_edit(app);
+        // Persist on each edit so the port/host survives a mode apply triggered
+        // elsewhere; the string mirror is the source of truth while editing.
+        gui_settings_save(&app->settings);
     } else if (metadata_text_field_active && s_metadata_window_open &&
                !s_record_limit_window_open && !s_version_info_window_open) {
         gui_ui_handle_active_text_edit(app);
@@ -7842,8 +8911,85 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            // Network (Server/Client) mode cycle: Local -> Server -> Client -> Local.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
+                int cur = app->settings.net_mode;
+                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
+                int next = (cur == GUI_NET_MODE_LOCAL) ? GUI_NET_MODE_SERVER
+                         : (cur == GUI_NET_MODE_SERVER) ? GUI_NET_MODE_CLIENT
+                         : GUI_NET_MODE_LOCAL;
+                app->settings.net_mode = next;
+                gui_ui_clear_text_edit();
+                gui_settings_save(&app->settings);
+                (void)gui_net_apply_mode(app);
+                // Returning to Local restores the local hardware device list
+                // (client mode had replaced it with the server's mirrored list).
+                if (next == GUI_NET_MODE_LOCAL) {
+                    gui_app_enumerate_devices(app);
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click a discovered server to connect to it (client mode).
+            if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                int disc_n = gui_net_discovered_count();
+                int disc_visible = disc_n;
+                if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
+                    disc_visible = VERSION_INFO_NET_DISCOVERY_MAX_ROWS;
+                }
+                for (int i = 0; i < disc_visible; i++) {
+                    if (Clay_PointerOver(CLAY_IDI("VersionInfoNetDiscItem", i))) {
+                        gui_ui_clear_text_edit();
+                        gui_net_select_discovered(app, i);
+                        gui_ui_set_click_consumed();
+                        return;
+                    }
+                }
+            }
+            // Connect/Disconnect button: toggles the client worker while
+            // staying in Client mode (discovery remains active when disconnected).
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetConnectButton")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_clear_text_edit();
+                gui_settings_save(&app->settings);
+                gui_net_client_toggle_connection(app);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the server port field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetServerPortField")) &&
+                app->settings.net_mode == GUI_NET_MODE_SERVER) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_SERVER_PORT,
+                                       CLAY_ID("VersionInfoNetServerPortField"), 6.0f, 6.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the client host field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientHostField")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_HOST,
+                                       CLAY_ID("VersionInfoNetClientHostField"), 8.0f, 8.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
+            // Click-to-edit the client port field.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientPortField")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_PORT,
+                                       CLAY_ID("VersionInfoNetClientPortField"), 6.0f, 6.0f);
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCloseButton"))) {
                 s_version_info_window_open = false;
+                // Commit any in-progress net field edit on close.
+                if (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
+                    s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
+                    s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
+                    gui_ui_clear_text_edit();
+                    gui_settings_save(&app->settings);
+                    (void)gui_net_apply_mode(app);
+                }
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -8124,7 +9270,11 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
-            if (app->is_capturing) {
+            bool control_capturing = app->is_capturing;
+            if (gui_net_is_client(app)) {
+                control_capturing = gui_net_client_peer_capturing(app);
+            }
+            if (control_capturing) {
 #if defined(__ANDROID__)
                 /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
                  * hang joining libusb/libuvc threads; never block the render
@@ -8183,6 +9333,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, "FX3ADC backend selected; MISRC/HSDAOH mode not applicable");
             } else if (mode_toggle_is_ddd) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
+            } else if (gui_net_is_client(app)) {
+                gui_app_set_status(app, "Client mode mirrors server capture mode; change mode on server");
             } else if (app->is_recording) {
                 TraceLog(LOG_INFO,
                          "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=1",

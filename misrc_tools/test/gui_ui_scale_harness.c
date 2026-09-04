@@ -118,11 +118,11 @@ int main(void)
                     GUI_UI_STATUS_LAYOUT_FULL_SINGLE,
                 "full status breakpoint restores the original labels");
     expect_true(gui_ui_get_status_layout_mode(1425, 900, false) ==
-                    GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE,
-                "default window compacts status labels before they overflow");
+                    GUI_UI_STATUS_LAYOUT_FULL_SINGLE,
+                "default window keeps full status labels at stock size");
     expect_true(gui_ui_get_status_layout_mode(1425, 900, true) ==
-                    GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE,
-                "recording at the default width compacts the dense counter row");
+                    GUI_UI_STATUS_LAYOUT_FULL_SINGLE,
+                "recording keeps full status labels at stock size");
     expect_true(gui_ui_get_status_layout_mode(
                     GUI_UI_STATUS_RECORDING_MINIMAL_BREAKPOINT - 1,
                     900, true) == GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE,

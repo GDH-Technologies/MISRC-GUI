@@ -445,6 +445,8 @@ if raylib_dep.found()
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
     'misrc_gui/ui/clay_renderer_raylib.c',
+    # Server/Client networking (cxadc_vhs_server-style peer mode)
+    'misrc_gui/net/gui_net.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_video_record.c',
@@ -511,6 +513,8 @@ if raylib_dep.found()
     endif
     # Need mincore for VirtualAlloc2/MapViewOfFile3 used by ringbuffer
     gui_ldflags += ['-lmincore']
+    # Winsock for the server/client networking module (gui_net.c)
+    gui_ldflags += ['-lws2_32']
     # simple_capture for device enumeration
     sources_gui += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'
     gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']

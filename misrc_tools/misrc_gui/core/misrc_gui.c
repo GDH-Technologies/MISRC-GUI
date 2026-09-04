@@ -33,6 +33,7 @@
 #include "../ui/gui_popup.h"
 #include "../output/gui_record.h"
 #include "../output/gui_audio.h"
+#include "../net/gui_net.h"
 #include "../../common/threading.h"
 #include "version.h"
 
@@ -84,7 +85,7 @@ static void print_usage(const char *program_name) {
     fprintf(stdout,
             "MISRC GUI %s\n"
             "Usage:\n"
-            "  %s [--help] [--version] [--smoke-test] [--debug-view]\n"
+            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>]\n"
             "  %s --preview-only <device> [--preview-format YUYV:WxH@fps]\n"
             "  %s --preview-probe | --preview-probe-stream <device> [seconds]\n"
             "  %s --preview-selftest\n"
@@ -102,6 +103,8 @@ static void print_usage(const char *program_name) {
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
+            "--config <path> loads settings from <path> instead of the default\n"
+            "           location (useful for automated GUI testing).\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -447,6 +450,7 @@ int main(int argc, char **argv) {
     bool show_version = false;
     bool smoke_test = false;
     bool has_capture_arg = false;
+    const char *config_path = NULL;  /* --config <path> override */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
@@ -467,6 +471,16 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--debug-view") == 0) {
             debug_view = true;
+            continue;
+        }
+        if (strcmp(a, "--config") == 0) {
+            // --config <path>: load settings from <path> instead of the
+            // platform default. Consumes the next arg. Recognized as a GUI
+            // flag so it is NOT treated as a capture arg (which would route
+            // the process into headless CLI capture mode).
+            if (i + 1 < argc) {
+                config_path = argv[++i];
+            }
             continue;
         }
         /* Headless preview diagnostics. These run without a window so the
@@ -603,7 +617,10 @@ int main(int argc, char **argv) {
     // Initialize sample rate early (before any capture/rendering can occur)
     atomic_store(&app.sample_rate, DEFAULT_SAMPLE_RATE);
 
-    // Load persistent settings (includes desktop path defaults)
+    // Load persistent settings (includes desktop path defaults). If --config
+    // <path> was passed, load from that file instead of the platform default
+    // so automated tests can launch the GUI with a pre-written config.
+    gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
 
@@ -943,6 +960,12 @@ int main(int argc, char **argv) {
             ui_zoom_result.passthrough_y * 20.0f
         }, dt);
 
+        // Server/Client networking: execute queued control commands on the
+        // main thread (server), and apply mirrored peer state (client). Both
+        // are no-ops when net_mode == Local.
+        gui_net_poll_commands(&app);
+        gui_net_poll_mirror(&app);
+
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
         if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
             gui_dropout_reason_t reason =
@@ -1011,7 +1034,10 @@ int main(int argc, char **argv) {
             // starts so the MS2130 has time to complete its initial HDMI/USB sync
             // and deliver the first data callback (first-connect on Windows can
             // take 3-4 seconds before any data arrives).
-            if (app.is_capturing && (now - app.capture_start_time) > 5.0
+            // Client ingest mode is excluded: its data source is the network pump,
+            // not a local hsdaoh device, so the hsdaoh-callback watchdog does not
+            // apply (and must not tear down the ingest or re-enumerate devices).
+            if (app.is_capturing && !gui_net_is_client(&app) && (now - app.capture_start_time) > 5.0
                 && gui_capture_device_timeout(&app, 2000)) {
                 // Device was disconnected unexpectedly - clean up properly
                 fprintf(stderr, "[GUI] Device timeout detected, disconnecting...\n");

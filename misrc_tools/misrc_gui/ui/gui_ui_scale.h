@@ -10,8 +10,11 @@
 #define GUI_UI_SCALE_HUD_DURATION_S 1.5
 #define GUI_UI_SCALE_HUD_FADE_S 0.3
 #define GUI_UI_MODAL_MARGIN 12
-#define GUI_UI_STATUS_COMPACT_BREAKPOINT 1450
-#define GUI_UI_STATUS_RECORDING_FULL_BREAKPOINT 1500
+// Compact (short-label) readouts kick in below this width. Keep this below
+// the default startup window so full labels remain visible at stock size and
+// compact labels only appear once width pressure is real.
+#define GUI_UI_STATUS_COMPACT_BREAKPOINT 1360
+#define GUI_UI_STATUS_RECORDING_FULL_BREAKPOINT 1425
 #define GUI_UI_STATUS_RECORDING_MINIMAL_BREAKPOINT 920
 #define GUI_UI_STATUS_NARROW_BREAKPOINT 960
 #define GUI_UI_STATUS_RECORDING_NARROW_BREAKPOINT 1100
