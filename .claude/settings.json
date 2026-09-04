@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(meson *)",
+      "Bash(ninja *)",
+      "Bash(pkg-config *)",
+      "Bash(scripts/build-local.sh*)",
+      "Bash(python3 misrc_tools/test/ci_guard_tests.py*)",
+      "Bash(build-local/misrc_gui --smoke-test)",
+      "Bash(build-local/misrc_gui --version)",
+      "Bash(build-local/misrc_gui --help)",
+      "Bash(build-local/misrc_gui --device-list)",
+      "Bash(gh label list *)",
+      "Bash(gh run watch *)",
+      "Bash(gh run view *)"
+    ],
+    "deny": [
+      "Read(*.env)",
+      "Bash(git worktree add:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(pip install:*)"
+    ],
+    "ask": [
+      "Bash(curl:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh repo edit:*)",
+      "Bash(git commit:*)",
+      "Bash(rm:*)",
+      "Bash(git worktree remove:*)",
+      "Bash(claude plugin install:*)",
+      "Bash(scripts/build-appimage-local.sh*)"
+    ],
+    "defaultMode": "auto",
+    "additionalDirectories": [
+      "~/Repos/digitization-toolkit",
+      "~/Repos/capture-node",
+      "~/Repos/cxadc-linux"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_github_github__issue_write|mcp__plugin_github_github__create_pull_request",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/github-conventions.py",
+            "timeout": 15,
+            "statusMessage": "Checking GitHub conventions..."
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_github_github__pull_request_read|mcp__plugin_github_github__merge_pull_request|mcp__plugin_github_github__create_pull_request|mcp__plugin_github_github__update_pull_request_branch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/ci-platform-status.py",
+            "timeout": 25,
+            "statusMessage": "Checking GitHub Actions platform status..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/ci-platform-status.py",
+            "if": "Bash(gh run *)",
+            "timeout": 25,
+            "statusMessage": "Checking GitHub Actions platform status..."
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/ci-platform-status.py",
+            "if": "Bash(gh workflow *)",
+            "timeout": 25,
+            "statusMessage": "Checking GitHub Actions platform status..."
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-deps.py",
+            "timeout": 120,
+            "statusMessage": "Creating the worktree and linking .deps"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-deps.py",
+            "timeout": 60,
+            "statusMessage": "Removing the worktree"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-deps.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "worktree": {
+    "baseRef": "fresh"
+  },
+  "enabledPlugins": {
+    "clangd-lsp@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "github@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "hookify@claude-plugins-official": true,
+    "context7@claude-plugins-official": false
+  }
+}
