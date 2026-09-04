@@ -2390,6 +2390,62 @@ def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
+    """Every capture, record and net-ingest path sits on common/ringbuffer.c's
+    mirrored mapping, and --smoke-test returns before it is ever created, so a
+    host where rb_init() fails looks healthy in CI and captures nothing in use.
+    macOS 26 rejects O_NOFOLLOW on shm_open() with EINVAL, which shm_anon.h's
+    POSIX path passed unconditionally: every ring failed there with rc 2.
+    Compiles the real ringbuffer.c against a harness that creates rings and
+    proves the two halves alias."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: ringbuffer mirror runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the ringbuffer mirror runtime guard")
+        print("SKIP: ringbuffer mirror runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/ringbuffer_mirror_harness.c"
+    ringbuffer_path = repo_root / "misrc_tools/common/ringbuffer.c"
+    include_dir = repo_root / "misrc_tools/common"
+
+    for required in (harness_path, ringbuffer_path):
+        if not required.exists():
+            return fail(f"Ringbuffer mirror guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_rb_mirror_guard_") as temp_root:
+        exe_path = Path(temp_root) / "ringbuffer_mirror_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            "-D_GNU_SOURCE",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(ringbuffer_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Ringbuffer mirror harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Ringbuffer mirror harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_ui_scale_policy_runtime(repo_root: Path) -> int:
     cc = shutil.which("cc")
     if cc is None:
@@ -2680,6 +2736,7 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
+        checks.insert(9, ("ringbuffer mirror runtime", lambda: check_ringbuffer_mirror_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(11, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
