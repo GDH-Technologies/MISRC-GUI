@@ -8,14 +8,12 @@
 /dist/
 /misrc_tools/build/
 
-# /build/ is two things at once: it holds tracked helper scripts (build-static.sh,
-# install-udev-rules.sh, LEGAL.txt) and it is where `cmake -B build` drops output for
-# the root CMakeLists.txt. A bare `/build/` ignored both, so a new script added next
-# to the tracked ones vanished from `git status` instead of being committed. Ignore
-# the CMake output, keep the helpers visible.
-/build/*
-!/build/*.sh
-!/build/LEGAL.txt
+# /build/ used to hold tracked helper scripts alongside `cmake -B build` output, so
+# the pattern here had to ignore the output while un-ignoring the helpers. Upstream
+# 705a42b deleted the last of them (build-static.sh, install-udev-rules.sh,
+# LEGAL.txt), so /build/ is now nothing but CMake output and a bare ignore is right.
+# Restore the `/build/*` + `!` negations if a tracked helper ever lands here again.
+/build/
 
 # Python bytecode. misrc_tools/test/ci_guard_tests.py is importable as a module and
 # not only runnable as a script, so anything that imports it (tooling, a REPL, another
@@ -42,3 +40,6 @@ __pycache__/
 # with a build timestamp + the host NDK path. Never commit it for the same
 # reason: regenerating it on CI dirties the tree and tags the version -dirty.
 /android/deps-versions.txt
+
+# Claude worktrees are local scratch, never repo content
+**/.claude/worktrees/

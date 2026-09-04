@@ -82,11 +82,31 @@ static bool gui_settings_ensure_parent_dirs(const char *file_path) {
     return true;
 }
 
+// Optional override path for the settings file, set via --config <path> on
+// the GUI command line. When non-NULL, gui_settings_load/save use this path
+// instead of the platform-default location. This makes automated GUI testing
+// easy: launch the GUI with a pre-written config (e.g. Server mode + port)
+// without touching the user's real settings.
+static const char *s_override_settings_path = NULL;
+
+void gui_settings_set_override_path(const char *path) {
+    s_override_settings_path = (path && path[0]) ? path : NULL;
+}
+
+bool gui_settings_override_active(void) {
+    return s_override_settings_path != NULL;
+}
+
 // Settings file location
 static const char* get_settings_file_path(void) {
     static char settings_path[512];
     static bool initialized = false;
     
+    if (s_override_settings_path && s_override_settings_path[0]) {
+        // --config <path> override: use it directly (no platform logic).
+        snprintf(settings_path, sizeof(settings_path), "%s", s_override_settings_path);
+        return settings_path;
+    }
     if (!initialized) {
 #if defined(__ANDROID__)
         // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
@@ -524,6 +544,17 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->demod_squelch = 0.0f;             // 0.0 = squelch open
     settings->demod_volume = 1.0f;              // 1.0 = unity gain
     settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
+
+    // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
+    // is Local (no networking). Default port 8080 mirrors the reference server.
+    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
+    settings->net_server_port = 8080;
+    snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
+             (unsigned)settings->net_server_port);
+    settings->net_client_host[0] = '\0';
+    settings->net_client_port = 8080;
+    snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
+             (unsigned)settings->net_client_port);
 }
 
 // Simple JSON-like format for settings
@@ -673,6 +704,13 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
     fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
     fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
+    // Server/Client networking (cxadc_vhs_server-style peer mode).
+    fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
+    fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
+    fprintf(f, "  \"net_server_port_str\": \"%s\",\n", settings->net_server_port_str);
+    fprintf(f, "  \"net_client_host\": \"%s\",\n", settings->net_client_host);
+    fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
+    fprintf(f, "  \"net_client_port_str\": \"%s\",\n", settings->net_client_port_str);
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -1378,6 +1416,45 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "demod_output_pair")) != NULL) {
         settings->demod_output_pair = atoi(value);
+    }
+
+    // Server/Client networking (cxadc_vhs_server-style peer mode).
+    if ((value = find_value(content, "net_mode")) != NULL) {
+        int mode = atoi(value);
+        if (mode < 0 || mode > 2) mode = 0;
+        settings->net_mode = mode;
+    }
+    if ((value = find_value(content, "net_server_port")) != NULL) {
+        long p = atol(value);
+        if (p < 1 || p > 65535) p = 8080;
+        settings->net_server_port = (uint16_t)p;
+    }
+    if ((value = find_value(content, "net_server_port_str")) != NULL) {
+        strncpy(settings->net_server_port_str, value, sizeof(settings->net_server_port_str) - 1);
+        settings->net_server_port_str[sizeof(settings->net_server_port_str) - 1] = '\0';
+    }
+    if ((value = find_value(content, "net_client_host")) != NULL) {
+        strncpy(settings->net_client_host, value, sizeof(settings->net_client_host) - 1);
+        settings->net_client_host[sizeof(settings->net_client_host) - 1] = '\0';
+    }
+    if ((value = find_value(content, "net_client_port")) != NULL) {
+        long p = atol(value);
+        if (p < 1 || p > 65535) p = 8080;
+        settings->net_client_port = (uint16_t)p;
+    }
+    if ((value = find_value(content, "net_client_port_str")) != NULL) {
+        strncpy(settings->net_client_port_str, value, sizeof(settings->net_client_port_str) - 1);
+        settings->net_client_port_str[sizeof(settings->net_client_port_str) - 1] = '\0';
+    }
+    // Re-sync port string mirrors if the numeric port was loaded but the
+    // string mirror was absent/empty (older settings files).
+    if (settings->net_server_port_str[0] == '\0') {
+        snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
+                 (unsigned)settings->net_server_port);
+    }
+    if (settings->net_client_port_str[0] == '\0') {
+        snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
+                 (unsigned)settings->net_client_port);
     }
 
     // Backward-compat migration:
