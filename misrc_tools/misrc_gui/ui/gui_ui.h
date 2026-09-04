@@ -56,6 +56,12 @@ float gui_ui_get_scale_factor(void);
 // Physical framebuffer pixels per logical UI unit. This includes both the
 // application zoom and any OS backing scale such as macOS Retina.
 Vector2 gui_ui_get_render_scale(void);
+
+// Asks the platform what scale the current display wants, as a percent on the
+// supported steps. Wraps the pure policy in gui_ui_scale.h with the raylib
+// queries it must not depend on directly (that file is compiled standalone by
+// the CI guard). Safe to call every frame; requires an open window.
+int gui_ui_detect_display_scale_percent(void);
 void gui_ui_show_scale_hud(int percent);
 int gui_ui_get_layout_width(void);
 int gui_ui_get_layout_height(void);

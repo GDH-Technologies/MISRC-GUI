@@ -208,6 +208,44 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Playback Input Files
 
 
+## UI Scale (HiDPI displays)
+
+The interface is laid out in fixed logical pixels, so on a high-density display
+it renders small unless it is scaled. MISRC GUI detects the display's scale at
+startup and adopts it, so a 4K or 5K panel should be readable without any setup.
+
+You can override it at any time:
+
+| Action | Shortcut |
+| --- | --- |
+| Zoom in / out | `Ctrl` + mouse wheel (`Cmd` on macOS) |
+| Zoom in | `Ctrl` `+` |
+| Zoom out | `Ctrl` `-` |
+| Reset to 100% | `Ctrl` `0` |
+
+The scale ranges from 75% to 300% in 10% steps and is saved between runs.
+
+**Settings page → UI scale** exposes the same control, plus:
+
+- **Match display** — when ON, the scale follows the display's own scale and
+  re-applies it if the window is moved to another monitor. Zooming by hand
+  turns this OFF so your choice is not overridden later.
+- **Match now** — re-detect the current display and turn Match display back on.
+
+**Known limitation:** X11 and XWayland report a *single* content scale
+(`Xft.dpi`) shared by every monitor, so on a mixed-density X11 desktop the app
+cannot tell your displays apart and "Match display" will not change the scale
+when you move the window. Use the manual zoom on the odd panel out. Per-monitor
+following works where the compositor reports a per-window content scale.
+
+Run with `--debug-view` to log what was detected:
+
+```
+INFO: DISPLAY: content scale 2.00, monitor 0 (5120px/600mm) -> UI scale 200%
+INFO: DISPLAY: window 3584x2016 on a 5120x2880 monitor -> 1792x1008 logical at 200%
+```
+
+
 ## Scopes & Plugins
 
 

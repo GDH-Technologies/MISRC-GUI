@@ -28,6 +28,71 @@ int gui_ui_scale_parse_percent(const char *text)
     return gui_ui_scale_sanitize_percent((int)parsed);
 }
 
+// A backend that reports nothing useful hands us 1.0; a broken one can hand us
+// a wild value or a NaN. Both must be ignored rather than propagated into the
+// layout, so every reported factor passes through here first.
+static bool scale_signal_is_usable(float factor)
+{
+    return factor > 1.01f && factor < 100.0f;
+}
+
+int gui_ui_scale_snap_percent(float factor)
+{
+    // Also rejects NaN, which fails every ordered comparison.
+    if (!(factor > 0.0f)) return GUI_UI_SCALE_DEFAULT_PERCENT;
+
+    float raw = factor * 100.0f;
+    if (raw <= (float)GUI_UI_SCALE_MIN_PERCENT) return GUI_UI_SCALE_MIN_PERCENT;
+    if (raw >= (float)GUI_UI_SCALE_MAX_PERCENT) return GUI_UI_SCALE_MAX_PERCENT;
+
+    // 75% is the one supported step off the 10% grid, so it owns everything
+    // below the midpoint between it and 80% instead of rounding away.
+    if (raw < 77.5f) return GUI_UI_SCALE_MIN_PERCENT;
+
+    int stepped = (int)lroundf(raw / (float)GUI_UI_SCALE_STEP_PERCENT) *
+                  GUI_UI_SCALE_STEP_PERCENT;
+    if (stepped < 80) stepped = 80;
+    if (stepped > GUI_UI_SCALE_MAX_PERCENT) stepped = GUI_UI_SCALE_MAX_PERCENT;
+    return stepped;
+}
+
+int gui_ui_scale_from_display(float content_scale,
+                              int monitor_px_w,
+                              int monitor_mm_w,
+                              float backing_scale)
+{
+    float candidate = 1.0f;
+
+    if (scale_signal_is_usable(content_scale)) {
+        candidate = content_scale;
+    } else if (monitor_px_w > 0 && monitor_mm_w > 0) {
+        float inches = (float)monitor_mm_w / GUI_UI_SCALE_MM_PER_INCH;
+        candidate = ((float)monitor_px_w / inches) / GUI_UI_SCALE_REFERENCE_DPI;
+    }
+
+    // Whatever magnification raylib already applied is on screen already.
+    // Compensating for it a second time would halve the UI on exactly the
+    // HiDPI displays this detection exists to serve.
+    if (scale_signal_is_usable(backing_scale)) {
+        candidate /= backing_scale;
+    }
+
+    // Detection only ever scales up. A low-density panel -- a TV, a projector --
+    // is viewed from further away, so shrinking its UI would be backwards.
+    if (!(candidate > 1.0f)) return GUI_UI_SCALE_DEFAULT_PERCENT;
+
+    return gui_ui_scale_snap_percent(candidate);
+}
+
+bool gui_ui_scale_should_follow(int applied_percent,
+                                int detected_percent,
+                                bool auto_enabled)
+{
+    if (!auto_enabled) return false;
+    return gui_ui_scale_sanitize_percent(applied_percent) !=
+           gui_ui_scale_sanitize_percent(detected_percent);
+}
+
 int gui_ui_scale_step_percent(int current_percent, int direction)
 {
     int percent = gui_ui_scale_sanitize_percent(current_percent);

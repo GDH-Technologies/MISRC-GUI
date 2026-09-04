@@ -26,8 +26,10 @@ int main(void)
 
     expect_true(gui_ui_scale_sanitize_percent(75) == 75,
                 "minimum persisted scale remains valid");
-    expect_true(gui_ui_scale_sanitize_percent(200) == 200,
+    expect_true(gui_ui_scale_sanitize_percent(300) == 300,
                 "maximum persisted scale remains valid");
+    expect_true(gui_ui_scale_sanitize_percent(200) == 200,
+                "the former 200 ceiling remains a valid persisted step");
     expect_true(gui_ui_scale_sanitize_percent(0) == 100,
                 "invalid low persisted scale falls back to 100");
     expect_true(gui_ui_scale_sanitize_percent(999) == 100,
@@ -40,7 +42,9 @@ int main(void)
                 "missing persisted scale falls back to 100");
     expect_true(gui_ui_scale_parse_percent("") == 100,
                 "empty persisted scale falls back to 100");
-    expect_true(gui_ui_scale_parse_percent("250") == 100,
+    expect_true(gui_ui_scale_parse_percent("250") == 250,
+                "a step above the former 200 ceiling now parses");
+    expect_true(gui_ui_scale_parse_percent("310") == 100,
                 "out-of-range persisted scale falls back to 100");
     expect_true(gui_ui_scale_parse_percent("125junk") == 100,
                 "persisted scale with trailing data is rejected");
@@ -55,8 +59,10 @@ int main(void)
                 "keyboard zoom-in preserves the 75-to-80 transition");
     expect_true(gui_ui_scale_step_percent(80, -1) == 75,
                 "keyboard zoom-out preserves the 80-to-75 transition");
-    expect_true(gui_ui_scale_step_percent(200, 1) == 200,
+    expect_true(gui_ui_scale_step_percent(300, 1) == 300,
                 "keyboard zoom-in stops at the upper bound");
+    expect_true(gui_ui_scale_step_percent(200, 1) == 210,
+                "keyboard zoom-in continues past the former 200 ceiling");
     expect_true(gui_ui_scale_step_percent(75, -1) == 75,
                 "keyboard zoom-out stops at the lower bound");
     expect_true(gui_ui_scale_step_percent(150, 0) == 150,
@@ -199,9 +205,9 @@ int main(void)
     expect_true(result.changed && result.percent == 130,
                 "large modified wheel delta can cross multiple steps");
 
-    result = gui_ui_zoom_process(&state, 200, true, 0.0f, 1.0f);
+    result = gui_ui_zoom_process(&state, 300, true, 0.0f, 1.0f);
     expect_true(result.consumed && result.step_attempted &&
-                    !result.changed && result.percent == 200,
+                    !result.changed && result.percent == 300,
                 "upper-bound wheel attempt remains visible to HUD routing");
     result = gui_ui_zoom_process(&state, 75, true, 0.0f, -1.0f);
     expect_true(result.consumed && result.step_attempted &&
@@ -242,6 +248,60 @@ int main(void)
     result = gui_ui_zoom_process(&state, 100, true, 0.0f, 0.5f);
     expect_true(!result.changed && result.percent == 100,
                 "releasing the modifier clears a partial wheel gesture");
+
+    // --- display scale detection -------------------------------------------
+
+    expect_true(gui_ui_scale_snap_percent(1.0f) == 100,
+                "a unity factor snaps to 100 percent");
+    expect_true(gui_ui_scale_snap_percent(2.0f) == 200,
+                "a 2x factor snaps to 200 percent");
+    expect_true(gui_ui_scale_snap_percent(2.26f) == 230,
+                "an off-grid factor snaps to the nearest 10 percent step");
+    expect_true(gui_ui_scale_snap_percent(9.0f) == GUI_UI_SCALE_MAX_PERCENT,
+                "an absurd factor clamps to the ceiling");
+    expect_true(gui_ui_scale_snap_percent(0.5f) == GUI_UI_SCALE_MIN_PERCENT,
+                "a tiny factor clamps to the floor");
+    expect_true(gui_ui_scale_snap_percent(0.77f) == 75,
+                "the off-grid 75 percent step wins below the 77.5 midpoint");
+    expect_true(gui_ui_scale_snap_percent(0.79f) == 80,
+                "80 percent wins above the 77.5 midpoint");
+    expect_true(gui_ui_scale_snap_percent(0.0f) == 100,
+                "a zero factor falls back to 100");
+    expect_true(gui_ui_scale_snap_percent(-1.0f) == 100,
+                "a negative factor falls back to 100");
+    expect_true(gui_ui_scale_snap_percent(NAN) == 100,
+                "a NaN factor falls back to 100");
+
+    // A desktop that states its own scale is believed before physical density,
+    // so the app matches the rest of the session rather than out-scaling it.
+    expect_true(gui_ui_scale_from_display(2.0f, 5120, 600, 1.0f) == 200,
+                "a reported 2x content scale wins over physical density");
+    // Same 5120px/600mm panel (~217 PPI) with no content scale reported: the
+    // physical fallback carries it instead.
+    expect_true(gui_ui_scale_from_display(1.0f, 5120, 600, 1.0f) == 230,
+                "physical density drives detection when no content scale exists");
+    expect_true(gui_ui_scale_from_display(1.0f, 3840, 530, 1.0f) == 190,
+                "a 184 PPI panel detects its own density");
+    // Some HDMI panels report 0mm x 0mm. This must not divide by zero.
+    expect_true(gui_ui_scale_from_display(1.0f, 3072, 0, 1.0f) == 100,
+                "a monitor reporting no physical size falls back to 100");
+    expect_true(gui_ui_scale_from_display(1.0f, 0, 0, 1.0f) == 100,
+                "a monitor reporting nothing at all falls back to 100");
+    // A framebuffer raylib already magnified must not be compensated twice.
+    expect_true(gui_ui_scale_from_display(2.0f, 5120, 600, 2.0f) == 100,
+                "an already-scaled backing framebuffer is not double-applied");
+    // Detection only ever scales up; a sparse panel keeps 100 percent.
+    expect_true(gui_ui_scale_from_display(1.0f, 1920, 1210, 1.0f) == 100,
+                "a low-density panel is never scaled below 100 percent");
+    expect_true(gui_ui_scale_from_display(NAN, 5120, 600, NAN) == 230,
+                "non-finite platform readings are ignored, not propagated");
+
+    expect_true(gui_ui_scale_should_follow(100, 200, true),
+                "auto-follow adopts a newly detected scale");
+    expect_true(!gui_ui_scale_should_follow(200, 200, true),
+                "auto-follow is idle when the detected scale already applies");
+    expect_true(!gui_ui_scale_should_follow(100, 200, false),
+                "a manually pinned scale is never overridden by auto-follow");
 
     if (failures != 0) {
         fprintf(stderr, "%d UI scale policy assertion(s) failed\n", failures);

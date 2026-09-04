@@ -326,7 +326,10 @@ typedef struct {
     bool show_grid;
     float time_scale;         // Time per division (ms)
     float amplitude_scale;    // Amplitude scale factor
-    int ui_scale_percent;     // Ctrl/Cmd+wheel or +/- UI zoom, persisted as 75-200
+    int ui_scale_percent;     // Ctrl/Cmd+wheel or +/- UI zoom, persisted as 75-300
+    // While true the scale follows the display the window is on. Any manual
+    // zoom clears it, so a deliberate choice is never silently overridden.
+    bool ui_scale_auto;
 
     // Device discovery: V4L2/simple_capture device enumeration is opt-in.
     // Disabled by default since most users use hsdaoh/CXADC/DdD/FX3 backends;

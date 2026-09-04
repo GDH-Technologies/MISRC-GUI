@@ -140,6 +140,33 @@ int gui_ui_get_layout_height(void)
     return (height > 0) ? height : 1;
 }
 
+int gui_ui_detect_display_scale_percent(void)
+{
+    // GLFW reports content scale from Xft.dpi under X11/XWayland and from the
+    // compositor under Wayland, where it is also the signal that updates when
+    // the window moves between displays.
+    float content_scale = GetWindowScaleDPI().x;
+
+    // The per-monitor fallback. glfwGetWindowPos is unsupported on Wayland, so
+    // GetCurrentMonitor is only trustworthy under X11 -- which is exactly where
+    // content scale is a single global value and cannot distinguish displays.
+    // The two signals cover each other's blind spot.
+    int monitor = GetCurrentMonitor();
+    int monitor_px_w = GetMonitorWidth(monitor);
+    int monitor_mm_w = GetMonitorPhysicalWidth(monitor);
+
+    // Whatever magnification raylib already applied to the framebuffer.
+    float backing_scale = 1.0f;
+    int screen_width = GetScreenWidth();
+    int render_width = GetRenderWidth();
+    if (screen_width > 0 && render_width > 0) {
+        backing_scale = (float)render_width / (float)screen_width;
+    }
+
+    return gui_ui_scale_from_display(content_scale, monitor_px_w,
+                                     monitor_mm_w, backing_scale);
+}
+
 Vector2 gui_ui_get_render_scale(void)
 {
     float app_scale = gui_ui_get_scale_factor();
@@ -4738,6 +4765,95 @@ static void render_version_info_window(gui_app_t *app)
             }
         }
 
+        // UI scale. The Ctrl/Cmd+wheel and Ctrl/Cmd +/-/0 shortcuts have
+        // always driven this, but nothing surfaced them, so a HiDPI display
+        // just looked broken. Auto-follow adopts the display's own scale;
+        // touching the stepper pins the value instead.
+        {
+            static char ui_scale_label[16];
+            snprintf(ui_scale_label, sizeof(ui_scale_label), "%d%%",
+                     app->settings.ui_scale_percent);
+            bool at_min = app->settings.ui_scale_percent <= GUI_UI_SCALE_MIN_PERCENT;
+            bool at_max = app->settings.ui_scale_percent >= GUI_UI_SCALE_MAX_PERCENT;
+
+            CLAY(CLAY_ID("VersionInfoUiScaleRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoUiScaleLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("UI scale:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoUiScaleDec"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(at_min ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("-"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(at_min ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+                }
+                CLAY(CLAY_ID("VersionInfoUiScaleValue"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(ui_scale_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY(CLAY_ID("VersionInfoUiScaleInc"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(32), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(at_max ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("+"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(at_max ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+                }
+                CLAY_TEXT(CLAY_STRING("75-300%; also Ctrl/Cmd+wheel or Ctrl/Cmd +/-/0"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+
+            CLAY(CLAY_ID("VersionInfoUiScaleAutoRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoUiScaleAutoLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Match display:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoUiScaleAutoToggle"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(app->settings.ui_scale_auto ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(app->settings.ui_scale_auto ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY(CLAY_ID("VersionInfoUiScaleMatch"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Match now"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                CLAY_TEXT(CLAY_STRING("follow the display's scale (X11 reports one scale for all monitors)"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+        }
+
         // Network (Server/Client) section. Stock mode is Local (no networking).
         // Server hosts the HTTP control + RF/audio stream; Client connects to a
         // host and mirrors its device list/controls/capture state (master/slave).
@@ -8832,6 +8948,54 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, app->settings.show_core_pinning_in_settings
                     ? "Core pinning controls shown in Settings"
                     : "Core pinning controls hidden from Settings");
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleDec")) ||
+                Clay_PointerOver(CLAY_ID("VersionInfoUiScaleInc"))) {
+                int direction = Clay_PointerOver(CLAY_ID("VersionInfoUiScaleInc")) ? 1 : -1;
+                int next = gui_ui_scale_step_percent(app->settings.ui_scale_percent,
+                                                     direction);
+                if (next != app->settings.ui_scale_percent) {
+                    app->settings.ui_scale_percent = next;
+                    gui_ui_set_scale_percent(next);
+                    // Stepping by hand pins the value, exactly as Ctrl+wheel
+                    // does, so auto-follow cannot undo the choice later.
+                    app->settings.ui_scale_auto = false;
+                    gui_settings_save(&app->settings);
+                    gui_ui_show_scale_hud(next);
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleAutoToggle"))) {
+                app->settings.ui_scale_auto = !app->settings.ui_scale_auto;
+                if (app->settings.ui_scale_auto) {
+                    // Re-arming should take effect now rather than waiting for
+                    // the window to be moved to a different display.
+                    int detected = gui_ui_detect_display_scale_percent();
+                    app->settings.ui_scale_percent = detected;
+                    gui_ui_set_scale_percent(detected);
+                    gui_ui_show_scale_hud(detected);
+                }
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, app->settings.ui_scale_auto
+                    ? "UI scale now follows the display"
+                    : "UI scale pinned to the current value");
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleMatch"))) {
+                int detected = gui_ui_detect_display_scale_percent();
+                app->settings.ui_scale_percent = detected;
+                app->settings.ui_scale_auto = true;
+                gui_ui_set_scale_percent(detected);
+                gui_settings_save(&app->settings);
+                gui_ui_show_scale_hud(detected);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "UI scale matched to this display (%d%%)",
+                         detected);
+                gui_app_set_status(app, msg);
                 gui_ui_set_click_consumed();
                 return;
             }

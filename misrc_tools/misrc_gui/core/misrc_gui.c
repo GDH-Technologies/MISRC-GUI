@@ -74,7 +74,7 @@ volatile atomic_int do_exit = 0;
 // Font array for Clay
 // Index 0: Inter (general UI), Index 1: Space Mono (monospace sections)
 #define FONT_COUNT 2
-#define UI_FONT_ATLAS_SIZE 64
+#define UI_FONT_ATLAS_SIZE 128
 static Font fonts[FONT_COUNT];
 
 // Clay error handler
@@ -649,8 +649,71 @@ int main(int argc, char **argv) {
     InitWindow(default_window_width, default_window_height, GUI_WINDOW_CLASS_NAME);
     SetWindowTitle(window_title);
     gui_install_window_icons();
-    SetWindowMinSize(min_window_width, min_window_height);
     SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
+
+    // Adopt the display's scale before the first frame so a HiDPI panel is
+    // never shown an unreadable frame. Deliberately no FLAG_WINDOW_HIGHDPI:
+    // on X11 it only pre-scales the initial window size, which the block
+    // below does explicitly, and on Wayland it would make GetRenderWidth
+    // report physical pixels while gui_ui_get_base_layout_width still treats
+    // that number as logical -- leaving the UI exactly as small as it is now.
+    // This app does its own scaling via rlScalef; raylib must stay out of it.
+    if (app.settings.ui_scale_auto) {
+        int detected = gui_ui_detect_display_scale_percent();
+        TraceLog(LOG_INFO, "DISPLAY: content scale %.2f, monitor %d (%dpx/%dmm)"
+                           " -> UI scale %d%%",
+                 (double)GetWindowScaleDPI().x, GetCurrentMonitor(),
+                 GetMonitorWidth(GetCurrentMonitor()),
+                 GetMonitorPhysicalWidth(GetCurrentMonitor()), detected);
+        app.settings.ui_scale_percent = detected;
+        gui_ui_set_scale_percent(detected);
+    } else {
+        TraceLog(LOG_INFO, "DISPLAY: UI scale pinned at %d%% (auto-follow off)",
+                 app.settings.ui_scale_percent);
+    }
+
+    // The stock 1425x720 is a logical extent, so a scaled UI needs a
+    // proportionally larger window: at 200% that window lays out as 712x360
+    // and trips every status-bar compaction breakpoint before a single panel
+    // is drawn. Grow it with the scale, and prefer a fraction of the monitor
+    // when that is larger still.
+    {
+        float scale_factor = gui_ui_get_scale_factor();
+        int want_width = (int)((float)default_window_width * scale_factor);
+        int want_height = (int)((float)default_window_height * scale_factor);
+
+        int monitor = GetCurrentMonitor();
+        int monitor_width = GetMonitorWidth(monitor);
+        int monitor_height = GetMonitorHeight(monitor);
+        if (monitor_width > 0 && monitor_height > 0) {
+            int fit_width = (int)((float)monitor_width * 0.7f);
+            int fit_height = (int)((float)monitor_height * 0.7f);
+            if (fit_width > want_width) want_width = fit_width;
+            if (fit_height > want_height) want_height = fit_height;
+            if (want_width > monitor_width) want_width = monitor_width;
+            if (want_height > monitor_height) want_height = monitor_height;
+        }
+
+        if (want_width != default_window_width ||
+            want_height != default_window_height) {
+            SetWindowSize(want_width, want_height);
+            // GLFW keeps the top-left corner, so a grown window can hang off
+            // the bottom-right of the display. (A no-op under Wayland, where
+            // the compositor places windows itself.)
+            if (monitor_width > 0 && monitor_height > 0) {
+                Vector2 monitor_pos = GetMonitorPosition(monitor);
+                SetWindowPosition(
+                    (int)monitor_pos.x + (monitor_width - want_width) / 2,
+                    (int)monitor_pos.y + (monitor_height - want_height) / 2);
+            }
+        }
+        TraceLog(LOG_INFO, "DISPLAY: window %dx%d on a %dx%d monitor"
+                           " -> %dx%d logical at %d%%",
+                 want_width, want_height, monitor_width, monitor_height,
+                 (int)((float)want_width / scale_factor),
+                 (int)((float)want_height / scale_factor),
+                 app.settings.ui_scale_percent);
+    }
     SetTargetFPS(60);
     SetExitKey(0);  // Disable escape key auto-close
 
@@ -800,6 +863,11 @@ int main(int argc, char **argv) {
     gui_ui_zoom_state_t ui_zoom_state = {0};
     bool ui_scale_save_pending = false;
     double ui_scale_save_deadline = 0.0;
+    // Auto-follow tracks a candidate rather than applying immediately: a
+    // window dragged across a monitor boundary would otherwise relayout on
+    // every frame of the drag.
+    int ui_scale_auto_candidate = app.settings.ui_scale_percent;
+    double ui_scale_auto_deadline = 0.0;
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     double last_thread_promotion_time = 0.0;
     const double thread_promotion_interval_s = 0.25;
@@ -867,10 +935,44 @@ int main(int argc, char **argv) {
         if (ui_zoom_result.changed) {
             app.settings.ui_scale_percent = ui_zoom_result.percent;
             gui_ui_set_scale_percent(ui_zoom_result.percent);
+            // Zooming by hand is a deliberate choice. Stop following the
+            // display so moving the window never overrides it; the Settings
+            // panel re-arms auto-follow.
+            app.settings.ui_scale_auto = false;
+            ui_scale_auto_deadline = 0.0;
+            ui_scale_auto_candidate = ui_zoom_result.percent;
             last_layout_width = -1;
             last_layout_height = -1;
             ui_scale_save_pending = true;
             ui_scale_save_deadline = GetTime() + 0.4;
+        }
+
+        // Follow the display the window is on. Detection is a couple of GLFW
+        // queries, so polling it is cheaper than tracking monitor changes, but
+        // a change must hold for the debounce window before it is applied.
+        // This is layout-only and never touches the capture, extraction or
+        // display threads, so it is safe to let run mid-recording.
+        if (app.settings.ui_scale_auto) {
+            int detected_percent = gui_ui_detect_display_scale_percent();
+            if (detected_percent != ui_scale_auto_candidate) {
+                ui_scale_auto_candidate = detected_percent;
+                ui_scale_auto_deadline = GetTime() + 0.4;
+            } else if (ui_scale_auto_deadline > 0.0 &&
+                       GetTime() >= ui_scale_auto_deadline) {
+                ui_scale_auto_deadline = 0.0;
+                if (gui_ui_scale_should_follow(app.settings.ui_scale_percent,
+                                               detected_percent, true)) {
+                    app.settings.ui_scale_percent = detected_percent;
+                    gui_ui_set_scale_percent(detected_percent);
+                    last_layout_width = -1;
+                    last_layout_height = -1;
+                    gui_ui_show_scale_hud(detected_percent);
+                    ui_scale_save_pending = true;
+                    ui_scale_save_deadline = GetTime() + 0.4;
+                }
+            }
+        } else {
+            ui_scale_auto_deadline = 0.0;
         }
 
         if (show_ui_scale_hud) {
@@ -902,6 +1004,13 @@ int main(int argc, char **argv) {
             });
             last_layout_width = current_layout_width;
             last_layout_height = current_layout_height;
+            // The minimum window is a logical extent, so it has to move with
+            // the scale. This is the one site that fires on every scale
+            // change, wherever it came from -- the wheel, the keyboard, the
+            // Settings panel, or auto-follow.
+            float min_scale = gui_ui_get_scale_factor();
+            SetWindowMinSize((int)((float)min_window_width * min_scale),
+                             (int)((float)min_window_height * min_scale));
         }
 
         // Check for pending popup result (for async confirmations like file overwrite)
