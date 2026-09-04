@@ -14,7 +14,7 @@ conditions:
 `misrc_gui/net/` is upstream's newest subsystem (752182c, 2026-08-31) and is byte-identical
 between the fork and `harrypm/MISRC-GUI`; no fork commit has ever touched it. Its `/rf`
 fanout is known-broken (replay, unbounded leak, lost wakeup; `server_stop()` frees state under
-live client threads — `.claude/CLAUDE.md` *Gotchas*), and GDH has chosen this mode as its
+live client threads — `.claude/CLAUDE.md` *Gotchas*, fork issue #42), and GDH has chosen this mode as its
 remote-seat transport, so fixes here are the first upstream PRs.
 
 **Do it the upstream way:**

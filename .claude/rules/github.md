@@ -15,15 +15,16 @@ tool for:
 - proving a fix landed — `git merge-base --is-ancestor <sha> origin/main`
 - proving a fix shipped — `~/.local/bin/misrc_gui --version` on the host names the built tag
 
-## Issues are disabled on the fork (for now)
+## Issues
 
-GitHub disables issues on forks by default and this one still is. Enabling them is Reece's
-call (`gh repo edit GDH-Technologies/MISRC-GUI --enable-issues`). Until then a discovered gap
-is written into the PR body's **Owed after merge** or the active plan document, and the reply
-says so explicitly — never let it vanish into conversation. Once enabled: delete the default
-`bug` and `enhancement` labels (Type covers that axis org-wide) and create component labels
-that match this codebase — `capture-path`, `streaming`, `networking`, `cxadc`, `ui`, `build`,
-`ci`, `upstream`, `documentation` — reading the live set before every use.
+Enabled on 2026-09-04 (a fork starts with issues off). The default `bug` and `enhancement`
+labels were deleted the same day — Type covers that axis org-wide — and the component set
+was created: `capture-path` · `streaming` · `networking` · `cxadc` · `ui` · `build` · `ci` ·
+`upstream`, plus the workflow flags `regression` · `upstream-bound` · `documentation`. Read
+the live set before every use anyway (`gh label list -R GDH-Technologies/MISRC-GUI`); an
+unknown label fails the create call. #42 (the net-mode fanout) is the first issue and the
+shape to copy. If issues are ever found disabled again, write the gap into the PR body's
+**Owed after merge** and say so — never flip the repo setting yourself.
 
 Defects in upstream code are filed **here first**, with evidence, and reach harrypm as a PR
 through `/upstream-pr`. Never open an issue on `harrypm/MISRC-GUI` without Reece.

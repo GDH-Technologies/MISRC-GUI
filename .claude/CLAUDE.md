@@ -121,7 +121,7 @@ Fork-side:
   `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate switch.
 - The net server/client mode (`misrc_gui/net/gui_net.c`, upstream 752182c) is unproven: the
   `/rf` fanout replays, leaks and loses wakeups, and `server_stop()` frees state under live
-  client threads. Do not build on it until rewritten.
+  client threads. Do not build on it until rewritten (#42).
 - AppImage container build: `APPIMAGE_BUILD_IMAGE=misrc-appimage-build:22.04
   scripts/build-appimage-local.sh` — stock `ubuntu:22.04` fails at `meson setup` (apt libFLAC
   1.3.3). The image is in `~/misrc-appimage-build/`, outside the repo. The container runs as

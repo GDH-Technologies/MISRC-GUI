@@ -18,21 +18,21 @@ Honest gaps get verbally acknowledged and then lost. They belong in the tracker 
 moment of discovery, in a state where a future session can pick one up cold — which
 requires the evidence and the source pointers to live *in the issue*, not in a conversation.
 
-> [!IMPORTANT]
-> **Issues are currently disabled on `GDH-Technologies/MISRC-GUI`** (GitHub's default for a
-> fork). Check first: `gh repo view GDH-Technologies/MISRC-GUI --json hasIssuesEnabled`. If
-> they are off, draft the issue anyway, show it to Reece, and ask whether to enable issues
-> (`gh repo edit --enable-issues`) — his call, not yours. Until then the gap is written into
-> the PR body's **Owed after merge** or the active plan file, and your reply says so.
+> [!NOTE]
+> Issues were enabled on the fork on 2026-09-04 and the component label set exists
+> (`.claude/rules/github.md`). #42 is the first issue and the shape to copy. If
+> `gh repo view GDH-Technologies/MISRC-GUI --json hasIssuesEnabled` ever says false again,
+> draft anyway, show Reece, and ask — never flip the setting yourself.
 
 ## Procedure
 
 1. **Search for duplicates first.** `search_issues` / `list_issues` before drafting, so a
    finding lands on the existing issue as a comment instead of a new duplicate.
 2. **Read the live label set** — `gh label list -R GDH-Technologies/MISRC-GUI`. An unknown
-   label fails the create call outright. Today the set is GitHub's defaults only; component
-   labels (`capture-path`, `streaming`, `networking`, `cxadc`, `ui`, `build`, `ci`,
-   `upstream`) get created when issues are enabled — propose them, do not assume them.
+   label fails the create call outright. The component set is `capture-path`, `streaming`,
+   `networking`, `cxadc`, `ui`, `build`, `ci`, `upstream`, with the flags `regression`,
+   `upstream-bound`, `documentation` — but read the live set anyway; a renamed label fails
+   the call just the same.
 3. **Draft the issue and show it to Reece.** Title, type, priority, effort, labels, body.
    File it with `issue_write` once he approves.
 4. **Read back after writing.** `issue_read` the created issue and confirm Priority and
