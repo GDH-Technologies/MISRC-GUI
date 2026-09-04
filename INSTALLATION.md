@@ -61,3 +61,9 @@ The local==CI contract is enforced by `python misrc_tools/test/ci_guard_tests.py
 - Linux/macOS: `build-local/misrc_gui`
 
 Run `misrc_gui --smoke-test` to verify the binary is functional (same assertion CI uses).
+
+On a HiDPI display the UI scales itself to match the desktop at startup. If it
+still looks wrong, `Ctrl` + mouse wheel (`Cmd` on macOS) or `Ctrl` `+`/`-`/`0`
+adjusts it between 75% and 300%, and Settings → UI scale exposes the same
+control. `misrc_gui --debug-view` logs what was detected. See
+[UI Scale (HiDPI displays)](README.md#ui-scale-hidpi-displays) in the README.
