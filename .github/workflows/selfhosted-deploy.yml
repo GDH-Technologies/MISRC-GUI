@@ -8,9 +8,19 @@
 # docs/gdh-selfhosted-ci.md. Re-enable with:
 #   gh workflow enable "Build and release binary" --repo GDH-Technologies/MISRC-GUI
 #
-# Everything here runs on the org's own `workflow-master` machine (label `wm`). Pushes to
-# main additionally install the built binaries into ~/.local/bin, so the app launched from
-# the GNOME shortcut is always main.
+# Everything here runs on the org's own machines. `workflow-master` (label `wm`) builds
+# every event. `capture-server-0` (label `cs0`) joins only for the refs that install --
+# pushes to main and release tags -- because it is a 4-core capture box and PR churn there
+# would contend with capture work. Both machines install the built binaries into
+# ~/.local/bin, so the app launched from the GNOME shortcut on wm and the binaries used for
+# capture on cs0 are always main.
+#
+# cs0 is headless (multi-user.target, no Xorg installed), so it takes the binaries only:
+# the icon, the .desktop entry and the stale-launcher sweep are gated to wm. That is enough
+# for the CLI tools and for the GUI's own headless paths (--smoke-test returns before
+# InitWindow). To run the GUI's *server* mode on cs0 so a client on wm can drive its capture
+# hardware, launch it under Xvfb: misrc_gui calls InitWindow unconditionally, and net_mode
+# is honoured at startup only when --config is passed. See docs/gdh-selfhosted-ci.md.
 #
 # Release tags (v*) build and install too. misrc_tools/git-version.sh only resolves a real
 # version when HEAD is at an *exact* tag, so a tag has to be built as a tag: without this
@@ -48,34 +58,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
-    name: Build, test and install (wm)
-    # Strict pin: this fork builds only on workflow-master, never on GitHub-hosted runners.
+  # --------------------------------------------------------------------------------
+  # Bump the GDH release tag, so a merge to main produces a real version instead of
+  # dev-<date>-<sha>. The version script resolves a version only from an EXACT tag at
+  # HEAD, so the tag has to be created before anything builds.
+  #
+  # Pushing with the checkout-provided GITHUB_TOKEN deliberately does NOT start another
+  # workflow run -- GitHub suppresses that to prevent recursion -- so this does not
+  # re-trigger the tags: ['v*'] trigger and there is no double build. A tag pushed by a
+  # human still triggers it, which is what that trigger is for.
+  #
+  # It is its own job, and it runs BEFORE any build leg.
+  #
+  # It used to be the second step of the single build job, which was correct while there
+  # was exactly one machine. With a matrix it is not: both legs check out the same commit
+  # at the same time, so if the bump stayed in the matrix, either both machines would race
+  # to mint and push the same -gdh.N tag (one push wins, the loser dies on a rejected
+  # push), or -- if gated to a single leg -- the other leg would have already checked out
+  # before the tag existed, and the version script would resolve dev-<date>-<sha> for it.
+  # Two machines would then install two different version strings for one commit.
+  #
+  # Hoisting it to a dependency job makes the tag exist before either leg checks out, so
+  # both resolve the same version. It is minted once, on wm.
+  # --------------------------------------------------------------------------------
+  bump-tag:
+    name: Bump GDH release tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64, wm]
-    env:
-      BUILD_DIR: build-ci
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          # misrc_tools/git-version.sh needs tags + history to resolve a version rather
-          # than falling back to dev-<date>-nogit.
+          # The version script needs tags + history to resolve a version rather than
+          # falling back to dev-<date>-nogit.
           fetch-depth: 0
 
-      # ----------------------------------------------------------------------------
-      # Bump the GDH release tag, so a merge to main produces a real version instead of
-      # dev-<date>-<sha>. misrc_tools/git-version.sh resolves a version only from an
-      # EXACT tag at HEAD, so the tag is created before the build step below and the
-      # build then picks it up with no further plumbing.
-      #
-      # Pushing with the checkout-provided GITHUB_TOKEN deliberately does NOT start
-      # another workflow run -- GitHub suppresses that to prevent recursion -- so this
-      # does not re-trigger the tags: ['v*'] trigger and there is no double build. A tag
-      # pushed by a human still triggers it, which is what that trigger is for.
-      # ----------------------------------------------------------------------------
       - name: Bump GDH release tag
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
 
@@ -114,6 +132,44 @@ jobs:
           git tag -a "$next" -m "auto: ${GITHUB_SHA}"
           git push origin "$next"
           echo "tagged $next"
+
+  build-and-deploy:
+    name: Build, test and install (${{ matrix.runner }})
+    needs: [bump-tag]
+    # bump-tag runs only for pushes to main; on every other event it is SKIPPED, and a
+    # skipped dependency would skip this job too. Accept success or skipped, while still
+    # honouring cancellation and a genuine failure of the bump.
+    if: >-
+      !cancelled() &&
+      (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
+    # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
+    # runners. wm builds every event; cs0 joins only for the refs that install.
+    #
+    # Both legs live in ONE workflow run, and `concurrency` (above) arbitrates BETWEEN
+    # runs -- so the shared 'selfhosted-install' group still does the right thing: a newer
+    # push to main cancels the whole older run, both legs together, rather than the legs
+    # cancelling each other.
+    strategy:
+      # A failure on cs0 must not cancel wm's install, or vice versa.
+      fail-fast: false
+      matrix:
+        runner: >-
+          ${{ fromJSON(
+          (github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+          && '["wm","cs0"]' || '["wm"]') }}
+    runs-on: [self-hosted, Linux, X64, "${{ matrix.runner }}"]
+    env:
+      BUILD_DIR: build-ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # The version script needs tags + history to resolve a version rather than
+          # falling back to dev-<date>-nogit. bump-tag has already pushed the tag for this
+          # commit, so this checkout sees it.
+          fetch-depth: 0
 
       - name: Resolve deps prefix
         # Deliberately OUTSIDE the runner workspace: actions/checkout defaults to
@@ -155,16 +211,14 @@ jobs:
       # Install. Only on a real merge to main or a release tag -- PRs build and test but
       # never touch the machine's installed app.
       # ----------------------------------------------------------------------------
-      - name: Install to ~/.local
+      - name: Install binaries to ~/.local/bin
         if: >-
           github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
           set -euo pipefail
           bin_dir="$HOME/.local/bin"
-          app_dir="$HOME/.local/share/applications"
-          icon_dir="$HOME/.local/share/icons/hicolor/512x512/apps"
-          install -d "$bin_dir" "$app_dir" "$icon_dir"
+          install -d "$bin_dir"
 
           # Replace via a temp name + mv: rename is atomic, so an install cannot fail with
           # ETXTBSY if the GUI happens to be running, and a reader never sees a half file.
@@ -173,6 +227,26 @@ jobs:
             mv -f "$bin_dir/.$b.incoming" "$bin_dir/$b"
             echo "installed $bin_dir/$b"
           done
+
+      # ----------------------------------------------------------------------------
+      # Desktop integration -- wm ONLY.
+      #
+      # cs0 is a headless Fedora Server box: it boots to multi-user.target, has no Xorg
+      # and no GNOME, so an icon and a .desktop there would be launcher files no session
+      # will ever read. It also has no ImageMagick, which the icon step shells out to.
+      # The binaries above are the whole deliverable on cs0.
+      # ----------------------------------------------------------------------------
+      - name: Install desktop integration
+        if: >-
+          matrix.runner == 'wm' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          set -euo pipefail
+          app_dir="$HOME/.local/share/applications"
+          icon_dir="$HOME/.local/share/icons/hicolor/512x512/apps"
+          bin_dir="$HOME/.local/bin"
+          install -d "$app_dir" "$icon_dir"
 
           # Icon, only if absent (nothing here should churn it on every merge).
           if [ ! -f "$icon_dir/misrc.png" ] && [ -f assets/Icons/MISRC_Icon.png ]; then
@@ -258,7 +332,7 @@ jobs:
           "$HOME/.local/bin/misrc_gui" --smoke-test
           echo "Installed and verified: $installed"
           {
-            echo "### Deployed to \`wm\`"
+            echo "### Deployed to \`${{ matrix.runner }}\`"
             echo
             echo "- version: \`$installed\`"
             echo "- binaries: \`misrc_gui\`, \`misrc_capture\`, \`misrc_extract\` in \`~/.local/bin\`"

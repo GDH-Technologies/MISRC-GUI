@@ -4,17 +4,106 @@ Fork-local notes for `GDH-Technologies/MISRC-GUI`. None of this exists upstream.
 
 ## What runs, and where
 
-All CI for this fork runs on the org's own runner **`workflow-master`** (labels
-`self-hosted, Linux, X64, wm`), via `.github/workflows/selfhosted-deploy.yml`:
+CI for this fork runs on two of the org's own runners, via
+`.github/workflows/selfhosted-deploy.yml`:
 
-| Event | Build + guard tests | Install to `~/.local` |
+| Runner | Labels | Builds on |
 |---|---|---|
-| Pull request | yes | no |
-| Push to `main` | yes | **yes** |
-| `workflow_dispatch` | yes | no |
+| `workflow-master` | `self-hosted, Linux, X64, wm` | every event |
+| `capture-server-0` | `self-hosted, Linux, X64, cs0` | pushes to `main` and `v*` tags only |
 
-The runner service runs as `rdodge`, the same user as the desktop session, so the install
-step reaches `~/.local/bin` and the GNOME desktop entry without sudo.
+| Event | Runners | Build + guard tests | Install to `~/.local` |
+|---|---|---|---|
+| Pull request | wm | yes | no |
+| Push to `main` | wm + cs0 | yes | **yes** |
+| Release tag `v*` | wm + cs0 | yes | **yes** |
+| `workflow_dispatch` | wm | yes | no |
+
+cs0 is kept out of PR builds deliberately: it is a 4-core capture box, and PR churn there
+would contend with capture work. It joins only for the refs that actually install.
+
+Both runner services run as `rdodge`, so the install step reaches `~/.local/bin` without
+sudo. On wm that is also the desktop session user, so the GNOME desktop entry is written
+there too.
+
+### cs0 is headless, and takes binaries only
+
+cs0 boots to `multi-user.target` with no Xorg and no GNOME. The icon, the `.desktop` entry
+and the stale-launcher sweep are gated to `matrix.runner == 'wm'`; cs0 gets `misrc_gui`,
+`misrc_capture` and `misrc_extract` in `~/.local/bin` and nothing else. (cs0 also has no
+ImageMagick, which the icon step shells out to.)
+
+That is enough for the CLI tools and for the GUI's headless paths — `--smoke-test` returns
+before `InitWindow`, which is why the smoke test passes on a runner with no `DISPLAY`.
+
+### The tag bump is its own job
+
+`bump-tag` runs before either build leg, on wm, and mints at most one `-gdh.N` tag per
+commit. It used to be the second *step* of the single build job, which was correct while
+there was one machine and wrong as soon as there were two: both legs check out the same
+commit at the same time, so a bump inside the matrix would either have both machines racing
+to push the same tag (the loser dies on a rejected push), or — gated to one leg — leave the
+other leg having checked out before the tag existed, resolving `dev-<date>-<sha>` instead.
+One commit would then install two different version strings. As a dependency job the tag
+exists before either leg checks out, so both resolve the same version.
+
+`build-and-deploy` therefore carries
+`if: !cancelled() && (needs.bump-tag.result == 'success' || needs.bump-tag.result ==
+'skipped')` — without the `skipped` arm, every event other than a push to `main` would skip
+the build too.
+
+## Runner group access — invisible in the tree
+
+cs0 and cs1 live in the org runner group **`capture-nodes`**, which is `visibility:
+selected`. MISRC-GUI was not on its repository list, so `runs-on: [self-hosted, cs0]` would
+have sat queued forever with no error message. Granted once with:
+
+```bash
+gh api --method PUT \
+  orgs/GDH-Technologies/actions/runner-groups/3/repositories/1334308945
+```
+
+Inspect the current list with:
+
+```bash
+gh api orgs/GDH-Technologies/actions/runner-groups/3/repositories \
+  --jq '.repositories[].full_name'
+```
+
+`wm` needs none of this — it is in the `Default` group, whose visibility is `all`. This is
+the second thing about this fork's CI that is real but invisible in the working tree (the
+first is the disabled `build.yml` above), which is why it is written down here.
+
+## Running the GUI's server mode on cs0
+
+To drive cs0's capture hardware from the GUI on wm, cs0 runs `misrc_gui` in **Server** mode
+and wm runs it in **Client** mode. Two facts make this less obvious than it looks:
+
+- The server lives **only in the GUI binary**. `misrc_gui/net/gui_net.c` is listed in
+  `sources_gui` and never in `sources_capture` (`misrc_tools/meson.build`), so
+  `misrc_capture` and `misrc_extract` carry no HTTP server, no `/rf` stream and no discovery
+  beacon. There is no headless CLI server.
+- `misrc_gui` calls `InitWindow` unconditionally. The only arguments that return before it
+  are `--version`, `--help`, `--smoke-test` and the `--*-probe` / `--*-test` diagnostics.
+
+So a server on cs0 needs a framebuffer, and cs0 has `xorg-x11-server-Xvfb` installed for
+exactly that — no Xorg session, no VNC, no desktop; the framebuffer is created and torn down
+with the process:
+
+```bash
+xvfb-run -a misrc_gui --config ~/.config/misrc/server.json
+```
+
+`net_mode` is deliberately **not** resumed from saved settings: `gui_app_init` forces Local
+on every normal launch so a restart never resurrects a stale server or client. The single
+exception is `--config`, which the code carves out for scripted launches — `gui_app_init`
+then calls `gui_net_apply_mode()` and the server comes up at startup. That is why the server
+config is a separate file passed with `--config` rather than a flag or the stock settings
+file.
+
+GL under Xvfb comes from Mesa llvmpipe (software). That is fine for a process nobody watches
+— it is a data pump. If it ever proves too slow, the upgrade path is a real Xorg on cs0's
+GTX 1070 with `AllowEmptyInitialConfiguration`, not a bigger Xvfb.
 
 ## Upstream's build.yml is DISABLED — as a repo setting, not a file edit
 
@@ -88,7 +177,8 @@ Installs `misrc_gui`, `misrc_capture` and `misrc_extract` into `~/.local/bin`, w
 temp name plus `mv -f` — the rename is atomic, so a merge cannot fail with `ETXTBSY` while the GUI
 is open.
 
-It also rewrites `~/.local/share/applications/misrc_gui.desktop`. Note the `StartupWMClass`:
+That step runs on both machines. A second step, **gated to wm**, then rewrites
+`~/.local/share/applications/misrc_gui.desktop`. Note the `StartupWMClass`:
 
 ```
 Exec=/home/rdodge/.local/bin/misrc_gui %U
