@@ -1,0 +1,10 @@
+# clangd finds compile_commands.json in a source file's ancestor directories and in their
+# build/ subdirectories (https://clangd.llvm.org/design/compile-commands). This repo's root
+# build/ is tracked source, and meson writes the database into build-local/ via
+# scripts/build-local.sh, so without this file every .c resolves with no flags and clangd
+# reports false errors on raylib.h, clay.h and FLAC/*.h.
+#
+# The path is relative to this file, so a hook-built worktree uses its own build-local/
+# once it has been built there. Fork-only: upstream PRs are cherry-picks and never carry it.
+CompileFlags:
+  CompilationDatabase: build-local

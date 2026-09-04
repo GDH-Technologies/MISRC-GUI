@@ -18,7 +18,7 @@ Fork-only surfaces: `misrc_tools/misrc_gui/streaming/`, `misrc_tools/misrc_gui/i
 gui_preview_v4l2.c`, `misrc_tools/misrc_gui/output/gui_video_record.c`,
 `misrc_tools/misrc_gui/visualization/gui_preview_panel.c`,
 `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
-`scripts/fetch-mediamtx.sh`, `.claude/`.
+`scripts/fetch-mediamtx.sh`, `.claude/`, `.clangd`.
 
 ## Commands
 
@@ -87,6 +87,15 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
   `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`.
 - No formatter — there is no `.clang-format` upstream or here. Match the surrounding code.
+- Two hooks enforce this automatically (`.claude/settings.json`): `guards-on-edit.py` runs
+  `--static-only` after any edit to a guard-matched file (the deploy workflow, `meson.build`,
+  `scripts/build-*`, `git-version.sh`, the suite and its harnesses); `build-on-stop.sh` refuses
+  to end a turn while C sources differ from `origin/main` until an incremental build and
+  `--smoke-test` pass. `MISRC_GUARDS_ON_EDIT=0` / `MISRC_BUILD_ON_STOP=0` disable them for a
+  session.
+- Agents: `capture-path-verifier` (runtime checks), `dev-notes-auditor` (static check of the
+  five constraints below), `upstream-diff-curator` (the gate before `/upstream-pr`). Skills:
+  `/build`, `/guard`.
 
 ## Gotchas
 
@@ -135,11 +144,12 @@ Fork-side:
 ## GitHub
 
 Conventions in `.claude/rules/github.md`; procedures in `/file-issue`, `/close-issue`,
-`/open-pr`, `/sync-upstream`, `/upstream-pr`. Hooks append provenance footers and warn on
-Actions outages; never hand-write either.
+`/open-pr`, `/sync-upstream`, `/upstream-pr`, `/release-notes` (user-invoked). Hooks append
+provenance footers and warn on Actions outages; never hand-write either.
 
 ## External tools expected on PATH
 
 `meson`, `ninja`, `pkg-config`, `gcc`, `python3`, `ffmpeg`, `ffprobe`, `v4l2-ctl`,
 `arecord`/`amixer`, `mediamtx` (bundled into the AppImage by `scripts/fetch-mediamtx.sh`; on
-PATH for macOS/Windows), `clangd` (the `clangd-lsp` plugin reads `build-local/compile_commands.json`).
+PATH for macOS/Windows), `clangd` (the `clangd-lsp` plugin; the root `.clangd` points it at
+`build-local/compile_commands.json`, so build once before expecting diagnostics).
