@@ -9,18 +9,28 @@
 #   gh workflow enable "Build and release binary" --repo GDH-Technologies/MISRC-GUI
 #
 # Everything here runs on the org's own machines. `workflow-master` (label `wm`) builds
-# every event. `capture-server-0` (label `cs0`) joins only for the refs that install --
-# pushes to main and release tags -- because it is a 4-core capture box and PR churn there
-# would contend with capture work. Both machines install the built binaries into
-# ~/.local/bin, so the app launched from the GNOME shortcut on wm and the binaries used for
-# capture on cs0 are always main.
+# every event. `capture-server-0` (`cs0`) and `air-0` (`air0`) join only for the refs that
+# install -- pushes to main and release tags. cs0 is kept out of PR builds because it is a
+# 4-core capture box and PR churn there would contend with capture work; air0 is a laptop
+# that is often asleep. All three install into ~/.local/bin, so the binaries are always main.
 #
-# cs0 is headless (multi-user.target, no Xorg installed), so it takes the binaries only:
-# the icon, the .desktop entry and the stale-launcher sweep are gated to wm. That is enough
-# for the CLI tools and for the GUI's own headless paths (--smoke-test returns before
-# InitWindow). To run the GUI's *server* mode on cs0 so a client on wm can drive its capture
-# hardware, launch it under Xvfb: misrc_gui calls InitWindow unconditionally, and net_mode
-# is honoured at startup only when --config is passed. See docs/gdh-selfhosted-ci.md.
+# Each machine takes a different share of the deliverable, keyed on matrix.runner.os:
+#
+#   wm    Linux/X64   binaries + GNOME icon, .desktop entry and stale-launcher sweep
+#   cs0   Linux/X64   binaries only -- headless (multi-user.target, no Xorg, no ImageMagick)
+#   air0  macOS/ARM64 binaries + a real .app bundle in ~/Applications
+#
+# air0 is a GUI *client*: it connects over the LAN to a server on cs0 and drives that
+# machine's capture hardware. macOS will not launch a bare Mach-O from the Dock or Spotlight,
+# so it gets a proper bundle -- .icns, Info.plist, dylibs collected into Contents/Frameworks
+# with an @executable_path rpath, ad-hoc codesigned -- mirroring upstream build.yml's
+# macos-app-build job. Adding air0 also restores macOS build coverage to this fork, which had
+# none while build.yml is disabled; the first run of it found two real macOS regressions.
+#
+# To run the GUI's *server* mode on cs0 so a client can drive its capture hardware, launch it
+# under Xvfb: misrc_gui calls InitWindow unconditionally, and net_mode is honoured at startup
+# only when --config is passed. That trick has no macOS equivalent, which does not matter
+# while Macs are clients. See docs/gdh-selfhosted-ci.md.
 #
 # Release tags (v*) build and install too. misrc_tools/git-version.sh only resolves a real
 # version when HEAD is at an *exact* tag, so a tag has to be built as a tag: without this
@@ -134,7 +144,7 @@ jobs:
           echo "tagged $next"
 
   build-and-deploy:
-    name: Build, test and install (${{ matrix.runner }})
+    name: Build, test and install (${{ matrix.runner.name }})
     needs: [bump-tag]
     # bump-tag runs only for pushes to main; on every other event it is SKIPPED, and a
     # skipped dependency would skip this job too. Accept success or skipped, while still
@@ -143,22 +153,30 @@ jobs:
       !cancelled() &&
       (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
-    # runners. wm builds every event; cs0 joins only for the refs that install.
+    # runners. wm builds every event; cs0 and air0 join only for the refs that install.
     #
-    # Both legs live in ONE workflow run, and `concurrency` (above) arbitrates BETWEEN
+    # All legs live in ONE workflow run, and `concurrency` (above) arbitrates BETWEEN
     # runs -- so the shared 'selfhosted-install' group still does the right thing: a newer
-    # push to main cancels the whole older run, both legs together, rather than the legs
-    # cancelling each other.
+    # push to main cancels the whole older run, every leg together, rather than the legs
+    # cancelling each other. That is also what keeps a leg queued behind a sleeping air0
+    # from piling up: the next merge supersedes the whole stale run.
     strategy:
-      # A failure on cs0 must not cancel wm's install, or vice versa.
+      # A failure on one machine must not cancel another's install.
       fail-fast: false
       matrix:
+        # Each entry carries its own OS and arch labels rather than sharing one hardcoded
+        # pair, because a self-hosted runner self-reports them: wm and cs0 are Linux/X64,
+        # air0 is macOS/ARM64. A leg naming the wrong OS label matches no runner and sits
+        # queued forever with no error -- the same silent failure as a missing runner-group
+        # grant. Interpolating the labels as scalars keeps this to the one expression form
+        # already used below, rather than betting on an array-valued runs-on.
         runner: >-
           ${{ fromJSON(
           (github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
-          && '["wm","cs0"]' || '["wm"]') }}
-    runs-on: [self-hosted, Linux, X64, "${{ matrix.runner }}"]
+          && '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"cs0","os":"Linux","arch":"X64"},{"name":"air0","os":"macOS","arch":"ARM64"}]'
+          || '[{"name":"wm","os":"Linux","arch":"X64"}]') }}
+    runs-on: [self-hosted, "${{ matrix.runner.os }}", "${{ matrix.runner.arch }}", "${{ matrix.runner.name }}"]
     env:
       BUILD_DIR: build-ci
 
@@ -170,6 +188,21 @@ jobs:
           # falling back to dev-<date>-nogit. bump-tag has already pushed the tag for this
           # commit, so this checkout sees it.
           fetch-depth: 0
+
+      # macOS only. air0's Homebrew lives at /opt/homebrew but is NOT on the runner's
+      # non-interactive PATH, so meson, ninja, cmake and pkg-config are invisible without
+      # this. Formulas themselves are installed by hand once (see docs/gdh-selfhosted-ci.md)
+      # rather than by CI, matching how cs0's dnf packages were handled -- a missing one is
+      # self-diagnosing, because build-deps-unix.sh names the formula it wants.
+      - name: Set up Homebrew environment
+        if: matrix.runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          eval "$(/opt/homebrew/bin/brew shellenv)"
+          {
+            echo "PATH=$PATH"
+            echo "HOMEBREW_PREFIX=$HOMEBREW_PREFIX"
+          } >> "$GITHUB_ENV"
 
       - name: Resolve deps prefix
         # Deliberately OUTSIDE the runner workspace: actions/checkout defaults to
@@ -238,7 +271,7 @@ jobs:
       # ----------------------------------------------------------------------------
       - name: Install desktop integration
         if: >-
-          matrix.runner == 'wm' &&
+          matrix.runner.name == 'wm' &&
           github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
@@ -312,6 +345,201 @@ jobs:
 
           update-desktop-database "$app_dir" || true
 
+      # ----------------------------------------------------------------------------
+      # macOS app bundle -- air0 ONLY.
+      #
+      # macOS will not launch a bare Mach-O from the Dock, Finder or Spotlight, and air0
+      # exists to be a GUI client you pick up and use. So it gets a real bundle instead of
+      # the .desktop entry wm gets.
+      #
+      # The bundling below is lifted from upstream build.yml's macos-app-build job, minus
+      # the parts that only serve a release: no lipo universal merge (air0 is arm64 and
+      # installs in place), no hdiutil DMG, no artifact upload. Keeping the rest identical
+      # means this leg exercises the same bundling the release DMG depends on -- coverage
+      # this fork otherwise has none of, since build.yml is disabled.
+      #
+      # Dylibs are collected into Contents/Frameworks and rewritten to @rpath even though
+      # air0 has the Homebrew originals right there, because a bundle that silently depends
+      # on /opt/homebrew is exactly what the portability assertion at the end exists to
+      # catch before it reaches a release.
+      # ----------------------------------------------------------------------------
+      - name: Install macOS app bundle
+        if: >-
+          matrix.runner.os == 'macOS' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          BUILT_VERSION: ${{ steps.built.outputs.version }}
+        run: |
+          set -euo pipefail
+          DEPS_PREFIX="$MISRC_DEPS_PREFIX"
+          BREW_PREFIX="$(brew --prefix)"
+
+          APP_STAGE="$RUNNER_TEMP/MISRC.app"
+          APP_ROOT="$APP_STAGE/Contents"
+          FW_DIR="$APP_ROOT/Frameworks"
+          rm -rf "$APP_STAGE"
+          mkdir -p "$APP_ROOT/MacOS" "$APP_ROOT/Resources" "$FW_DIR"
+
+          # .icns is the only icon format the Dock and Finder read.
+          ICON_SRC="assets/Icons/MISRC_Icon.png"
+          test -f "$ICON_SRC"
+          ICONSET_DIR="$RUNNER_TEMP/MISRC.iconset"
+          rm -rf "$ICONSET_DIR"
+          mkdir -p "$ICONSET_DIR"
+          sips -z 16 16     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16.png"      >/dev/null
+          sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16@2x.png"   >/dev/null
+          sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32.png"      >/dev/null
+          sips -z 64 64     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32@2x.png"   >/dev/null
+          sips -z 128 128   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128.png"    >/dev/null
+          sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
+          sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256.png"    >/dev/null
+          sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
+          sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512.png"    >/dev/null
+          sips -z 1024 1024 "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/null
+          iconutil -c icns "$ICONSET_DIR" -o "$APP_ROOT/Resources/MISRC.icns"
+          rm -rf "$ICONSET_DIR"
+
+          cp "$BUILD_DIR/misrc_gui"     "$APP_ROOT/MacOS/MISRC"
+          cp "$BUILD_DIR/misrc_capture" "$APP_ROOT/MacOS/misrc_capture"
+          cp "$BUILD_DIR/misrc_extract" "$APP_ROOT/MacOS/misrc_extract"
+          chmod +x "$APP_ROOT/MacOS/MISRC" "$APP_ROOT/MacOS/misrc_capture" "$APP_ROOT/MacOS/misrc_extract"
+
+          # Quoted heredoc: the version is substituted afterwards with BSD sed rather than
+          # interpolated, so a tag-derived string can never be evaluated by the shell.
+          cat > "$APP_ROOT/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>MISRC</string>
+            <key>CFBundleDisplayName</key><string>MISRC</string>
+            <key>CFBundleIdentifier</key><string>dev.misrc.gui</string>
+            <key>CFBundleVersion</key><string>__BUILD_VERSION__</string>
+            <key>CFBundleShortVersionString</key><string>__BUILD_VERSION__</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>MISRC</string>
+            <key>CFBundleIconFile</key><string>MISRC</string>
+            <key>LSMinimumSystemVersion</key><string>10.15</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          sed -i '' "s/__BUILD_VERSION__/${BUILT_VERSION}/g" "$APP_ROOT/Info.plist"
+
+          shopt -s nullglob
+          is_system_lib() {
+            case "$1" in
+              /System/*|/usr/lib/*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          resolve_dep_path() {
+            local dep="$1"
+            if [[ "$dep" == @rpath/* ]]; then
+              local name="${dep#@rpath/}"
+              local candidates=(
+                "$DEPS_PREFIX/lib/$name"
+                "$DEPS_PREFIX/lib64/$name"
+                "$BREW_PREFIX/lib/$name"
+                $BREW_PREFIX/opt/*/lib/"$name"
+              )
+              local candidate
+              for candidate in "${candidates[@]}"; do
+                if [[ -f "$candidate" ]]; then
+                  printf '%s\n' "$candidate"
+                  return 0
+                fi
+              done
+              return 1
+            fi
+            printf '%s\n' "$dep"
+          }
+
+          collect_dep_tree() {
+            local dep="$1"
+            if is_system_lib "$dep"; then
+              return 0
+            fi
+            local resolved
+            resolved="$(resolve_dep_path "$dep")" || {
+              echo "Unable to resolve dylib dependency: $dep" >&2
+              return 1
+            }
+            local base
+            base="$(basename "$resolved")"
+            if [[ ! -f "$FW_DIR/$base" ]]; then
+              cp "$resolved" "$FW_DIR/$base"
+              chmod +w "$FW_DIR/$base"
+              install_name_tool -id "@rpath/$base" "$FW_DIR/$base"
+              while IFS= read -r subdep; do
+                collect_dep_tree "$subdep"
+              done < <(otool -L "$FW_DIR/$base" | tail -n +2 | awk '{print $1}')
+            fi
+          }
+
+          patch_macho_refs() {
+            local target="$1"
+            chmod +w "$target" || true
+            while IFS= read -r dep; do
+              if is_system_lib "$dep"; then
+                continue
+              fi
+              local base
+              if [[ "$dep" == @rpath/* ]]; then
+                base="$(basename "${dep#@rpath/}")"
+              else
+                base="$(basename "$dep")"
+              fi
+              if [[ -f "$FW_DIR/$base" ]]; then
+                install_name_tool -change "$dep" "@rpath/$base" "$target" || true
+              fi
+            done < <(otool -L "$target" | tail -n +2 | awk '{print $1}')
+          }
+
+          for BIN in "$APP_ROOT/MacOS/MISRC" "$APP_ROOT/MacOS/misrc_capture" "$APP_ROOT/MacOS/misrc_extract"; do
+            while IFS= read -r dep; do
+              collect_dep_tree "$dep"
+            done < <(otool -L "$BIN" | tail -n +2 | awk '{print $1}')
+          done
+
+          for BIN in "$APP_ROOT/MacOS/MISRC" "$APP_ROOT/MacOS/misrc_capture" "$APP_ROOT/MacOS/misrc_extract"; do
+            install_name_tool -add_rpath "@executable_path/../Frameworks" "$BIN" 2>/dev/null || true
+            patch_macho_refs "$BIN"
+          done
+          for DYLIB in "$FW_DIR"/*.dylib; do
+            patch_macho_refs "$DYLIB"
+          done
+
+          # A bundle that still names a Homebrew path is not self-contained.
+          for BIN in MISRC misrc_capture misrc_extract; do
+            if otool -L "$APP_ROOT/MacOS/$BIN" | grep -E '/opt/homebrew|/usr/local/opt'; then
+              echo "::error::non-portable Homebrew dylib path in $BIN"
+              exit 1
+            fi
+          done
+
+          # Ad-hoc signature. Enough for Gatekeeper here because the bundle is built in
+          # place and never downloaded, so it carries no com.apple.quarantine attribute.
+          codesign --force --deep --sign - "$APP_STAGE"
+
+          "$APP_ROOT/MacOS/MISRC" --smoke-test
+
+          # Swap into ~/Applications via a staged copy, so an interrupted install never
+          # leaves a half-written bundle where the Dock will find it. Replacing a running
+          # app is safe on macOS -- the running image keeps its inode.
+          app_dir="$HOME/Applications"
+          mkdir -p "$app_dir"
+          rm -rf "$app_dir/MISRC.app.incoming" "$app_dir/MISRC.app.old"
+          cp -R "$APP_STAGE" "$app_dir/MISRC.app.incoming"
+          if [ -d "$app_dir/MISRC.app" ]; then
+            mv "$app_dir/MISRC.app" "$app_dir/MISRC.app.old"
+          fi
+          mv "$app_dir/MISRC.app.incoming" "$app_dir/MISRC.app"
+          rm -rf "$app_dir/MISRC.app.old"
+          echo "installed $app_dir/MISRC.app"
+
       - name: Verify install
         if: >-
           github.event_name == 'push' &&
@@ -332,8 +560,21 @@ jobs:
           "$HOME/.local/bin/misrc_gui" --smoke-test
           echo "Installed and verified: $installed"
           {
-            echo "### Deployed to \`${{ matrix.runner }}\`"
+            echo "### Deployed to \`${{ matrix.runner.name }}\`"
             echo
             echo "- version: \`$installed\`"
             echo "- binaries: \`misrc_gui\`, \`misrc_capture\`, \`misrc_extract\` in \`~/.local/bin\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # On macOS the bundle is the deliverable, so verify it independently of the
+          # bare binaries: the version it reports must match, and it must actually run.
+          if [ "${{ matrix.runner.os }}" = "macOS" ]; then
+            app_bin="$HOME/Applications/MISRC.app/Contents/MacOS/MISRC"
+            app_version="$("$app_bin" --version)"
+            if [ "$app_version" != "$built" ]; then
+              echo "::error::app bundle version ($app_version) does not match built version ($built)"
+              exit 1
+            fi
+            "$app_bin" --smoke-test
+            echo "- app bundle: \`~/Applications/MISRC.app\`" >> "$GITHUB_STEP_SUMMARY"
+          fi

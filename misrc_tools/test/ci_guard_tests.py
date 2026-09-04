@@ -1175,6 +1175,12 @@ def check_mediamtx_config_runtime(repo_root: Path) -> int:
             "-o",
             str(exe_path),
         ]
+        # Same reason as the record-ringbuffer harness: a bare _POSIX_C_SOURCE
+        # hides INADDR_LOOPBACK (and the rest of the BSD extensions) on macOS,
+        # so the module compiles in the real build -- meson adds this on darwin
+        # -- but not in this standalone harness.
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
         built = subprocess.run(compile_cmd, capture_output=True, text=True)
         if built.returncode != 0:
             return fail(f"mediamtx config harness failed to compile:\n{built.stderr.strip()}")

@@ -1239,6 +1239,7 @@ int gui_rtsp_stream_start(const gui_rtsp_stream_opts_t *opts, char *err, size_t 
 void gui_rtsp_stream_request_stop(void) { }
 void gui_rtsp_stream_finish(void) { }
 void gui_rtsp_stream_shutdown(void) { }
+void gui_rtsp_stream_poll(void) { }
 gui_rtsp_stream_status_t gui_rtsp_stream_get_status(void)
 {
     gui_rtsp_stream_status_t st = {0};

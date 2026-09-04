@@ -662,8 +662,16 @@ static void met_step(void)
 
     if (met.fd < 0) {
         if (now < met.next_at) return;
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        /* SOCK_NONBLOCK and SOCK_CLOEXEC are Linux extensions to socket(); the
+         * BSDs and macOS accept only the type, so both flags go on afterwards
+         * with fcntl. Unconditional rather than #ifdef'd: this branch is the
+         * POSIX one for every non-Windows host, the two extra calls happen once
+         * per metrics poll rather than per frame, and one code path cannot drift
+         * between platforms. */
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) { met.next_at = now + MTX_METRICS_PERIOD_S; return; }
+        (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        (void)fcntl(fd, F_SETFD, fcntl(fd, F_GETFD, 0) | FD_CLOEXEC);
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
