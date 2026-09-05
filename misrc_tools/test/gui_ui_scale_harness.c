@@ -236,14 +236,24 @@ int main(void)
     expect_true(gui_ui_get_status_layout_mode(760, 900, false) ==
                     GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE,
                 "tiny breakpoint itself remains a compact single row");
-    expect_true(gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_FULL_SINGLE, true),
-                "wide status profile gives error text a dedicated row");
-    expect_true(gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, true),
-                "compact status profile gives error text a dedicated row");
-    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE, true),
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_FULL_SINGLE, true, 1600, 1599),
+                "wide error and reserved readouts fit one row with space to spare");
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_FULL_SINGLE, true, 1600, 1600),
+                "wide error remains one row at the exact width boundary");
+    expect_true(gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_FULL_SINGLE, true, 1600, 1601),
+                "wide error gets a dedicated row when one pixel short");
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, true, 1000, 999),
+                "compact error uses one row when the complete content fits");
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, true, 1000, 1000),
+                "compact error remains one row at the exact width boundary");
+    expect_true(gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, true, 1000, 1001),
+                "compact error gets a dedicated row when one pixel short");
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE, true, 320, 1600),
                 "minimal profile remains one row even when showing an error");
-    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, false),
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_COMPACT_SINGLE, false, 1000, 1600),
                 "normal compact status remains one row");
+    expect_true(!gui_ui_status_uses_two_rows(GUI_UI_STATUS_LAYOUT_FULL_SINGLE, false, 1600, 1800),
+                "normal wide status does not gain an error row");
     expect_true(!gui_ui_status_shows_extended_counters(
                     GUI_UI_STATUS_NARROW_BREAKPOINT - 1, false),
                 "narrow status hides lower-priority counters");

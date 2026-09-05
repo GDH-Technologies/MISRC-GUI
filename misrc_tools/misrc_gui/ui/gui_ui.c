@@ -1200,7 +1200,7 @@ static char status_errors_display[16];
 static char status_rf_buf_display[16];
 static char status_aud_buf_display[16];
 static char status_free_space_display[120];
-static char status_message_display[192];
+static char status_message_display[256];
 static char status_record_timer_display[16];
 static gui_device_buffer_view_t status_device_buffer_view;
 static char record_limit_state_display[96];
@@ -6317,11 +6317,9 @@ static bool render_main_panels(gui_app_t *app) {
             strstr(raw_status_gate, "timed out") != NULL ||
             strstr(raw_status_gate, "Capture stopped:") != NULL;
     }
-    // Long error messages get an explicit second line whenever there is enough
-    // height. Normal recording status is redundant with the timer, so omit it
-    // at every width to leave room for free-space/runway information.
-    bool status_two_rows = gui_ui_status_uses_two_rows(status_layout,
-                                                       status_is_error);
+    // Decide error rows below, once the complete message and fixed readout
+    // widths are known. Normal recording status is redundant with the timer.
+    bool status_two_rows = false;
     bool show_status_message = status_is_error ||
         (!status_minimal && !app->is_recording);
     /* Keep free-space visible by default and let the dynamic budget contract
@@ -6382,21 +6380,6 @@ static bool render_main_panels(gui_app_t *app) {
     const char *frames_label = status_compact_labels ? frames_label_compact : frames_label_full;
     const char *missed_label = status_compact_labels ? missed_label_compact : missed_label_full;
     const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
-    Clay_SizingAxis status_left_row_width = status_two_rows
-        ? CLAY_SIZING_GROW(0)
-        : CLAY_SIZING_FIT(0);
-    Clay_SizingAxis status_right_row_width = status_two_rows
-        ? CLAY_SIZING_GROW(0)
-        : CLAY_SIZING_FIT(0);
-    Clay_SizingAxis status_row_height = status_two_rows
-        ? CLAY_SIZING_FIXED(22)
-        : CLAY_SIZING_FIT(0);
-    Clay_SizingAxis status_spacer_width = status_two_rows
-        ? CLAY_SIZING_FIXED(0)
-        : CLAY_SIZING_GROW(0);
-    Clay_SizingAxis status_spacer_height = status_two_rows
-        ? CLAY_SIZING_FIXED(0)
-        : CLAY_SIZING_GROW(0);
     update_status_free_space(app);
 
     bool show_record_indicator = app->is_recording && !status_quarter_scale;
@@ -6615,6 +6598,8 @@ static bool render_main_panels(gui_app_t *app) {
     int min_message_width = status_tiny ? 56 : 96;
     int min_message_floor = 24;
     int status_message_width_budget = 0;
+    int status_error_width = status_is_error
+        ? gui_ui_measure_text_width(app, raw_status, status_font_size, 0) : 0;
     /* Recompute from the same starting point every frame. Only viewport,
      * font and capture configuration can change the readout tiers. */
     int readout_level = 0;
@@ -6728,8 +6713,18 @@ static bool render_main_panels(gui_app_t *app) {
         } else if (fixed_left_items > 1) {
             left_gaps_reserved = (fixed_left_items - 1) * status_left_gap;
         }
+        if (pass == 0) {
+            // Use reserved widths, never live counter text or previous-frame
+            // geometry. Prefer a second row to hiding readouts for an error.
+            int single_row_required_width = status_error_width + fixed_left_width +
+                left_gaps_reserved + right_required_width + status_bar_gap * 2;
+            status_two_rows = gui_ui_status_uses_two_rows(status_layout,
+                status_is_error, status_content_width, single_row_required_width);
+        }
         int outer_gaps = status_two_rows ? 0 : (status_bar_gap * 2);
-        int left_available = status_content_width - right_required_width - outer_gaps;
+        // With two rows the readouts no longer consume message-row width.
+        int left_available = status_content_width - outer_gaps -
+            (status_two_rows ? 0 : right_required_width);
         if (left_available < 0) left_available = 0;
         status_message_width_budget = show_status_message
             ? (left_available - fixed_left_width - left_gaps_reserved)
@@ -6737,10 +6732,15 @@ static bool render_main_panels(gui_app_t *app) {
 
         int required_without_message = right_required_width + fixed_left_width +
                                        left_gaps_reserved + outer_gaps;
-        int status_message_required = min_message_width;
+        int status_message_required = status_is_error && !status_two_rows && !status_minimal
+            ? status_error_width : min_message_width;
         bool fits_current_budget = show_status_message
             ? (status_message_width_budget >= status_message_required)
             : (required_without_message <= status_content_width);
+        // The second row must fit independently, even if the first already fits.
+        if (status_two_rows && right_required_width > status_content_width) {
+            fits_current_budget = false;
+        }
         if (fits_current_budget) {
             break;
         }
@@ -6944,6 +6944,21 @@ static bool render_main_panels(gui_app_t *app) {
         status_compact_labels || status_tiny, gui_ui_get_render_scale().x);
     render_channels_panel(app, spacing, status_compact_labels || status_tiny);
 
+    Clay_SizingAxis status_left_row_width = status_two_rows
+        ? CLAY_SIZING_GROW(0)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_right_row_width = status_two_rows
+        ? CLAY_SIZING_GROW(0)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_row_height = status_two_rows
+        ? CLAY_SIZING_FIXED(22)
+        : CLAY_SIZING_FIT(0);
+    Clay_SizingAxis status_spacer_width = status_two_rows
+        ? CLAY_SIZING_FIXED(0)
+        : CLAY_SIZING_GROW(0);
+    Clay_SizingAxis status_spacer_height = status_two_rows
+        ? CLAY_SIZING_FIXED(0)
+        : CLAY_SIZING_GROW(0);
     CLAY(CLAY_ID("StatusBar"), {
         .layout = {
             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(status_two_rows ? 52 : 28) },

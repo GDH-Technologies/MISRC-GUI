@@ -117,10 +117,12 @@ gui_ui_status_layout_mode_t gui_ui_get_status_layout_mode(int layout_width,
 }
 
 bool gui_ui_status_uses_two_rows(gui_ui_status_layout_mode_t layout_mode,
-                                 bool status_is_error)
+                                 bool status_is_error, int content_width,
+                                 int single_row_required_width)
 {
     return status_is_error &&
-        layout_mode != GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE;
+        layout_mode != GUI_UI_STATUS_LAYOUT_MINIMAL_SINGLE &&
+        single_row_required_width > content_width;
 }
 
 bool gui_ui_status_shows_extended_counters(int layout_width,

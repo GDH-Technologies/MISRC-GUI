@@ -93,10 +93,11 @@ gui_ui_status_layout_mode_t gui_ui_get_status_layout_mode(int layout_width,
                                                           int layout_height,
                                                           bool is_recording);
 
-// Error text is the only state important enough to add a second row. Minimal
-// layouts remain single-row to protect the remaining plot height.
+// Add a row only when the complete error and reserved readouts cannot fit.
+// Minimal layouts remain single-row to protect the remaining plot height.
 bool gui_ui_status_uses_two_rows(gui_ui_status_layout_mode_t layout_mode,
-                                 bool status_is_error);
+                                 bool status_is_error, int content_width,
+                                 int single_row_required_width);
 
 // Extended frame/missed/error counters are hidden below this width so a
 // normal compact status bar can remain on one line.
