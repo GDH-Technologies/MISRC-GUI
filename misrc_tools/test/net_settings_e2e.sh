@@ -160,11 +160,51 @@ else
     sleep 0.2
   done
   [ "$(jq .state <<<"$ST")" = 1 ] && pass "recording stopped and finalized (state 1)" || fail "recording did not stop: $ST"
-  curl -s "$(url /stop)" >/dev/null
   ls "$S"/out/*.flac >/dev/null 2>&1 && pass "FLAC output written: $(ls "$S"/out/*.flac | xargs -n1 basename | tr '\n' ' ')" \
     || fail "no FLAC output in $S/out"
   c=$(code_of "/set?key=flac_level&value=4")
   [ "$c" = 200 ] && pass "/set after the recording -> 200 again" || fail "/set after the recording -> $c"
+
+  # --- the overwrite prompt, answered over the wire -----------------------
+  # The files from the recording above exist; with overwrite_files off the
+  # next record start must raise the prompt, publish its text, and wait.
+  c=$(code_of "/set?key=overwrite_files&value=false")
+  [ "$c" = 200 ] || fail "/set overwrite_files=false -> $c"
+  sleep 0.3
+  curl -s "$(url "/record?on=1")" >/dev/null
+  for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .rec_pending)" = true ] && break; sleep 0.2; done
+  ST=$(curl -s "$(url /stats)")
+  if jq -e '.state == 1 and .rec_pending == true and (.rec_pending_text | test("will be overwritten"))
+            and (.rec_pending_text | test("rfA_e2e"))' <<<"$ST" >/dev/null; then
+    pass "a record start over existing files raises the overwrite prompt and /stats carries its text"
+  else
+    fail "overwrite prompt not raised or not published: $ST"
+  fi
+  c=$(code_of "/record?confirm=0")
+  [ "$c" = 200 ] && pass "/record?confirm=0 -> 200" || fail "/record?confirm=0 -> $c"
+  for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .rec_pending)" = false ] && break; sleep 0.2; done
+  ST=$(curl -s "$(url /stats)")
+  jq -e '.state == 1 and .rec_pending == false and (.rec_pending_text == "") and (.status | test("cancelled"))' <<<"$ST" >/dev/null \
+    && pass "cancel over the wire clears the prompt without recording ('$(jq -r .status <<<"$ST")')" \
+    || fail "cancel did not clear the prompt: $ST"
+  curl -s "$(url "/record?on=1")" >/dev/null
+  for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .rec_pending)" = true ] && break; sleep 0.2; done
+  c=$(code_of "/record?confirm=1")
+  [ "$c" = 200 ] || fail "/record?confirm=1 -> $c"
+  for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .state)" = 2 ] && break; sleep 0.2; done
+  ST=$(curl -s "$(url /stats)")
+  jq -e '.state == 2 and .rec_pending == false' <<<"$ST" >/dev/null \
+    && pass "overwrite over the wire starts the recording (state 2)" || fail "confirm did not start the recording: $ST"
+  curl -s "$(url "/record?on=0")" >/dev/null
+  for _ in $(seq 1 150); do
+    ST=$(curl -s "$(url /stats)")
+    [ "$(jq .state <<<"$ST")" = 1 ] && [ "$(jq .rec_finalizing <<<"$ST")" = false ] && break
+    sleep 0.2
+  done
+  c=$(code_of "/record?confirm=1")
+  [ "$c" = 200 ] && [ "$(curl -s "$(url /stats)" | jq .state)" = 1 ] \
+    && pass "a stray /record?confirm with nothing pending is harmless" || fail "stray confirm changed state: $(curl -s "$(url /stats)")"
+  curl -s "$(url /stop)" >/dev/null
 fi
 
 kill "$SRV"; wait "$SRV"; SRC=$?

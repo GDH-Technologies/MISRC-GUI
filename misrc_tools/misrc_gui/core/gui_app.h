@@ -368,6 +368,8 @@ typedef struct gui_app {
     atomic_bool net_cmd_stop;           // /stop requested
     atomic_bool net_cmd_record_on;      // /record?on=1 requested
     atomic_bool net_cmd_record_off;     // /record?on=0 requested
+    atomic_bool net_cmd_record_confirm; // /record?confirm=N: an answer to the overwrite prompt
+    atomic_int  net_cmd_record_confirm_value; // 1 overwrite, 0 cancel
     atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
     atomic_int  net_cmd_device_index;   // Device index argument for select_device.
 
