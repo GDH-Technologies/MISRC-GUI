@@ -606,6 +606,7 @@ static void gui_record_log_writef(const char *level, const char *format, ...) {
 
 // Overwrite confirmation pending state
 static bool s_overwrite_pending = false;
+static char s_overwrite_message[512];
 static gui_app_t *s_pending_app = NULL;
 
 static bool gui_record_collect_finalize_if_done(void) {
@@ -2691,6 +2692,7 @@ int gui_record_start(gui_app_t *app) {
 
         // Show confirmation popup with detailed info
         gui_popup_confirm("Overwrite Files?", message, "Overwrite", "Cancel", app);
+        snprintf(s_overwrite_message, sizeof(s_overwrite_message), "%s", message);
         s_overwrite_pending = true;
         s_pending_app = app;
         return RECORD_PENDING;
@@ -2719,6 +2721,7 @@ void gui_record_check_popup(gui_app_t *app) {
 
     // Popup closed, clear pending state
     s_overwrite_pending = false;
+    s_overwrite_message[0] = '\0';
 
     if (result == POPUP_RESULT_YES) {
         // User confirmed, start recording
@@ -2729,6 +2732,18 @@ void gui_record_check_popup(gui_app_t *app) {
     }
 
     s_pending_app = NULL;
+}
+
+const char *gui_record_pending_message(void) {
+    return s_overwrite_pending ? s_overwrite_message : "";
+}
+
+void gui_record_resolve_pending(gui_app_t *app, bool confirm) {
+    (void)app;
+    if (!s_overwrite_pending) return;
+    /* Same path as a click on the prompt: the popup carries the result and
+     * the next gui_record_check_popup() starts or cancels. */
+    gui_popup_resolve(confirm ? POPUP_RESULT_YES : POPUP_RESULT_NO);
 }
 
 // Internal: Start recording after confirmation
