@@ -45,15 +45,6 @@
   #define NET_INVALID_SOCKET INVALID_SOCKET
   #define net_close(s) closesocket(s)
   #define net_errno ((int)WSAGetLastError())
-  typedef CRITICAL_SECTION net_mutex_t;
-  typedef CONDITION_VARIABLE net_cond_t;
-  #define net_mutex_init(m)   InitializeCriticalSection(m)
-  #define net_mutex_destroy(m) DeleteCriticalSection(m)
-  #define net_mutex_lock(m)   EnterCriticalSection(m)
-  #define net_mutex_unlock(m) LeaveCriticalSection(m)
-  #define net_cond_init(c)    InitializeConditionVariable(c)
-  #define net_cond_destroy(c) ((void)0)
-  #define net_cond_broadcast(c) WakeAllConditionVariable(c)
 #else
   #include <sys/socket.h>
   #include <sys/types.h>
@@ -68,16 +59,11 @@
   #define NET_INVALID_SOCKET (-1)
   #define net_close(s) close(s)
   #define net_errno errno
-  typedef pthread_mutex_t net_mutex_t;
-  typedef pthread_cond_t net_cond_t;
-  #define net_mutex_init(m)   ((void)pthread_mutex_init(m, NULL))
-  #define net_mutex_destroy(m) ((void)pthread_mutex_destroy(m))
-  #define net_mutex_lock(m)   ((void)pthread_mutex_lock(m))
-  #define net_mutex_unlock(m) ((void)pthread_mutex_unlock(m))
-  #define net_cond_init(c)    ((void)pthread_cond_init(c, NULL))
-  #define net_cond_destroy(c) ((void)pthread_cond_destroy(c))
-  #define net_cond_broadcast(c) ((void)pthread_cond_broadcast(c))
 #endif
+
+/* Mutex/condvar shims shared with the fanout, and the fanout itself. */
+#include "gui_net_sync.h"
+#include "gui_net_fanout.h"
 
 static inline int net_sock_valid(net_sock_t s) {
 #ifdef _WIN32
@@ -188,184 +174,6 @@ static int net_read_headers(net_sock_t fd, char *buf, size_t cap) {
 }
 
 /* -------------------------------------------------------------------------
- * Broadcast fanout: one producer (capture tap), N subscribers (/rf clients).
- * Chunks are refcounted; a chunk is freed once no subscriber references it.
- * ------------------------------------------------------------------------- */
-
-typedef struct net_chunk {
-    size_t len;
-    int refcount;
-    struct net_chunk *next;
-    uint8_t data[];
-} net_chunk_t;
-
-typedef struct {
-    net_mutex_t mtx;
-    net_cond_t cond;
-    net_chunk_t *head;
-    net_chunk_t *tail;
-    int subscribers;
-    bool shutdown;
-    bool initialized;
-} net_fanout_t;
-
-typedef struct {
-    net_fanout_t *f;
-    net_chunk_t *cur;
-    size_t off;
-} net_fanout_sub_t;
-
-static void net_fanout_init(net_fanout_t *f) {
-    memset(f, 0, sizeof(*f));
-    net_mutex_init(&f->mtx);
-    net_cond_init(&f->cond);
-    f->initialized = true;
-}
-
-static void net_fanout_free_chunk(net_chunk_t *c) {
-    /* Decrement refcount; free if zero. Caller may pass NULL. */
-    if (!c) return;
-    if (--c->refcount <= 0) {
-        free(c);
-    }
-}
-
-static void net_fanout_destroy(net_fanout_t *f) {
-    if (!f || !f->initialized) return;
-    net_mutex_lock(&f->mtx);
-    f->shutdown = true;
-    net_cond_broadcast(&f->cond);
-    net_chunk_t *c = f->head;
-    while (c) {
-        net_chunk_t *n = c->next;
-        /* Drop producer reference. Subscribers should already be gone. */
-        c->refcount = 0;
-        free(c);
-        c = n;
-    }
-    f->head = f->tail = NULL;
-    net_mutex_unlock(&f->mtx);
-    net_cond_destroy(&f->cond);
-    net_mutex_destroy(&f->mtx);
-    f->initialized = false;
-}
-
-static void net_fanout_subscribe(net_fanout_t *f, net_fanout_sub_t *s) {
-    s->f = f;
-    s->cur = NULL;
-    s->off = 0;
-    net_mutex_lock(&f->mtx);
-    f->subscribers++;
-    /* Start at head (oldest buffered) if any. */
-    if (f->head) {
-        s->cur = f->head;
-        s->cur->refcount++;
-    }
-    net_mutex_unlock(&f->mtx);
-}
-
-static void net_fanout_unsubscribe(net_fanout_sub_t *s) {
-    if (!s || !s->f) return;
-    net_fanout_t *f = s->f;
-    net_mutex_lock(&f->mtx);
-    if (f->subscribers > 0) f->subscribers--;
-    net_chunk_t *cur = s->cur;
-    s->cur = NULL;
-    s->off = 0;
-    net_mutex_unlock(&f->mtx);
-    net_fanout_free_chunk(cur);
-    s->f = NULL;
-}
-
-/* Producer: append data. If there are no subscribers, drop it (no copy/alloc). */
-static void net_fanout_push(net_fanout_t *f, const void *data, size_t len) {
-    if (!f || !f->initialized || len == 0) return;
-    net_mutex_lock(&f->mtx);
-    if (f->shutdown || f->subscribers <= 0) {
-        net_mutex_unlock(&f->mtx);
-        return;
-    }
-    net_chunk_t *c = (net_chunk_t *)malloc(sizeof(net_chunk_t) + len);
-    if (!c) {
-        net_mutex_unlock(&f->mtx);
-        return;
-    }
-    c->len = len;
-    c->refcount = f->subscribers; /* each current subscriber will read it */
-    c->next = NULL;
-    memcpy(c->data, data, len);
-    if (f->tail) f->tail->next = c; else f->head = c;
-    f->tail = c;
-    net_cond_broadcast(&f->cond);
-    net_mutex_unlock(&f->mtx);
-}
-
-/* Subscriber: read up to cap bytes into dst. Blocks up to timeout_ms for data.
- * Returns bytes read (0 if timeout with no data), -1 on shutdown/EOF. */
-static ssize_t net_fanout_read(net_fanout_sub_t *s, void *dst, size_t cap, int timeout_ms) {
-    if (!s || !s->f) return -1;
-    net_fanout_t *f = s->f;
-    size_t copied = 0;
-    net_mutex_lock(&f->mtx);
-    while (cap > 0) {
-        if (s->cur && s->off >= s->cur->len) {
-            /* Advance to next chunk, release current. */
-            net_chunk_t *next = s->cur->next;
-            if (next) next->refcount++;
-            net_chunk_t *done = s->cur;
-            s->cur = next;
-            s->off = 0;
-            net_mutex_unlock(&f->mtx);
-            net_fanout_free_chunk(done);
-            net_mutex_lock(&f->mtx);
-            continue;
-        }
-        if (s->cur) {
-            size_t avail = s->cur->len - s->off;
-            size_t n = (avail < cap) ? avail : cap;
-            memcpy((char *)dst + copied, s->cur->data + s->off, n);
-            s->off += n;
-            copied += n;
-            cap -= n;
-            if (cap == 0) break;
-            continue;
-        }
-        /* No current chunk: wait for producer or shutdown. */
-        if (f->shutdown) {
-            break;
-        }
-        if (timeout_ms <= 0) {
-            break;
-        }
-        /* Wait with timeout. */
-#ifdef _WIN32
-        if (!SleepConditionVariableCS(&f->cond, &f->mtx, (unsigned long)timeout_ms)) {
-            break;
-        }
-#else
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-        int rc = pthread_cond_timedwait(&f->cond, &f->mtx, &ts);
-        if (rc == ETIMEDOUT) {
-            timeout_ms = 0;
-            break;
-        }
-#endif
-        /* Loop back: maybe a new chunk arrived or shutdown. */
-        if (!s->cur && f->head) {
-            s->cur = f->head;
-            s->cur->refcount++;
-        }
-        if (f->shutdown) break;
-    }
-    net_mutex_unlock(&f->mtx);
-    return (ssize_t)copied;
-}
-
-/* -------------------------------------------------------------------------
  * Net state
  * ------------------------------------------------------------------------- */
 
@@ -382,6 +190,15 @@ typedef struct {
     uint64_t last_seen_ms;
 } net_discovered_t;
 
+/* One accepted connection. The listener registers it before the serving
+ * thread starts and that thread releases it on exit, so server_stop() can
+ * shut every live socket down and wait for the threads to finish before it
+ * frees anything they touch. */
+typedef struct net_client_conn {
+    net_sock_t fd;
+    struct net_client_conn *next;
+} net_client_conn_t;
+
 typedef struct {
     gui_app_t *app;
     uint16_t port;
@@ -396,7 +213,16 @@ typedef struct {
     /* UDP discovery beacon broadcaster. */
     thrd_t beacon_thread;
     atomic_bool beacon_stop;
+    /* Live client connections and the threads serving them. */
+    net_mutex_t clients_mtx;
+    net_client_conn_t *clients;
+    atomic_int client_threads;
 } net_server_t;
+
+typedef struct {
+    net_server_t *srv;
+    net_client_conn_t *conn;
+} server_client_ctx_t;
 
 typedef struct {
     gui_app_t *app;
@@ -447,6 +273,35 @@ typedef struct {
 /* The single active net state (Local => NULL). Stored on app->net_state. */
 static net_server_t *s_server = NULL;
 static net_client_t *s_client = NULL;
+
+/* The server the buffer-manager write tap pushes into, and how many pushes
+ * are in flight on the capture thread. server_stop() clears the pointer and
+ * then waits for the count to reach zero before it destroys the fanouts. */
+static _Atomic(net_server_t *) s_tap_server = NULL;
+static atomic_int s_tap_inflight = 0;
+
+/* Runs on the producer's thread from bufmgr_write_end() for every commit to
+ * BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO, whichever backend wrote it. Cheap when
+ * no server is running or no client is streaming. */
+static void server_write_tap(void *ctx, buffer_id_t id, const void *data, size_t bytes) {
+    (void)ctx;
+    atomic_fetch_add(&s_tap_inflight, 1);
+    net_server_t *srv = atomic_load(&s_tap_server);
+    if (srv) {
+        if (id == BUF_CAPTURE_RF) net_fanout_push(&srv->rf, data, bytes);
+        else if (id == BUF_CAPTURE_AUDIO) net_fanout_push(&srv->audio, data, bytes);
+    }
+    atomic_fetch_sub(&s_tap_inflight, 1);
+}
+
+/* Idempotent. Also re-run from gui_net_poll_commands() so a buffer-manager
+ * re-init (memory budget change) cannot silently detach the stream. */
+static void server_install_tap(gui_app_t *app) {
+    if (bufmgr_get_write_tap(&app->buffers, BUF_CAPTURE_RF) != server_write_tap) {
+        bufmgr_set_write_tap(&app->buffers, BUF_CAPTURE_RF, server_write_tap, NULL);
+        bufmgr_set_write_tap(&app->buffers, BUF_CAPTURE_AUDIO, server_write_tap, NULL);
+    }
+}
 
 /* Global init state. */
 static bool s_globals_init = false;
@@ -647,7 +502,8 @@ static int server_parse_arg(const char *uri_after_path, const char *key, int def
 }
 
 /* Split URI into path + query (in-place in a local copy). */
-static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *method, char *uri) {
+static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *method, char *uri) {
+    gui_app_t *app = srv->app;
     if (0 != strcmp(method, "GET")) {
         net_send_str(fd, "HTTP/1.0 405 Method Not Allowed\r\n\r\n");
         return;
@@ -731,36 +587,54 @@ static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *met
     }
     if (strcmp(uri, "/rf") == 0 || strcmp(uri, "/baseband") == 0) {
         net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
-        net_fanout_t *f = (uri[1] == 'r') ? &s_server->rf : &s_server->audio;
-        atomic_int *ctr = (uri[1] == 'r') ? &s_server->rf_clients : &s_server->audio_clients;
+        bool is_rf = (uri[1] == 'r');
+        net_fanout_t *f = is_rf ? &srv->rf : &srv->audio;
+        atomic_int *ctr = is_rf ? &srv->rf_clients : &srv->audio_clients;
         atomic_fetch_add(ctr, 1);
         net_fanout_sub_t sub;
         net_fanout_subscribe(f, &sub);
         uint8_t buf[64 * 1024];
         for (;;) {
-            ssize_t n = net_fanout_read(&sub, buf, sizeof(buf), 1000);
-            if (n < 0) break;
+            int n = net_fanout_read(&sub, buf, sizeof(buf), 1000);
+            if (n < 0) break;                  /* fanout shut down: server stopping */
             if (n == 0) {
-                /* No data for 1s; check socket still alive with a zero-byte probe is
-                 * awkward cross-platform, so just keep going. */
+                /* Nothing captured for 1 s (server idle). Keep the connection. */
+                if (atomic_load(&srv->stop_flag)) break;
                 continue;
             }
-            if (net_send_all(fd, buf, (size_t)n) != 0) break;
+            if (net_send_all(fd, buf, (size_t)n) != 0) break;   /* client went away */
         }
+        uint64_t delivered = 0, dropped = 0;
+        net_fanout_sub_stats(&sub, &delivered, &dropped, NULL);
         net_fanout_unsubscribe(&sub);
         atomic_fetch_sub(ctr, 1);
+        fprintf(stderr, "[NET] %s client done: sent %llu bytes, dropped %llu\n",
+                uri, (unsigned long long)delivered, (unsigned long long)dropped);
         return;
     }
     net_send_str(fd, "HTTP/1.0 404 Not Found\r\n\r\n");
 }
 
+/* Unregister a connection, close its socket and drop the thread count. The
+ * count is the last thing a client thread touches in srv. */
+static void server_conn_release(net_server_t *srv, net_client_conn_t *conn) {
+    net_mutex_lock(&srv->clients_mtx);
+    for (net_client_conn_t **pp = &srv->clients; *pp; pp = &(*pp)->next) {
+        if (*pp == conn) { *pp = conn->next; break; }
+    }
+    net_mutex_unlock(&srv->clients_mtx);
+    net_close(conn->fd);
+    free(conn);
+    atomic_fetch_sub(&srv->client_threads, 1);
+}
+
 /* Per-client thread: read one request, serve it, close. For /rf + /baseband
- * the serve loops until the client disconnects. */
+ * the serve loops until the client disconnects or the server stops. */
 static int server_client_thread(void *arg) {
-    typedef struct { gui_app_t *app; net_sock_t fd; } ctx_t;
-    ctx_t *c = (ctx_t *)arg;
-    gui_app_t *app = c->app;
-    net_sock_t fd = c->fd;
+    server_client_ctx_t *c = (server_client_ctx_t *)arg;
+    net_server_t *srv = c->srv;
+    net_client_conn_t *conn = c->conn;
+    net_sock_t fd = conn->fd;
     free(c);
 
     /* Bound recv/send so a stuck/missing client cannot hold this (detached)
@@ -769,26 +643,22 @@ static int server_client_thread(void *arg) {
 
     char buf[0x1000];
     int len = net_read_headers(fd, buf, sizeof(buf));
-    if (len <= 0) {
-        net_close(fd);
-        return 0;
+    if (len > 0) {
+        char method[8] = {0};
+        char uri[256] = {0};
+        int v1 = 0, v2 = 0;
+        if (4 == sscanf(buf, "%7s %255s HTTP/%d.%d", method, uri, &v1, &v2)) {
+            server_handle_request(srv, fd, method, uri);
+        } else {
+            net_send_str(fd, "HTTP/1.0 400 Bad Request\r\n\r\n");
+        }
     }
-    char method[8] = {0};
-    char uri[256] = {0};
-    int v1 = 0, v2 = 0;
-    if (4 != sscanf(buf, "%7s %255s HTTP/%d.%d", method, uri, &v1, &v2)) {
-        net_send_str(fd, "HTTP/1.0 400 Bad Request\r\n\r\n");
-        net_close(fd);
-        return 0;
-    }
-    server_handle_request(app, fd, method, uri);
-    net_close(fd);
+    server_conn_release(srv, conn);
     return 0;
 }
 
 static int server_listen_thread(void *arg) {
     net_server_t *srv = (net_server_t *)arg;
-    gui_app_t *app = srv->app;
     /* Non-blocking accept loop: select() with a short timeout so this thread
      * checks stop_flag frequently and thrd_join() returns within ~200ms on
      * server_stop(). A blocking accept() would never wake from close() alone
@@ -813,15 +683,23 @@ static int server_listen_thread(void *arg) {
             if (atomic_load(&srv->stop_flag)) break;
             continue;
         }
-        typedef struct { gui_app_t *app; net_sock_t fd; } ctx_t;
-        ctx_t *c = (ctx_t *)malloc(sizeof(ctx_t));
-        if (!c) { net_close(cfd); continue; }
-        c->app = app;
-        c->fd = cfd;
+        net_client_conn_t *conn = (net_client_conn_t *)calloc(1, sizeof(*conn));
+        server_client_ctx_t *c = (server_client_ctx_t *)malloc(sizeof(*c));
+        if (!conn || !c) { net_close(cfd); free(conn); free(c); continue; }
+        conn->fd = cfd;
+        c->srv = srv;
+        c->conn = conn;
+        /* Register before the thread exists, so once the listener has been
+         * joined server_stop() sees every connection there is. */
+        net_mutex_lock(&srv->clients_mtx);
+        conn->next = srv->clients;
+        srv->clients = conn;
+        net_mutex_unlock(&srv->clients_mtx);
+        atomic_fetch_add(&srv->client_threads, 1);
         thrd_t t;
         if (thrd_create(&t, server_client_thread, c) != thrd_success) {
-            net_close(cfd);
             free(c);
+            server_conn_release(srv, conn);
             continue;
         }
         net_thread_detach(&t);
@@ -871,8 +749,11 @@ static int server_start(gui_app_t *app, uint16_t port) {
     atomic_store(&srv->rf_clients, 0);
     atomic_store(&srv->audio_clients, 0);
     atomic_store(&srv->beacon_stop, false);
-    net_fanout_init(&srv->rf);
-    net_fanout_init(&srv->audio);
+    net_fanout_init(&srv->rf, 0);
+    net_fanout_init(&srv->audio, 0);
+    net_mutex_init(&srv->clients_mtx);
+    srv->clients = NULL;
+    atomic_store(&srv->client_threads, 0);
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!net_sock_valid(srv->listen_fd)) {
@@ -912,12 +793,18 @@ static int server_start(gui_app_t *app, uint16_t port) {
     s_server = srv;
     app->net_state = srv;
     atomic_store(&app->net_connected, true);
+    /* Feed the fanouts from every BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO commit. */
+    server_install_tap(app);
+    atomic_store(&s_tap_server, srv);
     fprintf(stderr, "[NET] server listening on :%u\n", (unsigned)port);
     return 0;
 }
 
 static void server_stop(net_server_t *srv) {
     if (!srv) return;
+    /* Stop the capture-thread tap first; a push already inside it finishes
+     * before the fanouts go away (the in-flight wait below). */
+    atomic_store(&s_tap_server, NULL);
     atomic_store(&srv->stop_flag, true);
     atomic_store(&srv->running, false);
     atomic_store(&srv->beacon_stop, true);
@@ -932,11 +819,39 @@ static void server_stop(net_server_t *srv) {
         net_close(srv->listen_fd);
         srv->listen_fd = NET_INVALID_SOCKET;
     }
-    thrd_join(srv->listen_thread, NULL);
+    thrd_join(srv->listen_thread, NULL);   /* no new client threads after this */
     thrd_join(srv->beacon_thread, NULL);
-    /* Wake any /rf + /baseband streaming subscribers so they exit. */
+    /* Wake every /rf + /baseband reader (their reads now return -1) and abort
+     * any client blocked in recv()/send() by shutting its socket down. The
+     * threads own their sockets and close them on the way out. */
+    net_fanout_shutdown(&srv->rf);
+    net_fanout_shutdown(&srv->audio);
+    net_mutex_lock(&srv->clients_mtx);
+    for (net_client_conn_t *conn = srv->clients; conn; conn = conn->next) {
+#ifdef _WIN32
+        shutdown(conn->fd, 2 /* SD_BOTH */);
+#else
+        shutdown(conn->fd, SHUT_RDWR);
+#endif
+    }
+    net_mutex_unlock(&srv->clients_mtx);
+    /* Wait for the client threads to be done with srv. Bounded by their 5 s
+     * socket timeouts even if the shutdown() above were not enough. */
+    int waited_ms = 0;
+    while (atomic_load(&srv->client_threads) > 0) {
+        thrd_sleep_ms(5);
+        waited_ms += 5;
+        if (waited_ms == 2000) {
+            fprintf(stderr, "[NET] server: still waiting for %d client thread(s)\n",
+                    atomic_load(&srv->client_threads));
+        }
+    }
+    while (atomic_load(&s_tap_inflight) > 0) {
+        thrd_sleep_ms(1);
+    }
     net_fanout_destroy(&srv->rf);
     net_fanout_destroy(&srv->audio);
+    net_mutex_destroy(&srv->clients_mtx);
     if (srv->app) {
         atomic_store(&srv->app->net_connected, false);
         srv->app->net_state = NULL;
@@ -1820,24 +1735,11 @@ int gui_net_apply_mode(gui_app_t *app) {
     return 0;
 }
 
-void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes) {
-    (void)app;
-    if (s_server && s_server->rf.initialized) {
-        net_fanout_push(&s_server->rf, data, bytes);
-    }
-}
-
-void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
-    (void)app;
-    if (s_server && s_server->audio.initialized) {
-        net_fanout_push(&s_server->audio, data, bytes);
-    }
-}
-
 void gui_net_poll_commands(gui_app_t *app) {
     if (!app) return;
     /* Server mode: execute queued commands locally on the main thread. */
     if (s_server) {
+        server_install_tap(app);
         if (atomic_exchange(&app->net_cmd_start, false)) {
             if (!app->is_capturing) {
                 fprintf(stderr, "[NET] server: executing /start\n");
