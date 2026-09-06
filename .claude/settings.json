@@ -15,6 +15,12 @@
       "Bash(build-local/misrc_gui --version)",
       "Bash(build-local/misrc_gui --help)",
       "Bash(build-local/misrc_gui --device-list)",
+      "Bash(pwsh -File scripts/build-local.ps1*)",
+      "Bash(python misrc_tools/test/ci_guard_tests.py*)",
+      "Bash(build-local/misrc_gui.exe --smoke-test)",
+      "Bash(build-local/misrc_gui.exe --version)",
+      "Bash(build-local/misrc_gui.exe --help)",
+      "Bash(build-local/misrc_gui.exe --device-list)",
       "Bash(gh label list *)",
       "Bash(gh run watch *)",
       "Bash(gh run view *)"

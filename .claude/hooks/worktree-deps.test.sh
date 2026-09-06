@@ -31,10 +31,18 @@ create() { # name -> stdout: hook stdout; rc preserved
   printf '{"hook_event_name":"WorktreeCreate","name":"%s","cwd":"%s","session_id":"%s"}' \
     "$1" "$MAIN" "$TAG" | python3 "$HOOK" 2>"$ERR"
 }
-remove() { # path
-  printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s"}' "$1" | python3 "$HOOK" 2>"$ERR"
+remove() { # path (backslashes JSON-escaped: on Windows the hook prints native paths)
+  local p; p="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1")"
+  printf '{"hook_event_name":"WorktreeRemove","worktree_path":%s}' "$p" | python3 "$HOOK" 2>"$ERR"
 }
 last_line() { printf '%s\n' "$1" | tail -n 1; }
+norm() { # path -> POSIX form for comparison (C:\x and C:/x both become /c/x under Git Bash/MSYS2)
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi
+}
+is_link() { # symlink, or a directory junction on Windows (Python's os.symlink fallback)
+  [ -L "$1" ] && return 0
+  case "${OSTYPE:-}" in msys*|cygwin*) fsutil reparsepoint query "$(cygpath -w "$1")" >/dev/null 2>&1 ;; *) return 1 ;; esac
+}
 head_of() { git -C "$1" rev-parse HEAD; }
 branch_of() { git -C "$1" rev-parse --abbrev-ref HEAD; }
 has_branch() { git -C "$MAIN" show-ref --verify --quiet "refs/heads/$1"; }
@@ -67,13 +75,13 @@ done
 set +e; out="$(create "$TAG")"; rc=$?; set -e
 wt="$(last_line "$out")"
 if [ "$rc" -eq 0 ]; then ok "create '$TAG' exits 0"; else bad "create exited $rc: $(cat "$ERR")"; fi
-if [ "$wt" = "$ROOT/$TAG" ]; then ok "last stdout line is the absolute path"; else bad "path was '$wt'"; fi
+if [ "$(norm "$wt")" = "$(norm "$ROOT/$TAG")" ]; then ok "last stdout line is the absolute path"; else bad "path was '$wt'"; fi
 if [ -f "$wt/.git" ]; then ok "worktree registered"; else bad "no .git file in $wt"; fi
 if [ "$(branch_of "$wt")" = "claude/$TAG" ]; then ok "branch is claude/$TAG"; else bad "branch is $(branch_of "$wt")"; fi
 if [ "$(head_of "$wt")" = "$(git -C "$MAIN" rev-parse origin/main)" ]; then ok "HEAD is origin/main"; else bad "HEAD is not origin/main"; fi
 if [ -d "$MAIN/.deps/install" ]; then
   if [ -d "$wt/.deps" ] && [ ! -L "$wt/.deps" ]; then ok ".deps/ is a real directory"; else bad ".deps/ is not a real directory"; fi
-  if [ -L "$wt/.deps/install" ] && [ "$(readlink -f "$wt/.deps/install")" = "$(readlink -f "$MAIN/.deps/install")" ]; then
+  if is_link "$wt/.deps/install" && [ "$(norm "$(readlink -f "$wt/.deps/install")")" = "$(norm "$(readlink -f "$MAIN/.deps/install")")" ]; then
     ok ".deps/install links to the main checkout's"
   else bad ".deps/install is not a link to $MAIN/.deps/install"; fi
   if [ -z "$(git -C "$wt" status --porcelain --untracked-files=all)" ]; then ok ".deps does not dirty the tree"; else bad "tree dirty after linking: $(git -C "$wt" status --porcelain --untracked-files=all | head -3)"; fi
@@ -107,7 +115,7 @@ if ! has_branch "claude/$TAG"; then ok "branch claude/$TAG deleted"; else bad "b
 # --- 7. type/topic naming -------------------------------------------------------------
 set +e; out="$(create "hooktest/x-$$")"; rc=$?; set -e
 wt2="$(last_line "$out")"
-if [ "$rc" -eq 0 ] && [ "$wt2" = "$ROOT/hooktest+x-$$" ]; then ok "type/topic -> directory type+topic"; else bad "type/topic rc=$rc path=$wt2"; fi
+if [ "$rc" -eq 0 ] && [ "$(norm "$wt2")" = "$(norm "$ROOT/hooktest+x-$$")" ]; then ok "type/topic -> directory type+topic"; else bad "type/topic rc=$rc path=$wt2"; fi
 if [ "$(branch_of "$wt2")" = "hooktest/x-$$" ]; then ok "type/topic -> branch type/topic"; else bad "branch is $(branch_of "$wt2")"; fi
 set +e; remove "$wt2" >/dev/null; rc=$?; set -e
 if [ "$rc" -eq 0 ] && [ ! -e "$wt2" ]; then ok "type/topic removes cleanly"; else bad "type/topic remove rc=$rc"; fi

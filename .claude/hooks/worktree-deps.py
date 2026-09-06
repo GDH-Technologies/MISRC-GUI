@@ -6,9 +6,13 @@ hook. A worktree of this repo is a plain single-repo checkout under
 `<main>/.claude/worktrees/<dir>/`, branched from `origin/main`, with the main checkout's
 vendored dependency prefixes reachable through symlinks so `scripts/build-local.sh` works
 unchanged inside it. `.deps/` is gitignored and only ever built in the main checkout
-(`scripts/build-deps-unix.sh`, `scripts/build-appimage-local.sh --native`); a worktree gets
-a real `.deps/` directory holding `install*` symlinks back to the main checkout's, because
-the ignore pattern `.deps/` matches a directory and not a bare symlink.
+(`scripts/build-deps-unix.sh`, `scripts/build-appimage-local.sh --native`,
+`scripts/build-local.ps1` on Windows); a worktree gets a real `.deps/` directory holding
+`install*` symlinks back to the main checkout's, because the ignore pattern `.deps/` matches
+a directory and not a bare symlink. On Windows, where a symlink needs Developer Mode, the
+link is a directory junction (`mklink /J`) instead; junctions are unlinked with `rmdir`
+before `git worktree remove` runs so nothing can ever recurse through one into the main
+checkout's real prefix.
 
 Naming: a topic with a `/` (`fix/foo`) becomes branch `fix/foo` in directory `fix+foo`; a
 bare topic (`foo`) becomes branch `claude/foo` in directory `foo`. The directory mapping is
@@ -241,12 +245,42 @@ def link_deps(repo: Repo, half: Path) -> None:
         return
     dst_dir = half / DEPS_DIR
     dst_dir.mkdir(exist_ok=True)
+    kind = "symlink"
     for prefix in prefixes:
         dst = dst_dir / prefix.name
         if dst.is_symlink() or dst.exists():
             continue
-        os.symlink(prefix, dst)
-    log(f"linked {DEPS_DIR}/{{{','.join(p.name for p in prefixes)}}} -> {src}")
+        try:
+            os.symlink(prefix, dst, target_is_directory=True)
+        except OSError as exc:
+            if os.name != "nt":
+                raise
+            # No symlink privilege (Developer Mode off): a directory junction needs none.
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(prefix)],
+                                    capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Failed(f"could not link {dst}: symlink: {exc}; "
+                             f"mklink /J: {result.stderr.strip() or result.stdout.strip()}")
+            kind = "junction"
+    log(f"linked {DEPS_DIR}/{{{','.join(p.name for p in prefixes)}}} -> {src} ({kind})")
+
+
+def unlink_junctions(half: Path) -> None:
+    """Windows: drop `.deps/install*` junctions before git touches the tree.
+
+    `os.rmdir` on a junction removes the reparse point only, never the target. Symlinks
+    are left to git, which unlinks them like any other entry.
+    """
+    if os.name != "nt":
+        return
+    dst_dir = half / DEPS_DIR
+    if not dst_dir.is_dir():
+        return
+    isjunction = getattr(os.path, "isjunction", None)
+    for entry in dst_dir.iterdir():
+        if entry.name.startswith("install") and isjunction is not None and isjunction(entry):
+            os.rmdir(entry)
+            log(f"unlinked junction {entry}")
 
 
 def copy_settings_local(repo: Repo, half: Path) -> None:
@@ -345,6 +379,7 @@ def remove_worktree(repo: Repo, half: Path, force: bool) -> None:
         raise Refused(f"{half} is not a registered worktree of {repo.main}")
     gate(st, force)
     unlock_if_stale(repo, st)
+    unlink_junctions(half)
     result = git(["-C", str(repo.main), "worktree", "remove", str(half)], timeout=120)
     if result.returncode != 0:
         raise Failed(f"git worktree remove {half} failed: {result.stderr.strip()}")
