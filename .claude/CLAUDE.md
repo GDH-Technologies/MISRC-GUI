@@ -83,8 +83,10 @@ source check; the vendored library is what links.
 
 `docs/gdh-selfhosted-ci.md`. `selfhosted-deploy.yml` runs on the org's own runners: `wm`
 (Linux, every event), `cs0` (Linux, `main` + tags only), `air0` (macOS ARM64, `main` + tags
-only, builds `~/Applications/MISRC.app`). PRs build and guard-test on wm only. `bump-tag`
-mints `v<upstream>-gdh.N` before the build legs so both resolve the same version. Installs
+only, builds `~/Applications/MISRC.app`), `win0` (Windows x64, every event, MSYS2 MINGW64
+build mirroring upstream's `windows-exe` job, installs to `%LOCALAPPDATA%\Programs\MISRC` +
+a Start Menu shortcut). PRs build and guard-test on wm and win0. `bump-tag` mints
+`v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 `GUI_WINDOW_CLASS_NAME` (guarded).
 
