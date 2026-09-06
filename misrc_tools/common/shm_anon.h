@@ -86,6 +86,17 @@ memfd_create(const char SHM_ANON_UNUSED(*_name), unsigned int SHM_ANON_UNUSED(fl
 	char *fill;
 	int fd, tries;
 
+	/* macOS's shm_open() honours only O_RDONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC
+	 * and rejects any other flag with EINVAL (seen on macOS 26.6: every
+	 * ringbuffer failed with rb_init() == 2). POSIX shm names are not
+	 * filesystem paths there, so O_NOFOLLOW guards nothing; keep it only
+	 * where it is honoured. */
+#if defined(__APPLE__)
+	const int open_flags = O_RDWR | O_CREAT | O_EXCL;
+#else
+	const int open_flags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW;
+#endif
+
 	*limit = 0;
 	start = name + strlen(name);
 	for (tries = 0; tries < 4; tries++) {
@@ -93,8 +104,7 @@ memfd_create(const char SHM_ANON_UNUSED(*_name), unsigned int SHM_ANON_UNUSED(fl
 		r = (unsigned long)tv.tv_sec + (unsigned long)tv.tv_nsec;
 		for (fill = start; fill < limit; r /= 8)
 			*fill++ = '0' + (r % 8);
-		fd = shm_open(
-		  name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+		fd = shm_open(name, open_flags, 0600);
 		if (fd != -1)
 			return shm_unlink_or_close(name, fd);
 		if (errno != EEXIST)
