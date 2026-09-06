@@ -988,13 +988,6 @@ void gui_capture_callback(void *data_info_ptr) {
     // Signal that new data is available (data events are managed by buffer manager)
     bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
 
-    // Server-mode data tap: fan out raw RF (+ audio) to any connected clients.
-    // No-op (cheap early-out) when not running the network server or no clients.
-    gui_net_tap_rf(app, buf_out, result.stream0_bytes);
-    if (buf_out_audio) {
-        gui_net_tap_audio(app, buf_out_audio, result.stream1_bytes);
-    }
-
     if (s_callback_count <= 3 && misrc_debug_enabled()) {
         fprintf(stderr, "[CB] Wrote %zu bytes to ringbuffer\n", result.stream0_bytes);
     }
