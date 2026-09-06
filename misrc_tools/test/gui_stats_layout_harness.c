@@ -54,9 +54,9 @@ Vector2 MeasureTextEx(Font font, const char *text, float font_size, float spacin
 const char *panel_view_type_name(panel_view_type_t type)
 {
     static const char *names[] = {
-        "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod"
+        "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod", "Preview"
     };
-    return type >= 0 && type < PANEL_VIEW_COUNT ? names[type] : "Unknown";
+    return type >= 0 && (size_t)type < sizeof(names) / sizeof(names[0]) ? names[type] : "Unknown";
 }
 
 bool panel_view_type_available(panel_view_type_t type)
