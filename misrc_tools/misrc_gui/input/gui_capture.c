@@ -2653,6 +2653,18 @@ void gui_app_stop_recording(gui_app_t *app) {
     gui_record_stop(app);
 }
 
+bool gui_app_effective_recording(const gui_app_t *app) {
+    if (!app) return false;
+    if (gui_net_is_client(app)) return gui_net_client_peer_recording(app);
+    return app->is_recording;
+}
+
+bool gui_app_control_capturing(const gui_app_t *app) {
+    if (!app) return false;
+    if (gui_net_is_client(app)) return gui_net_client_peer_capturing(app);
+    return app->is_capturing;
+}
+
 // Helper to update one direction of VU meter (pos or neg)
 static void update_vu_direction(float *level, float *peak, float *peak_hold_time,
                                  float target, float dt) {

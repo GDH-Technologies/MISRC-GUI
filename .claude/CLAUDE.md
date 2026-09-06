@@ -90,7 +90,7 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 60
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 63
   registered checks, several of which compile and run C harnesses in
   `misrc_tools/test/*_harness.c`. Meson has only three `test()` targets (DdD).
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
@@ -98,7 +98,12 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 - Headless modes for automation (`misrc_gui --help`): `--auto-record`, `--config <path>`
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
-  `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`.
+  `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`,
+  `--config <path> --net-serve [s]` (the net server with no window; needs the config's
+  `net_mode` 1 and both `net_server_port` and `net_server_port_str`) and
+  `--net-client-probe <host> <port> [s]` (mirror a server, print its settings as JSON).
+  `misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui 18080` runs the whole
+  server-side protocol against the Simulated device on any host, no Xvfb needed.
 - No formatter — there is no `.clang-format` upstream or here. Match the surrounding code.
 - Two hooks enforce this automatically (`.claude/settings.json`): `guards-on-edit.py` runs
   `--static-only` after any edit to a guard-matched file (the deploy workflow, `meson.build`,
@@ -138,9 +143,15 @@ Fork-side:
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
   `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate switch.
-- The net server/client mode (`misrc_gui/net/gui_net.c`, upstream 752182c) is unproven: the
-  `/rf` fanout replays, leaks and loses wakeups, and `server_stop()` frees state under live
-  client threads. Do not build on it until rewritten.
+- Net mode (`misrc_gui/net/gui_net.c`): a client never sets its own `is_recording` (the
+  audio thread would start writing WAVs); every readout and control goes through
+  `gui_app_effective_recording` / `gui_app_control_capturing`. During the UI pass a client's
+  `app->settings` is the SERVER's copy (view swap in `misrc_gui.c`, held until `EndDrawing`
+  because Clay draws text from pointers into it); code that runs off the main thread reads
+  `capture_ab_swap_invert`, not a settings field. The server applies `/set` only on its main
+  thread through `gui_ui_apply_remote_setting`; HTTP threads read published copies. The
+  `/rf` stream is 4 bytes per sample pair (160 MB/s at 40 MSps, above gigabit), dropped
+  oldest with no framing: a monitoring feed, never a recording source.
 - AppImage container build: `APPIMAGE_BUILD_IMAGE=misrc-appimage-build:22.04
   scripts/build-appimage-local.sh` — stock `ubuntu:22.04` fails at `meson setup` (apt libFLAC
   1.3.3). The image is in `~/misrc-appimage-build/`, outside the repo. The container runs as
