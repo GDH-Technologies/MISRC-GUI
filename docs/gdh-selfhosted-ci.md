@@ -27,13 +27,14 @@ often asleep. Both join only for the refs that actually install. win0 builds PRs
 it exists to catch Windows breakage before merge, and it is a development PC with nothing
 else contending for it.
 
-The runner services run as the machine's own desktop user — `rdodge` on wm and cs0, `dodge`
-on air0 and win0 — so the install step reaches the user's own profile without elevation. On
+The runner services run as the machine's own desktop user — `rdodge` on wm, cs0 and win0,
+`dodge` on air0 — so the install step reaches the user's own profile without elevation. On
 wm that is also the GNOME session user, so the desktop entry is written there too; on air0
 the runner is a LaunchAgent (`actions.runner.GDH-Technologies.air-0`) in the login session,
 so it can write `~/Applications`; on win0 it is a Windows service
-(`actions.runner.GDH-Technologies.WIN-NODE-0`) whose Log On account must be `dodge` — see
-below for why the default is wrong.
+(`actions.runner.GDH-Technologies.WIN-NODE-0`) whose Log On account must be `rdodge` (the
+desktop user; its profile folder is still `C:\Users\dodge`) — see below for why the default
+is wrong.
 
 ### Each leg carries its own runner labels
 
@@ -137,7 +138,7 @@ assertions. There is no capture hardware on win0.
 `config.cmd --runasservice` defaults the service Log On to `NT AUTHORITY\NETWORK SERVICE`,
 whose profile is `C:\Windows\ServiceProfiles\NetworkService`. Under that account `$HOME`,
 `%LOCALAPPDATA%` and the Start Menu all point somewhere no human will ever launch from, and
-the account cannot write into `dodge`'s profile. The first registration of `WIN-NODE-0` was
+the account cannot write into `rdodge`'s profile. The first registration of `WIN-NODE-0` was
 made that way and had to be redone. The runner's own `.credentials` are DPAPI-protected to
 the account that configured them, so changing the Log On account in `services.msc`
 afterwards is not enough: remove and re-register, and re-add the `win0` label, which is not
@@ -151,11 +152,11 @@ $rm  = gh api -X POST orgs/GDH-Technologies/actions/runners/remove-token --jq .t
 $reg = gh api -X POST orgs/GDH-Technologies/actions/runners/registration-token --jq .token
 .\config.cmd --url https://github.com/GDH-Technologies --token $reg `
   --name WIN-NODE-0 --labels win0 --runnergroup Default `
-  --runasservice --windowslogonaccount dodge          # prompts for the password
+  --runasservice --windowslogonaccount rdodge         # prompts for the password
 ```
 
 `config.cmd` grants the account *Log on as a service* itself. Verify with
-`sc.exe qc actions.runner.GDH-Technologies.WIN-NODE-0` (`SERVICE_START_NAME : .\dodge`) and
+`sc.exe qc actions.runner.GDH-Technologies.WIN-NODE-0` (`SERVICE_START_NAME : .\rdodge`) and
 `Get-Service actions.runner.GDH-Technologies.WIN-NODE-0` (`Running`). A service runs in
 session 0 with no desktop, which is fine: every step here is headless.
 
