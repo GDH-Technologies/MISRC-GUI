@@ -978,6 +978,27 @@ static void sink_put_json_string(sink_t *k, const char *text) {
     sink_puts(k, "\"");
 }
 
+size_t gui_settings_json_escape(const char *text, char *out, size_t cap) {
+    sink_t k = { out, cap, 0 };
+    if (out && cap) out[0] = '\0';
+    if (!text) return 0;
+    /* sink_put_json_string wraps in quotes; emit the same escapes bare. */
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        switch (*p) {
+            case '"':  sink_puts(&k, "\\\""); break;
+            case '\\': sink_puts(&k, "\\\\"); break;
+            case '\n': sink_puts(&k, "\\n"); break;
+            case '\r': sink_puts(&k, "\\r"); break;
+            case '\t': sink_puts(&k, "\\t"); break;
+            default:
+                if (*p < 0x20) sink_printf(&k, "\\u%04x", (unsigned)*p);
+                else sink_put(&k, (const char *)p, 1);
+                break;
+        }
+    }
+    return k.len;
+}
+
 size_t gui_settings_to_json(const gui_settings_t *s, unsigned exclude_flags,
                             char *buf, size_t cap) {
     sink_t k = { buf, cap, 0 };
@@ -1162,6 +1183,12 @@ bool gui_settings_field_equal(const gui_settings_t *a, const gui_settings_t *b,
         return strncmp((const char *)field_cptr(a, d), (const char *)field_cptr(b, d), d->cap) == 0;
     }
     return memcmp(field_cptr(a, d), field_cptr(b, d), field_size(d)) == 0;
+}
+
+void gui_settings_copy_field(gui_settings_t *dst, const gui_settings_t *src,
+                             const gui_setting_desc_t *d) {
+    if (!dst || !src || !d || dst == src) return;
+    memcpy(field_ptr(dst, d), field_cptr(src, d), field_size(d));
 }
 
 void gui_settings_copy_fields(gui_settings_t *dst, const gui_settings_t *src,

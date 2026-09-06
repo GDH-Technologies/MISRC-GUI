@@ -135,8 +135,11 @@ static int extraction_thread(void *ctx) {
             // Hardware-variant override: some MISRC V1.5/V2.5 setups have the
             // analog channels wired opposite to the default MISRC mapping.
             // In that case, invert MISRC swap behavior so GUI/record channels
-            // match the physical A/B inputs.
-            if (swap_channels && s_extract_app->settings.misrc_v15_v25_ab_swap) {
+            // match the physical A/B inputs. Read from the main-thread flag,
+            // not the settings field: on a net client the settings struct is
+            // swapped for the server's copy during the UI pass, and the flag
+            // is what the server's snapshot says either way.
+            if (swap_channels && s_extract_app->capture_ab_swap_invert) {
                 swap_channels = false;
             }
         }
