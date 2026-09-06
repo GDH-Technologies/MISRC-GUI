@@ -193,12 +193,31 @@ and wm runs it in **Client** mode. Two facts make this less obvious than it look
   `sources_gui` and never in `sources_capture` (`misrc_tools/meson.build`), so
   `misrc_capture` and `misrc_extract` carry no HTTP server, no `/rf` stream and no discovery
   beacon. There is no headless CLI server.
-- `misrc_gui` calls `InitWindow` unconditionally. The only arguments that return before it
-  are `--version`, `--help`, `--smoke-test` and the `--*-probe` / `--*-test` diagnostics.
+- `misrc_gui` calls `InitWindow` unconditionally for the GUI. The arguments that return
+  before it are `--version`, `--help`, `--smoke-test`, the `--*-probe` / `--*-test`
+  diagnostics, and `--net-serve`.
 
-So a server on cs0 needs a framebuffer, and cs0 has `xorg-x11-server-Xvfb` installed for
-exactly that — no Xorg session, no VNC, no desktop; the framebuffer is created and torn down
-with the process:
+The way to run a server with no window is the headless flag: everything the GUI's main loop
+does for the server (the command poller, the settings publisher, capture and record
+start/stop) minus the window. It refuses to run without `--config`, so it can never run on
+the host's live settings file:
+
+```bash
+misrc_gui --config ~/.config/misrc/server.json --net-serve        # until SIGTERM/SIGINT
+misrc_gui --config ~/.config/misrc/server.json --net-serve 600    # bounded, seconds
+```
+
+The config needs `net_mode` 1 and **both** `net_server_port` and `net_server_port_str`
+(the string mirror is what the mode applier reads). Its output folder must exist. An
+overwrite prompt cannot be answered headlessly, so set `overwrite_files` true or use
+auto-naming with timestamps. On any host, `misrc_tools/test/net_settings_e2e.sh
+build-local/misrc_gui 18080` drives such a server on the Simulated device through the
+whole protocol, then probes it as a client.
+
+Before `--net-serve` existed, a server on cs0 needed a framebuffer, and cs0 has
+`xorg-x11-server-Xvfb` installed for exactly that — no Xorg session, no VNC, no desktop; the
+framebuffer is created and torn down with the process. That still works, and it is the way
+to get a server whose *window* something else needs:
 
 ```bash
 xvfb-run -a misrc_gui --config ~/.config/misrc/server.json
@@ -215,11 +234,9 @@ GL under Xvfb comes from Mesa llvmpipe (software). That is fine for a process no
 — it is a data pump. If it ever proves too slow, the upgrade path is a real Xorg on cs0's
 GTX 1070 with `AllowEmptyInitialConfiguration`, not a bigger Xvfb.
 
-**This trick has no macOS equivalent.** There is no Xvfb on macOS, so a Mac cannot host a
-headless server the way cs0 does. It does not matter while Macs are clients, which is all
-air0 is today. If a Mac ever needs to *serve* — the likely shape of macOS capture hardware —
-the fix is to lift the net server out of `sources_gui` into a headless target that every
-platform can build, not to reproduce a virtual framebuffer. That is a follow-up, not built.
+**The Xvfb trick has no macOS equivalent**, but `--net-serve` does not need one: it is the
+same GUI binary with no window, so a Mac can host a server the same way. The server still
+lives only in `misrc_gui`; `misrc_capture` and `misrc_extract` carry no HTTP server.
 
 ## Upstream's build.yml is DISABLED — as a repo setting, not a file edit
 
