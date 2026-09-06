@@ -21,6 +21,48 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def strip_c_comments(source: str) -> str:
+    """Blank out /* */ and // comments, preserving line structure.
+
+    String and character literals are copied through untouched. Without that a
+    literal like "rtsp://" reads as the start of a line comment and silently
+    blanks the rest of the line, so a guard searching for it finds nothing and
+    reports the code missing when it is right there."""
+    out = []
+    i, n = 0, len(source)
+    while i < n:
+        ch = source[i]
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+            i = end
+        elif source.startswith("//", i):
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+            out.append(" " * (end - i))
+            i = end
+        elif ch in ('"', "'"):
+            # Copy the literal verbatim, honouring backslash escapes so that an
+            # escaped quote does not end it early.
+            out.append(ch)
+            i += 1
+            while i < n:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append(source[i:i + 2])
+                    i += 2
+                    continue
+                out.append(source[i])
+                if source[i] == ch or source[i] == "\n":
+                    i += 1
+                    break
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def extract_function_body(source: str, signature: str) -> str:
     pattern = re.compile(rf"{re.escape(signature)}\s*\{{(?P<body>.*?)\n\}}", re.S)
     match = pattern.search(source)
@@ -893,6 +935,55 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
     return 0
 
 
+def check_net_controls_publish_effective_mode(repo_root: Path) -> int:
+    """A net-mode client runs its own extraction on the raw /rf stream, so its
+    A/B swap decision must equal the server's. The server's decision is the
+    effective mode (capture_mode_runtime_misrc while recording, else
+    user_capture_mode_misrc), which the UI sync and the capture-settings clamp
+    force off for CXADC devices while deliberately leaving settings.misrc_mode
+    alone. /controls used to publish the setting, so a client of a CXADC server
+    swapped channels the server did not. The V1.5/V2.5 wiring flag inverts the
+    swap wherever it is applied, so it has to travel with the mode and the
+    client has to mirror it."""
+    net_c = repo_root / "misrc_tools/misrc_gui/net/gui_net.c"
+    if not net_c.exists():
+        return fail(f"missing {net_c}")
+    code = strip_c_comments(read_text(net_c))
+
+    m = re.search(r"static void server_build_controls\s*\([^)]*\)\s*\{", code)
+    if not m:
+        return fail("gui_net.c: server_build_controls() not found")
+    end = code.find("\n}\n", m.end())
+    body = code[m.end():end if end >= 0 else len(code)]
+    if "settings.misrc_mode" in body:
+        return fail(
+            "gui_net.c: server_build_controls() publishes settings.misrc_mode. Publish the "
+            "effective mode (capture_mode_runtime_misrc while recording, else "
+            "user_capture_mode_misrc); a CXADC server runs with the setting left on."
+        )
+    for needle in (
+        "capture_mode_runtime_misrc",
+        "user_capture_mode_misrc",
+        '\\"misrc_v15_v25_ab_swap\\"',
+        "settings.misrc_v15_v25_ab_swap",
+    ):
+        if needle not in body:
+            return fail(f"gui_net.c: server_build_controls() no longer references {needle}")
+
+    m2 = re.search(r'client_get\s*\([^;]*"/controls"', code)
+    if not m2:
+        return fail("gui_net.c: the client /controls poll was not found")
+    window = code[m2.end():m2.end() + 2500]
+    if not re.search(r'json_bool\s*\(\s*\w+\s*,\s*"misrc_mode"', window):
+        return fail("gui_net.c: the client /controls poll does not mirror misrc_mode")
+    if not re.search(
+        r'app->settings\.misrc_v15_v25_ab_swap\s*=\s*json_bool\s*\(\s*\w+\s*,\s*"misrc_v15_v25_ab_swap"',
+        window,
+    ):
+        return fail("gui_net.c: the client /controls poll does not mirror misrc_v15_v25_ab_swap")
+    return 0
+
+
 def check_windows_packaging_assertions(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -1348,6 +1439,182 @@ def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_net_fanout_runtime(repo_root: Path) -> int:
+    """The /rf and /baseband streams are fed by the net fanout
+    (misrc_gui/net/gui_net_fanout.c). The original pinned the queue head
+    forever (every wake-up replayed the stream from chunk #1), never released
+    the producer's reference (unbounded growth at RF rate for as long as a
+    client was connected), attached to queued data only after a successful wait
+    (a reader with data already waiting slept until the next push), and
+    reported shutdown as a 0-byte timeout (the handler loop never exited, so
+    server_stop() freed the queue under it). Compiles the real module against a
+    harness that drives it the way the handler does and measures delivered vs
+    pushed vs dropped, ordering, wake-up latency, memory held after a drain and
+    the shutdown hand-off."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: net fanout runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the net fanout runtime guard")
+        print("SKIP: net fanout runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/net_fanout_harness.c"
+    fanout_path = repo_root / "misrc_tools/misrc_gui/net/gui_net_fanout.c"
+    net_include = repo_root / "misrc_tools/misrc_gui/net"
+
+    for required in (harness_path, fanout_path):
+        if not required.exists():
+            return fail(f"Net fanout guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_net_fanout_guard_") as temp_root:
+        exe_path = Path(temp_root) / "net_fanout_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            "-pthread",
+            f"-I{net_include}",
+            str(harness_path),
+            str(fanout_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Net fanout harness failed to compile:\n{built.stderr.strip()}")
+        try:
+            ran = subprocess.run([str(exe_path)], capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            return fail(f"Net fanout harness hung for {exc.timeout}s (a reader never woke up)")
+        if ran.returncode != 0:
+            return fail(
+                "Net fanout harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
+def check_bufmgr_write_tap_runtime(repo_root: Path) -> int:
+    """The network server's /rf and /baseband streams are fed by a producer-side
+    tap on the buffer manager (bufmgr_set_write_tap): bufmgr_write_end() hands
+    the committed region to the tap on the writer's thread, so every capture
+    backend (hsdaoh, CXADC, DdD, FX3, RTL-SDR, playback, simulated) streams
+    without calling into the net module. Before the tap existed only the hsdaoh
+    callback fed the fanout and a CXADC server streamed nothing. Compiles
+    buffer_manager.c against a harness with flat ringbuffer stubs and checks
+    the tap sees the right region, after commit, and only when installed."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: buffer manager write tap runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the buffer manager write tap runtime guard")
+        print("SKIP: buffer manager write tap runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/bufmgr_write_tap_harness.c"
+    buffer_manager_path = repo_root / "misrc_tools/common/buffer_manager.c"
+    include_dir = repo_root / "misrc_tools/common"
+
+    for required in (harness_path, buffer_manager_path):
+        if not required.exists():
+            return fail(f"Buffer manager write tap guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_bufmgr_tap_guard_") as temp_root:
+        exe_path = Path(temp_root) / "bufmgr_write_tap_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(buffer_manager_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Buffer manager write tap harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Buffer manager write tap harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
+def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
+    """Every capture, record and net-ingest path sits on common/ringbuffer.c's
+    mirrored mapping, and --smoke-test returns before it is ever created, so a
+    host where rb_init() fails looks healthy in CI and captures nothing in use.
+    macOS 26 rejects O_NOFOLLOW on shm_open() with EINVAL, which shm_anon.h's
+    POSIX path passed unconditionally: every ring failed there with rc 2.
+    Compiles the real ringbuffer.c against a harness that creates rings and
+    proves the two halves alias."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: ringbuffer mirror runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the ringbuffer mirror runtime guard")
+        print("SKIP: ringbuffer mirror runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/ringbuffer_mirror_harness.c"
+    ringbuffer_path = repo_root / "misrc_tools/common/ringbuffer.c"
+    include_dir = repo_root / "misrc_tools/common"
+
+    for required in (harness_path, ringbuffer_path):
+        if not required.exists():
+            return fail(f"Ringbuffer mirror guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_rb_mirror_guard_") as temp_root:
+        exe_path = Path(temp_root) / "ringbuffer_mirror_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            "-D_GNU_SOURCE",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(ringbuffer_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Ringbuffer mirror harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Ringbuffer mirror harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_ui_scale_policy_runtime(repo_root: Path) -> int:
     cc = shutil.which("cc")
     if cc is None:
@@ -1547,6 +1814,7 @@ def main() -> int:
         ("UI scale integration contract", lambda: check_ui_scale_integration_contract(
             repo_root, gui_c_path, gui_settings_c_path, meson_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
+        ("net controls publish the effective mode", lambda: check_net_controls_publish_effective_mode(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -1561,6 +1829,9 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
+        checks.insert(9, ("net fanout runtime", lambda: check_net_fanout_runtime(repo_root)))
+        checks.insert(10, ("buffer manager write tap runtime", lambda: check_bufmgr_write_tap_runtime(repo_root)))
+        checks.insert(11, ("ringbuffer mirror runtime", lambda: check_ringbuffer_mirror_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real

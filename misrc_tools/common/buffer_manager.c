@@ -161,6 +161,8 @@ int bufmgr_init_custom(buffer_manager_t *mgr, const buffer_config_t *configs) {
             mgr->configs[i] = s_default_configs[i];
         }
         mgr->policies[i] = s_default_policies[i];
+        atomic_store(&mgr->write_tap[i], (bufmgr_write_tap_fn)0);
+        atomic_store(&mgr->write_tap_ctx[i], (void *)0);
     }
 
     /* Initialize non-lazy buffers */
@@ -383,13 +385,43 @@ void *bufmgr_write_begin(buffer_manager_t *mgr, buffer_id_t id,
 void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
     if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return;
 
-    rb_write_finished(&mgr->buffers[id], bytes);
+    ringbuffer_t *rb = &mgr->buffers[id];
+    /* The region being committed. rb_write_ptr() has no side effects, so
+     * asking again before rb_write_finished() yields the same pointer
+     * bufmgr_write_begin() handed out (the mapping is contiguous). */
+    const void *region = rb_write_ptr(rb, bytes);
+    rb_write_finished(rb, bytes);
     atomic_fetch_add(&mgr->stats[id].bytes_written, bytes);
 
     /* Signal that data is available */
     if (mgr->events_initialized[id]) {
         rb_event_signal(&mgr->data_events[id]);
     }
+
+    /* Hand the committed region to the tap, if one is installed. Runs after
+     * the signal so the local pipeline is never delayed by the tap's copy. */
+    bufmgr_write_tap_fn tap = atomic_load(&mgr->write_tap[id]);
+    if (tap && region) {
+        tap(atomic_load(&mgr->write_tap_ctx[id]), id, region, bytes);
+    }
+}
+
+void bufmgr_set_write_tap(buffer_manager_t *mgr, buffer_id_t id,
+                          bufmgr_write_tap_fn fn, void *ctx) {
+    if (!mgr || id >= BUF_COUNT) return;
+    if (fn) {
+        /* ctx first, so a writer that sees fn also sees its ctx. */
+        atomic_store(&mgr->write_tap_ctx[id], ctx);
+        atomic_store(&mgr->write_tap[id], fn);
+    } else {
+        atomic_store(&mgr->write_tap[id], (bufmgr_write_tap_fn)0);
+        atomic_store(&mgr->write_tap_ctx[id], (void *)0);
+    }
+}
+
+bufmgr_write_tap_fn bufmgr_get_write_tap(buffer_manager_t *mgr, buffer_id_t id) {
+    if (!mgr || id >= BUF_COUNT) return (bufmgr_write_tap_fn)0;
+    return atomic_load(&mgr->write_tap[id]);
 }
 
 int bufmgr_write(buffer_manager_t *mgr, buffer_id_t id,

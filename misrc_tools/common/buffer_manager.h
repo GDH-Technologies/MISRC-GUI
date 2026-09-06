@@ -73,6 +73,16 @@ typedef struct {
 } backpressure_policy_t;
 
 /*
+ * Producer-side write tap. When one is installed on a buffer, bufmgr_write_end()
+ * calls it on the writer's thread with the region it just committed, after the
+ * bytes are visible to readers. The GUI's network server uses it to fan out
+ * BUF_CAPTURE_RF / BUF_CAPTURE_AUDIO to streaming clients without any capture
+ * backend knowing the server exists. A tap runs inside the capture callback and
+ * must not block.
+ */
+typedef void (*bufmgr_write_tap_fn)(void *ctx, buffer_id_t id, const void *data, size_t bytes);
+
+/*
  * Buffer manager instance
  */
 typedef struct buffer_manager {
@@ -91,6 +101,10 @@ typedef struct buffer_manager {
 
     /* Statistics */
     buffer_stats_t stats[BUF_COUNT];
+
+    /* Optional write taps (bufmgr_set_write_tap); cleared by init */
+    _Atomic(bufmgr_write_tap_fn) write_tap[BUF_COUNT];
+    _Atomic(void *) write_tap_ctx[BUF_COUNT];
 
     /* Lifecycle */
     bool manager_initialized;
@@ -216,6 +230,20 @@ void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes);
  */
 int bufmgr_write(buffer_manager_t *mgr, buffer_id_t id,
                   const void *data, size_t bytes);
+
+/*
+ * Install (fn != NULL) or remove (fn == NULL) the write tap for a buffer.
+ *
+ * Safe to call while a producer is writing: the pointers are exchanged
+ * atomically. Removing a tap that a writer is racing can let one in-flight
+ * call observe ctx == NULL, so a tap that must survive removal should keep its
+ * own state rather than rely on ctx. Re-initialising the manager clears every
+ * tap; the installer is expected to re-check (bufmgr_get_write_tap) if it
+ * needs to persist across that.
+ */
+void bufmgr_set_write_tap(buffer_manager_t *mgr, buffer_id_t id,
+                          bufmgr_write_tap_fn fn, void *ctx);
+bufmgr_write_tap_fn bufmgr_get_write_tap(buffer_manager_t *mgr, buffer_id_t id);
 
 /*-----------------------------------------------------------------------------
  * Consumer API (reading from buffers)
