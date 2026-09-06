@@ -4,7 +4,7 @@ Fork-local notes for `GDH-Technologies/MISRC-GUI`. None of this exists upstream.
 
 ## What runs, and where
 
-CI for this fork runs on three of the org's own runners, via
+CI for this fork runs on four of the org's own runners, via
 `.github/workflows/selfhosted-deploy.yml`:
 
 | Runner | Labels | Builds on | Gets |
@@ -12,23 +12,28 @@ CI for this fork runs on three of the org's own runners, via
 | `workflow-master` | `self-hosted, Linux, X64, wm` | every event | binaries + GNOME desktop entry |
 | `capture-server-0` | `self-hosted, Linux, X64, cs0` | `main` and `v*` tags only | binaries only |
 | `air-0` | `self-hosted, macOS, ARM64, air0` | `main` and `v*` tags only | binaries + `~/Applications/MISRC.app` |
+| `WIN-NODE-0` | `self-hosted, Windows, X64, win0` | every event | binaries + Start Menu shortcut in `%LOCALAPPDATA%\Programs\MISRC` |
 
 | Event | Runners | Build + guard tests | Install |
 |---|---|---|---|
-| Pull request | wm | yes | no |
-| Push to `main` | wm + cs0 + air0 | yes | **yes** |
-| Release tag `v*` | wm + cs0 + air0 | yes | **yes** |
-| `workflow_dispatch` | wm | yes | no |
+| Pull request | wm + win0 | yes | no |
+| Push to `main` | wm + cs0 + air0 + win0 | yes | **yes** |
+| Release tag `v*` | wm + cs0 + air0 + win0 | yes | **yes** |
+| `workflow_dispatch` | wm + win0 | yes | no |
 
 cs0 and air0 are kept out of PR builds deliberately, for different reasons: cs0 is a 4-core
 capture box where PR churn would contend with capture work, and air0 is a laptop that is
-often asleep. Both join only for the refs that actually install.
+often asleep. Both join only for the refs that actually install. win0 builds PRs on purpose:
+it exists to catch Windows breakage before merge, and it is a development PC with nothing
+else contending for it.
 
 The runner services run as the machine's own desktop user — `rdodge` on wm and cs0, `dodge`
-on air0 — so the install step reaches `~/.local/bin` without sudo. On wm that is also the
-GNOME session user, so the desktop entry is written there too; on air0 the runner is a
-LaunchAgent (`actions.runner.GDH-Technologies.air-0`) in the login session, so it can write
-`~/Applications`.
+on air0 and win0 — so the install step reaches the user's own profile without elevation. On
+wm that is also the GNOME session user, so the desktop entry is written there too; on air0
+the runner is a LaunchAgent (`actions.runner.GDH-Technologies.air-0`) in the login session,
+so it can write `~/Applications`; on win0 it is a Windows service
+(`actions.runner.GDH-Technologies.WIN-NODE-0`) whose Log On account must be `dodge` — see
+below for why the default is wrong.
 
 ### Each leg carries its own runner labels
 
@@ -109,6 +114,109 @@ module and the brew formula that provides it. `nasm` is not actually needed on a
 
 Unlike cs0, air0 needs **no runner-group grant**: it is in the `Default` group, whose
 visibility is `all`.
+
+### win0 is a Windows dev PC, and builds under MSYS2 MINGW64
+
+win0 restores the Windows x64 coverage this fork lost when `build.yml` was disabled, and it
+runs on every event so a PR that breaks the Windows build fails **before** merge. The leg
+mirrors upstream `build.yml`'s `windows-exe` job rather than the fork's
+`scripts/build-local.ps1`: the same MSYS2 MINGW64 shell, `scripts/build-deps-windows.sh` for
+the static libuvc + hsdaoh + raylib prefix, the job's own `meson setup`/`compile` lines, and
+its release assertions — GUI subsystem, and an import table naming only system DLLs.
+`build-local.ps1` is not used because it pip-installs meson/ninja into the runner user's
+profile, and CI does not mutate the machine.
+
+What the leg proves is narrower than on Linux. Streaming, V4L2 preview, video record and
+mediamtx supervision are compiled-out `#else` stubs on Windows, so the guard suite's
+Linux/macOS-only runtime harnesses self-skip (9 of 67 at the time of writing). The Windows
+leg covers the build contract, the UI/record/FLAC/playback code, and the static-link
+assertions. There is no capture hardware on win0.
+
+#### The runner must run as the desktop user, not NETWORK SERVICE
+
+`config.cmd --runasservice` defaults the service Log On to `NT AUTHORITY\NETWORK SERVICE`,
+whose profile is `C:\Windows\ServiceProfiles\NetworkService`. Under that account `$HOME`,
+`%LOCALAPPDATA%` and the Start Menu all point somewhere no human will ever launch from, and
+the account cannot write into `dodge`'s profile. The first registration of `WIN-NODE-0` was
+made that way and had to be redone. The runner's own `.credentials` are DPAPI-protected to
+the account that configured them, so changing the Log On account in `services.msc`
+afterwards is not enough: remove and re-register, and re-add the `win0` label, which is not
+a default label and is lost on removal:
+
+```powershell
+# from C:\Users\dodge\actions-runner, in an elevated PowerShell
+gh auth refresh -h github.com -s admin:org            # once; the runner APIs need it
+$rm  = gh api -X POST orgs/GDH-Technologies/actions/runners/remove-token --jq .token
+.\config.cmd remove --token $rm
+$reg = gh api -X POST orgs/GDH-Technologies/actions/runners/registration-token --jq .token
+.\config.cmd --url https://github.com/GDH-Technologies --token $reg `
+  --name WIN-NODE-0 --labels win0 --runnergroup Default `
+  --runasservice --windowslogonaccount dodge          # prompts for the password
+```
+
+`config.cmd` grants the account *Log on as a service* itself. Verify with
+`sc.exe qc actions.runner.GDH-Technologies.WIN-NODE-0` (`SERVICE_START_NAME : .\dodge`) and
+`Get-Service actions.runner.GDH-Technologies.WIN-NODE-0` (`Running`). A service runs in
+session 0 with no desktop, which is fine: every step here is headless.
+
+#### One-time prep on win0
+
+MSYS2 at `C:\msys64` (the path `scripts/build-local.ps1` hardcodes, and the one the
+workflow's `shell:` line names), with the `windows-exe` job's MINGW64 package list plus
+`libjpeg-turbo` (CI has it, `INSTALLATION.md` omits it) and `clang-tools-extra` (clangd for
+the editor plugin). Installed by hand once, as on air0; CI never runs pacman:
+
+```
+pacman -Syu   # twice on a fresh install: the first pass upgrades the runtime and exits
+pacman -S --needed git mingw-w64-x86_64-{cmake,fftw,flac,gcc,libjpeg-turbo,libusb,libsoxr,meson,nasm,ninja,pkgconf,clang-tools-extra}
+```
+
+Git for Windows must be installed (it is the `bash` a Windows runner uses for plain `run:`
+steps, and the `git` `actions/checkout` uses). Nothing needs to be on the user PATH: the
+MSYS2 steps get their PATH from `/etc/profile` via `MSYSTEM=MINGW64`.
+
+The runner is in the `Default` runner group (visibility `all`), so like wm and air0 it
+needs no runner-group grant.
+
+#### Line endings
+
+Git for Windows' *system* gitconfig sets `core.autocrlf=true` and the repo has no
+`.gitattributes`, so `actions/checkout` leaves every `.sh` with CRLF endings and MSYS2 bash
+fails on `#!/usr/bin/env bash\r`. The leg's first step after checkout re-checks the workspace
+out as LF (`git config core.autocrlf false && git rm -r --cached . && git reset --hard`) —
+workspace-local, so there is no runner-level git setting to remember. Upstream's own CI
+survives CRLF only because `git-version.sh` diffs with `--ignore-cr-at-eol`; that guard
+still matters here, and `ci_guard_tests.py` asserts it.
+
+#### Install layout on win0
+
+Binaries go to `%LOCALAPPDATA%\Programs\MISRC` (the per-user application convention), a
+`MISRC GUI.lnk` is written to the user's Start Menu programs folder with the icon taken from
+the `.exe` (which embeds `MISRC_Icon.ico` through `misrc_gui.rc`), and the install directory
+is appended to the **user** PATH once via the .NET environment API (`setx` truncates at
+1024 characters). The deps cache is `%USERPROFILE%\.cache\misrc\.deps\install`, the same
+`$HOME/.cache/misrc/.deps/install` the other machines use, outside the workspace for the same
+reason.
+
+Windows refuses to overwrite or delete a running image but allows it to be renamed, so the
+install moves a live `misrc_gui.exe` aside under a unique name before the new one takes its
+place, and sweeps the aside copies on the next install. An open GUI therefore never blocks a
+deploy; it keeps running the old image until relaunched.
+
+#### Reproducing the win0 leg by hand
+
+```
+C:\msys64\usr\bin\env.exe MSYSTEM=MINGW64 CHERE_INVOKING=1 C:\msys64\usr\bin\bash.exe -l
+  DEPS_PREFIX="$HOME/.cache/misrc/.deps/install" bash scripts/build-deps-windows.sh
+  export PKG_CONFIG_PATH="$HOME/.cache/misrc/.deps/install/lib/pkgconfig:$MINGW_PREFIX/lib/pkgconfig"
+  meson setup build-ci misrc_tools --buildtype release
+  meson compile -C build-ci misrc_capture misrc_extract misrc_gui
+  python misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-ci/misrc_gui.exe
+  build-ci/misrc_gui.exe --smoke-test
+```
+
+Everyday development on win0 uses `pwsh -File scripts/build-local.ps1` instead (see
+`.claude/CLAUDE.md`); the two share `.deps` contents but not the prefix path.
 
 ### Adding air0 immediately found two real macOS regressions
 
@@ -244,13 +352,15 @@ Two reasons it is a setting rather than an `if:` guard on each job:
 2. `build.yml` is the file upstream changes most. Leaving it untouched keeps every upstream
    merge conflict-free.
 
-### Consequence: no cross-platform coverage here
+### Consequence: partial cross-platform coverage here
 
-Windows, macOS and Android are no longer built on this fork at all. A fork-local change can
-break them without CI noticing — this has already nearly happened once (a file-scope `static`
-whose only use sat inside `#if !defined(_WIN32)`, i.e. an unused-variable warning on Windows
-only). Before sending work upstream, re-enable `build.yml` and run it once via
-`workflow_dispatch`.
+With `build.yml` off, cross-platform coverage comes only from the self-hosted legs: Windows
+x64 on win0 (every event, so before merge) and macOS arm64 on air0 (after merge). Android,
+Windows arm64 and macOS Intel are not built on this fork at all. A fork-local change can
+still break those without CI noticing — this nearly happened once before win0 existed (a
+file-scope `static` whose only use sat inside `#if !defined(_WIN32)`, i.e. an
+unused-variable warning on Windows only). Before sending work upstream, re-enable
+`build.yml` and run it once via `workflow_dispatch`.
 
 ## The deps cache
 

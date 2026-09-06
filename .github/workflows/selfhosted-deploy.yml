@@ -8,17 +8,22 @@
 # docs/gdh-selfhosted-ci.md. Re-enable with:
 #   gh workflow enable "Build and release binary" --repo GDH-Technologies/MISRC-GUI
 #
-# Everything here runs on the org's own machines. `workflow-master` (label `wm`) builds
-# every event. `capture-server-0` (`cs0`) and `air-0` (`air0`) join only for the refs that
-# install -- pushes to main and release tags. cs0 is kept out of PR builds because it is a
-# 4-core capture box and PR churn there would contend with capture work; air0 is a laptop
-# that is often asleep. All three install into ~/.local/bin, so the binaries are always main.
+# Everything here runs on the org's own machines. `workflow-master` (label `wm`) and
+# `WIN-NODE-0` (`win0`) build every event. `capture-server-0` (`cs0`) and `air-0` (`air0`)
+# join only for the refs that install -- pushes to main and release tags. cs0 is kept out of
+# PR builds because it is a 4-core capture box and PR churn there would contend with capture
+# work; air0 is a laptop that is often asleep. win0 builds PRs because catching Windows
+# breakage before merge is the reason it is here. The POSIX machines install into
+# ~/.local/bin; win0 into %LOCALAPPDATA%\Programs\MISRC. The binaries are always main.
 #
 # Each machine takes a different share of the deliverable, keyed on matrix.runner.os:
 #
 #   wm    Linux/X64   binaries + GNOME icon, .desktop entry and stale-launcher sweep
 #   cs0   Linux/X64   binaries only -- headless (multi-user.target, no Xorg, no ImageMagick)
 #   air0  macOS/ARM64 binaries + a real .app bundle in ~/Applications
+#   win0  Windows/X64 binaries + a Start Menu shortcut; built under MSYS2 MINGW64 exactly
+#                     like upstream build.yml's windows-exe job (static link, GUI subsystem,
+#                     system-DLL-only import table), which this fork otherwise never runs
 #
 # air0 is a GUI *client*: it connects over the LAN to a server on cs0 and drives that
 # machine's capture hardware. macOS will not launch a bare Mach-O from the Dock or Spotlight,
@@ -153,7 +158,8 @@ jobs:
       !cancelled() &&
       (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
-    # runners. wm builds every event; cs0 and air0 join only for the refs that install.
+    # runners. wm and win0 build every event; cs0 and air0 join only for the refs that
+    # install.
     #
     # All legs live in ONE workflow run, and `concurrency` (above) arbitrates BETWEEN
     # runs -- so the shared 'selfhosted-install' group still does the right thing: a newer
@@ -166,7 +172,8 @@ jobs:
       matrix:
         # Each entry carries its own OS and arch labels rather than sharing one hardcoded
         # pair, because a self-hosted runner self-reports them: wm and cs0 are Linux/X64,
-        # air0 is macOS/ARM64. A leg naming the wrong OS label matches no runner and sits
+        # air0 is macOS/ARM64, win0 is Windows/X64. A leg naming the wrong OS label matches
+        # no runner and sits
         # queued forever with no error -- the same silent failure as a missing runner-group
         # grant. Interpolating the labels as scalars keeps this to the one expression form
         # already used below, rather than betting on an array-valued runs-on.
@@ -174,8 +181,8 @@ jobs:
           ${{ fromJSON(
           (github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
-          && '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"cs0","os":"Linux","arch":"X64"},{"name":"air0","os":"macOS","arch":"ARM64"}]'
-          || '[{"name":"wm","os":"Linux","arch":"X64"}]') }}
+          && '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"cs0","os":"Linux","arch":"X64"},{"name":"air0","os":"macOS","arch":"ARM64"},{"name":"win0","os":"Windows","arch":"X64"}]'
+          || '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"win0","os":"Windows","arch":"X64"}]') }}
     runs-on: [self-hosted, "${{ matrix.runner.os }}", "${{ matrix.runner.arch }}", "${{ matrix.runner.name }}"]
     env:
       BUILD_DIR: build-ci
@@ -204,38 +211,145 @@ jobs:
             echo "HOMEBREW_PREFIX=$HOMEBREW_PREFIX"
           } >> "$GITHUB_ENV"
 
-      - name: Resolve deps prefix
-        # Deliberately OUTSIDE the runner workspace: actions/checkout defaults to
-        # clean:true (git clean -ffdx), which would delete a workspace-local .deps every
-        # run -- rebuilding hsdaoh+raylib each merge, and worse, leaving the installed
-        # binary's RUNPATH pointing at a directory the next checkout deletes.
+      # Windows only. Git for Windows' system gitconfig sets core.autocrlf=true and the
+      # repo carries no .gitattributes, so actions/checkout leaves every .sh with CRLF
+      # endings, which MSYS2 bash cannot execute (`$'\r': command not found`). Re-check the
+      # tree out as LF, in the workspace only -- no runner-level git config to remember.
+      - name: Normalize line endings to LF
+        if: matrix.runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          git config core.autocrlf false
+          git rm -r --cached -q .
+          git reset --hard -q
+          test -z "$(git status --porcelain)"
+
+      - name: Resolve platform paths
+        # The deps prefix is deliberately OUTSIDE the runner workspace: actions/checkout
+        # defaults to clean:true (git clean -ffdx), which would delete a workspace-local
+        # .deps every run -- rebuilding hsdaoh+raylib each merge, and worse, leaving the
+        # installed binary's RUNPATH pointing at a directory the next checkout deletes.
         #
         # The path must still contain the literal ".deps/install": ci_guard_tests.py's
         # check_built_gui_links_vendored_hsdaoh asserts that substring in ldd output.
-        run: echo "MISRC_DEPS_PREFIX=$HOME/.cache/misrc/.deps/install" >> "$GITHUB_ENV"
+        #
+        # EXE and INSTALL_BIN let the shared steps below stay platform-neutral: the Windows
+        # binary is misrc_gui.exe and installs under %LOCALAPPDATA%\Programs\MISRC (the
+        # per-user application convention), the POSIX ones are bare names in ~/.local/bin.
+        # Git Bash (the default `bash` shell on a Windows runner) exposes $LOCALAPPDATA and
+        # cygpath, and the POSIX-form paths written here are usable by every later bash
+        # step, the MSYS2 ones included -- both mount drives as /c.
+        run: |
+          set -euo pipefail
+          {
+            echo "MISRC_DEPS_PREFIX=$HOME/.cache/misrc/.deps/install"
+            if [ "${{ matrix.runner.os }}" = "Windows" ]; then
+              echo "EXE=.exe"
+              echo "INSTALL_BIN=$(cygpath -u "$LOCALAPPDATA")/Programs/MISRC"
+              echo 'INSTALL_BIN_DISPLAY=%LOCALAPPDATA%\Programs\MISRC'
+            else
+              echo "EXE="
+              echo "INSTALL_BIN=$HOME/.local/bin"
+              echo "INSTALL_BIN_DISPLAY=~/.local/bin"
+            fi
+          } >> "$GITHUB_ENV"
 
       - name: Build vendored deps (hsdaoh + raylib)
+        if: matrix.runner.os != 'Windows'
         # Stamp-gated (build-deps-unix.sh:54) -- a warm cache exits immediately with
         # "deps already built (stamp matches)". Invoked via `bash` because the script is
         # tracked mode 100644, not 100755; scripts/build-local.sh:85 does the same.
         run: DEPS_PREFIX="$MISRC_DEPS_PREFIX" bash scripts/build-deps-unix.sh
 
       - name: Build misrc_gui + CLI tools
+        if: matrix.runner.os != 'Windows'
         run: bash scripts/build-local.sh --all
 
+      # ----------------------------------------------------------------------------
+      # Windows build -- win0 ONLY. Runs in the machine's own MSYS2 MINGW64 shell
+      # (C:\msys64, packages installed by hand once: see docs/gdh-selfhosted-ci.md), the
+      # same environment upstream build.yml's windows-exe job gets from setup-msys2. The
+      # shell line is the one setup-msys2 generates; MSYSTEM selects the MINGW64 prefix in
+      # /etc/profile and CHERE_INVOKING keeps the login shell in the workspace.
+      #
+      # scripts/build-deps-windows.sh mirrors the windows-exe deps block (static libuvc +
+      # hsdaoh + raylib, stamp-gated), and the meson lines are the windows-exe job's own.
+      # Not scripts/build-local.ps1: that entry point pip-installs meson/ninja into the
+      # runner user's profile, and CI does not mutate the machine.
+      # ----------------------------------------------------------------------------
+      - name: Build vendored deps (hsdaoh + libuvc + raylib, MSYS2)
+        if: matrix.runner.os == 'Windows'
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYSTEM: MINGW64
+          CHERE_INVOKING: '1'
+        run: DEPS_PREFIX="$MISRC_DEPS_PREFIX" bash scripts/build-deps-windows.sh
+
+      - name: Build misrc_gui + CLI tools (MSYS2)
+        if: matrix.runner.os == 'Windows'
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYSTEM: MINGW64
+          CHERE_INVOKING: '1'
+        run: |
+          export PKG_CONFIG_PATH="$MISRC_DEPS_PREFIX/lib/pkgconfig:$MISRC_DEPS_PREFIX/lib64/pkgconfig:${MINGW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export CMAKE_PREFIX_PATH="$MISRC_DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
+          export CC=gcc CXX=g++
+          pkg-config --modversion hsdaoh fftw3f flac
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release
+          meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
+
       - name: Guard tests
+        if: matrix.runner.os != 'Windows'
         # Full suite (not --static-only): cc, pkg-config and bash are present on wm, so the
         # runtime checks actually run instead of hard-failing.
         run: python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui"
 
+      - name: Guard tests (MSYS2)
+        if: matrix.runner.os == 'Windows'
+        # MSYS2's python and objdump, as in upstream's windows-exe job: the post-build
+        # hsdaoh check reads the import table with objdump on Windows, and the UI-scale
+        # runtime guard compiles with `cc`, which MINGW64 provides. The Linux/macOS-only
+        # runtime harnesses self-skip.
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYSTEM: MINGW64
+          CHERE_INVOKING: '1'
+        run: python misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui.exe"
+
+      - name: Static-link contract (MSYS2)
+        if: matrix.runner.os == 'Windows'
+        # Upstream's release assertions for the Windows EXE, so the fork cannot drift
+        # from them unnoticed: GUI subsystem, and an import table naming only system DLLs
+        # (anything else means a MinGW runtime or dependency DLL leaked into the link).
+        # The allowlist is build.yml's.
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYSTEM: MINGW64
+          CHERE_INVOKING: '1'
+        run: |
+          exe="$BUILD_DIR/misrc_gui.exe"
+          test "$(objdump -p "$exe" | awk '/^Subsystem[[:space:]]/ {print $2; exit}')" = "00000002"
+          while IFS= read -r dll; do
+            case "$(echo "$dll" | tr '[:lower:]' '[:upper:]')" in
+              API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL)
+                ;;
+              *)
+                echo "::error::non-system runtime DLL dependency in $exe: $dll"
+                exit 1
+                ;;
+            esac
+          done < <(objdump -p "$exe" | awk '/DLL Name:/ {print $3}')
+          echo "import table: system DLLs only; subsystem: GUI"
+
       - name: Smoke test
         # Headless -- the runner service has no DISPLAY, so the GUI is never opened.
-        run: "\"$BUILD_DIR/misrc_gui\" --smoke-test"
+        run: "\"$BUILD_DIR/misrc_gui$EXE\" --smoke-test"
 
       - name: Report build version
         run: |
           set -euo pipefail
-          version="$("$BUILD_DIR/misrc_gui" --version)"
+          version="$("$BUILD_DIR/misrc_gui$EXE" --version)"
           echo "Built version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
         id: built
@@ -246,6 +360,7 @@ jobs:
       # ----------------------------------------------------------------------------
       - name: Install binaries to ~/.local/bin
         if: >-
+          matrix.runner.os != 'Windows' &&
           github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
@@ -260,6 +375,70 @@ jobs:
             mv -f "$bin_dir/.$b.incoming" "$bin_dir/$b"
             echo "installed $bin_dir/$b"
           done
+
+      # ----------------------------------------------------------------------------
+      # Windows install -- win0 ONLY. %LOCALAPPDATA%\Programs\MISRC, the per-user
+      # application location, plus a Start Menu shortcut so the GUI is launchable from
+      # the Start menu and search; the shortcut takes its icon from the .exe, which
+      # embeds MISRC_Icon.ico through misrc_gui.rc.
+      #
+      # Windows will not let a running image be overwritten or deleted, but it will let
+      # it be renamed. So a live file is moved aside under a unique name before the new
+      # one takes its place, and the aside copies are swept on the next install -- an
+      # open GUI never blocks a deploy, and a reader never sees a half-written file.
+      # ----------------------------------------------------------------------------
+      - name: Install binaries to %LOCALAPPDATA%\Programs\MISRC
+        if: >-
+          matrix.runner.os == 'Windows' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          set -euo pipefail
+          bin_dir="$INSTALL_BIN"
+          mkdir -p "$bin_dir"
+          rm -f "$bin_dir"/.*.old.* 2>/dev/null || true
+          for b in misrc_gui misrc_capture misrc_extract; do
+            cp "$BUILD_DIR/$b.exe" "$bin_dir/.$b.exe.incoming"
+            if [ -f "$bin_dir/$b.exe" ]; then
+              mv -f "$bin_dir/$b.exe" "$bin_dir/.$b.exe.old.$$"
+            fi
+            mv -f "$bin_dir/.$b.exe.incoming" "$bin_dir/$b.exe"
+            rm -f "$bin_dir/.$b.exe.old.$$" 2>/dev/null || true
+            echo "installed $bin_dir/$b.exe"
+          done
+
+      - name: Install Start Menu shortcut
+        if: >-
+          matrix.runner.os == 'Windows' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\MISRC'
+          $exe = Join-Path $dir 'misrc_gui.exe'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+
+          # Rewritten idempotently, like the .desktop entry on wm.
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'MISRC GUI.lnk'
+          $shell = New-Object -ComObject WScript.Shell
+          $sc = $shell.CreateShortcut($lnk)
+          $sc.TargetPath = $exe
+          $sc.WorkingDirectory = $dir
+          $sc.IconLocation = "$exe,0"
+          $sc.Description = 'MISRC GUI (installed by CI from main)'
+          $sc.Save()
+          Write-Output "installed $lnk"
+
+          # The install dir on the user PATH, once, so misrc_capture/misrc_extract are
+          # callable from any new terminal. The .NET API, not setx: setx truncates PATH at
+          # 1024 characters.
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $parts = @($userPath -split ';' | Where-Object { $_ -ne '' })
+          if ($parts -notcontains $dir) {
+            [Environment]::SetEnvironmentVariable('Path', (($parts + $dir) -join ';'), 'User')
+            Write-Output "added $dir to the user PATH"
+          }
 
       # ----------------------------------------------------------------------------
       # Desktop integration -- wm ONLY.
@@ -551,19 +730,20 @@ jobs:
           BUILT_VERSION: ${{ steps.built.outputs.version }}
         run: |
           set -euo pipefail
-          installed="$("$HOME/.local/bin/misrc_gui" --version)"
+          gui="$INSTALL_BIN/misrc_gui$EXE"
+          installed="$("$gui" --version)"
           built="$BUILT_VERSION"
           if [ "$installed" != "$built" ]; then
             echo "::error::installed version ($installed) does not match built version ($built)"
             exit 1
           fi
-          "$HOME/.local/bin/misrc_gui" --smoke-test
+          "$gui" --smoke-test
           echo "Installed and verified: $installed"
           {
             echo "### Deployed to \`${{ matrix.runner.name }}\`"
             echo
             echo "- version: \`$installed\`"
-            echo "- binaries: \`misrc_gui\`, \`misrc_capture\`, \`misrc_extract\` in \`~/.local/bin\`"
+            echo "- binaries: \`misrc_gui$EXE\`, \`misrc_capture$EXE\`, \`misrc_extract$EXE\` in \`$INSTALL_BIN_DISPLAY\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # On macOS the bundle is the deliverable, so verify it independently of the
