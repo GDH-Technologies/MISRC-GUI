@@ -4227,8 +4227,6 @@ static void render_version_info_window(gui_app_t *app)
         {
             int mode = app->settings.net_mode;
             if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_CLIENT) mode = GUI_NET_MODE_LOCAL;
-            const char *mode_label = gui_net_mode_name(mode);
-            Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
             CLAY(CLAY_ID("VersionInfoNetModeRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -4236,19 +4234,25 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(CLAY_STRING("Mode:"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
-                CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
-                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-                    },
-                    .backgroundColor = to_clay_color(mode_bg),
-                    .cornerRadius = CLAY_CORNER_RADIUS(4)
-                }) {
-                    CLAY_TEXT(make_string(mode_label),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                // One button per mode with the current one lit: a direct pick
+                // (Local -> Client is one click), not a cycle.
+                for (int m = GUI_NET_MODE_LOCAL; m <= GUI_NET_MODE_CLIENT; m++) {
+                    bool cur = (m == mode);
+                    bool hot = Clay_PointerOver(CLAY_IDI("VersionInfoNetModeBtn", m));
+                    Color mode_bg = cur ? COLOR_BUTTON_ACTIVE : (hot ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
+                    const char *mode_label = gui_net_mode_name(m);
+                    CLAY(CLAY_IDI("VersionInfoNetModeBtn", m), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                        },
+                        .backgroundColor = to_clay_color(mode_bg),
+                        .cornerRadius = CLAY_CORNER_RADIUS(4)
+                    }) {
+                        CLAY_TEXT(make_string(mode_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cur ? COLOR_TEXT : COLOR_TEXT_DIM) }));
+                    }
                 }
-                CLAY_TEXT(CLAY_STRING("click to cycle Local / Server / Client"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
         }
 
@@ -8197,21 +8201,22 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Network (Server/Client) mode cycle: Local -> Server -> Client -> Local.
-            if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
+            // Network (Server/Client) mode: one button per mode, picked directly.
+            // Clicking the lit button is a no-op (no re-apply, no re-save).
+            for (int m = GUI_NET_MODE_LOCAL; m <= GUI_NET_MODE_CLIENT; m++) {
+                if (!Clay_PointerOver(CLAY_IDI("VersionInfoNetModeBtn", m))) continue;
                 int cur = app->settings.net_mode;
                 if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
-                int next = (cur == GUI_NET_MODE_LOCAL) ? GUI_NET_MODE_SERVER
-                         : (cur == GUI_NET_MODE_SERVER) ? GUI_NET_MODE_CLIENT
-                         : GUI_NET_MODE_LOCAL;
-                app->settings.net_mode = next;
-                gui_ui_clear_text_edit();
-                gui_settings_save(&app->settings);
-                (void)gui_net_apply_mode(app);
-                // Returning to Local restores the local hardware device list
-                // (client mode had replaced it with the server's mirrored list).
-                if (next == GUI_NET_MODE_LOCAL) {
-                    gui_app_enumerate_devices(app);
+                if (m != cur) {
+                    app->settings.net_mode = m;
+                    gui_ui_clear_text_edit();
+                    gui_settings_save(&app->settings);
+                    (void)gui_net_apply_mode(app);
+                    // Returning to Local restores the local hardware device list
+                    // (client mode had replaced it with the server's mirrored list).
+                    if (m == GUI_NET_MODE_LOCAL) {
+                        gui_app_enumerate_devices(app);
+                    }
                 }
                 gui_ui_set_click_consumed();
                 return;
