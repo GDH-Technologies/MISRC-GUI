@@ -695,6 +695,13 @@ static int server_listen_thread(void *arg) {
             if (atomic_load(&srv->stop_flag)) break;
             continue;
         }
+        /* BSD sockets (macOS) hand accept() the listener's O_NONBLOCK; Linux
+         * does not. The handler reads with a blocking recv() under
+         * SO_RCVTIMEO, so make the mode explicit: on macOS the first recv()
+         * otherwise returns EAGAIN before the request has arrived and the
+         * connection is closed unread, which the peer sees as a reset with no
+         * reply (1 in 200 requests idle, 13 of 35 under the e2e's load). */
+        net_set_blocking(cfd);
         net_client_conn_t *conn = (net_client_conn_t *)calloc(1, sizeof(*conn));
         server_client_ctx_t *c = (server_client_ctx_t *)malloc(sizeof(*c));
         if (!conn || !c) { net_close(cfd); free(conn); free(c); continue; }
