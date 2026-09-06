@@ -184,6 +184,14 @@ jobs:
           && '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"cs0","os":"Linux","arch":"X64"},{"name":"air0","os":"macOS","arch":"ARM64"},{"name":"win0","os":"Windows","arch":"X64"}]'
           || '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"win0","os":"Windows","arch":"X64"}]') }}
     runs-on: [self-hosted, "${{ matrix.runner.os }}", "${{ matrix.runner.arch }}", "${{ matrix.runner.name }}"]
+    # On a Windows runner the default shell for a plain `run:` step is pwsh, not bash --
+    # `set -euo pipefail` there is parsed as Set-Variable and the step dies. Pinning bash
+    # here makes every shared step run under Git for Windows' bash on win0, and is the
+    # interpreter the Linux/macOS legs already got. Steps that need something else
+    # (MSYS2, pwsh) say so explicitly.
+    defaults:
+      run:
+        shell: bash
     env:
       BUILD_DIR: build-ci
 
@@ -236,9 +244,10 @@ jobs:
         # EXE and INSTALL_BIN let the shared steps below stay platform-neutral: the Windows
         # binary is misrc_gui.exe and installs under %LOCALAPPDATA%\Programs\MISRC (the
         # per-user application convention), the POSIX ones are bare names in ~/.local/bin.
-        # Git Bash (the default `bash` shell on a Windows runner) exposes $LOCALAPPDATA and
-        # cygpath, and the POSIX-form paths written here are usable by every later bash
-        # step, the MSYS2 ones included -- both mount drives as /c.
+        # Git for Windows' bash (what `shell: bash` resolves to on a Windows runner)
+        # exposes $LOCALAPPDATA and cygpath, and the POSIX-form paths written here are
+        # usable by every later bash step, the MSYS2 ones included -- both mount drives
+        # as /c.
         run: |
           set -euo pipefail
           {

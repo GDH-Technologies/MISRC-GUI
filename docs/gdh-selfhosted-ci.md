@@ -171,9 +171,11 @@ pacman -Syu   # twice on a fresh install: the first pass upgrades the runtime an
 pacman -S --needed git mingw-w64-x86_64-{cmake,fftw,flac,gcc,libjpeg-turbo,libusb,libsoxr,meson,nasm,ninja,pkgconf,clang-tools-extra}
 ```
 
-Git for Windows must be installed (it is the `bash` a Windows runner uses for plain `run:`
-steps, and the `git` `actions/checkout` uses). Nothing needs to be on the user PATH: the
-MSYS2 steps get their PATH from `/etc/profile` via `MSYSTEM=MINGW64`.
+Git for Windows must be installed: `actions/checkout` uses its `git`, and its `bash` is what
+`shell: bash` resolves to on a Windows runner. The job pins `defaults.run.shell: bash`
+because a Windows runner's default for a plain `run:` step is **pwsh** -- the first run of
+the leg died on `set -euo pipefail` being parsed as `Set-Variable`. Nothing needs to be on
+the user PATH: the MSYS2 steps get their PATH from `/etc/profile` via `MSYSTEM=MINGW64`.
 
 The runner is in the `Default` runner group (visibility `all`), so like wm and air0 it
 needs no runner-group grant.
