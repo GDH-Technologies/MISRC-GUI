@@ -24,6 +24,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <errno.h>
+#include <signal.h>
 
 #ifndef MIRSC_TOOLS_VERSION
 #define MIRSC_TOOLS_VERSION "dev"
@@ -59,7 +60,6 @@
   #include <netdb.h>
   #include <unistd.h>
   #include <fcntl.h>
-  #include <signal.h>
   typedef int net_sock_t;
   #define NET_INVALID_SOCKET (-1)
   #define net_close(s) close(s)
