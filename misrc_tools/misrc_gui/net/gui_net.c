@@ -14,6 +14,7 @@
 #include "../core/gui_settings.h"
 #include "../output/gui_record.h"
 #include "../ui/gui_ui.h"
+#include "../ui/gui_popup.h"
 #include "gui_net_query.h"
 #include "version.h"
 
@@ -258,6 +259,7 @@ typedef struct {
     bool published_effective_misrc;
     char published_status[256];
     uint32_t published_status_seq;
+    char published_pending[512];    /* the overwrite prompt's text while it waits, else "" */
     uint64_t published_disk_free;
     bool published_once;            /* main thread only */
     double published_disk_time;     /* main thread only */
@@ -339,6 +341,7 @@ typedef struct {
     char peer_status[256];           /* under set_mtx */
     uint32_t peer_status_seq;
     bool peer_status_dirty;
+    char peer_pending_text[512];     /* under set_mtx: the server's overwrite prompt */
 } net_client_t;
 
 typedef struct {
@@ -519,10 +522,13 @@ static void server_publish(net_server_t *srv, gui_app_t *app) {
     bool eff = app->is_recording ? app->capture_mode_runtime_misrc : app->user_capture_mode_misrc;
     bool status_changed = strncmp(srv->published_status, app->status_message,
                                   sizeof(srv->published_status) - 1) != 0;
+    const char *pending = gui_record_pending_message();
+    bool pending_changed = strncmp(srv->published_pending, pending,
+                                   sizeof(srv->published_pending) - 1) != 0;
     double now = net_now_s();
     bool disk_due = (now - srv->published_disk_time) >= 1.0;
     if (srv->published_once && gen == srv->published_generation &&
-        eff == srv->published_effective_misrc && !status_changed && !disk_due) {
+        eff == srv->published_effective_misrc && !status_changed && !pending_changed && !disk_due) {
         return;
     }
     uint64_t disk_free = srv->published_disk_free;
@@ -540,6 +546,9 @@ static void server_publish(net_server_t *srv, gui_app_t *app) {
     if (status_changed || !srv->published_once) {
         snprintf(srv->published_status, sizeof(srv->published_status), "%s", app->status_message);
         srv->published_status_seq++;
+    }
+    if (pending_changed || !srv->published_once) {
+        snprintf(srv->published_pending, sizeof(srv->published_pending), "%s", pending);
     }
     srv->published_disk_free = disk_free;
     srv->published_once = true;
@@ -584,10 +593,12 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     bool rec_pending = gui_record_is_pending();
     bool rec_finalizing = gui_record_is_finalizing();
     char status_esc[600];
+    char pending_esc[1100];   /* 511 chars, every one possibly escaped */
     uint32_t status_seq, gen;
     uint64_t disk_free;
     net_mutex_lock(&srv->pub_mtx);
     gui_settings_json_escape(srv->published_status, status_esc, sizeof(status_esc));
+    gui_settings_json_escape(srv->published_pending, pending_esc, sizeof(pending_esc));
     status_seq = srv->published_status_seq;
     gen = srv->published_generation;
     disk_free = srv->published_disk_free;
@@ -600,7 +611,8 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
         "\"audio_frame_bytes\":%d,"
         "\"rec_elapsed_ms\":%llu,\"rec_bytes\":%llu,"
         "\"rec_raw_a\":%llu,\"rec_raw_b\":%llu,\"rec_comp_a\":%llu,\"rec_comp_b\":%llu,"
-        "\"rec_drops\":%u,\"disk_free\":%llu,\"rec_pending\":%s,\"rec_finalizing\":%s,"
+        "\"rec_drops\":%u,\"disk_free\":%llu,\"rec_pending\":%s,\"rec_pending_text\":\"%s\","
+        "\"rec_finalizing\":%s,"
         "\"status\":\"%s\",\"status_seq\":%u,\"generation\":%u}",
         state, (unsigned)sr, (unsigned long long)total,
         (unsigned)frames, (unsigned)errors, sel,
@@ -609,7 +621,7 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
         (unsigned long long)raw_a, (unsigned long long)raw_b,
         (unsigned long long)comp_a, (unsigned long long)comp_b,
         (unsigned)rec_drops, (unsigned long long)disk_free,
-        rec_pending ? "true" : "false", rec_finalizing ? "true" : "false",
+        rec_pending ? "true" : "false", pending_esc, rec_finalizing ? "true" : "false",
         status_esc, (unsigned)status_seq, (unsigned)gen);
 }
 
@@ -838,7 +850,7 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
         return;
     }
     if (strcmp(uri, "/stats") == 0) {
-        char json[2048];
+        char json[4096];
         server_build_stats(srv, app, json, sizeof(json));
         char hdr[160];
         snprintf(hdr, sizeof(hdr),
@@ -918,6 +930,20 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
         return;
     }
     if (strcmp(uri, "/record") == 0) {
+        int confirm = server_parse_arg(query, "confirm", -1);
+        if (confirm >= 0) {
+            /* A client answering the overwrite prompt it mirrors from
+             * rec_pending; resolved on the main thread like every command.
+             * Nothing pending -> harmless no-op. */
+            atomic_store(&app->net_cmd_record_confirm_value, confirm ? 1 : 0);
+            atomic_store(&app->net_cmd_record_confirm, true);
+            const char *cmsg = confirm ? "record overwrite confirmed\r\n" : "record overwrite cancelled\r\n";
+            char chdr[128];
+            snprintf(chdr, sizeof(chdr), "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n", strlen(cmsg));
+            net_send_str(fd, chdr);
+            net_send_str(fd, cmsg);
+            return;
+        }
         int on = server_parse_arg(query, "on", 1);
         if (on) atomic_store(&app->net_cmd_record_on, true);
         else atomic_store(&app->net_cmd_record_off, true);
@@ -1654,14 +1680,23 @@ static void client_apply_stats(net_client_t *cli, const char *stats) {
     atomic_store(&cli->peer_rec_comp_b, (uint_fast64_t)json_u64(stats, "rec_comp_b", 0));
     atomic_store(&cli->peer_disk_free, (uint_fast64_t)json_u64(stats, "disk_free", 0));
     atomic_store(&cli->peer_rec_drops, (uint_fast32_t)json_int(stats, "rec_drops", 0));
-    atomic_store(&cli->peer_rec_pending, json_bool(stats, "rec_pending", false));
+    bool pending = json_bool(stats, "rec_pending", false);
     atomic_store(&cli->peer_rec_finalizing, json_bool(stats, "rec_finalizing", false));
 
     char status[256];
+    char ptext[512];
     uint32_t sseq = (uint32_t)json_int(stats, "status_seq", 0);
     uint32_t gen = (uint32_t)json_int(stats, "generation", 0);
     bool stale = false;
     net_mutex_lock(&cli->set_mtx);
+    /* The prompt's text lands before the flag so the mirror never shows an
+     * empty dialog (an older server has no rec_pending_text: fallback text). */
+    if (pending && gui_settings_find_value(stats, "rec_pending_text", ptext, sizeof(ptext), true)) {
+        snprintf(cli->peer_pending_text, sizeof(cli->peer_pending_text), "%s", ptext);
+    } else {
+        cli->peer_pending_text[0] = '\0';
+    }
+    atomic_store(&cli->peer_rec_pending, pending);
     if (gui_settings_find_value(stats, "status", status, sizeof(status), true) &&
         sseq != cli->peer_status_seq) {
         snprintf(cli->peer_status, sizeof(cli->peer_status), "%s", status);
@@ -1824,7 +1859,7 @@ static int client_worker_thread(void *arg) {
     int miss_streak = 0;  /* consecutive /stats failures; tear down ingest only after several */
     bool first_contact = false;  /* fetch /devices + /settings immediately on first good /stats */
     while (!atomic_load(&cli->stop_flag)) {
-        char stats[4096];
+        char stats[8192];
         size_t blen = 0;
         if (client_get(cli->host, cli->port, "/stats", stats, sizeof(stats), &blen, NULL) != 0) {
             /* Transient failure: don't immediately tear down ingest. A single
@@ -1890,6 +1925,12 @@ static int client_worker_thread(void *arg) {
         }
         if (atomic_exchange(&app->net_cmd_record_off, false)) {
             (void)client_get(cli->host, cli->port, "/record?on=0", NULL, 0, NULL, NULL);
+        }
+        if (atomic_exchange(&app->net_cmd_record_confirm, false)) {
+            int v = atomic_load(&app->net_cmd_record_confirm_value);
+            char cpath[64];
+            snprintf(cpath, sizeof(cpath), "/record?confirm=%d", v ? 1 : 0);
+            (void)client_get(cli->host, cli->port, cpath, NULL, 0, NULL, NULL);
         }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
@@ -2277,6 +2318,16 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_app_stop_recording(app);
             }
         }
+        if (atomic_exchange(&app->net_cmd_record_confirm, false)) {
+            /* A client's answer to the overwrite prompt. The next
+             * gui_record_check_popup() (each GUI frame, or the headless
+             * loop) then starts or cancels exactly as a local click would. */
+            int v = atomic_load(&app->net_cmd_record_confirm_value);
+            if (gui_record_is_pending()) {
+                fprintf(stderr, "[NET] server: executing /record confirm=%d\n", v);
+                gui_record_resolve_pending(app, v != 0);
+            }
+        }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
             if (!app->is_capturing && n >= 0 && n < app->device_count) {
@@ -2324,6 +2375,51 @@ void gui_net_poll_commands(gui_app_t *app) {
      * must NOT execute them locally. Nothing to do here for client. */
 }
 
+/* The server's overwrite prompt, shown on the client too. While the
+ * server's record start waits on "Overwrite Files?", /stats carries
+ * rec_pending plus the prompt's text; this raises the same confirm dialog
+ * here and forwards the answer as /record?confirm=N. Whichever side answers
+ * first wins: once the server's rec_pending drops, a copy still open here is
+ * dismissed without answering. Main thread only. */
+static bool s_client_prompt_open = false;      /* our copy of the dialog is up */
+static bool s_client_prompt_answered = false;  /* answered here; wait for the server to clear */
+
+static void client_mirror_overwrite_prompt(gui_app_t *app, net_client_t *cli) {
+    bool pending = atomic_load(&cli->connected) && atomic_load(&cli->peer_rec_pending);
+    if (!pending) {
+        s_client_prompt_answered = false;
+        if (s_client_prompt_open) {
+            s_client_prompt_open = false;
+            if (gui_popup_is_open()) gui_popup_dismiss();
+        }
+        return;
+    }
+    if (s_client_prompt_answered) return;
+    if (!s_client_prompt_open) {
+        if (gui_popup_is_open()) return;       /* another dialog first; retry next frame */
+        char text[512];
+        net_mutex_lock(&cli->set_mtx);
+        snprintf(text, sizeof(text), "%s", cli->peer_pending_text);
+        net_mutex_unlock(&cli->set_mtx);
+        if (!text[0]) {
+            snprintf(text, sizeof(text),
+                     "The server's output files already exist.\n\nOverwrite them on the server?");
+        }
+        gui_popup_confirm("Overwrite Files? (on the server)", text, "Overwrite", "Cancel", NULL);
+        s_client_prompt_open = true;
+        return;
+    }
+    popup_result_t r = gui_popup_get_result();
+    if (r == POPUP_RESULT_NONE) return;
+    s_client_prompt_open = false;
+    s_client_prompt_answered = true;
+    bool yes = (r == POPUP_RESULT_YES);
+    atomic_store(&app->net_cmd_record_confirm_value, yes ? 1 : 0);
+    atomic_store(&app->net_cmd_record_confirm, true);
+    gui_net_set_status(app, yes ? "Overwrite confirmed, sent to the server"
+                                : "Overwrite cancelled, sent to the server");
+}
+
 void gui_net_poll_mirror(gui_app_t *app) {
     if (!app) return;
     if (s_client) {
@@ -2356,6 +2452,7 @@ void gui_net_poll_mirror(gui_app_t *app) {
         client_apply_snapshot(app, s_client);
         client_apply_set_results(app, s_client);
         client_expire_pending();
+        client_mirror_overwrite_prompt(app, s_client);
 
         /* The pipeline follows the server's effective mode and wiring flag,
          * never a settings field (the view swap may be replacing those). */
@@ -2789,6 +2886,7 @@ int gui_net_serve_main(int seconds) {
         while (!s_headless_stop && (deadline_ms == 0 || get_time_ms() < deadline_ms)) {
             gui_net_poll_commands(app);
             gui_net_poll_mirror(app);
+            gui_record_check_popup(app);   /* a client's /record?confirm= answer lands here */
             thrd_sleep_ms(20);
         }
         if (app->is_recording) gui_app_stop_recording(app);

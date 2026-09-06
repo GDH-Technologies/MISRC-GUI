@@ -22,7 +22,14 @@
  *                              per-key rule); 422 invalid value; 503 no answer in 1 s
  *   GET /start              -> request capture start (server executes on main thread)
  *   GET /stop               -> request capture stop
- *   GET /record?on=1|0      -> request recording on/off
+ *   GET /record?on=1|0      -> request recording on/off. When the start hits
+ *                              existing files, the server's "Overwrite Files?"
+ *                              prompt waits: /stats shows rec_pending with the
+ *                              prompt's text in rec_pending_text, and a client
+ *                              mirrors the dialog.
+ *   GET /record?confirm=1|0 -> answer that prompt (overwrite / cancel), resolved
+ *                              on the server's main thread; a no-op when nothing
+ *                              is pending
  *   GET /device?N           -> request device selection N
  *   GET /rf                 -> chunked raw RF stream (tapped from BUF_CAPTURE_RF writes)
  *   GET /baseband           -> chunked raw audio stream (tapped from BUF_CAPTURE_AUDIO writes)

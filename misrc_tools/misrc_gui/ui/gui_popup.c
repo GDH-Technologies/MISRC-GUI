@@ -108,6 +108,19 @@ void gui_popup_dismiss(void)
     }
 }
 
+void gui_popup_resolve(popup_result_t result)
+{
+    if (result == POPUP_RESULT_NONE) return;
+    if (s_popup.type != POPUP_TYPE_NONE && s_popup.result == POPUP_RESULT_NONE) {
+        s_popup.result = result;
+    }
+}
+
+const char *gui_popup_message(void)
+{
+    return gui_popup_is_open() ? s_popup.message : "";
+}
+
 //-----------------------------------------------------------------------------
 // Rendering
 //-----------------------------------------------------------------------------

@@ -1204,8 +1204,10 @@ def check_net_settings_protocol(repo_root: Path) -> int:
     HTTP handler validates, queues and waits), the HTTP threads read
     published copies, the client worker never writes app->settings, a client
     never persists a server value, /stats carries the recording relay, the
-    extraction reads the main-thread swap flag, and the two headless modes
-    exist and return before InitWindow."""
+    extraction reads the main-thread swap flag, the two headless modes
+    exist and return before InitWindow, and the overwrite prompt travels
+    both ways (/stats publishes its text, the client mirrors the dialog and
+    answers with /record?confirm=N, resolved on the server's main thread)."""
     net_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/net/gui_net.c"))
 
     def body_of(name: str, src: str, pattern: str = None) -> str:
@@ -1219,6 +1221,14 @@ def check_net_settings_protocol(repo_root: Path) -> int:
     for uri in ("/settings", "/set"):
         if f'strcmp(uri, "{uri}") == 0' not in dispatch:
             return fail(f"gui_net.c: server_handle_request() does not dispatch {uri}")
+    rec = dispatch.find('strcmp(uri, "/record") == 0')
+    on = dispatch.find('server_parse_arg(query, "on"', rec)
+    conf = dispatch.find('server_parse_arg(query, "confirm"', rec)
+    if rec < 0 or conf < 0 or on < 0 or conf > on:
+        return fail("gui_net.c: /record must parse confirm= before on= (on= defaults to 1 when "
+                    "absent, so a confirm query parsed second would start a recording)")
+    if "net_cmd_record_confirm" not in dispatch[rec:on]:
+        return fail("gui_net.c: /record?confirm= must only raise net_cmd_record_confirm for the main thread")
 
     setter = body_of("server_handle_set", net_c)
     if not setter:
@@ -1239,14 +1249,23 @@ def check_net_settings_protocol(repo_root: Path) -> int:
     if "gui_ui_apply_remote_setting(" not in commands or "server_publish(" not in commands:
         return fail("gui_net.c: gui_net_poll_commands() must apply queued /set requests through "
                     "gui_ui_apply_remote_setting() and publish the settings for the HTTP threads")
+    if "net_cmd_record_confirm" not in commands or "gui_record_resolve_pending(" not in commands:
+        return fail("gui_net.c: gui_net_poll_commands() must resolve a client's /record?confirm= answer "
+                    "through gui_record_resolve_pending() on the main thread")
 
     stats = body_of("server_build_stats", net_c)
     for key in ("rec_elapsed_ms", "rec_bytes", "rec_raw_a", "rec_comp_b", "rec_drops",
-                "disk_free", "rec_pending", "rec_finalizing", "status", "status_seq", "generation"):
+                "disk_free", "rec_pending", "rec_pending_text", "rec_finalizing", "status",
+                "status_seq", "generation"):
         if f'\\"{key}\\"' not in stats:
             return fail(f"gui_net.c: /stats no longer carries {key}")
     if "published_status" not in stats or "gui_settings_json_escape(" not in stats:
         return fail("gui_net.c: /stats must relay the published (escaped) status line")
+    if "published_pending" not in stats:
+        return fail("gui_net.c: /stats must relay the published overwrite-prompt text, not read the record module")
+    publish = body_of("server_publish", net_c)
+    if "gui_record_pending_message(" not in publish or "published_pending" not in publish:
+        return fail("gui_net.c: server_publish() must copy gui_record_pending_message() for the HTTP threads")
 
     a = net_c.find("static void client_apply_stats(")
     b = net_c.find("static int client_discovery_thread(")
@@ -1261,6 +1280,8 @@ def check_net_settings_protocol(repo_root: Path) -> int:
         return fail("gui_net.c: the client worker saves settings")
     if 'client_get(cli->host, cli->port, "/settings"' not in worker:
         return fail("gui_net.c: the client worker does not poll /settings")
+    if '"/record?confirm=%d"' not in worker or "rec_pending_text" not in worker:
+        return fail("gui_net.c: the client worker must forward /record?confirm= and parse rec_pending_text")
 
     mirror = body_of("gui_net_poll_mirror", net_c)
     if "gui_settings_save(" in mirror:
@@ -1269,6 +1290,18 @@ def check_net_settings_protocol(repo_root: Path) -> int:
         return fail("gui_net.c: gui_net_poll_mirror() must wire net_peer_state and net_peer_status")
     if re.search(r"app->status_message\s*[\[=]", mirror) or "gui_app_set_status(" in mirror:
         return fail("gui_net.c: gui_net_poll_mirror() writes the bottom status bar; the relay goes to net_peer_status")
+    if "client_mirror_overwrite_prompt(" not in mirror:
+        return fail("gui_net.c: gui_net_poll_mirror() must mirror the server's overwrite prompt")
+    prompt = body_of("client_mirror_overwrite_prompt", net_c)
+    for needed in ("peer_rec_pending", "gui_popup_confirm(", "gui_popup_get_result(", "gui_popup_dismiss(",
+                   "net_cmd_record_confirm_value", "net_cmd_record_confirm,"):
+        if needed not in prompt:
+            return fail(f"gui_net.c: client_mirror_overwrite_prompt() must use {needed}")
+    if "gui_record_" in prompt:
+        return fail("gui_net.c: the client's prompt mirror must not touch the local record module")
+    serve = body_of("gui_net_serve_main", net_c)
+    if "gui_record_check_popup(" not in serve:
+        return fail("gui_net.c: the --net-serve loop must call gui_record_check_popup() or a confirm never resolves")
     if re.search(r"app->is_recording\s*=", net_c):
         return fail("gui_net.c sets is_recording; a client must never (gui_app_effective_recording is the readout)")
 

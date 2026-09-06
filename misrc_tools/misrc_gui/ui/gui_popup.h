@@ -80,6 +80,17 @@ void *gui_popup_get_user_data(void);
  */
 void gui_popup_dismiss(void);
 
+/* Close an open popup with a given result, as if the matching button had
+ * been clicked. For answers that arrive from somewhere other than this
+ * window: a net client answering the server's overwrite prompt, or the
+ * server answering so the client's copy of the prompt closes. No-op when no
+ * popup is open.
+ */
+void gui_popup_resolve(popup_result_t result);
+
+/* The message of the open popup, or "" when none is open. */
+const char *gui_popup_message(void);
+
 //-----------------------------------------------------------------------------
 // Integration Functions (called by gui_ui.c)
 //-----------------------------------------------------------------------------
