@@ -219,6 +219,30 @@ jobs:
             echo "HOMEBREW_PREFIX=$HOMEBREW_PREFIX"
           } >> "$GITHUB_ENV"
 
+      # Windows only, and FIRST. The runner service's PATH carries Git for Windows' cmd\
+      # directory (which is how actions/checkout finds git.exe) but not its bin\, where
+      # bash.exe lives, so `shell: bash` failed with `bash: command not found`. The runner
+      # consults GITHUB_PATH when it resolves a step's shell, so appending bin\ here is
+      # enough for every later bash step -- and it stays inside the workflow instead of
+      # becoming a machine setting nobody remembers. Runs in pwsh, which every Windows
+      # runner has.
+      - name: Expose Git for Windows bash
+        if: matrix.runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Get-ItemProperty 'HKLM:\SOFTWARE\GitForWindows' -ErrorAction SilentlyContinue).InstallPath
+          if (-not $root) {
+            # No registry key (portable install): walk up from git.exe until bin\bash.exe appears.
+            $dir = Split-Path -Parent (Get-Command git.exe).Source
+            while ($dir -and -not (Test-Path (Join-Path $dir 'bin\bash.exe'))) { $dir = Split-Path -Parent $dir }
+            $root = $dir
+          }
+          $bash = Join-Path $root 'bin\bash.exe'
+          if (-not (Test-Path $bash)) { throw "Git for Windows bash not found (root='$root')" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path -Parent $bash)
+          Write-Output "bash: $bash"
+
       # Windows only. Git for Windows' system gitconfig sets core.autocrlf=true and the
       # repo carries no .gitattributes, so actions/checkout leaves every .sh with CRLF
       # endings, which MSYS2 bash cannot execute (`$'\r': command not found`). Re-check the
