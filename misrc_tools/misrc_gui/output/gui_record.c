@@ -1731,14 +1731,30 @@ static bool gui_record_flac_append_comment(FLAC__StreamMetadata *block,
     return true;
 }
 
-static void gui_record_embed_flac_duration_metadata(gui_app_t *app,
-                                                    const char *path,
-                                                    const char *channel_label,
-                                                    uint64_t total_samples,
-                                                    uint32_t sample_rate_hz)
+/* Finalize FLAC metadata in a single in-place pass using the simple iterator.
+ *
+ * Two updates are needed after encoding finishes:
+ *   1. STREAMINFO.total_samples / sample_rate — the encoder writes raw Hz-domain
+ *      sample counts but the RF FLAC stores sample_rate in kHz (40 MHz exceeds
+ *      FLAC's 20-bit Hz field), so total_samples must be scaled to the kHz
+ *      domain for the file's reported duration to match real time.
+ *   2. Vorbis comment duration tags (DURATION_SECONDS, LENGTH, RF_TOTAL_SAMPLES,
+ *      RF_SAMPLE_RATE, RF_SAMPLE_RATE_KHZ) for post-processing tools.
+ *
+ * Both are done in place with the simple iterator: STREAMINFO is a fixed-size
+ * block so set_block writes it without a temp file; the Vorbis comment entries
+ * are appended to the existing VC block (created by the encoder with adjacent
+ * padding), so set_block with use_padding=true grows it by consuming padding —
+ * also in place. This replaces the old chain-write path which rewrote the
+ * entire multi-GB FLAC file to a temp copy for every metadata change. */
+static void gui_record_finalize_flac_metadata(gui_app_t *app,
+                                              const char *path,
+                                              const char *channel_label,
+                                              uint64_t total_samples,
+                                              uint32_t sample_rate_hz)
 {
     if (!path || !path[0] || total_samples == 0 || sample_rate_hz == 0) return;
-    uint64_t rf_sample_rate_hz = (uint64_t)sample_rate_hz * 1000ULL; // RF FLAC stores kHz in STREAMINFO.sample_rate
+    uint64_t rf_sample_rate_hz = (uint64_t)sample_rate_hz * 1000ULL;
     double duration_seconds = (double)total_samples / (double)rf_sample_rate_hz;
     if (duration_seconds < 0.0) duration_seconds = 0.0;
     uint64_t length_ms = (uint64_t)llround(duration_seconds * 1000.0);
@@ -1754,11 +1770,19 @@ static void gui_record_embed_flac_duration_metadata(gui_app_t *app,
     snprintf(sample_rate_str, sizeof(sample_rate_str), "%" PRIu64, rf_sample_rate_hz);
     snprintf(sample_rate_khz_str, sizeof(sample_rate_khz_str), "%u", sample_rate_hz);
 
+    // STREAMINFO total_samples in the kHz-scaled domain.
+    FLAC__uint64 duration_total_samples = (total_samples + 500ULL) / 1000ULL;
+    if (duration_total_samples == 0 && total_samples > 0) duration_total_samples = 1;
+    FLAC__uint64 max_total_samples = ((FLAC__uint64)1 << 36) - 1;
+    FLAC__uint64 clamped_total = (duration_total_samples > max_total_samples)
+                                   ? max_total_samples
+                                   : duration_total_samples;
+
     FLAC__Metadata_SimpleIterator *it = FLAC__metadata_simple_iterator_new();
     if (!it) {
         if (app) {
             gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC metadata iterator for duration tagging",
+                "Failed to allocate FLAC metadata iterator for finalize",
                 GUI_ERROR_CLASS_NONE, 0);
         }
         return;
@@ -1775,114 +1799,22 @@ static void gui_record_embed_flac_duration_metadata(gui_app_t *app,
         return;
     }
 
-    FLAC__StreamMetadata *block = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    if (!block) {
-        if (app) {
-            gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC Vorbis comment block for duration tagging",
-                GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_simple_iterator_delete(it);
-        return;
-    }
-
-    bool ok =
-        gui_record_flac_append_comment(block, "DURATION_SECONDS", duration_seconds_str) &&
-        gui_record_flac_append_comment(block, "LENGTH", length_ms_str) &&
-        gui_record_flac_append_comment(block, "RF_TOTAL_SAMPLES", total_samples_str) &&
-        gui_record_flac_append_comment(block, "RF_SAMPLE_RATE", sample_rate_str) &&
-        gui_record_flac_append_comment(block, "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str);
-    if (!ok) {
-        if (app) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "Failed building FLAC duration metadata for %s (%s)",
-                     channel_label ? channel_label : "RF", path);
-            gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_object_delete(block);
-        FLAC__metadata_simple_iterator_delete(it);
-        return;
-    }
-
-    // Iterator starts at STREAMINFO; insert the duration comment block directly after it.
-    if (!FLAC__metadata_simple_iterator_insert_block_after(it, block, /*use_padding=*/true)) {
-        if (app) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "Failed writing FLAC duration metadata for %s (%s)",
-                     channel_label ? channel_label : "RF", path);
-            gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_object_delete(block);
-    }
-
-    FLAC__metadata_simple_iterator_delete(it);
-}
-
-static void gui_record_update_flac_streaminfo_duration(gui_app_t *app,
-                                                       const char *path,
-                                                       const char *channel_label,
-                                                       uint64_t total_samples,
-                                                       uint32_t sample_rate_hz)
-{
-    if (!path || !path[0] || total_samples == 0 || sample_rate_hz == 0) return;
-
-    FLAC__Metadata_Chain *chain = FLAC__metadata_chain_new();
-    if (!chain) {
-        if (app) {
-            gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC metadata chain for STREAMINFO update",
-                GUI_ERROR_CLASS_NONE, 0);
-        }
-        return;
-    }
-
-    if (!FLAC__metadata_chain_read(chain, path)) {
-        if (app) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "Failed to read FLAC metadata chain for %s (%s)",
-                     channel_label ? channel_label : "RF", path);
-            gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_chain_delete(chain);
-        return;
-    }
-
-    FLAC__Metadata_Iterator *iter = FLAC__metadata_iterator_new();
-    if (!iter) {
-        if (app) {
-            gui_record_log_capture_event(app, "WARN",
-                "Failed to allocate FLAC metadata iterator for STREAMINFO update",
-                GUI_ERROR_CLASS_NONE, 0);
-        }
-        FLAC__metadata_chain_delete(chain);
-        return;
-    }
-    FLAC__metadata_iterator_init(iter, chain);
-    FLAC__StreamMetadata *block = FLAC__metadata_iterator_get_block(iter);
-    if (!block || block->type != FLAC__METADATA_TYPE_STREAMINFO) {
+    /* 1. Update STREAMINFO (first block, fixed 34-byte size → in-place write). */
+    FLAC__StreamMetadata *si_block = FLAC__metadata_simple_iterator_get_block(it);
+    if (!si_block || si_block->type != FLAC__METADATA_TYPE_STREAMINFO) {
         if (app) {
             char msg[512];
             snprintf(msg, sizeof(msg), "STREAMINFO block not found for %s (%s)",
                      channel_label ? channel_label : "RF", path);
             gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
         }
-        FLAC__metadata_iterator_delete(iter);
-        FLAC__metadata_chain_delete(chain);
+        if (si_block) FLAC__metadata_object_delete(si_block);
+        FLAC__metadata_simple_iterator_delete(it);
         return;
     }
-
-    // RF sample_rate is stored in kHz in STREAMINFO; to make header duration reflect real time,
-    // STREAMINFO.total_samples must be expressed in the same scaled domain.
-    FLAC__uint64 duration_total_samples = (total_samples + 500ULL) / 1000ULL; // rounded from Hz-domain samples
-    if (duration_total_samples == 0 && total_samples > 0) duration_total_samples = 1;
-    FLAC__uint64 max_total_samples = ((FLAC__uint64)1 << 36) - 1;
-    FLAC__uint64 clamped_total = (duration_total_samples > max_total_samples)
-                                   ? max_total_samples
-                                   : duration_total_samples;
-    block->data.stream_info.total_samples = clamped_total;
-    block->data.stream_info.sample_rate = sample_rate_hz;
-
-    if (!FLAC__metadata_chain_write(chain, /*use_padding=*/true, /*preserve_file_stats=*/true)) {
+    si_block->data.stream_info.total_samples = clamped_total;
+    si_block->data.stream_info.sample_rate = sample_rate_hz;
+    if (!FLAC__metadata_simple_iterator_set_block(it, si_block, /*use_padding=*/false)) {
         if (app) {
             char msg[512];
             snprintf(msg, sizeof(msg), "Failed to write STREAMINFO duration for %s (%s)",
@@ -1890,9 +1822,56 @@ static void gui_record_update_flac_streaminfo_duration(gui_app_t *app,
             gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
         }
     }
+    FLAC__metadata_object_delete(si_block);
 
-    FLAC__metadata_iterator_delete(iter);
-    FLAC__metadata_chain_delete(chain);
+    /* 2. Find the existing Vorbis comment block and append duration tags.
+    *    The encoder creates a VC block (with adjacent padding when the writer
+    *    is configured for it), so set_block with use_padding=true can grow it
+    *    in place by consuming the adjacent padding — no temp file. */
+    bool vc_updated = false;
+    while (FLAC__metadata_simple_iterator_next(it)) {
+        FLAC__StreamMetadata *vc_block = FLAC__metadata_simple_iterator_get_block(it);
+        if (!vc_block) continue;
+        if (vc_block->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+            bool ok =
+                gui_record_flac_append_comment(vc_block, "DURATION_SECONDS", duration_seconds_str) &&
+                gui_record_flac_append_comment(vc_block, "LENGTH", length_ms_str) &&
+                gui_record_flac_append_comment(vc_block, "RF_TOTAL_SAMPLES", total_samples_str) &&
+                gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE", sample_rate_str) &&
+                gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str);
+            if (ok) {
+                if (!FLAC__metadata_simple_iterator_set_block(it, vc_block, /*use_padding=*/true)) {
+                    if (app) {
+                        char msg[512];
+                        snprintf(msg, sizeof(msg), "Failed writing FLAC duration tags for %s (%s)",
+                                 channel_label ? channel_label : "RF", path);
+                        gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
+                    }
+                } else {
+                    vc_updated = true;
+                }
+            } else {
+                if (app) {
+                    char msg[512];
+                    snprintf(msg, sizeof(msg), "Failed building FLAC duration tags for %s (%s)",
+                             channel_label ? channel_label : "RF", path);
+                    gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
+                }
+            }
+            FLAC__metadata_object_delete(vc_block);
+            break;
+        }
+        FLAC__metadata_object_delete(vc_block);
+    }
+
+    if (!vc_updated && app) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Vorbis comment block not found for %s (%s) — duration tags not embedded",
+                 channel_label ? channel_label : "RF", path);
+        gui_record_log_capture_event(app, "WARN", msg, GUI_ERROR_CLASS_NONE, 0);
+    }
+
+    FLAC__metadata_simple_iterator_delete(it);
 }
 #endif
 
@@ -2879,19 +2858,17 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     }
 
 #if LIBFLAC_ENABLED == 1
-    // Embed finalized duration metadata in RF FLAC files for easier post handling.
+    // Finalize RF FLAC metadata in a single in-place pass: STREAMINFO duration
+    // (kHz-scaled total_samples) + Vorbis comment duration tags. Both are
+    // written in place via the simple iterator — no full-file temp copy.
     if (app->settings.use_flac) {
         if (app->settings.capture_a && s_record_path_a[0]) {
-            gui_record_update_flac_streaminfo_duration(app, s_record_path_a, "CH A",
-                                                       flac_samples_a, s_record_sample_rate_a);
-            gui_record_embed_flac_duration_metadata(app, s_record_path_a, "CH A",
-                                                    flac_samples_a, s_record_sample_rate_a);
+            gui_record_finalize_flac_metadata(app, s_record_path_a, "CH A",
+                                              flac_samples_a, s_record_sample_rate_a);
         }
         if (app->settings.capture_b && s_record_path_b[0]) {
-            gui_record_update_flac_streaminfo_duration(app, s_record_path_b, "CH B",
-                                                       flac_samples_b, s_record_sample_rate_b);
-            gui_record_embed_flac_duration_metadata(app, s_record_path_b, "CH B",
-                                                    flac_samples_b, s_record_sample_rate_b);
+            gui_record_finalize_flac_metadata(app, s_record_path_b, "CH B",
+                                              flac_samples_b, s_record_sample_rate_b);
         }
     }
 #endif
