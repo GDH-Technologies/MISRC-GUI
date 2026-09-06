@@ -31,8 +31,18 @@ python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/m
 build-local/misrc_gui --rtsp-soak          # capture-path acceptance: RF throughput stream-off vs stream-on
 ```
 
-In a worktree the `WorktreeCreate` hook symlinks `.deps` from the main checkout, so the same
-commands work. Without the symlink:
+Windows host (MSYS2 MINGW64 at `C:\msys64`, packages per `build.yml`'s `windows-exe` job):
+`pwsh -File scripts/build-local.ps1 [-All] [-Clean]` builds `.deps/install` via
+`scripts/build-deps-windows.sh` and then `build-local/misrc_gui.exe`, running `--smoke-test`
+itself; guards are `python misrc_tools/test/ci_guard_tests.py --static-only` and
+`--post-build --gui-path build-local/misrc_gui.exe`. The clone must have
+`git config core.autocrlf false` (Git for Windows' system default is `true`, which checks out
+every `.sh` as CRLF and breaks it under MSYS2 bash). Streaming, V4L2 preview, video record and
+mediamtx are compiled-out stubs on Windows, so the `--rtsp-*`, `--preview-*`, `--video-*` and
+`--mediamtx-test` modes prove nothing there.
+
+In a worktree the `WorktreeCreate` hook symlinks `.deps` from the main checkout (a directory
+junction on Windows), so the same commands work. Without the symlink:
 `PKG_CONFIG_PATH=/home/rdodge/Repos/MISRC-GUI/.deps/install/lib/pkgconfig meson setup <scratch> misrc_tools`.
 Meson then warns it "fell back to system hsdaoh" — that is its literal `.deps/install`-under-
 source check; the vendored library is what links.
@@ -157,5 +167,6 @@ provenance footers and warn on Actions outages; never hand-write either.
 
 `meson`, `ninja`, `pkg-config`, `gcc`, `python3`, `ffmpeg`, `ffprobe`, `v4l2-ctl`,
 `arecord`/`amixer`, `mediamtx` (bundled into the AppImage by `scripts/fetch-mediamtx.sh`; on
-PATH for macOS/Windows), `clangd` (the `clangd-lsp` plugin; the root `.clangd` points it at
-`build-local/compile_commands.json`, so build once before expecting diagnostics).
+PATH for macOS; not used on Windows, where `gui_mediamtx.c` is compiled out), `clangd` (the
+`clangd-lsp` plugin; the root `.clangd` points it at `build-local/compile_commands.json`, so
+build once before expecting diagnostics).
