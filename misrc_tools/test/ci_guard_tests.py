@@ -935,6 +935,187 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
     return 0
 
 
+# Every key the hand-written settings writer emitted at v1.1.8, before the
+# descriptor table replaced it. The table may add keys (an old build ignores
+# what it does not know) but must never rename or drop one: a file written by
+# the new build has to load in the previous one, or a rollback loses settings.
+SETTINGS_KEYS_V1_1_8 = (
+    "device_index", "output_path", "auto_names_enabled", "output_base_name",
+    "append_timestamp_on_capture_start", "rf_bits_a", "rf_bits_b", "cxadc_tenbit_mode_a",
+    "cxadc_tenbit_mode_b", "rf_tag_a", "rf_tag_b", "output_filename_a", "output_filename_b",
+    "capture_a", "capture_b", "sample_count", "capture_time", "overwrite_files", "aux_filename",
+    "raw_filename", "audio_4ch_filename", "audio_2ch_12_filename", "audio_2ch_34_filename",
+    "audio_1ch_1_filename", "audio_1ch_2_filename", "audio_1ch_3_filename",
+    "audio_1ch_4_filename", "audio_1ch_1_label", "audio_1ch_2_label", "audio_1ch_3_label",
+    "audio_1ch_4_label", "audio_tag_4ch", "audio_tag_2ch_12", "audio_tag_2ch_34",
+    "enable_audio_4ch", "enable_audio_2ch_12", "enable_audio_2ch_34", "audio_monitor_playback",
+    "audio_monitor_ch34", "misrc_mode", "misrc_v15_v25_ab_swap", "stop_on_dropout",
+    "level_autostop_enabled", "level_autostop_level_str", "level_autostop_duration_str",
+    "ingest_project", "ingest_tape_id", "ingest_tape_format", "ingest_tape_size",
+    "ingest_tape_speed", "ingest_tape_condition", "ingest_operator", "ingest_location",
+    "ingest_notes", "enable_audio_1ch_1", "enable_audio_1ch_2", "enable_audio_1ch_3",
+    "enable_audio_1ch_4", "pad_lower_bits", "show_peak_levels", "suppress_clip_a",
+    "suppress_clip_b", "reduce_8bit_a", "reduce_8bit_b", "enable_resample_a",
+    "enable_resample_b", "resample_rate_a", "resample_rate_b", "resample_quality_a",
+    "resample_quality_b", "resample_gain_a", "resample_gain_b", "ddd_decimation", "use_flac",
+    "flac_12bit", "flac_level", "flac_verification", "flac_threads", "flac_affinity_enabled",
+    "flac_affinity_cpu_list", "show_grid", "time_scale", "amplitude_scale", "ui_scale_percent",
+    "discover_simple_capture", "show_core_pinning_in_settings", "memory_budget_gb",
+    "update_last_check_unix_s", "update_last_release_tag", "update_available_cached",
+    "rtlsdr_freq_hz", "rtlsdr_gain_mode", "rtlsdr_gain_tenths_db", "rtlsdr_sample_rate_hz",
+    "rtlsdr_agc", "rtlsdr_offset_corr", "demod_mode", "demod_bandwidth_hz", "demod_squelch",
+    "demod_volume", "demod_output_pair", "net_mode", "net_server_port", "net_server_port_str",
+    "net_client_host", "net_client_port", "net_client_port_str", "playback_file_a",
+    "playback_file_b",
+)
+
+# Fields that describe the machine running this GUI rather than the capture,
+# so a net client keeps its own and never sends them to a server.
+SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
+    "audio_monitor_playback", "audio_monitor_ch34", "show_grid", "time_scale", "amplitude_scale",
+    "ui_scale_percent", "show_core_pinning_in_settings", "memory_budget_gb",
+    "update_last_check_unix_s", "update_last_release_tag", "update_available_cached",
+    "demod_mode", "demod_bandwidth_hz", "demod_squelch", "demod_volume", "demod_output_pair",
+    "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
+    "net_client_port_str", "playback_file_a", "playback_file_b",
+))
+
+# Struct fields deliberately not persisted (the duration limits are forced to
+# 0 on every load; the feature left the UI).
+SETTINGS_UNPERSISTED_FIELDS = frozenset(("capture_limit_seconds", "record_limit_seconds"))
+
+
+def check_settings_table_covers_struct(repo_root: Path) -> int:
+    """gui_settings_t is written, read, published and set through the one
+    descriptor table in gui_settings_table.c. A field added to the struct but
+    not the table is the old failure in a new place: it looks like a setting,
+    it is never saved, and it is quietly the default after every restart. So:
+    every struct field has a table row (or is in the explicit unpersisted
+    list), every row names a real field, keys are unique, the v1.1.8 key set
+    is still written (a rename or a drop breaks rollback), the client-local
+    set is exactly the agreed one, and the DdD row stays under ENABLE_DDD."""
+    header = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.h")
+    table = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
+
+    m = re.search(r"typedef struct \{(.*?)\} gui_settings_t;", header, re.S)
+    if not m:
+        return fail("gui_settings.h no longer defines gui_settings_t")
+    body = strip_c_comments(m.group(1))
+    members = re.findall(
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)*;",
+        body, re.M)
+    if len(members) < 90:
+        return fail(f"gui_settings.h: parsed only {len(members)} gui_settings_t fields; the parser is stale")
+
+    rows = []
+    for line in strip_c_comments(table).splitlines():
+        r = re.match(r'\s*GS_[A-Z0-9]+\s*\(\s*"([a-z0-9_]+)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)(.*)\)\s*,?\s*$', line)
+        if r:
+            rows.append((r.group(1), r.group(2), r.group(3)))
+    if len(rows) < 100:
+        return fail(f"gui_settings_table.c: parsed only {len(rows)} table rows; the parser is stale")
+
+    keys = [k for k, _, _ in rows]
+    dups = sorted({k for k in keys if keys.count(k) > 1})
+    if dups:
+        return fail(f"gui_settings_table.c has duplicate keys: {', '.join(dups)}")
+
+    struct_fields = set(members)
+    row_fields = {f for _, f, _ in rows}
+    unknown = sorted(row_fields - struct_fields)
+    if unknown:
+        return fail(f"gui_settings_table.c names fields gui_settings_t does not have: {', '.join(unknown)}")
+    missing = sorted(struct_fields - row_fields - SETTINGS_UNPERSISTED_FIELDS)
+    if missing:
+        return fail(
+            f"gui_settings_t fields with no table row: {', '.join(missing)}. Add a GS_* row to "
+            "gui_settings_table.c (or, if the field must never persist, to SETTINGS_UNPERSISTED_FIELDS)."
+        )
+
+    written = {k for k, _, rest in rows if "GS_LOAD_ONLY" not in rest}
+    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - written)
+    if dropped:
+        return fail(
+            f"settings keys written at v1.1.8 are no longer written: {', '.join(dropped)}. "
+            "A rename or a drop breaks loading the new file in an older build."
+        )
+
+    local = {k for k, _, rest in rows if ("GS_CLIENT_LOCAL" in rest or "GS_LOCAL" in rest)}
+    if local != SETTINGS_CLIENT_LOCAL_KEYS:
+        extra = sorted(local - SETTINGS_CLIENT_LOCAL_KEYS)
+        lost = sorted(SETTINGS_CLIENT_LOCAL_KEYS - local)
+        return fail(
+            "the client-local key set drifted from the agreed one: "
+            f"unexpectedly local: {extra or 'none'}; no longer local: {lost or 'none'}"
+        )
+
+    ddd_blocks = re.findall(r"#ifdef ENABLE_DDD(.*?)#endif", table, re.S)
+    if not any('"ddd_decimation"' in block for block in ddd_blocks):
+        return fail("gui_settings_table.c: the ddd_decimation row must sit inside #ifdef ENABLE_DDD")
+    return 0
+
+
+def check_settings_roundtrip_runtime(repo_root: Path) -> int:
+    """Compiles gui_settings_table.c standalone (no raylib) and drives it with
+    a settings file in the exact format the hand-written writer produced at
+    v1.1.8: load -> save -> load must be a fixed point, every key written once
+    (the old writer emitted nine twice), unknown keys dropped, the load-time
+    clamps and migrations intact, the JSON snapshot lossless, and the strict
+    (network) parser refusing what the raw file dialect cannot hold. This is
+    what lets the table replace the writer without an existing settings file
+    changing meaning."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: settings round-trip runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the settings round-trip runtime guard")
+        print("SKIP: settings round-trip runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_settings_roundtrip_harness.c"
+    table_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"
+    scale_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui_scale.c"
+    fixture_path = repo_root / "misrc_tools/test/fixtures/settings_v1_1_8.json"
+    for required in (harness_path, table_path, scale_path, fixture_path):
+        if not required.exists():
+            return fail(f"Settings round-trip guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_settings_rt_guard_") as temp_root:
+        exe_path = Path(temp_root) / "settings_roundtrip_guard"
+        # No -Werror: the auto-name formatter's snprintf calls are bounded by
+        # MAX_FILENAME_LEN on purpose and trip -Wformat-truncation.
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{table_path.parent}",
+            f"-I{scale_path.parent}",
+            str(harness_path),
+            str(table_path),
+            str(scale_path),
+            "-lm",
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Settings round-trip harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path), str(fixture_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Settings round-trip harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_net_controls_publish_effective_mode(repo_root: Path) -> int:
     """A net-mode client runs its own extraction on the raw /rf stream, so its
     A/B swap decision must equal the server's. The server's decision is the
@@ -970,17 +1151,285 @@ def check_net_controls_publish_effective_mode(repo_root: Path) -> int:
         if needle not in body:
             return fail(f"gui_net.c: server_build_controls() no longer references {needle}")
 
+    # /settings publishes the same effective mode (server_publish computes it
+    # for the published copy the handlers read).
+    m_pub = re.search(r"static void server_publish\s*\([^)]*\)\s*\{", code)
+    if not m_pub:
+        return fail("gui_net.c: server_publish() not found")
+    pub_end = code.find("\n}\n", m_pub.end())
+    pub_body = code[m_pub.end():pub_end if pub_end >= 0 else len(code)]
+    if "capture_mode_runtime_misrc" not in pub_body or "user_capture_mode_misrc" not in pub_body:
+        return fail("gui_net.c: server_publish() no longer derives the effective mode for /settings")
+
+    # The client: /settings carries misrc_mode_effective; an older server
+    # without /settings still gets mode + swap from /controls. Both land in
+    # the STAGED snapshot (never app->settings from the worker), and the
+    # main thread feeds the pipeline from it in gui_net_poll_mirror.
     m2 = re.search(r'client_get\s*\([^;]*"/controls"', code)
     if not m2:
-        return fail("gui_net.c: the client /controls poll was not found")
-    window = code[m2.end():m2.end() + 2500]
-    if not re.search(r'json_bool\s*\(\s*\w+\s*,\s*"misrc_mode"', window):
-        return fail("gui_net.c: the client /controls poll does not mirror misrc_mode")
+        return fail("gui_net.c: the client /controls fallback was not found")
+    window = code[m2.end():m2.end() + 1200]
+    if not re.search(r'staged_effective_misrc\s*=\s*json_bool\s*\(\s*\w+\s*,\s*"misrc_mode"', window):
+        return fail("gui_net.c: the /controls fallback does not stage misrc_mode as the effective mode")
     if not re.search(
-        r'app->settings\.misrc_v15_v25_ab_swap\s*=\s*json_bool\s*\(\s*\w+\s*,\s*"misrc_v15_v25_ab_swap"',
+        r'staged_settings\.misrc_v15_v25_ab_swap\s*=\s*json_bool\s*\(\s*\w+\s*,\s*"misrc_v15_v25_ab_swap"',
         window,
     ):
-        return fail("gui_net.c: the client /controls poll does not mirror misrc_v15_v25_ab_swap")
+        return fail("gui_net.c: the /controls fallback does not stage misrc_v15_v25_ab_swap")
+    m3 = re.search(r'json_bool\s*\(\s*\w+\s*,\s*"misrc_mode_effective"', code)
+    if not m3:
+        return fail("gui_net.c: the client does not read misrc_mode_effective from /settings")
+    m4 = re.search(r"void gui_net_poll_mirror\s*\([^)]*\)\s*\{", code)
+    if not m4:
+        return fail("gui_net.c: gui_net_poll_mirror() not found")
+    mirror_body = code[m4.end():code.find("\n}\n", m4.end())]
+    if "user_capture_mode_misrc = s_peer_effective_misrc" not in mirror_body or \
+       "capture_ab_swap_invert" not in mirror_body:
+        return fail("gui_net.c: gui_net_poll_mirror() does not feed the effective mode and the swap flag to the pipeline")
+
+    # The UI's client branch follows that, not a settings field.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    m5 = re.search(r"void gui_ui_sync_capture_mode_state\s*\([^)]*\)\s*\{", ui)
+    if not m5:
+        return fail("gui_ui.c: gui_ui_sync_capture_mode_state() not found")
+    client_branch = ui[m5.end():ui.find("#ifdef ENABLE_DDD", m5.end())]
+    if "gui_net_is_client(app)" not in client_branch or "settings.misrc_mode" in client_branch.split("gui_net_is_client(app)")[1]:
+        return fail("gui_ui.c: the client branch of gui_ui_sync_capture_mode_state() reads settings.misrc_mode; "
+                    "it must follow user_capture_mode_misrc, which the mirror sets from the server's effective mode")
+    return 0
+
+
+def check_net_settings_protocol(repo_root: Path) -> int:
+    """The settings setter is applied on the server's MAIN thread only (the
+    HTTP handler validates, queues and waits), the HTTP threads read
+    published copies, the client worker never writes app->settings, a client
+    never persists a server value, /stats carries the recording relay, the
+    extraction reads the main-thread swap flag, the two headless modes
+    exist and return before InitWindow, and the overwrite prompt travels
+    both ways (/stats publishes its text, the client mirrors the dialog and
+    answers with /record?confirm=N, resolved on the server's main thread)."""
+    net_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/net/gui_net.c"))
+
+    def body_of(name: str, src: str, pattern: str = None) -> str:
+        m = re.search(pattern or (r"\b" + re.escape(name) + r"\s*\([^)]*\)\s*\{"), src)
+        if not m:
+            return ""
+        end = src.find("\n}\n", m.end())
+        return src[m.end():end if end >= 0 else len(src)]
+
+    dispatch = body_of("server_handle_request", net_c)
+    for uri in ("/settings", "/set"):
+        if f'strcmp(uri, "{uri}") == 0' not in dispatch:
+            return fail(f"gui_net.c: server_handle_request() does not dispatch {uri}")
+    rec = dispatch.find('strcmp(uri, "/record") == 0')
+    on = dispatch.find('server_parse_arg(query, "on"', rec)
+    conf = dispatch.find('server_parse_arg(query, "confirm"', rec)
+    if rec < 0 or conf < 0 or on < 0 or conf > on:
+        return fail("gui_net.c: /record must parse confirm= before on= (on= defaults to 1 when "
+                    "absent, so a confirm query parsed second would start a recording)")
+    if "net_cmd_record_confirm" not in dispatch[rec:on]:
+        return fail("gui_net.c: /record?confirm= must only raise net_cmd_record_confirm for the main thread")
+
+    setter = body_of("server_handle_set", net_c)
+    if not setter:
+        return fail("gui_net.c: server_handle_set() not found")
+    for status in ("400", "422", "503"):
+        if f"server_send_error(fd, {status}" not in setter:
+            return fail(f"gui_net.c: server_handle_set() never answers {status}")
+    for forbidden in ("gui_settings_save(", "gui_ui_apply_remote_setting(", "gui_settings_apply_key(&app->settings"):
+        if forbidden in setter:
+            return fail(f"gui_net.c: server_handle_set() runs on an HTTP thread and must not call {forbidden}; "
+                        "it validates against the published copy and queues for the main thread")
+    if re.search(r"app->settings\.\w+(\[[^\]]*\])*\s*=[^=]", setter):
+        return fail("gui_net.c: server_handle_set() assigns app->settings on an HTTP thread")
+    if "gui_settings_apply_key(scratch" not in setter:
+        return fail("gui_net.c: server_handle_set() no longer dry-runs the value on a scratch copy")
+
+    commands = body_of("gui_net_poll_commands", net_c)
+    if "gui_ui_apply_remote_setting(" not in commands or "server_publish(" not in commands:
+        return fail("gui_net.c: gui_net_poll_commands() must apply queued /set requests through "
+                    "gui_ui_apply_remote_setting() and publish the settings for the HTTP threads")
+    if "net_cmd_record_confirm" not in commands or "gui_record_resolve_pending(" not in commands:
+        return fail("gui_net.c: gui_net_poll_commands() must resolve a client's /record?confirm= answer "
+                    "through gui_record_resolve_pending() on the main thread")
+
+    stats = body_of("server_build_stats", net_c)
+    for key in ("rec_elapsed_ms", "rec_bytes", "rec_raw_a", "rec_comp_b", "rec_drops",
+                "disk_free", "rec_pending", "rec_pending_text", "rec_finalizing", "status",
+                "status_seq", "generation"):
+        if f'\\"{key}\\"' not in stats:
+            return fail(f"gui_net.c: /stats no longer carries {key}")
+    if "published_status" not in stats or "gui_settings_json_escape(" not in stats:
+        return fail("gui_net.c: /stats must relay the published (escaped) status line")
+    if "published_pending" not in stats:
+        return fail("gui_net.c: /stats must relay the published overwrite-prompt text, not read the record module")
+    publish = body_of("server_publish", net_c)
+    if "gui_record_pending_message(" not in publish or "published_pending" not in publish:
+        return fail("gui_net.c: server_publish() must copy gui_record_pending_message() for the HTTP threads")
+
+    a = net_c.find("static void client_apply_stats(")
+    b = net_c.find("static int client_discovery_thread(")
+    if a < 0 or b < 0 or b < a:
+        return fail("gui_net.c: the client worker span was not found")
+    worker = net_c[a:b]
+    if re.search(r"app->settings\.\w+(\[[^\]]*\])*\s*=[^=]", worker):
+        return fail("gui_net.c: the client worker writes app->settings; it must stage the snapshot for the main thread")
+    if re.search(r"app->user_capture_mode_misrc\s*=", worker):
+        return fail("gui_net.c: the client worker writes user_capture_mode_misrc off the main thread")
+    if "gui_settings_save(" in worker:
+        return fail("gui_net.c: the client worker saves settings")
+    if 'client_get(cli->host, cli->port, "/settings"' not in worker:
+        return fail("gui_net.c: the client worker does not poll /settings")
+    if '"/record?confirm=%d"' not in worker or "rec_pending_text" not in worker:
+        return fail("gui_net.c: the client worker must forward /record?confirm= and parse rec_pending_text")
+
+    mirror = body_of("gui_net_poll_mirror", net_c)
+    if "gui_settings_save(" in mirror:
+        return fail("gui_net.c: gui_net_poll_mirror() saves settings")
+    if "net_peer_state" not in mirror or "net_peer_status" not in mirror:
+        return fail("gui_net.c: gui_net_poll_mirror() must wire net_peer_state and net_peer_status")
+    if re.search(r"app->status_message\s*[\[=]", mirror) or "gui_app_set_status(" in mirror:
+        return fail("gui_net.c: gui_net_poll_mirror() writes the bottom status bar; the relay goes to net_peer_status")
+    if "client_mirror_overwrite_prompt(" not in mirror:
+        return fail("gui_net.c: gui_net_poll_mirror() must mirror the server's overwrite prompt")
+    prompt = body_of("client_mirror_overwrite_prompt", net_c)
+    for needed in ("peer_rec_pending", "gui_popup_confirm(", "gui_popup_get_result(", "gui_popup_dismiss(",
+                   "net_cmd_record_confirm_value", "net_cmd_record_confirm,"):
+        if needed not in prompt:
+            return fail(f"gui_net.c: client_mirror_overwrite_prompt() must use {needed}")
+    if "gui_record_" in prompt:
+        return fail("gui_net.c: the client's prompt mirror must not touch the local record module")
+    serve = body_of("gui_net_serve_main", net_c)
+    if "gui_record_check_popup(" not in serve:
+        return fail("gui_net.c: the --net-serve loop must call gui_record_check_popup() or a confirm never resolves")
+    if re.search(r"app->is_recording\s*=", net_c):
+        return fail("gui_net.c sets is_recording; a client must never (gui_app_effective_recording is the readout)")
+
+    view_end = body_of("gui_net_client_view_end", net_c)
+    if "gui_settings_copy_fields(&app->settings, &s_peer_view, true)" not in view_end or \
+       "gui_settings_save(&app->settings)" not in view_end:
+        return fail("gui_net.c: gui_net_client_view_end() must restore the client's own settings "
+                    "(client-local fields from the view) before it saves anything")
+
+    extract = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.c"))
+    if "capture_ab_swap_invert" not in extract or "settings.misrc_v15_v25_ab_swap" in extract:
+        return fail("gui_extract.c must read capture_ab_swap_invert (main-thread flag), not the settings field")
+
+    main_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    usage = body_of("print_usage", main_c)
+    for flag in ("--net-serve", "--net-client-probe"):
+        if flag not in usage:
+            return fail(f"misrc_gui.c: print_usage() does not list {flag}")
+        pos = main_c.find(f'strcmp(argv[i], "{flag}") == 0')
+        init = main_c.find("InitWindow(")
+        if pos < 0 or init < 0 or pos > init:
+            return fail(f"misrc_gui.c: {flag} must be dispatched before InitWindow")
+    if "gui_net_client_view_begin(&app)" not in main_c or "gui_net_client_view_end(&app)" not in main_c:
+        return fail("misrc_gui.c: the main loop must wrap the UI pass in gui_net_client_view_begin/end")
+    if main_c.find("gui_net_client_view_end(&app)") < main_c.find("EndDrawing();"):
+        return fail("misrc_gui.c: gui_net_client_view_end() must run after EndDrawing(): Clay draws text from pointers into app->settings")
+    return 0
+
+
+def check_record_parity(repo_root: Path) -> int:
+    """The Record button, its click and the R/Space keys read the effective
+    recording and capture state (the server's on a net client), and nothing
+    outside gui_record.c ever assigns is_recording: a client that set it would
+    start writing WAV files from its ingest."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    render_pos = ui.find('CLAY(CLAY_ID("RecordButton")')
+    if render_pos < 0:
+        return fail("gui_ui.c: the RecordButton render was not found")
+    render_window = ui[max(0, render_pos - 2600):render_pos]
+    if "gui_app_effective_recording(app)" not in render_window:
+        return fail("gui_ui.c: the RecordButton render does not use gui_app_effective_recording")
+    # The capturing flag the render reads is the toolbar's, declared once near the top of
+    # the function; it must come from the helper so a client sees the server's state.
+    decl_pos = ui.rfind("bool control_capturing = ", 0, render_pos)
+    if decl_pos < 0 or not ui[decl_pos:].startswith("bool control_capturing = gui_app_control_capturing(app)"):
+        return fail("gui_ui.c: the capturing flag the RecordButton render uses does not come from gui_app_control_capturing")
+    if "app->is_recording" in render_window:
+        return fail("gui_ui.c: the RecordButton render still reads app->is_recording")
+    click_pos = ui.find('Clay_PointerOver(CLAY_ID("RecordButton"))')
+    if click_pos < 0:
+        return fail("gui_ui.c: the RecordButton click was not found")
+    click_window = ui[click_pos:click_pos + 1400]
+    if "gui_app_effective_recording(app)" not in click_window or "gui_app_control_capturing(app)" not in click_window:
+        return fail("gui_ui.c: the RecordButton click does not branch on the effective state")
+    if "app->is_recording" in click_window:
+        return fail("gui_ui.c: the RecordButton click still reads app->is_recording")
+    lock = ui[ui.find("static bool gui_ui_settings_locked("):]
+    lock = lock[:lock.find("\n}\n")]
+    if "gui_net_client_peer_recording(app)" not in lock:
+        return fail("gui_ui.c: gui_ui_settings_locked() does not consider the server's recording state")
+
+    main_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"))
+    key_r = main_c.find("IsKeyPressed(KEY_R)")
+    key_space = main_c.find("IsKeyPressed(KEY_SPACE)")
+    if key_r < 0 or key_space < 0:
+        return fail("misrc_gui.c: the R / Space hotkeys were not found")
+    if "gui_app_effective_recording(&app)" not in main_c[key_r:key_r + 500] or \
+       "gui_app_control_capturing(&app)" not in main_c[key_r - 20:key_r + 500]:
+        return fail("misrc_gui.c: the R hotkey does not use the effective recording and capture state")
+    if "gui_app_control_capturing(&app)" not in main_c[key_space:key_space + 300]:
+        return fail("misrc_gui.c: the Space hotkey does not use the effective capture state")
+
+    gui_root = repo_root / "misrc_tools/misrc_gui"
+    for path in sorted(gui_root.rglob("*.c")):
+        if path.name == "gui_record.c":
+            continue
+        src = strip_c_comments(read_text(path))
+        m = re.search(r"(->|\.)is_recording\s*=[^=]", src)
+        if m:
+            line = src[:m.start()].count("\n") + 1
+            return fail(f"{path.relative_to(repo_root)}:{line} assigns is_recording; only gui_record.c may")
+    return 0
+
+
+def check_net_query_runtime(repo_root: Path) -> int:
+    """Compiles misrc_gui/net/gui_net_query.c standalone and runs the query,
+    percent-decode and percent-encode cases the settings setter depends on: a
+    value that decodes wrongly lands in a setting."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: net query runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the net query runtime guard")
+        print("SKIP: net query runtime guard (cc not available)")
+        return 0
+    harness_path = repo_root / "misrc_tools/test/net_query_harness.c"
+    query_path = repo_root / "misrc_tools/misrc_gui/net/gui_net_query.c"
+    for required in (harness_path, query_path):
+        if not required.exists():
+            return fail(f"Net query guard source is missing: {required}")
+    with tempfile.TemporaryDirectory(prefix="misrc_net_query_guard_") as temp_root:
+        exe_path = Path(temp_root) / "net_query_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            f"-I{query_path.parent}",
+            str(harness_path),
+            str(query_path),
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Net query harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Net query harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
     return 0
 
 
@@ -1664,7 +2113,10 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
                                         meson_path: Path) -> int:
     gui_c = read_text(gui_c_path)
     settings_c = read_text(gui_settings_c_path)
-    gui_app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    # The struct and the table moved out of gui_app.h / gui_settings.c so the
+    # settings code compiles without raylib; the contract follows them.
+    settings_table_c = read_text(gui_settings_c_path.with_name("gui_settings_table.c"))
+    gui_settings_h = read_text(gui_settings_c_path.with_name("gui_settings.h"))
     gui_ui_h = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h")
     gui_ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
     popup_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_popup.c")
@@ -1676,10 +2128,11 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     meson = read_text(meson_path)
 
     required_snippets = [
-        (gui_app_h, "int ui_scale_percent;", "persisted settings field"),
-        (settings_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
-        (settings_c, '\\"ui_scale_percent\\": %d', "settings save key"),
-        (settings_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (gui_settings_h, "int ui_scale_percent;", "persisted settings field"),
+        (settings_table_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
+        (settings_table_c, '"ui_scale_percent",', "settings table key"),
+        (settings_table_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (settings_c, "GUI_SETTINGS_MAX_FILE_BYTES", "settings file written through the table"),
         (meson, "'misrc_gui/ui/gui_ui_scale.c'", "UI scale policy product source"),
         (gui_c, "gui_ui_zoom_process(&ui_zoom_state", "single wheel routing policy"),
         (gui_c, "IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)", "100% reset shortcut"),
@@ -1815,6 +2268,9 @@ def main() -> int:
             repo_root, gui_c_path, gui_settings_c_path, meson_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("net controls publish the effective mode", lambda: check_net_controls_publish_effective_mode(repo_root)),
+        ("every settings field is in the table", lambda: check_settings_table_covers_struct(repo_root)),
+        ("net settings protocol contract", lambda: check_net_settings_protocol(repo_root)),
+        ("record button follows the effective recording state", lambda: check_record_parity(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -1829,9 +2285,11 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
+        checks.insert(12, ("settings round-trip runtime", lambda: check_settings_roundtrip_runtime(repo_root)))
         checks.insert(9, ("net fanout runtime", lambda: check_net_fanout_runtime(repo_root)))
         checks.insert(10, ("buffer manager write tap runtime", lambda: check_bufmgr_write_tap_runtime(repo_root)))
         checks.insert(11, ("ringbuffer mirror runtime", lambda: check_ringbuffer_mirror_runtime(repo_root)))
+        checks.insert(13, ("net query runtime", lambda: check_net_query_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real

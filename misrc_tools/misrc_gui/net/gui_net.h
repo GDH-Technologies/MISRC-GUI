@@ -13,9 +13,23 @@
  *   GET /stats              -> JSON capture/device state snapshot
  *   GET /devices            -> JSON enumerated device list (for client dropdown mirror)
  *   GET /controls           -> JSON mirrored control state (misrc mode, bits, resample)
+ *   GET /settings           -> JSON {generation, state, misrc_mode_effective, settings:{...}}:
+ *                              every server-owned setting by its settings-file key
+ *   GET /set?key=K&value=V  -> set one setting (V percent-encoded); applied on the
+ *                              server's main thread with the settings panel's own
+ *                              checks. 200 {ok,key,value,generation}; 400 unknown or
+ *                              not remotely settable; 409 refused (recording, or a
+ *                              per-key rule); 422 invalid value; 503 no answer in 1 s
  *   GET /start              -> request capture start (server executes on main thread)
  *   GET /stop               -> request capture stop
- *   GET /record?on=1|0      -> request recording on/off
+ *   GET /record?on=1|0      -> request recording on/off. When the start hits
+ *                              existing files, the server's "Overwrite Files?"
+ *                              prompt waits: /stats shows rec_pending with the
+ *                              prompt's text in rec_pending_text, and a client
+ *                              mirrors the dialog.
+ *   GET /record?confirm=1|0 -> answer that prompt (overwrite / cancel), resolved
+ *                              on the server's main thread; a no-op when nothing
+ *                              is pending
  *   GET /device?N           -> request device selection N
  *   GET /rf                 -> chunked raw RF stream (tapped from BUF_CAPTURE_RF writes)
  *   GET /baseband           -> chunked raw audio stream (tapped from BUF_CAPTURE_AUDIO writes)
@@ -113,5 +127,39 @@ void gui_net_client_toggle_connection(gui_app_t *app);
 /* True when client mode is connected and the peer server reports capture/record
  * state active (peer /stats state >= 1). */
 bool gui_net_client_peer_capturing(const gui_app_t *app);
+/* True when connected and the peer reports recording (state == 2). A client
+ * never sets its own is_recording (that would start local WAV writers), so
+ * every "are we recording" readout goes through gui_app_effective_recording. */
+bool gui_net_client_peer_recording(const gui_app_t *app);
+
+/* The server's settings on a client. The worker stages /settings; the main
+ * thread applies the snapshot in gui_net_poll_mirror(). For the UI pass the
+ * client swaps a copy of the snapshot into app->settings (view_begin) and
+ * swaps its own settings back afterwards (view_end), sending every
+ * server-owned field the pass changed as a /set. The client's own settings
+ * file never holds a server value. */
+void gui_net_client_view_begin(gui_app_t *app);
+void gui_net_client_view_end(gui_app_t *app);
+bool gui_net_client_peer_settings_valid(const gui_app_t *app);
+uint32_t gui_net_client_peer_generation(const gui_app_t *app);
+double gui_net_client_peer_settings_age_s(const gui_app_t *app);
+/* -1 not known yet, 0 the server has no /settings (older build), 1 it does. */
+int gui_net_client_server_settings_support(const gui_app_t *app);
+void gui_net_client_request_settings_refresh(gui_app_t *app);
+/* The most recent refused /set ("key: reason"), and how long ago. */
+bool gui_net_client_last_set_error(const gui_app_t *app, char *buf, size_t cap, double *age_s);
+/* Recording relay from the peer's /stats. */
+bool gui_net_client_peer_record_pending(const gui_app_t *app);
+bool gui_net_client_peer_record_finalizing(const gui_app_t *app);
+uint32_t gui_net_client_peer_record_drops(const gui_app_t *app);
+uint64_t gui_net_client_peer_disk_free(const gui_app_t *app);
+
+/* Headless modes (return before InitWindow):
+ *  - serve: run the server from a --config file with no window, pumping the
+ *    main-thread pollers, for `seconds` (0 = until SIGTERM/SIGINT);
+ *  - client probe: connect to host:port, mirror for `seconds`, print one JSON
+ *    line with the snapshot and the peer state. Exit codes in gui_net.c. */
+int gui_net_serve_main(int seconds);
+int gui_net_client_probe_main(const char *host, int port, int seconds);
 
 #endif /* GUI_NET_H */

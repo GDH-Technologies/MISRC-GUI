@@ -11,14 +11,21 @@
 #include "../../common/buffer_manager.h"
 #include "../../common/rb_event.h"
 #include "../../common/threading.h"
+#include "../core/gui_settings.h"
+#include "../output/gui_record.h"
+#include "../ui/gui_ui.h"
+#include "../ui/gui_popup.h"
+#include "gui_net_query.h"
 #include "version.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <errno.h>
+#include <signal.h>
 
 #ifndef MIRSC_TOOLS_VERSION
 #define MIRSC_TOOLS_VERSION "dev"
@@ -54,7 +61,6 @@
   #include <netdb.h>
   #include <unistd.h>
   #include <fcntl.h>
-  #include <signal.h>
   typedef int net_sock_t;
   #define NET_INVALID_SOCKET (-1)
   #define net_close(s) close(s)
@@ -199,6 +205,25 @@ typedef struct net_client_conn {
     struct net_client_conn *next;
 } net_client_conn_t;
 
+/* A queued GET /set request and the main thread's answer to it. The HTTP
+ * thread validates the value against the published settings, queues the
+ * request and waits (bounded) for the answer; only the main thread applies
+ * it, with the same checks and side effects the settings panel has. */
+#define NET_SET_QUEUE 8
+#define NET_SET_WAIT_MS 1000
+typedef struct {
+    uint32_t seq;
+    char key[64];
+    char value[512];
+} net_set_req_t;
+
+typedef struct {
+    uint32_t seq;
+    int http;               /* 200 applied; 400/409/422 refused */
+    uint32_t generation;    /* gui_settings_generation() after the attempt */
+    char msg[160];          /* canonical value on 200, the reason otherwise */
+} net_set_res_t;
+
 typedef struct {
     gui_app_t *app;
     uint16_t port;
@@ -217,6 +242,29 @@ typedef struct {
     net_mutex_t clients_mtx;
     net_client_conn_t *clients;
     atomic_int client_threads;
+    /* /set requests in flight (HTTP threads enqueue, main thread answers). */
+    net_mutex_t set_mtx;
+    net_cond_t set_cv;
+    net_set_req_t set_q[NET_SET_QUEUE];
+    int set_q_count;
+    net_set_res_t set_res[NET_SET_QUEUE];
+    int set_res_count;
+    uint32_t set_seq;
+    /* What the HTTP threads publish: main-thread copies refreshed by
+     * server_publish() from gui_net_poll_commands(), so no handler reads
+     * app->settings or the status line while the main thread writes them. */
+    net_mutex_t pub_mtx;
+    gui_settings_t published;
+    uint32_t published_generation;
+    bool published_effective_misrc;
+    char published_status[256];
+    uint32_t published_status_seq;
+    char published_pending[512];    /* the overwrite prompt's text while it waits, else "" */
+    bool published_rec_pending;     /* with the text above, so one /stats is self-consistent */
+    bool published_rec_finalizing;
+    uint64_t published_disk_free;
+    bool published_once;            /* main thread only */
+    double published_disk_time;     /* main thread only */
 } net_server_t;
 
 typedef struct {
@@ -261,6 +309,41 @@ typedef struct {
     atomic_bool disc_dirty;
     /* Forwarded-command flags are the shared app->net_cmd_* atomics; the
      * worker drains them and sends HTTP GETs. */
+
+    /* The server's settings, staged by the worker from /settings and applied
+     * by the main thread in gui_net_poll_mirror(). Under set_mtx. */
+    net_mutex_t set_mtx;
+    gui_settings_t staged_settings;
+    uint32_t staged_generation;
+    bool staged_effective_misrc;
+    bool staged_settings_valid;
+    bool staged_settings_dirty;
+    bool staged_controls_dirty;      /* older server: mode + swap via /controls only */
+    int server_settings_support;     /* -1 unknown, 0 no /settings, 1 yes */
+    uint64_t staged_settings_time_ms;
+    atomic_bool settings_refresh_req;
+    /* Outbound /set requests (main thread queues, worker sends) and their
+     * answers (worker stores, main thread consumes). Under set_mtx. */
+    net_set_req_t out_q[NET_SET_QUEUE * 2];
+    int out_count;
+    uint32_t out_seq;
+    net_set_res_t results[NET_SET_QUEUE * 2];
+    int res_count;
+    /* Recording relay from /stats. */
+    atomic_uint_fast64_t peer_rec_elapsed_ms;
+    atomic_uint_fast64_t peer_rec_bytes;
+    atomic_uint_fast64_t peer_rec_raw_a;
+    atomic_uint_fast64_t peer_rec_raw_b;
+    atomic_uint_fast64_t peer_rec_comp_a;
+    atomic_uint_fast64_t peer_rec_comp_b;
+    atomic_uint_fast64_t peer_disk_free;
+    atomic_uint_fast32_t peer_rec_drops;
+    atomic_bool peer_rec_pending;
+    atomic_bool peer_rec_finalizing;
+    char peer_status[256];           /* under set_mtx */
+    uint32_t peer_status_seq;
+    bool peer_status_dirty;
+    char peer_pending_text[512];     /* under set_mtx: the server's overwrite prompt */
 } net_client_t;
 
 typedef struct {
@@ -273,6 +356,25 @@ typedef struct {
 /* The single active net state (Local => NULL). Stored on app->net_state. */
 static net_server_t *s_server = NULL;
 static net_client_t *s_client = NULL;
+
+/* Client view state (defined with the view functions below). */
+static void client_view_reset(void);
+static void client_apply_snapshot(gui_app_t *app, net_client_t *cli);
+static void client_apply_set_results(gui_app_t *app, net_client_t *cli);
+static void client_expire_pending(void);
+static bool s_peer_valid;
+static bool s_peer_controls_only;
+static bool s_peer_effective_misrc;
+static gui_settings_t s_peer_applied;
+/* --net-client-probe mirrors without ingesting (no buffers, no extraction). */
+static bool s_probe_no_ingest = false;
+
+/* raylib's clock is only initialised by InitWindow; the headless modes have
+ * no window, and a NaN elapsed time must read as 0, not as a huge number. */
+static double net_now_s(void) {
+    double t = GetTime();
+    return isfinite(t) ? t : 0.0;
+}
 
 /* The server the buffer-manager write tap pushes into, and how many pushes
  * are in flight on the capture thread. server_stop() clears the pointer and
@@ -412,8 +514,58 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
  * Server: HTTP request handling
  * ------------------------------------------------------------------------- */
 
-/* Build /stats JSON into buf. Reads gui_app_t atomics + selected device. */
-static void server_build_stats(gui_app_t *app, char *buf, size_t len) {
+/* Main thread only (from gui_net_poll_commands): copy what the HTTP threads
+ * publish. Copies only when something changed (the settings generation, the
+ * effective mode, the status line) and refreshes the output folder's free
+ * space about once a second, so no handler reads app->settings or calls
+ * statvfs off the main thread. */
+static void server_publish(net_server_t *srv, gui_app_t *app) {
+    uint32_t gen = gui_settings_generation();
+    bool eff = app->is_recording ? app->capture_mode_runtime_misrc : app->user_capture_mode_misrc;
+    bool status_changed = strncmp(srv->published_status, app->status_message,
+                                  sizeof(srv->published_status) - 1) != 0;
+    const char *pending = gui_record_pending_message();
+    bool rec_pending = gui_record_is_pending();
+    bool rec_finalizing = gui_record_is_finalizing();
+    bool pending_changed = strncmp(srv->published_pending, pending,
+                                   sizeof(srv->published_pending) - 1) != 0 ||
+                           rec_pending != srv->published_rec_pending ||
+                           rec_finalizing != srv->published_rec_finalizing;
+    double now = net_now_s();
+    bool disk_due = (now - srv->published_disk_time) >= 1.0;
+    if (srv->published_once && gen == srv->published_generation &&
+        eff == srv->published_effective_misrc && !status_changed && !pending_changed && !disk_due) {
+        return;
+    }
+    uint64_t disk_free = srv->published_disk_free;
+    if (disk_due || !srv->published_once) {
+        uint64_t f = 0;
+        disk_free = gui_record_get_output_free_space_bytes(app, &f) ? f : 0;
+        srv->published_disk_time = now;
+    }
+    net_mutex_lock(&srv->pub_mtx);
+    if (!srv->published_once || gen != srv->published_generation) {
+        srv->published = app->settings;
+        srv->published_generation = gen;
+    }
+    srv->published_effective_misrc = eff;
+    if (status_changed || !srv->published_once) {
+        snprintf(srv->published_status, sizeof(srv->published_status), "%s", app->status_message);
+        srv->published_status_seq++;
+    }
+    if (pending_changed || !srv->published_once) {
+        snprintf(srv->published_pending, sizeof(srv->published_pending), "%s", pending);
+        srv->published_rec_pending = rec_pending;
+        srv->published_rec_finalizing = rec_finalizing;
+    }
+    srv->published_disk_free = disk_free;
+    srv->published_once = true;
+    net_mutex_unlock(&srv->pub_mtx);
+}
+
+/* Build /stats JSON into buf. Reads gui_app_t atomics + selected device, and
+ * the recording relay a client shows in place of its own record readouts. */
+static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, size_t len) {
     int state = 0;
     if (app->is_recording) state = 2;
     else if (app->is_capturing) state = 1;
@@ -432,14 +584,189 @@ static void server_build_stats(gui_app_t *app, char *buf, size_t len) {
     /* Audio frame size: the capture callback pads 24-bit/4ch to 12 bytes.
      * Report 12 so clients can re-frame /baseband correctly. */
     int audio_frame = 12;
+
+    /* Recording relay. */
+    uint64_t rec_elapsed_ms = 0;
+    if (app->is_recording) {
+        double e = net_now_s() - app->recording_start_time;
+        if (isfinite(e) && e > 0.0) rec_elapsed_ms = (uint64_t)(e * 1000.0);
+    }
+    uint64_t rec_bytes = atomic_load(&app->recording_bytes);
+    uint64_t raw_a = atomic_load(&app->recording_raw_a);
+    uint64_t raw_b = atomic_load(&app->recording_raw_b);
+    uint64_t comp_a = atomic_load(&app->recording_compressed_a);
+    uint64_t comp_b = atomic_load(&app->recording_compressed_b);
+    uint32_t rec_drops = (uint32_t)(atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops) +
+                                    atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops));
+    /* rec_pending, its text, rec_finalizing and the status line come from one
+     * publish, so a reader never sees the flag cleared before the text and
+     * the "cancelled" status that go with it (a 20 ms window otherwise). */
+    bool rec_pending, rec_finalizing;
+    char status_esc[600];
+    char pending_esc[1100];   /* 511 chars, every one possibly escaped */
+    uint32_t status_seq, gen;
+    uint64_t disk_free;
+    net_mutex_lock(&srv->pub_mtx);
+    gui_settings_json_escape(srv->published_status, status_esc, sizeof(status_esc));
+    gui_settings_json_escape(srv->published_pending, pending_esc, sizeof(pending_esc));
+    rec_pending = srv->published_rec_pending;
+    rec_finalizing = srv->published_rec_finalizing;
+    status_seq = srv->published_status_seq;
+    gen = srv->published_generation;
+    disk_free = srv->published_disk_free;
+    net_mutex_unlock(&srv->pub_mtx);
+
     snprintf(buf, len,
         "{\"state\":%d,\"sample_rate\":%u,\"total_samples\":%llu,"
         "\"frames\":%u,\"errors\":%u,\"selected_device\":%d,"
         "\"device_count\":%d,\"device_name\":\"%s\",\"device_type\":%d,"
-        "\"audio_frame_bytes\":%d}",
+        "\"audio_frame_bytes\":%d,"
+        "\"rec_elapsed_ms\":%llu,\"rec_bytes\":%llu,"
+        "\"rec_raw_a\":%llu,\"rec_raw_b\":%llu,\"rec_comp_a\":%llu,\"rec_comp_b\":%llu,"
+        "\"rec_drops\":%u,\"disk_free\":%llu,\"rec_pending\":%s,\"rec_pending_text\":\"%s\","
+        "\"rec_finalizing\":%s,"
+        "\"status\":\"%s\",\"status_seq\":%u,\"generation\":%u}",
         state, (unsigned)sr, (unsigned long long)total,
         (unsigned)frames, (unsigned)errors, sel,
-        dcount, dname, dtype, audio_frame);
+        dcount, dname, dtype, audio_frame,
+        (unsigned long long)rec_elapsed_ms, (unsigned long long)rec_bytes,
+        (unsigned long long)raw_a, (unsigned long long)raw_b,
+        (unsigned long long)comp_a, (unsigned long long)comp_b,
+        (unsigned)rec_drops, (unsigned long long)disk_free,
+        rec_pending ? "true" : "false", pending_esc, rec_finalizing ? "true" : "false",
+        status_esc, (unsigned)status_seq, (unsigned)gen);
+}
+
+static const char *http_reason(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 422: return "Unprocessable Entity";
+        case 503: return "Service Unavailable";
+        default:  return "Error";
+    }
+}
+
+static void server_send_json(net_sock_t fd, int status, const char *body) {
+    char hdr[192];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.0 %d %s\r\nContent-Type: text/json\r\nContent-Length: %zu\r\n\r\n",
+        status, http_reason(status), strlen(body));
+    net_send_str(fd, hdr);
+    net_send_str(fd, body);
+}
+
+static void server_send_error(net_sock_t fd, int status, const char *error, uint32_t generation) {
+    char esc[400];
+    gui_settings_json_escape(error, esc, sizeof(esc));
+    char body[560];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\",\"generation\":%u}",
+             esc, (unsigned)generation);
+    server_send_json(fd, status, body);
+}
+
+/* GET /set?key=<k>&value=<percent-encoded>. Validates on this thread against
+ * the published copy (so a value the table refuses never reaches the main
+ * thread), then queues the request and waits up to NET_SET_WAIT_MS for the
+ * main thread's answer. A timeout answers 503; the request stays queued and
+ * shows up in the next /settings. */
+static void server_handle_set(net_server_t *srv, net_sock_t fd, const char *query) {
+    uint32_t gen_now;
+    net_mutex_lock(&srv->pub_mtx);
+    gen_now = srv->published_generation;
+    net_mutex_unlock(&srv->pub_mtx);
+
+    char key[64];
+    char value[1600];
+    if (!query || !net_query_get(query, "key", key, sizeof(key)) || !key[0]) {
+        server_send_error(fd, 400, "missing key", gen_now);
+        return;
+    }
+    if (!net_query_get(query, "value", value, sizeof(value))) {
+        server_send_error(fd, 400, "missing value", gen_now);
+        return;
+    }
+    if (!net_percent_decode(value)) {
+        server_send_error(fd, 400, "malformed percent-encoding", gen_now);
+        return;
+    }
+    const gui_setting_desc_t *d = gui_settings_find(key);
+    if (!d) {
+        server_send_error(fd, 400, "unknown key", gen_now);
+        return;
+    }
+    if (d->flags & (GS_CLIENT_LOCAL | GS_WRITE_ONLY | GS_LOAD_ONLY | GS_NO_REMOTE_SET)) {
+        server_send_error(fd, 400, "key is not remotely settable", gen_now);
+        return;
+    }
+    gui_settings_t *scratch = (gui_settings_t *)malloc(sizeof(*scratch));
+    if (!scratch) { net_send_str(fd, "HTTP/1.0 500 Internal Error\r\n\r\n"); return; }
+    net_mutex_lock(&srv->pub_mtx);
+    *scratch = srv->published;
+    net_mutex_unlock(&srv->pub_mtx);
+    char err[160];
+    int arc = gui_settings_apply_key(scratch, key, value, true, err, sizeof(err));
+    free(scratch);
+    if (arc != 0) {
+        char msg[224];
+        snprintf(msg, sizeof(msg), "invalid value: %s", err);
+        server_send_error(fd, 422, msg, gen_now);
+        return;
+    }
+
+    uint32_t seq;
+    net_mutex_lock(&srv->set_mtx);
+    if (srv->set_q_count >= NET_SET_QUEUE) {
+        net_mutex_unlock(&srv->set_mtx);
+        server_send_error(fd, 503, "server busy; retry", gen_now);
+        return;
+    }
+    seq = ++srv->set_seq;
+    net_set_req_t *r = &srv->set_q[srv->set_q_count++];
+    r->seq = seq;
+    snprintf(r->key, sizeof(r->key), "%s", key);
+    snprintf(r->value, sizeof(r->value), "%s", value);
+    net_mutex_unlock(&srv->set_mtx);
+
+    net_set_res_t res;
+    memset(&res, 0, sizeof(res));
+    bool got = false;
+    int waited = 0;
+    net_mutex_lock(&srv->set_mtx);
+    while (!got && waited <= NET_SET_WAIT_MS && !atomic_load(&srv->stop_flag)) {
+        for (int i = 0; i < srv->set_res_count; i++) {
+            if (srv->set_res[i].seq == seq) {
+                res = srv->set_res[i];
+                memmove(&srv->set_res[i], &srv->set_res[i + 1],
+                        (size_t)(srv->set_res_count - i - 1) * sizeof(res));
+                srv->set_res_count--;
+                got = true;
+                break;
+            }
+        }
+        if (got) break;
+        net_cond_timedwait_ms(&srv->set_cv, &srv->set_mtx, 50);
+        waited += 50;
+    }
+    net_mutex_unlock(&srv->set_mtx);
+
+    if (!got) {
+        server_send_error(fd, 503, "server busy; retry (the change is still queued)", gen_now);
+        return;
+    }
+    if (res.http == 200) {
+        char kesc[160], vesc[520];
+        gui_settings_json_escape(key, kesc, sizeof(kesc));
+        gui_settings_json_escape(res.msg, vesc, sizeof(vesc));
+        char body[800];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"key\":\"%s\",\"value\":\"%s\",\"generation\":%u}",
+                 kesc, vesc, (unsigned)res.generation);
+        server_send_json(fd, 200, body);
+    } else {
+        server_send_error(fd, res.http, res.msg, res.generation);
+    }
 }
 
 static void server_build_devices(gui_app_t *app, char *buf, size_t len) {
@@ -535,8 +862,8 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
         return;
     }
     if (strcmp(uri, "/stats") == 0) {
-        char json[512];
-        server_build_stats(app, json, sizeof(json));
+        char json[4096];
+        server_build_stats(srv, app, json, sizeof(json));
         char hdr[160];
         snprintf(hdr, sizeof(hdr),
             "HTTP/1.0 200 OK\r\nContent-Type: text/json\r\nContent-Length: %zu\r\n\r\n",
@@ -569,6 +896,41 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
         net_send_str(fd, json);
         return;
     }
+    if (strcmp(uri, "/settings") == 0) {
+        /* Every server-owned setting (client-local and write-only keys are
+         * excluded), from the published copy, plus the generation a client
+         * uses to tell whether its snapshot is current and the effective
+         * mode its extraction must run (see server_build_controls). */
+        const size_t cap = 32768;
+        char *body = (char *)malloc(cap);
+        if (!body) { net_send_str(fd, "HTTP/1.0 500 Internal Error\r\n\r\n"); return; }
+        int state = app->is_recording ? 2 : (app->is_capturing ? 1 : 0);
+        net_mutex_lock(&srv->pub_mtx);
+        int n = snprintf(body, cap,
+            "{\"generation\":%u,\"state\":%d,\"misrc_mode_effective\":%s,\"settings\":",
+            (unsigned)srv->published_generation, state,
+            srv->published_effective_misrc ? "true" : "false");
+        size_t need = 0;
+        if (n > 0 && (size_t)n < cap) {
+            need = gui_settings_to_json(&srv->published, GS_CLIENT_LOCAL | GS_WRITE_ONLY,
+                                        body + n, cap - (size_t)n);
+        }
+        net_mutex_unlock(&srv->pub_mtx);
+        if (n <= 0 || (size_t)n + need + 2 >= cap) {
+            free(body);
+            net_send_str(fd, "HTTP/1.0 500 Internal Error\r\n\r\n");
+            return;
+        }
+        body[(size_t)n + need] = '}';
+        body[(size_t)n + need + 1] = '\0';
+        server_send_json(fd, 200, body);
+        free(body);
+        return;
+    }
+    if (strcmp(uri, "/set") == 0) {
+        server_handle_set(srv, fd, query);
+        return;
+    }
     if (strcmp(uri, "/start") == 0) {
         atomic_store(&app->net_cmd_start, true);
         net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nstart requested\r\n");
@@ -580,6 +942,20 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
         return;
     }
     if (strcmp(uri, "/record") == 0) {
+        int confirm = server_parse_arg(query, "confirm", -1);
+        if (confirm >= 0) {
+            /* A client answering the overwrite prompt it mirrors from
+             * rec_pending; resolved on the main thread like every command.
+             * Nothing pending -> harmless no-op. */
+            atomic_store(&app->net_cmd_record_confirm_value, confirm ? 1 : 0);
+            atomic_store(&app->net_cmd_record_confirm, true);
+            const char *cmsg = confirm ? "record overwrite confirmed\r\n" : "record overwrite cancelled\r\n";
+            char chdr[128];
+            snprintf(chdr, sizeof(chdr), "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n", strlen(cmsg));
+            net_send_str(fd, chdr);
+            net_send_str(fd, cmsg);
+            return;
+        }
         int on = server_parse_arg(query, "on", 1);
         if (on) atomic_store(&app->net_cmd_record_on, true);
         else atomic_store(&app->net_cmd_record_off, true);
@@ -657,9 +1033,10 @@ static int server_client_thread(void *arg) {
     int len = net_read_headers(fd, buf, sizeof(buf));
     if (len > 0) {
         char method[8] = {0};
-        char uri[256] = {0};
+        /* /set carries a percent-encoded setting value (up to ~1.5 KB). */
+        char uri[2048] = {0};
         int v1 = 0, v2 = 0;
-        if (4 == sscanf(buf, "%7s %255s HTTP/%d.%d", method, uri, &v1, &v2)) {
+        if (4 == sscanf(buf, "%7s %2047s HTTP/%d.%d", method, uri, &v1, &v2)) {
             server_handle_request(srv, fd, method, uri);
         } else {
             net_send_str(fd, "HTTP/1.0 400 Bad Request\r\n\r\n");
@@ -773,6 +1150,14 @@ static int server_start(gui_app_t *app, uint16_t port) {
     net_mutex_init(&srv->clients_mtx);
     srv->clients = NULL;
     atomic_store(&srv->client_threads, 0);
+    net_mutex_init(&srv->set_mtx);
+    net_cond_init(&srv->set_cv);
+    net_mutex_init(&srv->pub_mtx);
+    srv->set_q_count = 0;
+    srv->set_res_count = 0;
+    srv->set_seq = 0;
+    srv->published_once = false;
+    srv->published_disk_time = -10.0;
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!net_sock_valid(srv->listen_fd)) {
@@ -827,6 +1212,10 @@ static void server_stop(net_server_t *srv) {
     atomic_store(&srv->stop_flag, true);
     atomic_store(&srv->running, false);
     atomic_store(&srv->beacon_stop, true);
+    /* Wake any /set handler waiting for an answer; it sees stop_flag. */
+    net_mutex_lock(&srv->set_mtx);
+    net_cond_broadcast(&srv->set_cv);
+    net_mutex_unlock(&srv->set_mtx);
     if (net_sock_valid(srv->listen_fd)) {
         /* shutdown() wakes any blocking select()/accept() on this socket in
          * addition to the non-blocking loop, then close(). */
@@ -871,6 +1260,9 @@ static void server_stop(net_server_t *srv) {
     net_fanout_destroy(&srv->rf);
     net_fanout_destroy(&srv->audio);
     net_mutex_destroy(&srv->clients_mtx);
+    net_cond_destroy(&srv->set_cv);
+    net_mutex_destroy(&srv->set_mtx);
+    net_mutex_destroy(&srv->pub_mtx);
     if (srv->app) {
         atomic_store(&srv->app->net_connected, false);
         srv->app->net_state = NULL;
@@ -941,14 +1333,19 @@ static net_sock_t client_connect(const char *host, uint16_t port) {
 
 /* Send "GET <path> HTTP/1.0\r\n\r\n", read headers + full body into body_out
  * (up to body_cap). HTTP/1.0 closes the connection at EOF, so keep reading
- * until recv returns 0 (EOF) or the body buffer is full. Returns 0 on
- * success, -1 on error. body_len receives the number of body bytes stored
- * (excluding the NUL terminator). */
+ * until recv returns 0 (EOF) or the body buffer is full. Returns 0 on a 200,
+ * -1 otherwise. body_len receives the number of body bytes stored (excluding
+ * the NUL terminator); status_out (optional) the HTTP status, 0 when no
+ * response was parsed. The body is read for every status, so a refused /set
+ * can carry its reason. */
 static int client_get(const char *host, uint16_t port, const char *path,
-                      char *body_out, size_t body_cap, size_t *body_len) {
+                      char *body_out, size_t body_cap, size_t *body_len, int *status_out) {
+    if (status_out) *status_out = 0;
+    if (body_len) *body_len = 0;
+    if (body_out && body_cap) body_out[0] = '\0';
     net_sock_t fd = client_connect(host, port);
     if (!net_sock_valid(fd)) return -1;
-    char req[512];
+    char req[2304];
     snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n", path, host);
     if (net_send_str(fd, req) != 0) { net_close(fd); return -1; }
     /* Read into a header buffer until we find the end-of-headers marker. */
@@ -974,9 +1371,14 @@ static int client_get(const char *host, uint16_t port, const char *path,
             break;
         }
     }
+    int status = 0;
+    if (got_headers && strncmp(hbuf, "HTTP/1.", 7) == 0) {
+        const char *sp = strchr(hbuf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    if (status_out) *status_out = status;
     int rc = -1;
-    if (got_headers &&
-        (strncmp(hbuf, "HTTP/1.0 200", 12) == 0 || strncmp(hbuf, "HTTP/1.1 200", 12) == 0)) {
+    if (got_headers && status > 0) {
         /* Copy any body bytes that arrived with the headers, then keep
          * reading until EOF (HTTP/1.0 closes the socket) so the full body
          * is captured - a small JSON body often arrives in a later TCP
@@ -1002,7 +1404,7 @@ static int client_get(const char *host, uint16_t port, const char *path,
             body_out[body_total] = '\0';
             if (body_len) *body_len = body_total;
         }
-        rc = 0;
+        rc = (status == 200) ? 0 : -1;
     }
     net_close(fd);
     return rc;
@@ -1041,6 +1443,14 @@ static bool json_bool(const char *j, const char *key, bool def) {
     p += strlen(pat);
     while (*p == ' ' || *p == '\t') p++;
     return (strncmp(p, "true", 4) == 0);
+}
+
+static uint64_t json_u64(const char *j, const char *key, uint64_t def) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(j, pat);
+    if (!p) return def;
+    return (uint64_t)strtoull(p + strlen(pat), NULL, 10);
 }
 
 /* Ingest pump thread: connect /rf (or /baseband), read body bytes, re-frame to
@@ -1260,20 +1670,210 @@ static void client_stop_ingest(gui_app_t *app, net_client_t *cli) {
     gui_net_set_status(app, "Client ingest stopped");
 }
 
-/* Worker thread: connect, poll /stats + /devices + /controls, mirror, and
- * forward queued command flags to the server. Does NOT touch is_capturing or
- * buffers directly (the main thread starts/stops ingest on state changes). */
+/* Parse a /stats body: the peer state the mirror always had, plus the
+ * recording relay and the status line. Worker thread. */
+static void client_apply_stats(net_client_t *cli, const char *stats) {
+    int st = json_int(stats, "state", 0);
+    int sr = json_int(stats, "sample_rate", 0);
+    int sel = json_int(stats, "selected_device", -1);
+    int dc = json_int(stats, "device_count", 0);
+    int af = json_int(stats, "audio_frame_bytes", 12);
+    atomic_store(&cli->peer_state, st);
+    atomic_store(&cli->peer_sample_rate, sr);
+    atomic_store(&cli->peer_selected, sel);
+    atomic_store(&cli->peer_device_count, dc);
+    atomic_store(&cli->peer_audio_frame_bytes, af);
+
+    atomic_store(&cli->peer_rec_elapsed_ms, (uint_fast64_t)json_u64(stats, "rec_elapsed_ms", 0));
+    atomic_store(&cli->peer_rec_bytes, (uint_fast64_t)json_u64(stats, "rec_bytes", 0));
+    atomic_store(&cli->peer_rec_raw_a, (uint_fast64_t)json_u64(stats, "rec_raw_a", 0));
+    atomic_store(&cli->peer_rec_raw_b, (uint_fast64_t)json_u64(stats, "rec_raw_b", 0));
+    atomic_store(&cli->peer_rec_comp_a, (uint_fast64_t)json_u64(stats, "rec_comp_a", 0));
+    atomic_store(&cli->peer_rec_comp_b, (uint_fast64_t)json_u64(stats, "rec_comp_b", 0));
+    atomic_store(&cli->peer_disk_free, (uint_fast64_t)json_u64(stats, "disk_free", 0));
+    atomic_store(&cli->peer_rec_drops, (uint_fast32_t)json_int(stats, "rec_drops", 0));
+    bool pending = json_bool(stats, "rec_pending", false);
+    atomic_store(&cli->peer_rec_finalizing, json_bool(stats, "rec_finalizing", false));
+
+    char status[256];
+    char ptext[512];
+    uint32_t sseq = (uint32_t)json_int(stats, "status_seq", 0);
+    uint32_t gen = (uint32_t)json_int(stats, "generation", 0);
+    bool stale = false;
+    net_mutex_lock(&cli->set_mtx);
+    /* The prompt's text lands before the flag so the mirror never shows an
+     * empty dialog (an older server has no rec_pending_text: fallback text). */
+    if (pending && gui_settings_find_value(stats, "rec_pending_text", ptext, sizeof(ptext), true)) {
+        snprintf(cli->peer_pending_text, sizeof(cli->peer_pending_text), "%s", ptext);
+    } else {
+        cli->peer_pending_text[0] = '\0';
+    }
+    atomic_store(&cli->peer_rec_pending, pending);
+    if (gui_settings_find_value(stats, "status", status, sizeof(status), true) &&
+        sseq != cli->peer_status_seq) {
+        snprintf(cli->peer_status, sizeof(cli->peer_status), "%s", status);
+        cli->peer_status_seq = sseq;
+        cli->peer_status_dirty = true;
+    }
+    /* A server-side edit bumps the generation; fetch the snapshot now rather
+     * than on the 3 s tick. */
+    if (cli->staged_settings_valid && gen > cli->staged_generation) stale = true;
+    net_mutex_unlock(&cli->set_mtx);
+    if (stale) atomic_store(&cli->settings_refresh_req, true);
+}
+
+/* Parse a /devices body into the staged device list. Worker thread. */
+static void client_apply_devices(net_client_t *cli, const char *dj) {
+    int count = json_int(dj, "count", 0);
+    int selected = json_int(dj, "selected", -1);
+    if (count < 0) count = 0;
+    if (count > MAX_DEVICES) count = MAX_DEVICES;
+    /* Parse device entries by finding "name":"..." occurrences. */
+    net_mutex_lock(&cli->dev_mtx);
+    cli->staged_device_count = 0;
+    const char *p = dj;
+    for (int i = 0; i < count; i++) {
+        const char *idx = strstr(p, "\"index\":");
+        const char *nm = strstr(p, "\"name\":\"");
+        if (!nm) break;
+        int ti = idx ? atoi(idx + 8) : i;
+        char name[80];
+        json_str(nm, "name", name, sizeof(name));
+        device_info_t *d = &cli->staged_devices[cli->staged_device_count];
+        snprintf(d->name, sizeof(d->name), "%s", name);
+        d->serial[0] = '\0';
+        /* We don't know the real device type; mark as a generic
+         * "remote" entry using SIMPLE_CAPTURE as a neutral tag so
+         * the dropdown renders. The client never opens it. */
+        d->type = DEVICE_TYPE_SIMPLE_CAPTURE;
+        d->index = ti;
+        cli->staged_device_count++;
+        p = nm + 8;
+    }
+    cli->staged_selected = selected;
+    cli->staged_dirty = true;
+    net_mutex_unlock(&cli->dev_mtx);
+}
+
+/* GET /settings and stage the server's settings. An older server without
+ * the endpoint (404) gets the two fields the client's own pipeline needs
+ * from /controls instead. Worker thread. */
+static void client_fetch_settings(net_client_t *cli) {
+    const size_t cap = 32768;
+    char *sj = (char *)malloc(cap);
+    if (!sj) return;
+    int status = 0;
+    size_t blen = 0;
+    int rc = client_get(cli->host, cli->port, "/settings", sj, cap, &blen, &status);
+    if (rc == 0) {
+        gui_settings_t *snap = (gui_settings_t *)malloc(sizeof(*snap));
+        if (snap) {
+            gui_settings_init_defaults(snap);
+            size_t n = 0;
+            const gui_setting_desc_t *t = gui_settings_table(&n);
+            char val[600];
+            for (size_t i = 0; i < n; i++) {
+                if (t[i].flags & (GS_CLIENT_LOCAL | GS_WRITE_ONLY | GS_LOAD_ONLY)) continue;
+                if (!gui_settings_find_value(sj, t[i].key, val, sizeof(val), true)) continue;
+                (void)gui_settings_apply_key(snap, t[i].key, val, false, NULL, 0);
+            }
+            uint32_t gen = (uint32_t)json_int(sj, "generation", 0);
+            bool eff = json_bool(sj, "misrc_mode_effective", snap->misrc_mode);
+            net_mutex_lock(&cli->set_mtx);
+            cli->staged_settings = *snap;
+            cli->staged_generation = gen;
+            cli->staged_effective_misrc = eff;
+            cli->staged_settings_valid = true;
+            cli->staged_settings_dirty = true;
+            cli->staged_settings_time_ms = get_time_ms();
+            cli->server_settings_support = 1;
+            net_mutex_unlock(&cli->set_mtx);
+            free(snap);
+        }
+    } else if (status == 404) {
+        char cj[512];
+        bool have = client_get(cli->host, cli->port, "/controls", cj, sizeof(cj), &blen, NULL) == 0;
+        net_mutex_lock(&cli->set_mtx);
+        cli->server_settings_support = 0;
+        if (have) {
+            cli->staged_effective_misrc = json_bool(cj, "misrc_mode", false);
+            cli->staged_settings.misrc_v15_v25_ab_swap = json_bool(cj, "misrc_v15_v25_ab_swap", false);
+            cli->staged_controls_dirty = true;
+        }
+        net_mutex_unlock(&cli->set_mtx);
+    }
+    free(sj);
+}
+
+/* Send every queued /set and store the answers; re-fetch /settings after
+ * so the canonical values arrive with the generation that carries them.
+ * Worker thread. */
+static void client_send_pending_sets(net_client_t *cli) {
+    bool sent_any = false;
+    for (;;) {
+        net_set_req_t req;
+        bool have = false;
+        net_mutex_lock(&cli->set_mtx);
+        if (cli->out_count > 0) {
+            req = cli->out_q[0];
+            memmove(&cli->out_q[0], &cli->out_q[1], (size_t)(cli->out_count - 1) * sizeof(req));
+            cli->out_count--;
+            have = true;
+        }
+        net_mutex_unlock(&cli->set_mtx);
+        if (!have) break;
+
+        char enc[1600];
+        net_percent_encode(req.value, enc, sizeof(enc));
+        char path[1800];
+        snprintf(path, sizeof(path), "/set?key=%s&value=%s", req.key, enc);
+        char body[1024];
+        int status = 0;
+        size_t blen = 0;
+        int rc = client_get(cli->host, cli->port, path, body, sizeof(body), &blen, &status);
+        net_set_res_t res;
+        memset(&res, 0, sizeof(res));
+        res.seq = req.seq;
+        res.http = (rc == 0) ? 200 : status;
+        res.generation = (uint32_t)json_int(body, "generation", 0);
+        if (res.http == 200) {
+            (void)gui_settings_find_value(body, "value", res.msg, sizeof(res.msg), true);
+        } else if (status > 0) {
+            if (!gui_settings_find_value(body, "error", res.msg, sizeof(res.msg), true)) {
+                snprintf(res.msg, sizeof(res.msg), "HTTP %d", status);
+            }
+        } else {
+            snprintf(res.msg, sizeof(res.msg), "no response from server");
+        }
+        fprintf(stderr, "[NET] client: /set %s -> %d%s%s\n", req.key, res.http,
+                res.http == 200 ? "" : ": ", res.http == 200 ? "" : res.msg);
+        net_mutex_lock(&cli->set_mtx);
+        if (cli->res_count >= (int)(NET_SET_QUEUE * 2)) {
+            memmove(&cli->results[0], &cli->results[1], (size_t)(NET_SET_QUEUE * 2 - 1) * sizeof(res));
+            cli->res_count = NET_SET_QUEUE * 2 - 1;
+        }
+        cli->results[cli->res_count++] = res;
+        net_mutex_unlock(&cli->set_mtx);
+        sent_any = true;
+    }
+    if (sent_any) client_fetch_settings(cli);
+}
+
+/* Worker thread: connect, poll /stats + /devices + /settings, stage the
+ * mirror, forward queued command flags and /set requests to the server.
+ * Does NOT touch is_capturing, buffers or app->settings (the main thread
+ * starts/stops ingest and applies the snapshot). */
 static int client_worker_thread(void *arg) {
     net_client_t *cli = (net_client_t *)arg;
     gui_app_t *app = cli->app;
     int backoff_ms = 500;
     int last_peer_state = -1;
     int miss_streak = 0;  /* consecutive /stats failures; tear down ingest only after several */
-    bool first_contact = false;  /* fetch /devices immediately on first good /stats */
+    bool first_contact = false;  /* fetch /devices + /settings immediately on first good /stats */
     while (!atomic_load(&cli->stop_flag)) {
-        char stats[1024];
+        char stats[8192];
         size_t blen = 0;
-        if (client_get(cli->host, cli->port, "/stats", stats, sizeof(stats), &blen) != 0) {
+        if (client_get(cli->host, cli->port, "/stats", stats, sizeof(stats), &blen, NULL) != 0) {
             /* Transient failure: don't immediately tear down ingest. A single
              * missed /stats (e.g. server briefly busy, network blip) used to
              * flap the whole ingest start/stop cycle. Only mark disconnected
@@ -1297,52 +1897,19 @@ static int client_worker_thread(void *arg) {
         backoff_ms = 500;
 
         /* On the first successful /stats after (re)connect, fetch /devices
-         * immediately so the toolbar device dropdown populates right away
-         * instead of waiting up to ~3s for the periodic tick. */
+         * and /settings immediately so the dropdown and the settings panel
+         * populate right away instead of waiting up to ~3s for the tick. */
         if (!first_contact) {
             first_contact = true;
             char *dj0 = (char *)malloc(16384);
-            int drc = dj0 ? client_get(cli->host, cli->port, "/devices", dj0, 16384, NULL) : -1;
-            if (drc == 0) {
-                int count = json_int(dj0, "count", 0);
-                int selected = json_int(dj0, "selected", -1);
-                if (count < 0) count = 0;
-                if (count > MAX_DEVICES) count = MAX_DEVICES;
-                net_mutex_lock(&cli->dev_mtx);
-                cli->staged_device_count = 0;
-                const char *p = dj0;
-                for (int i = 0; i < count; i++) {
-                    const char *nm = strstr(p, "\"name\":\"");
-                    if (!nm) break;
-                    const char *idx = strstr(p, "\"index\":");
-                    int ti = idx ? atoi(idx + 8) : i;
-                    char name[80];
-                    json_str(nm, "name", name, sizeof(name));
-                    device_info_t *d = &cli->staged_devices[cli->staged_device_count];
-                    snprintf(d->name, sizeof(d->name), "%s", name);
-                    d->serial[0] = '\0';
-                    d->type = DEVICE_TYPE_SIMPLE_CAPTURE;  /* generic remote tag */
-                    d->index = ti;
-                    cli->staged_device_count++;
-                    p = nm + 8;
-                }
-                cli->staged_selected = selected;
-                cli->staged_dirty = true;
-                net_mutex_unlock(&cli->dev_mtx);
+            if (dj0 && client_get(cli->host, cli->port, "/devices", dj0, 16384, NULL, NULL) == 0) {
+                client_apply_devices(cli, dj0);
             }
             free(dj0);
+            client_fetch_settings(cli);
         }
 
-        int st = json_int(stats, "state", 0);
-        int sr = json_int(stats, "sample_rate", 0);
-        int sel = json_int(stats, "selected_device", -1);
-        int dc = json_int(stats, "device_count", 0);
-        int af = json_int(stats, "audio_frame_bytes", 12);
-        atomic_store(&cli->peer_state, st);
-        atomic_store(&cli->peer_sample_rate, sr);
-        atomic_store(&cli->peer_selected, sel);
-        atomic_store(&cli->peer_device_count, dc);
-        atomic_store(&cli->peer_audio_frame_bytes, af);
+        client_apply_stats(cli, stats);
         /* Drive ingest from the connection state, NOT peer capture state. This
          * keeps the /rf + /baseband pump streams open continuously while the
          * client is connected, so the feed doesn't flap (tear down + rebuild
@@ -1351,96 +1918,55 @@ static int client_worker_thread(void *arg) {
          * idle, and data flows immediately when the server captures again. */
         atomic_store(&cli->ingest_want, atomic_load(&cli->connected));
 
+        int st = atomic_load(&cli->peer_state);
         if (st != last_peer_state) {
-            fprintf(stderr, "[NET] client: peer state -> %d (sr=%d)\n", st, sr);
+            fprintf(stderr, "[NET] client: peer state -> %d (sr=%d)\n", st,
+                    atomic_load(&cli->peer_sample_rate));
             last_peer_state = st;
         }
 
         /* Forward queued commands (drain flags the UI/main set for the client). */
         if (atomic_exchange(&app->net_cmd_start, false)) {
-            (void)client_get(cli->host, cli->port, "/start", NULL, 0, NULL);
+            (void)client_get(cli->host, cli->port, "/start", NULL, 0, NULL, NULL);
         }
         if (atomic_exchange(&app->net_cmd_stop, false)) {
-            (void)client_get(cli->host, cli->port, "/stop", NULL, 0, NULL);
+            (void)client_get(cli->host, cli->port, "/stop", NULL, 0, NULL, NULL);
         }
         if (atomic_exchange(&app->net_cmd_record_on, false)) {
-            (void)client_get(cli->host, cli->port, "/record?on=1", NULL, 0, NULL);
+            (void)client_get(cli->host, cli->port, "/record?on=1", NULL, 0, NULL, NULL);
         }
         if (atomic_exchange(&app->net_cmd_record_off, false)) {
-            (void)client_get(cli->host, cli->port, "/record?on=0", NULL, 0, NULL);
+            (void)client_get(cli->host, cli->port, "/record?on=0", NULL, 0, NULL, NULL);
+        }
+        if (atomic_exchange(&app->net_cmd_record_confirm, false)) {
+            int v = atomic_load(&app->net_cmd_record_confirm_value);
+            char cpath[64];
+            snprintf(cpath, sizeof(cpath), "/record?confirm=%d", v ? 1 : 0);
+            (void)client_get(cli->host, cli->port, cpath, NULL, 0, NULL, NULL);
         }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
             char path[64];
             snprintf(path, sizeof(path), "/device?%d", n);
-            (void)client_get(cli->host, cli->port, path, NULL, 0, NULL);
+            (void)client_get(cli->host, cli->port, path, NULL, 0, NULL, NULL);
         }
 
-        /* Periodically refresh the device list + controls (every ~3s). */
+        /* Settings edits made on this client. */
+        client_send_pending_sets(cli);
+
+        /* Periodically refresh the device list + settings (every ~3s), or
+         * sooner when asked (a /set answered, a generation bump seen). */
         static int dev_tick = 0;
-        if ((dev_tick++ % 3) == 0) {
+        bool tick = ((dev_tick++ % 3) == 0);
+        if (tick) {
             char *dj = (char *)malloc(16384);
-            if (dj && client_get(cli->host, cli->port, "/devices", dj, 16384, &blen) == 0) {
-                int count = json_int(dj, "count", 0);
-                int selected = json_int(dj, "selected", -1);
-                if (count < 0) count = 0;
-                if (count > MAX_DEVICES) count = MAX_DEVICES;
-                /* Parse device entries by finding "name":"..." occurrences. */
-                net_mutex_lock(&cli->dev_mtx);
-                cli->staged_device_count = 0;
-                const char *p = dj;
-                for (int i = 0; i < count; i++) {
-                    const char *idx = strstr(p, "\"index\":");
-                    const char *nm = strstr(p, "\"name\":\"");
-                    if (!nm) break;
-                    int ti = idx ? atoi(idx + 8) : i;
-                    char name[80];
-                    json_str(nm, "name", name, sizeof(name));
-                    device_info_t *d = &cli->staged_devices[cli->staged_device_count];
-                    snprintf(d->name, sizeof(d->name), "%s", name);
-                    d->serial[0] = '\0';
-                    /* We don't know the real device type; mark as a generic
-                     * "remote" entry using SIMPLE_CAPTURE as a neutral tag so
-                     * the dropdown renders. The client never opens it. */
-                    d->type = DEVICE_TYPE_SIMPLE_CAPTURE;
-                    d->index = ti;
-                    cli->staged_device_count++;
-                    p = nm + 8;
-                }
-                cli->staged_selected = selected;
-                cli->staged_dirty = true;
-                net_mutex_unlock(&cli->dev_mtx);
+            if (dj && client_get(cli->host, cli->port, "/devices", dj, 16384, &blen, NULL) == 0) {
+                client_apply_devices(cli, dj);
             }
             free(dj);
-
-            char cj[512];
-            if (client_get(cli->host, cli->port, "/controls", cj, sizeof(cj), &blen) == 0) {
-                /* Mirror the server's capture controls into local settings so
-                 * the client UI reflects the master's configuration. We write
-                 * here (worker thread); the UI/main reads next frame. These are
-                 * the master-owned settings the slave must follow. */
-                bool mm = json_bool(cj, "misrc_mode", false);
-                app->settings.misrc_mode = mm;
-                app->user_capture_mode_misrc = mm;
-                /* The extraction swap is misrc_mode inverted by this wiring
-                 * flag; it describes the server's hardware, so follow it. */
-                app->settings.misrc_v15_v25_ab_swap = json_bool(cj, "misrc_v15_v25_ab_swap", false);
-                int rba = json_int(cj, "rf_bits_a", 16);
-                int rbb = json_int(cj, "rf_bits_b", 16);
-                if (rba == 8 || rba == 12 || rba == 16) app->settings.rf_bits_a = (uint8_t)rba;
-                if (rbb == 8 || rbb == 12 || rbb == 16) app->settings.rf_bits_b = (uint8_t)rbb;
-                app->settings.cxadc_tenbit_mode_card[0] = json_bool(cj, "cxadc_tenbit_a", false);
-                app->settings.cxadc_tenbit_mode_card[1] = json_bool(cj, "cxadc_tenbit_b", false);
-                app->settings.enable_resample_a = json_bool(cj, "resample_a", false);
-                app->settings.enable_resample_b = json_bool(cj, "resample_b", false);
-                int rra = json_int(cj, "resample_rate_a", 0);
-                int rrb = json_int(cj, "resample_rate_b", 0);
-                if (rra > 0) app->settings.resample_rate_a = (float)rra;
-                if (rrb > 0) app->settings.resample_rate_b = (float)rrb;
-                app->settings.use_flac = json_bool(cj, "use_flac", true);
-                int fl = json_int(cj, "flac_level", -1);
-                if (fl >= 0 && fl <= 8) app->settings.flac_level = fl;
-            }
+        }
+        if (tick || atomic_exchange(&cli->settings_refresh_req, false)) {
+            client_fetch_settings(cli);
         }
 
     /* 1s poll interval: halves TCP connection churn vs 500ms while staying
@@ -1614,6 +2140,21 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port) {
     atomic_store(&cli->discovery_stop, false);
     net_mutex_init(&cli->dev_mtx);
     net_mutex_init(&cli->disc_mtx);
+    net_mutex_init(&cli->set_mtx);
+    cli->staged_settings_valid = false;
+    cli->staged_settings_dirty = false;
+    cli->staged_controls_dirty = false;
+    cli->server_settings_support = -1;
+    cli->staged_generation = 0;
+    cli->out_count = 0;
+    cli->out_seq = 0;
+    cli->res_count = 0;
+    cli->peer_status[0] = '\0';
+    cli->peer_status_seq = 0;
+    cli->peer_status_dirty = false;
+    atomic_store(&cli->settings_refresh_req, false);
+    atomic_store(&cli->peer_rec_pending, false);
+    atomic_store(&cli->peer_rec_finalizing, false);
 
     /* Start the UDP discovery listener so the UI can show found servers, even
      * before a specific host is selected. */
@@ -1621,6 +2162,7 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port) {
         fprintf(stderr, "[NET] client: discovery thread failed\n");
         net_mutex_destroy(&cli->dev_mtx);
         net_mutex_destroy(&cli->disc_mtx);
+        net_mutex_destroy(&cli->set_mtx);
         free(cli);
         return -1;
     }
@@ -1649,8 +2191,10 @@ static void client_stop(net_client_t *cli) {
     }
     net_mutex_destroy(&cli->dev_mtx);
     net_mutex_destroy(&cli->disc_mtx);
+    net_mutex_destroy(&cli->set_mtx);
     free(cli);
     s_client = NULL;
+    client_view_reset();
 }
 
 /* -------------------------------------------------------------------------
@@ -1786,6 +2330,16 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_app_stop_recording(app);
             }
         }
+        if (atomic_exchange(&app->net_cmd_record_confirm, false)) {
+            /* A client's answer to the overwrite prompt. The next
+             * gui_record_check_popup() (each GUI frame, or the headless
+             * loop) then starts or cancels exactly as a local click would. */
+            int v = atomic_load(&app->net_cmd_record_confirm_value);
+            if (gui_record_is_pending()) {
+                fprintf(stderr, "[NET] server: executing /record confirm=%d\n", v);
+                gui_record_resolve_pending(app, v != 0);
+            }
+        }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
             if (!app->is_capturing && n >= 0 && n < app->device_count) {
@@ -1793,9 +2347,89 @@ void gui_net_poll_commands(gui_app_t *app) {
                 app->selected_device = n;
             }
         }
+        /* /set requests: apply here, on the main thread, with the settings
+         * panel's own checks and side effects, then answer the waiting
+         * handler. Answers nobody collects (a handler that timed out) are
+         * capped and the oldest dropped. */
+        for (;;) {
+            net_set_req_t req;
+            bool have = false;
+            net_mutex_lock(&s_server->set_mtx);
+            if (s_server->set_q_count > 0) {
+                req = s_server->set_q[0];
+                memmove(&s_server->set_q[0], &s_server->set_q[1],
+                        (size_t)(s_server->set_q_count - 1) * sizeof(req));
+                s_server->set_q_count--;
+                have = true;
+            }
+            net_mutex_unlock(&s_server->set_mtx);
+            if (!have) break;
+            net_set_res_t res;
+            memset(&res, 0, sizeof(res));
+            res.seq = req.seq;
+            res.http = gui_ui_apply_remote_setting(app, req.key, req.value, res.msg, sizeof(res.msg));
+            res.generation = gui_settings_generation();
+            fprintf(stderr, "[NET] server: /set %s -> %d%s%s\n", req.key, res.http,
+                    res.http == 200 ? "" : ": ", res.http == 200 ? "" : res.msg);
+            net_mutex_lock(&s_server->set_mtx);
+            if (s_server->set_res_count >= NET_SET_QUEUE) {
+                memmove(&s_server->set_res[0], &s_server->set_res[1],
+                        (size_t)(NET_SET_QUEUE - 1) * sizeof(res));
+                s_server->set_res_count = NET_SET_QUEUE - 1;
+            }
+            s_server->set_res[s_server->set_res_count++] = res;
+            net_cond_broadcast(&s_server->set_cv);
+            net_mutex_unlock(&s_server->set_mtx);
+        }
+        server_publish(s_server, app);
     }
     /* Client mode: the worker drains the command flags and forwards them; we
      * must NOT execute them locally. Nothing to do here for client. */
+}
+
+/* The server's overwrite prompt, shown on the client too. While the
+ * server's record start waits on "Overwrite Files?", /stats carries
+ * rec_pending plus the prompt's text; this raises the same confirm dialog
+ * here and forwards the answer as /record?confirm=N. Whichever side answers
+ * first wins: once the server's rec_pending drops, a copy still open here is
+ * dismissed without answering. Main thread only. */
+static bool s_client_prompt_open = false;      /* our copy of the dialog is up */
+static bool s_client_prompt_answered = false;  /* answered here; wait for the server to clear */
+
+static void client_mirror_overwrite_prompt(gui_app_t *app, net_client_t *cli) {
+    bool pending = atomic_load(&cli->connected) && atomic_load(&cli->peer_rec_pending);
+    if (!pending) {
+        s_client_prompt_answered = false;
+        if (s_client_prompt_open) {
+            s_client_prompt_open = false;
+            if (gui_popup_is_open()) gui_popup_dismiss();
+        }
+        return;
+    }
+    if (s_client_prompt_answered) return;
+    if (!s_client_prompt_open) {
+        if (gui_popup_is_open()) return;       /* another dialog first; retry next frame */
+        char text[512];
+        net_mutex_lock(&cli->set_mtx);
+        snprintf(text, sizeof(text), "%s", cli->peer_pending_text);
+        net_mutex_unlock(&cli->set_mtx);
+        if (!text[0]) {
+            snprintf(text, sizeof(text),
+                     "The server's output files already exist.\n\nOverwrite them on the server?");
+        }
+        gui_popup_confirm("Overwrite Files? (on the server)", text, "Overwrite", "Cancel", NULL);
+        s_client_prompt_open = true;
+        return;
+    }
+    popup_result_t r = gui_popup_get_result();
+    if (r == POPUP_RESULT_NONE) return;
+    s_client_prompt_open = false;
+    s_client_prompt_answered = true;
+    bool yes = (r == POPUP_RESULT_YES);
+    atomic_store(&app->net_cmd_record_confirm_value, yes ? 1 : 0);
+    atomic_store(&app->net_cmd_record_confirm, true);
+    gui_net_set_status(app, yes ? "Overwrite confirmed, sent to the server"
+                                : "Overwrite cancelled, sent to the server");
 }
 
 void gui_net_poll_mirror(gui_app_t *app) {
@@ -1816,7 +2450,7 @@ void gui_net_poll_mirror(gui_app_t *app) {
             net_mutex_unlock(&s_client->dev_mtx);
         }
         /* Drive ingest start/stop from peer capture state (main thread). */
-        bool want = atomic_load(&s_client->ingest_want);
+        bool want = atomic_load(&s_client->ingest_want) && !s_probe_no_ingest;
         bool active = atomic_load(&s_client->ingest_active);
         if (want && !active && atomic_load(&s_client->connected)) {
             client_start_ingest(app, s_client);
@@ -1826,6 +2460,44 @@ void gui_net_poll_mirror(gui_app_t *app) {
         /* Mirror peer sample rate into app for display. */
         int psr = atomic_load(&s_client->peer_sample_rate);
         if (psr > 0) atomic_store(&app->sample_rate, (uint32_t)psr);
+
+        client_apply_snapshot(app, s_client);
+        client_apply_set_results(app, s_client);
+        client_expire_pending();
+        client_mirror_overwrite_prompt(app, s_client);
+
+        /* The pipeline follows the server's effective mode and wiring flag,
+         * never a settings field (the view swap may be replacing those). */
+        if (s_peer_valid || s_peer_controls_only) {
+            app->user_capture_mode_misrc = s_peer_effective_misrc;
+            if (!app->is_recording) app->capture_mode_runtime_misrc = s_peer_effective_misrc;
+            app->capture_ab_swap_invert = s_peer_applied.misrc_v15_v25_ab_swap;
+        }
+
+        /* Recording relay: the readouts that key on these counters show the
+         * server's recording. is_recording itself is never set on a client. */
+        int ps = atomic_load(&s_client->peer_state);
+        atomic_store(&app->net_peer_state, ps);
+        if (atomic_load(&s_client->connected)) {
+            atomic_store(&app->recording_bytes, atomic_load(&s_client->peer_rec_bytes));
+            atomic_store(&app->recording_raw_a, atomic_load(&s_client->peer_rec_raw_a));
+            atomic_store(&app->recording_raw_b, atomic_load(&s_client->peer_rec_raw_b));
+            atomic_store(&app->recording_compressed_a, atomic_load(&s_client->peer_rec_comp_a));
+            atomic_store(&app->recording_compressed_b, atomic_load(&s_client->peer_rec_comp_b));
+            if (ps == 2) {
+                double elapsed_s = (double)atomic_load(&s_client->peer_rec_elapsed_ms) / 1000.0;
+                app->recording_start_time = net_now_s() - elapsed_s;
+            }
+        }
+        /* The server's bottom-bar message, for the bar's client-mode reader. */
+        net_mutex_lock(&s_client->set_mtx);
+        if (s_client->peer_status_dirty) {
+            snprintf(app->net_peer_status, sizeof(app->net_peer_status), "%s", s_client->peer_status);
+            app->net_peer_status_seq++;
+            app->net_peer_status_time = net_now_s();
+            s_client->peer_status_dirty = false;
+        }
+        net_mutex_unlock(&s_client->set_mtx);
     }
 }
 
@@ -1910,11 +2582,421 @@ bool gui_net_client_connection_running(const gui_app_t *app) {
     return atomic_load(&s_client->worker_started);
 }
 
+/* -------------------------------------------------------------------------
+ * Client: the server's settings on this machine (main thread only).
+ *
+ * s_peer_applied is the last snapshot from /settings. s_peer_view is what the
+ * UI pass sees and edits: gui_net_client_view_begin() swaps it into
+ * app->settings (with the client's own client-local fields copied in) and
+ * gui_net_client_view_end() swaps the client's own settings back, saves them
+ * if the pass asked to, and turns every server-owned field the pass changed
+ * into a /set. A field with a /set in flight is "pending": a snapshot does
+ * not overwrite it until the server has answered and a snapshot at or past
+ * the generation that answer carries has arrived (or 5 s pass). A refused
+ * /set reverts the field and surfaces the reason.
+ * ------------------------------------------------------------------------- */
+#define NET_PENDING_MAX 192
+#define NET_PENDING_TIMEOUT_MS 5000
+
+typedef struct {
+    bool active;
+    bool acked;
+    uint32_t seq;
+    uint32_t clear_at_gen;
+    uint64_t t0_ms;
+} net_pending_t;
+
+static bool s_view_active = false;
+static bool s_peer_valid = false;
+static bool s_peer_controls_only = false;     /* older server: mode + swap only */
+static bool s_peer_effective_misrc = false;
+static uint32_t s_peer_generation = 0;
+static uint64_t s_peer_time_ms = 0;
+static gui_settings_t s_own_backup;
+static gui_settings_t s_peer_view;
+static gui_settings_t s_peer_applied;
+static net_pending_t s_pending[NET_PENDING_MAX];
+static char s_last_set_error[256];
+static uint64_t s_last_set_error_ms = 0;
+
+static void client_view_reset(void) {
+    s_peer_valid = false;
+    s_peer_controls_only = false;
+    s_peer_generation = 0;
+    s_peer_time_ms = 0;
+    memset(s_pending, 0, sizeof(s_pending));
+    s_last_set_error[0] = '\0';
+    s_last_set_error_ms = 0;
+    /* s_view_active is left alone: a mode change inside the UI pass still
+     * needs view_end to restore app->settings. */
+}
+
+static bool desc_is_remote(const gui_setting_desc_t *d) {
+    return (d->flags & (GS_CLIENT_LOCAL | GS_WRITE_ONLY | GS_LOAD_ONLY | GS_NO_REMOTE_SET)) == 0;
+}
+
+/* Main thread: take a dirty staged snapshot into s_peer_applied and the view. */
+static void client_apply_snapshot(gui_app_t *app, net_client_t *cli) {
+    (void)app;
+    if (!cli->staged_settings_dirty && !cli->staged_controls_dirty) return;
+    net_mutex_lock(&cli->set_mtx);
+    if (cli->staged_settings_dirty) {
+        s_peer_applied = cli->staged_settings;
+        s_peer_generation = cli->staged_generation;
+        s_peer_time_ms = cli->staged_settings_time_ms;
+        s_peer_effective_misrc = cli->staged_effective_misrc;
+        cli->staged_settings_dirty = false;
+        bool first = !s_peer_valid;
+        s_peer_valid = true;
+        s_peer_controls_only = false;
+        size_t n = 0;
+        const gui_setting_desc_t *t = gui_settings_table(&n);
+        for (size_t i = 0; i < n && i < NET_PENDING_MAX; i++) {
+            if (!desc_is_remote(&t[i])) {
+                /* Client-local fields in the view come from this machine
+                 * (view_begin refreshes them every frame); the rest are
+                 * never sent. Keep the view's copy. */
+                if (first) gui_settings_copy_field(&s_peer_view, &s_peer_applied, &t[i]);
+                continue;
+            }
+            if (s_pending[i].active) {
+                if (s_pending[i].acked && s_peer_generation >= s_pending[i].clear_at_gen) {
+                    s_pending[i].active = false;   /* the server's canonical value wins now */
+                } else {
+                    continue;                      /* keep the edit until the server answers */
+                }
+            }
+            gui_settings_copy_field(&s_peer_view, &s_peer_applied, &t[i]);
+        }
+    }
+    if (cli->staged_controls_dirty) {
+        s_peer_effective_misrc = cli->staged_effective_misrc;
+        s_peer_applied.misrc_v15_v25_ab_swap = cli->staged_settings.misrc_v15_v25_ab_swap;
+        s_peer_controls_only = !s_peer_valid;
+        cli->staged_controls_dirty = false;
+    }
+    net_mutex_unlock(&cli->set_mtx);
+}
+
+/* Main thread: consume the worker's /set answers. */
+static void client_apply_set_results(gui_app_t *app, net_client_t *cli) {
+    for (;;) {
+        net_set_res_t res;
+        bool have = false;
+        net_mutex_lock(&cli->set_mtx);
+        if (cli->res_count > 0) {
+            res = cli->results[0];
+            memmove(&cli->results[0], &cli->results[1], (size_t)(cli->res_count - 1) * sizeof(res));
+            cli->res_count--;
+            have = true;
+        }
+        net_mutex_unlock(&cli->set_mtx);
+        if (!have) break;
+
+        size_t n = 0;
+        const gui_setting_desc_t *t = gui_settings_table(&n);
+        for (size_t i = 0; i < n && i < NET_PENDING_MAX; i++) {
+            if (!s_pending[i].active || s_pending[i].seq != res.seq) continue;
+            if (res.http == 200) {
+                s_pending[i].acked = true;
+                s_pending[i].clear_at_gen = res.generation;
+            } else {
+                /* Refused: back to what the server has, and say why. */
+                gui_settings_copy_field(&s_peer_view, &s_peer_applied, &t[i]);
+                s_pending[i].active = false;
+                snprintf(s_last_set_error, sizeof(s_last_set_error), "%s: %s", t[i].key,
+                         res.msg[0] ? res.msg : "refused");
+                s_last_set_error_ms = get_time_ms();
+                char msg[300];
+                snprintf(msg, sizeof(msg), "Server refused %s", s_last_set_error);
+                gui_net_set_status(app, msg);
+            }
+            break;
+        }
+    }
+}
+
+/* Main thread: a /set nobody answered in NET_PENDING_TIMEOUT_MS stops
+ * protecting its field; the next snapshot wins. */
+static void client_expire_pending(void) {
+    uint64_t now = get_time_ms();
+    for (size_t i = 0; i < NET_PENDING_MAX; i++) {
+        if (s_pending[i].active && now - s_pending[i].t0_ms > NET_PENDING_TIMEOUT_MS) {
+            s_pending[i].active = false;
+        }
+    }
+}
+
+void gui_net_client_view_begin(gui_app_t *app) {
+    if (!app || !s_client || s_view_active || !s_peer_valid) return;
+    s_own_backup = app->settings;
+    /* The client-local fields are this machine's, whatever the view shows. */
+    gui_settings_copy_fields(&s_peer_view, &app->settings, true);
+    app->settings = s_peer_view;
+    (void)gui_settings_suspend_save(true);
+    s_view_active = true;
+}
+
+void gui_net_client_view_end(gui_app_t *app) {
+    if (!app || !s_view_active) return;
+    s_view_active = false;
+    s_peer_view = app->settings;
+    app->settings = s_own_backup;
+    /* Client-local edits made during the pass belong to this machine. */
+    gui_settings_copy_fields(&app->settings, &s_peer_view, true);
+    bool requested = gui_settings_suspend_save(false);
+    if (requested) gui_settings_save(&app->settings);
+    if (!s_client) return;
+
+    /* Every server-owned field the pass changed becomes a /set. A string
+     * being typed into is sent when the edit ends, not per keystroke. */
+    bool text_active = gui_ui_text_edit_active();
+    uint64_t now = get_time_ms();
+    size_t n = 0;
+    const gui_setting_desc_t *t = gui_settings_table(&n);
+    for (size_t i = 0; i < n && i < NET_PENDING_MAX; i++) {
+        if (!desc_is_remote(&t[i])) continue;
+        if (s_pending[i].active) continue;
+        if (gui_settings_field_equal(&s_peer_view, &s_peer_applied, &t[i])) continue;
+        if (t[i].type == GS_STR && text_active) continue;
+        char v[512];
+        if (!gui_settings_format_value(&s_peer_view, &t[i], v, sizeof(v))) continue;
+        net_mutex_lock(&s_client->set_mtx);
+        if (s_client->out_count < (int)(NET_SET_QUEUE * 2)) {
+            uint32_t seq = ++s_client->out_seq;
+            net_set_req_t *r = &s_client->out_q[s_client->out_count++];
+            r->seq = seq;
+            snprintf(r->key, sizeof(r->key), "%s", t[i].key);
+            snprintf(r->value, sizeof(r->value), "%s", v);
+            s_pending[i].active = true;
+            s_pending[i].acked = false;
+            s_pending[i].seq = seq;
+            s_pending[i].clear_at_gen = 0;
+            s_pending[i].t0_ms = now;
+        }
+        net_mutex_unlock(&s_client->set_mtx);
+    }
+}
+
+bool gui_net_client_peer_settings_valid(const gui_app_t *app) {
+    (void)app;
+    return s_client != NULL && s_peer_valid;
+}
+
+uint32_t gui_net_client_peer_generation(const gui_app_t *app) {
+    (void)app;
+    return s_peer_valid ? s_peer_generation : 0;
+}
+
+double gui_net_client_peer_settings_age_s(const gui_app_t *app) {
+    (void)app;
+    if (!s_peer_valid || s_peer_time_ms == 0) return -1.0;
+    return (double)(get_time_ms() - s_peer_time_ms) / 1000.0;
+}
+
+int gui_net_client_server_settings_support(const gui_app_t *app) {
+    (void)app;
+    if (!s_client) return -1;
+    net_mutex_lock(&s_client->set_mtx);
+    int r = s_client->server_settings_support;
+    net_mutex_unlock(&s_client->set_mtx);
+    return r;
+}
+
+void gui_net_client_request_settings_refresh(gui_app_t *app) {
+    (void)app;
+    if (s_client) atomic_store(&s_client->settings_refresh_req, true);
+}
+
+bool gui_net_client_last_set_error(const gui_app_t *app, char *buf, size_t cap, double *age_s) {
+    (void)app;
+    if (!s_last_set_error[0]) return false;
+    if (buf && cap) snprintf(buf, cap, "%s", s_last_set_error);
+    if (age_s) *age_s = (double)(get_time_ms() - s_last_set_error_ms) / 1000.0;
+    return true;
+}
+
+bool gui_net_client_peer_recording(const gui_app_t *app) {
+    (void)app;
+    if (!s_client) return false;
+    if (!atomic_load(&s_client->connected)) return false;
+    return atomic_load(&s_client->peer_state) == 2;
+}
+
+bool gui_net_client_peer_record_pending(const gui_app_t *app) {
+    (void)app;
+    return s_client && atomic_load(&s_client->connected) && atomic_load(&s_client->peer_rec_pending);
+}
+
+bool gui_net_client_peer_record_finalizing(const gui_app_t *app) {
+    (void)app;
+    return s_client && atomic_load(&s_client->connected) && atomic_load(&s_client->peer_rec_finalizing);
+}
+
+uint32_t gui_net_client_peer_record_drops(const gui_app_t *app) {
+    (void)app;
+    return s_client ? (uint32_t)atomic_load(&s_client->peer_rec_drops) : 0;
+}
+
+uint64_t gui_net_client_peer_disk_free(const gui_app_t *app) {
+    (void)app;
+    return s_client ? (uint64_t)atomic_load(&s_client->peer_disk_free) : 0;
+}
+
 bool gui_net_client_peer_capturing(const gui_app_t *app) {
     (void)app;
     if (!s_client) return false;
     if (!atomic_load(&s_client->connected)) return false;
     return atomic_load(&s_client->peer_state) >= 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Headless modes (no window; return before InitWindow in misrc_gui.c).
+ * ------------------------------------------------------------------------- */
+static volatile sig_atomic_t s_headless_stop = 0;
+
+static void headless_on_signal(int sig) {
+    (void)sig;
+    s_headless_stop = 1;
+}
+
+/* Exit codes: 0 ran and shut down cleanly; 2 no --config, or its net_mode is
+ * not Server; 3 the server did not start (port in use?). */
+int gui_net_serve_main(int seconds) {
+    if (!gui_settings_override_active()) {
+        fprintf(stderr, "--net-serve needs --config <path>; it will not run on the live settings file\n");
+        return 2;
+    }
+    gui_app_t *app = (gui_app_t *)calloc(1, sizeof(*app));
+    if (!app) return 2;
+    atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    gui_settings_load(&app->settings);
+    if (app->settings.net_mode != GUI_NET_MODE_SERVER) {
+        fprintf(stderr, "--net-serve: the config's net_mode is %d, not Server (1)\n", app->settings.net_mode);
+        free(app);
+        return 2;
+    }
+    app->settings.capture_limit_seconds = 0;
+    /* Starts the server: gui_app_init applies the config's net mode when a
+     * --config override is active. */
+    gui_app_init(app);
+    gui_app_enumerate_devices(app);
+    int rc = 0;
+    if (!gui_net_is_server(app) || !gui_net_active(app)) {
+        fprintf(stderr, "--net-serve: the server did not start (port %u in use?)\n",
+                (unsigned)app->settings.net_server_port);
+        rc = 3;
+    } else {
+        fprintf(stderr, "[NET] --net-serve: listening on :%u with %d device(s), for %s\n",
+                (unsigned)app->settings.net_server_port, app->device_count,
+                seconds > 0 ? "a bounded run" : "as long as it takes (SIGINT/SIGTERM stop it)");
+        signal(SIGINT, headless_on_signal);
+#ifdef SIGTERM
+        signal(SIGTERM, headless_on_signal);
+#endif
+        uint64_t deadline_ms = seconds > 0 ? get_time_ms() + (uint64_t)seconds * 1000ULL : 0;
+        while (!s_headless_stop && (deadline_ms == 0 || get_time_ms() < deadline_ms)) {
+            gui_net_poll_commands(app);
+            gui_net_poll_mirror(app);
+            gui_record_check_popup(app);   /* a client's /record?confirm= answer lands here */
+            thrd_sleep_ms(20);
+        }
+        if (app->is_recording) gui_app_stop_recording(app);
+        int waited = 0;
+        while (gui_record_is_finalizing() && waited < 60000) {
+            thrd_sleep_ms(50);
+            waited += 50;
+        }
+        if (app->is_capturing) gui_app_stop_capture(app);
+        gui_record_cleanup();
+        gui_settings_save(&app->settings);
+    }
+    gui_app_cleanup(app);
+    free(app);
+    return rc;
+}
+
+/* Connect to host:port as a client without ingesting, mirror for `seconds`,
+ * print one JSON line and exit. Exit codes: 0 a snapshot arrived and the
+ * mirror never touched the local settings; 2 never connected; 3 the mirror
+ * wrote the local settings; 4 connected to a server with /settings but no
+ * snapshot arrived; 5 the server has no /settings (older build); 6 the
+ * client's own is_recording became true. */
+int gui_net_client_probe_main(const char *host, int port, int seconds) {
+    if (!host || !host[0] || port <= 0 || port > 65535) {
+        fprintf(stderr, "usage: --net-client-probe <host> <port> [seconds]\n");
+        return 2;
+    }
+    if (seconds <= 0) seconds = 5;
+    gui_app_t *app = (gui_app_t *)calloc(1, sizeof(*app));
+    if (!app) return 2;
+    atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    gui_settings_init_defaults(&app->settings);
+    app->settings.net_mode = GUI_NET_MODE_CLIENT;
+    snprintf(app->settings.net_client_host, sizeof(app->settings.net_client_host), "%s", host);
+    app->settings.net_client_port = (uint16_t)port;
+    snprintf(app->settings.net_client_port_str, sizeof(app->settings.net_client_port_str), "%d", port);
+    gui_settings_t *before = (gui_settings_t *)malloc(sizeof(*before));
+    if (!before) { free(app); return 2; }
+    *before = app->settings;
+
+    s_probe_no_ingest = true;
+    gui_net_init_globals();
+    int rc = 0;
+    if (gui_net_apply_mode(app) != 0) {
+        fprintf(stderr, "--net-client-probe: could not start the client\n");
+        rc = 2;
+    } else {
+        uint64_t deadline_ms = get_time_ms() + (uint64_t)seconds * 1000ULL;
+        while (get_time_ms() < deadline_ms) {
+            gui_net_poll_mirror(app);
+            thrd_sleep_ms(50);
+        }
+        bool connected = gui_net_active(app);
+        int support = gui_net_client_server_settings_support(app);
+        bool have = gui_net_client_peer_settings_valid(app);
+        bool local_touched = memcmp(&app->settings, before, sizeof(*before)) != 0;
+        if (!connected) rc = 2;
+        else if (support == 0) rc = 5;
+        else if (!have) rc = 4;
+        else if (local_touched) rc = 3;
+        else if (app->is_recording) rc = 6;
+
+        const size_t cap = 40000;
+        char *json = (char *)malloc(cap);
+        if (json) {
+            char status_esc[600];
+            gui_settings_json_escape(app->net_peer_status, status_esc, sizeof(status_esc));
+            int n = snprintf(json, cap,
+                "{\"connected\":%s,\"settings_support\":%d,\"generation\":%u,\"peer_state\":%d,"
+                "\"misrc_mode_effective\":%s,\"rec_bytes\":%llu,\"rec_drops\":%u,\"disk_free\":%llu,"
+                "\"status\":\"%s\",\"local_settings_touched\":%s,\"settings\":",
+                connected ? "true" : "false", support,
+                (unsigned)gui_net_client_peer_generation(app), atomic_load(&app->net_peer_state),
+                s_peer_effective_misrc ? "true" : "false",
+                (unsigned long long)atomic_load(&app->recording_bytes),
+                (unsigned)gui_net_client_peer_record_drops(app),
+                (unsigned long long)gui_net_client_peer_disk_free(app),
+                status_esc, local_touched ? "true" : "false");
+            size_t need = 0;
+            if (n > 0 && (size_t)n < cap) {
+                need = have ? gui_settings_to_json(&s_peer_applied, GS_CLIENT_LOCAL | GS_WRITE_ONLY,
+                                                   json + n, cap - (size_t)n)
+                            : (size_t)snprintf(json + n, cap - (size_t)n, "null");
+            }
+            if (n > 0 && (size_t)n + need + 2 < cap) {
+                json[(size_t)n + need] = '}';
+                json[(size_t)n + need + 1] = '\0';
+                printf("%s\n", json);
+            }
+            free(json);
+        }
+    }
+    gui_net_stop(app);
+    s_probe_no_ingest = false;
+    free(before);
+    free(app);
+    return rc;
 }
 
 /* Toggle client connect/disconnect while remaining in Client mode:

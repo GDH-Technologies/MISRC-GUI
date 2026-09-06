@@ -45,6 +45,16 @@ void gui_record_check_popup(gui_app_t *app);
 // Check if waiting for popup confirmation
 bool gui_record_is_pending(void);
 
+// The overwrite prompt's message while gui_record_is_pending(), else "".
+// The net server publishes it so a client can show the same prompt.
+const char *gui_record_pending_message(void);
+
+// Answer the pending overwrite prompt as if its button had been clicked
+// (a net client's answer, applied on the server's main thread). The next
+// gui_record_check_popup() then starts or cancels. No-op when nothing is
+// pending.
+void gui_record_resolve_pending(gui_app_t *app, bool confirm);
+
 // Stop recording
 void gui_record_stop(gui_app_t *app);
 

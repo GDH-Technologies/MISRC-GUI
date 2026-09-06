@@ -49,6 +49,16 @@ void gui_handle_interactions(gui_app_t *app);
 void gui_ui_sync_capture_mode_state(gui_app_t *app);
 void gui_ui_sync_android_keyboard_state(void);
 
+/* Server side of the net setter (GET /set): apply one key on the main thread
+ * with the same refusals and side effects the settings panel's click
+ * handlers have. Returns the HTTP status for the reply: 200 with the
+ * canonical value in msg, or 400/409/422 with the reason. */
+int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *value,
+                                char *msg, size_t msg_cap);
+/* True while a settings text field is being typed into (the client-mode
+ * view swap defers sending string fields until the edit ends). */
+bool gui_ui_text_edit_active(void);
+
 // Application-controlled UI zoom. Layout and pointer coordinates remain in
 // logical units while the renderer scales them into the window framebuffer.
 void gui_ui_set_scale_percent(int percent);

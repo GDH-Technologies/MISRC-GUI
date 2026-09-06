@@ -83,6 +83,10 @@ static void print_usage(const char *program_name) {
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>]\n"
             "\n"
+            "Headless (no window):\n"
+            "  --config <path> --net-serve [seconds]      (the net server, no window)\n"
+            "  --net-client-probe <host> <port> [seconds] (mirror a server, print its settings)\n"
+            "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
             "--config <path> loads settings from <path> instead of the default\n"
@@ -428,6 +432,23 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        /* The net server with no window: everything the GUI's main loop does
+         * for it, minus the window. Needs --config (it refuses to run on the
+         * live settings file); --config may come before or after this flag. */
+        if (strcmp(argv[i], "--net-serve") == 0) {
+            int secs = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+            for (int j = 1; j + 1 < argc; j++) {
+                if (strcmp(argv[j], "--config") == 0) config_path = argv[j + 1];
+            }
+            gui_settings_set_override_path(config_path);
+            return gui_net_serve_main(secs);
+        }
+        if (strcmp(argv[i], "--net-client-probe") == 0) {
+            const char *host = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int port = (i + 2 < argc) ? atoi(argv[i + 2]) : 8080;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 5;
+            return gui_net_client_probe_main(host, port, secs);
+        }
         has_capture_arg = true;
     }
 #if !defined(__ANDROID__)
@@ -746,16 +767,19 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // On a net client both keys act on the SERVER's state: its own
+            // is_capturing only means the ingest is up, and its is_recording
+            // is never set (see gui_app_effective_recording).
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
-                if (app.is_capturing) {
+                if (gui_app_control_capturing(&app)) {
                     gui_app_stop_capture(&app);
                 } else {
                     gui_app_start_capture(&app);
                 }
             }
 
-            if (IsKeyPressed(KEY_R) && app.is_capturing && !app.settings_panel_open) {
-                if (app.is_recording) {
+            if (IsKeyPressed(KEY_R) && gui_app_control_capturing(&app) && !app.settings_panel_open) {
+                if (gui_app_effective_recording(&app)) {
                     gui_app_stop_recording(&app);
                 } else {
                     gui_app_start_recording(&app);
@@ -974,7 +998,12 @@ int main(int argc, char **argv) {
         // Note: Display processing now handled by display thread via panel_process_all()
         // Each panel type (waveform, histogram, FFT) receives raw samples via vtable->process()
 
-        // Build UI layout
+        // Build UI layout. On a net client the whole pass, layout through
+        // render, sees and edits the SERVER's settings: view_begin swaps a
+        // copy of the snapshot into app->settings and view_end (after
+        // EndDrawing, because Clay draws text from pointers into it) swaps the
+        // client's own back and sends what changed as /set requests.
+        gui_net_client_view_begin(&app);
         Clay_BeginLayout();
         gui_render_layout(&app);
         Clay_RenderCommandArray render_commands = Clay_EndLayout();
@@ -1008,6 +1037,7 @@ int main(int argc, char **argv) {
         #endif
 
         EndDrawing();
+        gui_net_client_view_end(&app);
     }
 
     // Cleanup
