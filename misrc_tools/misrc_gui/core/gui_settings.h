@@ -314,6 +314,10 @@ bool gui_settings_find_value(const char *content, const char *key,
 size_t gui_settings_to_json(const gui_settings_t *s, unsigned exclude_flags,
                             char *buf, size_t cap);
 
+/* JSON-escape text into out (quotes, backslashes, control characters; no
+ * surrounding quotes). Returns the needed length like snprintf. */
+size_t gui_settings_json_escape(const char *text, char *out, size_t cap);
+
 /* Parse and store one key. Returns 0 on success, -1 for an unknown key, -2
  * for an invalid value (err describes why). strict selects the network
  * rules (see gui_setting_parse_fn). */
@@ -332,6 +336,9 @@ bool gui_settings_field_equal(const gui_settings_t *a, const gui_settings_t *b,
  * GS_CLIENT_LOCAL flag from src to dst. */
 void gui_settings_copy_fields(gui_settings_t *dst, const gui_settings_t *src,
                               bool client_local);
+/* Copy one table field from src to dst. */
+void gui_settings_copy_field(gui_settings_t *dst, const gui_settings_t *src,
+                             const gui_setting_desc_t *d);
 
 /* A counter that gui_settings_save() bumps, so a peer can tell whether the
  * snapshot it holds is current. Starts at 1. */

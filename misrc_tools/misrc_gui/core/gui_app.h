@@ -225,6 +225,11 @@ typedef struct gui_app {
     bool capture_mode_runtime_misrc;   // Mode latched at recording start (stable for recording session)
     bool capture_backend_upstream;     // Active backend for current capture session (true=upstream callback)
     bool capture_has_channel_b;        // Runtime capability flag used by extraction/display mapping
+    // The V1.5/V2.5 wiring inversion the extraction applies to the MISRC A/B
+    // swap. Set on the main thread: from settings locally, from the server's
+    // snapshot on a net client, so the extraction thread never reads a
+    // settings field that a client-mode view swap may be replacing.
+    bool capture_ab_swap_invert;
 
     // Device enumeration
     device_info_t devices[MAX_DEVICES];
@@ -381,6 +386,14 @@ typedef struct gui_app {
     // clobbering the bottom bar.
     char net_status[160];
     double net_status_time;  // unused placeholder (mirrors status_message pattern)
+
+    // The server's own bottom-bar message, relayed to a net client by
+    // gui_net_poll_mirror() (main thread). Never copied into status_message:
+    // the bar's reader consults it in client mode and prefixes it, so the
+    // capture/record path stays the only writer of the bar on either side.
+    char net_peer_status[256];
+    uint32_t net_peer_status_seq;   // bumps when the server's message changes
+    double net_peer_status_time;    // GetTime() when it last changed here
 } gui_app_t;
 
 static inline void gui_app_count_parser_errors(gui_app_t *app, uint32_t count) {
@@ -413,6 +426,14 @@ int gui_app_capture_busy(void);
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
 void gui_app_stop_recording(gui_app_t *app);
+/* "Are we recording" for every readout and control: is_recording locally,
+ * the server's recording state on a net client (which never sets its own
+ * is_recording; that would start local WAV writers). */
+bool gui_app_effective_recording(const gui_app_t *app);
+/* "Is there a capture the controls act on": is_capturing locally, the
+ * server's capture state on a net client (where is_capturing only means the
+ * ingest is connected). */
+bool gui_app_control_capturing(const gui_app_t *app);
 
 // Update functions (called each frame)
 void gui_app_update_vu_meters(gui_app_t *app, float dt);

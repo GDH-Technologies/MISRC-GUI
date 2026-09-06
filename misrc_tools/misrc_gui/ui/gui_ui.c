@@ -221,11 +221,9 @@ static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
     return app->settings.cxadc_tenbit_mode_card[card_idx] ? 16 : 8;
 }
-static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
+/* The bit-depth and resample-rate clamp that follows a card's tenbit flag. */
+static void gui_ui_apply_cxadc_bit_mode_clamp(gui_app_t *app, int card_idx)
 {
-    if (!app) return;
-    if (card_idx < 0 || card_idx > 1) card_idx = 0;
-    app->settings.cxadc_tenbit_mode_card[card_idx] = !app->settings.cxadc_tenbit_mode_card[card_idx];
     uint8_t cxadc_bits = gui_ui_cxadc_rf_bits(app, card_idx);
     float cxadc_base_rate_khz = gui_ui_cxadc_base_rate_khz(app, card_idx);
     if (card_idx == 0) {
@@ -239,6 +237,14 @@ static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
             app->settings.resample_rate_b = cxadc_base_rate_khz;
         }
     }
+}
+
+static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
+{
+    if (!app) return;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    app->settings.cxadc_tenbit_mode_card[card_idx] = !app->settings.cxadc_tenbit_mode_card[card_idx];
+    gui_ui_apply_cxadc_bit_mode_clamp(app, card_idx);
     gui_settings_save(&app->settings);
     const char *card_label = (card_idx == 0) ? "A" : "B";
     bool enabled = app->settings.cxadc_tenbit_mode_card[card_idx];
@@ -1222,18 +1228,21 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
         s_capture_mode_state_initialized = true;
         gui_ui_trace_capture_mode_state(app, "ui_init_from_settings", true);
     }
-    /* Client mode mirrors server controls; never let local UI mode state
-     * override the peer-provided mode snapshot. */
+    /* Client mode mirrors the server's EFFECTIVE mode: gui_net_poll_mirror()
+     * has already set user_capture_mode_misrc and capture_ab_swap_invert from
+     * the server's snapshot. The UI state follows those, never a settings
+     * field: during the UI pass app->settings is the server's copy, and its
+     * misrc_mode is the saved setting, which a CXADC server runs with off. */
     if (gui_net_is_client(app)) {
-        bool mirrored_mode = app->settings.misrc_mode;
+        bool mirrored_mode = app->user_capture_mode_misrc;
         s_capture_mode_state_misrc = mirrored_mode;
-        app->user_capture_mode_misrc = mirrored_mode;
         if (!app->is_recording) {
             app->capture_mode_runtime_misrc = mirrored_mode;
         }
         gui_ui_trace_capture_mode_state(app, "gui_ui_sync_capture_mode_state_client", false);
         return;
     }
+    app->capture_ab_swap_invert = app->settings.misrc_v15_v25_ab_swap;
 #ifdef ENABLE_DDD
     bool ddd_mode = gui_ui_selected_device_is_ddd(app);
 #else
@@ -1585,14 +1594,19 @@ static void update_status_free_space(gui_app_t *app)
     s_status_free_space_last_update_s = now;
 
     uint64_t free_bytes = 0;
-    if (gui_record_get_output_free_space_bytes(app, &free_bytes)) {
+    if (gui_net_is_client(app)) {
+        /* The bar describes the server's output folder on a client. */
+        free_bytes = gui_net_client_peer_disk_free(app);
+        s_status_free_space_cached_bytes = free_bytes;
+        s_status_free_space_valid = (free_bytes > 0);
+    } else if (gui_record_get_output_free_space_bytes(app, &free_bytes)) {
         s_status_free_space_cached_bytes = free_bytes;
         s_status_free_space_valid = true;
     } else {
         s_status_free_space_valid = false;
     }
 
-    if (!app->is_recording) {
+    if (!gui_app_effective_recording(app)) {
         s_status_output_last_bytes = 0;
         s_status_output_last_sample_s = 0.0;
         s_status_output_rate_bps = 0.0;
@@ -1951,7 +1965,18 @@ static void gui_ui_clear_text_edit(void)
 
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
-    return app && app->is_recording;
+    if (!app) return false;
+    /* A client edits the server's settings: locked while the server records
+     * (the server would refuse anyway) and until its settings have arrived. */
+    if (gui_net_is_client(app)) {
+        return gui_net_client_peer_recording(app) || !gui_net_client_peer_settings_valid(app);
+    }
+    return app->is_recording;
+}
+
+bool gui_ui_text_edit_active(void)
+{
+    return s_active_text_field != UI_TEXT_FIELD_NONE;
 }
 
 
@@ -2128,6 +2153,92 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         default:
             return false;
     }
+}
+
+/* ------------------------------------------------------------------------
+ * Remote settings (GET /set): the server-side apply. Runs on the main thread
+ * from gui_net_poll_commands(). The refusals are the panel's own, then the
+ * table parses the value (strict), then the side effect the click handler
+ * would have run, then the same sync + save every local edit gets.
+ * ---------------------------------------------------------------------- */
+int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *value,
+                                char *msg, size_t msg_cap)
+{
+    if (msg && msg_cap) msg[0] = '\0';
+    if (!app || !key || !value) {
+        snprintf(msg, msg_cap, "missing argument");
+        return 400;
+    }
+    const gui_setting_desc_t *d = gui_settings_find(key);
+    if (!d) {
+        snprintf(msg, msg_cap, "unknown key");
+        return 400;
+    }
+    if (d->flags & (GS_CLIENT_LOCAL | GS_WRITE_ONLY | GS_LOAD_ONLY | GS_NO_REMOTE_SET)) {
+        snprintf(msg, msg_cap, "key is not remotely settable");
+        return 400;
+    }
+    if (app->is_recording || gui_record_is_pending()) {
+        snprintf(msg, msg_cap, "settings are locked while recording");
+        return 409;
+    }
+
+    /* The per-key rules the panel enforces before it lets a click through. */
+    bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+    if ((strcmp(key, "rf_bits_a") == 0 || strcmp(key, "rf_bits_b") == 0) && cxadc_mode) {
+        snprintf(msg, msg_cap, "bit depth follows the CXADC card mode on this server");
+        return 409;
+    }
+    if (strncmp(key, "flac_affinity", 13) == 0 && !gui_ui_flac_affinity_supported()) {
+        snprintf(msg, msg_cap, "FLAC core pinning is not supported on this server");
+        return 409;
+    }
+    if (strcmp(key, "output_path") == 0 && !gui_settings_path_is_dir(value)) {
+        snprintf(msg, msg_cap, "not a directory on the server");
+        return 422;
+    }
+
+    char err[160];
+    int rc = gui_settings_apply_key(&app->settings, key, value, true, err, sizeof(err));
+    if (rc == -1) {
+        snprintf(msg, msg_cap, "unknown key");
+        return 400;
+    }
+    if (rc != 0) {
+        snprintf(msg, msg_cap, "invalid value: %s", err);
+        return 422;
+    }
+
+    /* The side effect the click handler would have run. */
+    if (strcmp(key, "misrc_mode") == 0) {
+        gui_ui_set_capture_mode_state(app, app->settings.misrc_mode);
+    } else if (strcmp(key, "cxadc_tenbit_mode_a") == 0) {
+        gui_ui_apply_cxadc_bit_mode_clamp(app, 0);
+    } else if (strcmp(key, "cxadc_tenbit_mode_b") == 0) {
+        gui_ui_apply_cxadc_bit_mode_clamp(app, 1);
+    } else if (strcmp(key, "capture_b") == 0 && !app->settings.capture_b) {
+        /* Channel B off takes its resampler with it, as the panel does. */
+        app->settings.enable_resample_b = false;
+    } else if (strcmp(key, "use_flac") == 0 && !app->settings.use_flac) {
+        /* RAW has no 12-bit; the panel bumps 12 to 16 when FLAC goes off. */
+        if (app->settings.rf_bits_a == 12) app->settings.rf_bits_a = 16;
+        if (app->settings.rf_bits_b == 12) app->settings.rf_bits_b = 16;
+    } else if (strcmp(key, "discover_simple_capture") == 0 && !app->is_capturing) {
+        gui_app_enumerate_devices(app);
+    }
+    if (d->flags & GS_AUTO_NAME_INPUT) {
+        gui_settings_refresh_auto_names(&app->settings);
+    }
+    gui_ui_sync_capture_mode_state(app);
+    gui_settings_save(&app->settings);
+
+    /* The canonical value, for the reply. (Not named `v`: the Clay text
+     * guard pairs make_string(v) sites with the nearest `char v[]`.) */
+    char canonical[512];
+    if (gui_settings_format_value(&app->settings, d, canonical, sizeof(canonical))) {
+        snprintf(msg, msg_cap, "%s", canonical);
+    }
+    return 200;
 }
 
 static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
@@ -2793,7 +2904,19 @@ static void render_settings_panel(gui_app_t *app) {
                 .childGap = 8
             }
         }) {
-            CLAY_TEXT(CLAY_STRING("Settings"),
+            /* On a net client these are the SERVER's settings: the title says
+             * whose, and a line under it says why they are locked, or what
+             * the server last refused. */
+            bool settings_is_client = gui_net_is_client(app);
+            static char settings_title[200];
+            if (settings_is_client) {
+                snprintf(settings_title, sizeof(settings_title), "Settings (server %s:%u)",
+                         app->settings.net_client_host[0] ? app->settings.net_client_host : "?",
+                         (unsigned)app->settings.net_client_port);
+            } else {
+                snprintf(settings_title, sizeof(settings_title), "Settings");
+            }
+            CLAY_TEXT(make_string(settings_title),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_TITLE, .textColor = to_clay_color(COLOR_TEXT) }));
 
             CLAY(CLAY_ID("SettingsHeaderSpacer"), {
@@ -2811,6 +2934,31 @@ static void render_settings_panel(gui_app_t *app) {
                 CLAY_TEXT(CLAY_STRING("X"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
             }
+        }
+        if (gui_net_is_client(app)) {
+            static char settings_client_note[320];
+            Color note_color = COLOR_METER_YELLOW;
+            double err_age = 0.0;
+            char err[256];
+            if (!gui_net_client_peer_settings_valid(app)) {
+                snprintf(settings_client_note, sizeof(settings_client_note), "%s",
+                         gui_net_client_server_settings_support(app) == 0
+                             ? "This server has no /settings (older build); change settings on the server"
+                             : (gui_net_active(app) ? "Server settings not received yet"
+                                                    : "Not connected to a server"));
+            } else if (gui_net_client_peer_recording(app)) {
+                snprintf(settings_client_note, sizeof(settings_client_note),
+                         "Locked while the server is recording");
+            } else if (gui_net_client_last_set_error(app, err, sizeof(err), &err_age) && err_age < 8.0) {
+                snprintf(settings_client_note, sizeof(settings_client_note), "Server refused %s", err);
+                note_color = COLOR_CLIP_RED;
+            } else {
+                snprintf(settings_client_note, sizeof(settings_client_note),
+                         "Edits are applied on the server; the server's own device rules still apply");
+                note_color = COLOR_TEXT_DIM;
+            }
+            CLAY_TEXT(make_string(settings_client_note),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(note_color) }));
         }
 
 
@@ -2901,17 +3049,21 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
             }
         }
 
-        // Choose output folder button (so the handler has a real element)
-        CLAY(CLAY_ID("ChooseOutputFolderButton"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(32) },
-                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-            },
-            .backgroundColor = to_clay_color(COLOR_BUTTON),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
-        }) {
-            CLAY_TEXT(CLAY_STRING("Choose..."),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+        // Choose output folder button (so the handler has a real element).
+        // Not on a net client: the picker would browse THIS machine, and the
+        // folder is the server's. The path stays a text field there.
+        if (!gui_net_is_client(app)) {
+            CLAY(CLAY_ID("ChooseOutputFolderButton"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(32) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                },
+                .backgroundColor = to_clay_color(COLOR_BUTTON),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("Choose..."),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
         }
     }
 }
@@ -4271,6 +4423,83 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
             }
         }
+        /* Client only: the state of the server's settings on this machine,
+         * the last refused edit, and the ingest counters the bottom bar gives
+         * up in client mode (there they read as the server's recording). */
+        if (gui_net_is_client(app)) {
+            static char net_settings_line[160];
+            int support = gui_net_client_server_settings_support(app);
+            if (gui_net_client_peer_settings_valid(app)) {
+                double age = gui_net_client_peer_settings_age_s(app);
+                snprintf(net_settings_line, sizeof(net_settings_line), "gen %u, synced %.0f s ago",
+                         (unsigned)gui_net_client_peer_generation(app), age < 0.0 ? 0.0 : age);
+            } else if (support == 0) {
+                snprintf(net_settings_line, sizeof(net_settings_line), "server has no /settings (older build)");
+            } else {
+                snprintf(net_settings_line, sizeof(net_settings_line), "not received");
+            }
+            CLAY(CLAY_ID("VersionInfoNetSettingsRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetSettingsLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Server settings:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY_TEXT(make_string(net_settings_line),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                CLAY(CLAY_ID("VersionInfoNetSettingsRefresh"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(70), CLAY_SIZING_FIXED(24) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                    .backgroundColor = to_clay_color(Clay_PointerOver(CLAY_ID("VersionInfoNetSettingsRefresh")) ? COLOR_BUTTON_HOVER : COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Refresh"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+            }
+            static char net_last_change[300];
+            double err_age = 0.0;
+            char err[256];
+            if (gui_net_client_last_set_error(app, err, sizeof(err), &err_age)) {
+                snprintf(net_last_change, sizeof(net_last_change), "refused %s (%.0f s ago)", err, err_age);
+            } else {
+                snprintf(net_last_change, sizeof(net_last_change), "ok");
+            }
+            CLAY(CLAY_ID("VersionInfoNetLastChangeRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetLastChangeLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Last change:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY_TEXT(make_string(net_last_change),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+            static char net_ingest_line[160];
+            {
+                size_t rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
+                size_t rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
+                size_t rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
+                int rf_pct = rf_size > 0 ? (int)(((rf_tail - rf_head) * 100) / rf_size) : 0;
+                size_t au_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
+                size_t au_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
+                size_t au_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
+                int au_pct = au_size > 0 ? (int)(((au_tail - au_head) * 100) / au_size) : 0;
+                snprintf(net_ingest_line, sizeof(net_ingest_line),
+                         "RF buf %d%%  Audio buf %d%%  Missed %u  Errors %u", rf_pct, au_pct,
+                         (unsigned)atomic_load(&app->missed_frame_count),
+                         (unsigned)atomic_load(&app->error_count));
+            }
+            CLAY(CLAY_ID("VersionInfoNetIngestRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetIngestLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Ingest:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY_TEXT(make_string(net_ingest_line),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
         // Credits (without license/year text).
         CLAY_TEXT(CLAY_STRING("(c) Harry Munday, AlessandroAU, Stefan O, Vrunk11, machcnz"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
@@ -5034,8 +5263,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     int toolbar_width = gui_ui_get_layout_width();
     bool toolbar_compact = toolbar_width < GUI_UI_STATUS_COMPACT_BREAKPOINT;
     // Use the same local/remote state for measuring and drawing this frame.
-    bool control_capturing = gui_net_is_client(app)
-        ? gui_net_client_peer_capturing(app) : app->is_capturing;
+    bool control_capturing = gui_app_control_capturing(app);
     const device_info_t *selected_device =
         app->selected_device >= 0 && app->selected_device < app->device_count
             ? &app->devices[app->selected_device] : NULL;
@@ -5066,11 +5294,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     gui_ui_trace_capture_mode_render(app, mode_misrc, mode_source_runtime);
     // Toggle is only clickable for hsdaoh/simple_capture backends where
     // the MISRC/HSDAOH A/B-swap is meaningful.
-    bool mode_change_allowed = !app->is_recording &&
+    // On a client the toggle edits the server's saved mode through /set (the
+    // server applies its own device rules); it stays locked while the server
+    // records, like every other setting.
+    bool mode_change_allowed = !gui_app_effective_recording(app) &&
                                !cxadc_mode &&
                                !fx3_mode &&
                                !ddd_mode &&
-                               !gui_net_is_client(app);
+                               (!gui_net_is_client(app) || gui_net_client_peer_settings_valid(app));
     Color mode_bg = mode_misrc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
     if (!mode_change_allowed) {
         mode_bg = ui_disabled_color(mode_bg);
@@ -5385,15 +5616,32 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             : PLAYBACK_STATE_STOPPED;
         bool playback_paused = (playback_state == PLAYBACK_STATE_PAUSED);
 
-        // Record button (capture) / Play-Pause button (playback mode)
-        bool record_finalizing = gui_record_is_finalizing();
-        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (app->is_recording ? COLOR_CLIP_RED : COLOR_BUTTON);
-        const char *record_label = record_finalizing ? "Finalize" : (app->is_recording ? "Stop Rec" : "Record");
+        // Record button (capture) / Play-Pause button (playback mode). On a
+        // net client every state here is the server's: the client never
+        // records locally, and its is_capturing only means the ingest is up.
+        bool is_client = gui_net_is_client(app);
+        bool rec = gui_app_effective_recording(app);
+        bool record_finalizing = is_client ? gui_net_client_peer_record_finalizing(app)
+                                           : gui_record_is_finalizing();
+        bool record_pending = is_client ? gui_net_client_peer_record_pending(app)
+                                        : gui_record_is_pending();
+        // Finalize no longer blocks a new recording; tint the idle button
+        // orange as the indicator, but recording state always wins.
+        Color record_color = rec ? COLOR_CLIP_RED
+                             : (record_finalizing ? (Color){184, 118, 20, 255} : COLOR_BUTTON);
+        const char *record_label = rec ? "Stop Rec"
+                                   : (record_finalizing ? "Finalize" : "Record");
+        // A record start waiting on the server's overwrite prompt: yellow, so
+        // the client operator knows the server needs an answer.
+        if (!rec && record_pending) {
+            record_color = COLOR_METER_YELLOW;
+            record_label = "Pending";
+        }
         // Flash the finalize icon red if a persistent output-file write error
         // is active (e.g. file locked by another app) so the user knows the
         // recording had write issues. Blink at ~1 Hz between the finalize
         // orange and clip red.
-        if (record_finalizing && gui_record_has_write_error()) {
+        if (!is_client && record_finalizing && !rec && gui_record_has_write_error()) {
             bool blink_on = (fmod(GetTime(), 1.0) < 0.5);
             record_color = blink_on ? COLOR_CLIP_RED : (Color){184, 118, 20, 255};
         }
@@ -5405,13 +5653,15 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         if (!playback_mode && toolbar_very_narrow) {
             if (record_finalizing) {
                 record_display_label = "Fin";
-            } else if (app->is_recording) {
+            } else if (rec) {
                 record_display_label = "Stop";
+            } else if (record_pending) {
+                record_display_label = "Pend";
             } else {
                 record_display_label = "Rec";
             }
         }
-        if (!app->is_capturing) record_color = (Color){ 50, 50, 55, 255 };
+        if (!control_capturing) record_color = (Color){ 50, 50, 55, 255 };
         CLAY(CLAY_ID("RecordButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(record_button_width), CLAY_SIZING_FIXED(32) },
@@ -5420,7 +5670,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             .backgroundColor = to_clay_color(record_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            Color text_color = app->is_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
+            Color text_color = control_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
             CLAY_TEXT(make_string(record_display_label),
                 CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(text_color) }));
         }
@@ -6270,9 +6520,24 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
 static bool render_main_panels(gui_app_t *app) {
     int status_width = gui_ui_get_layout_width();
     int status_height = gui_ui_get_layout_height();
+    /* On a net client the bar describes the SERVER's recording: its state,
+     * timer, bytes, drops and free space arrive through the mirror, and its
+     * own bottom-bar message is shown, prefixed, whenever it is newer than
+     * anything this client has said. The capture/record path stays the only
+     * writer of the bar on either machine; this is its reader picking the
+     * machine. The client's own ingest health keeps the buffer readouts. */
+    bool status_is_client = gui_net_is_client(app);
+    bool status_recording = gui_app_effective_recording(app);
+    static char status_peer_message[300];
+    const char *status_source_message = app->status_message;
+    if (status_is_client && app->net_peer_status[0] &&
+        app->net_peer_status_time > app->status_message_time) {
+        snprintf(status_peer_message, sizeof(status_peer_message), "server: %s", app->net_peer_status);
+        status_source_message = status_peer_message;
+    }
     gui_ui_status_layout_mode_t status_layout =
         gui_ui_get_status_layout_mode(status_width, status_height,
-                                      app->is_recording);
+                                      status_recording);
     bool status_quarter_scale =
         status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
         status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
@@ -6303,7 +6568,7 @@ static bool render_main_panels(gui_app_t *app) {
     // readout (and widen the message budget) so the actual error text isn't
     // truncated behind the free-space label. This is what makes CXADC/USB
     // permission failures readable in the bottom bar instead of "CXADC permi...".
-    const char *raw_status_gate = (app->status_message[0] != '\0') ? app->status_message : NULL;
+    const char *raw_status_gate = (status_source_message[0] != '\0') ? status_source_message : NULL;
     bool status_is_error = false;
     if (raw_status_gate) {
         status_is_error =
@@ -6321,7 +6586,7 @@ static bool render_main_panels(gui_app_t *app) {
     // widths are known. Normal recording status is redundant with the timer.
     bool status_two_rows = false;
     bool show_status_message = status_is_error ||
-        (!status_minimal && !app->is_recording);
+        (!status_minimal && !status_recording);
     /* Keep free-space visible by default and let the dynamic budget contract
      * gaps/widths first; only hide it as a last resort. Error status still
      * reserves the left-side for readable failure text. */
@@ -6365,15 +6630,18 @@ static bool render_main_panels(gui_app_t *app) {
     const char *rf_buffer_label_full = "RF Buffer:";
     const char *audio_buffer_label_full = "Audio Buffer:";
     const char *samples_label_full = status_tiny ? "S:" : "Samples:";
-    const char *frames_label_full = "Frames:";
-    const char *missed_label_full = "Missed:";
+    /* A client has no frames of its own; the Frames and Missed slots carry
+     * the server's record drops and bytes written, and Errors goes away. */
+    const char *frames_label_full = status_is_client ? "Drops:" : "Frames:";
+    const char *missed_label_full = status_is_client ? "Written:" : "Missed:";
     const char *errors_label_full = "Errors:";
     const char *rf_buffer_label_compact = "RF:";
     const char *audio_buffer_label_compact = "Aud:";
     const char *samples_label_compact = status_tiny ? "S:" : "Samp:";
-    const char *frames_label_compact = "F:";
-    const char *missed_label_compact = "M:";
+    const char *frames_label_compact = status_is_client ? "D:" : "F:";
+    const char *missed_label_compact = status_is_client ? "W:" : "M:";
     const char *errors_label_compact = "E:";
+    if (status_is_client) show_error_count = false;
     const char *rf_buffer_label = status_compact_labels ? rf_buffer_label_compact : rf_buffer_label_full;
     const char *audio_buffer_label = status_compact_labels ? audio_buffer_label_compact : audio_buffer_label_full;
     const char *samples_label = status_compact_labels ? samples_label_compact : samples_label_full;
@@ -6382,7 +6650,7 @@ static bool render_main_panels(gui_app_t *app) {
     const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
     update_status_free_space(app);
 
-    bool show_record_indicator = app->is_recording && !status_quarter_scale;
+    bool show_record_indicator = status_recording && !status_quarter_scale;
     if (show_record_indicator) {
         double rec_duration = GetTime() - app->recording_start_time;
         int rec_hours = (int)(rec_duration / 3600);
@@ -6392,9 +6660,11 @@ static bool render_main_panels(gui_app_t *app) {
                  "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
     }
 
-    const char *raw_status = (app->status_message[0] != '\0')
-        ? app->status_message
-        : (app->is_capturing ? "Capturing..." : "Ready");
+    const char *raw_status = (status_source_message[0] != '\0')
+        ? status_source_message
+        : (status_is_client
+            ? (gui_app_control_capturing(app) ? "Capturing (server)..." : "Ready")
+            : (app->is_capturing ? "Capturing..." : "Ready"));
     Color status_color = COLOR_TEXT_DIM;
     if (status_is_error) {
         status_color = COLOR_CLIP_RED;
@@ -6415,7 +6685,13 @@ static bool render_main_panels(gui_app_t *app) {
             char runway_hms[24];
             format_status_free_space_label(free_only_full, sizeof(free_only_full), s_status_free_space_cached_bytes);
             format_status_free_space_compact_label(free_only_compact, sizeof(free_only_compact), s_status_free_space_cached_bytes);
-            if (app->is_recording) {
+            if (status_is_client) {
+                /* It is the server's disk. */
+                char srv_full[48];
+                snprintf(srv_full, sizeof(srv_full), "Srv %s", free_only_full);
+                snprintf(free_only_full, sizeof(free_only_full), "%s", srv_full);
+            }
+            if (status_recording) {
                 bool runway_known = s_status_output_rate_bps > 0.0;
                 if (runway_known) {
                     double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
@@ -6447,7 +6723,7 @@ static bool render_main_panels(gui_app_t *app) {
             } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
                 free_space_color = COLOR_METER_YELLOW;
             }
-        } else if (app->is_recording) {
+        } else if (status_recording) {
             snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
                      "Free: N/A | Runway --:--:--");
             if (status_tiny) {
@@ -6543,10 +6819,17 @@ static bool render_main_panels(gui_app_t *app) {
     /* Snapshot readouts once for this frame; their values do not affect the
      * width budget. Buffer fill and fault colors may still update normally. */
     {
-        format_status_counter(status_frames_display, sizeof(status_frames_display),
-                              atomic_load(&app->frame_count));
-        format_status_counter(status_missed_display, sizeof(status_missed_display),
-                              missed);
+        if (status_is_client) {
+            format_status_counter(status_frames_display, sizeof(status_frames_display),
+                                  gui_net_client_peer_record_drops(app));
+            format_status_free_space_compact_label(status_missed_display, sizeof(status_missed_display),
+                                                   (uint64_t)atomic_load(&app->recording_bytes));
+        } else {
+            format_status_counter(status_frames_display, sizeof(status_frames_display),
+                                  atomic_load(&app->frame_count));
+            format_status_counter(status_missed_display, sizeof(status_missed_display),
+                                  app->is_capturing ? atomic_load(&app->missed_frame_count) : 0);
+        }
         format_status_counter(status_errors_display, sizeof(status_errors_display),
                               errors);
         size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
@@ -7825,6 +8108,12 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetSettingsRefresh"))) {
+                gui_net_client_request_settings_refresh(app);
+                gui_app_set_status(app, "Refreshing the server's settings");
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoMemoryBudgetToggle"))) {
                 // Cycle 1 -> 2 -> 4 -> 8 -> 16 -> 1 GB. Apply immediately when
                 // idle by tearing down and re-initializing the buffer manager;
@@ -7865,9 +8154,12 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoV4l2Toggle"))) {
                 // Toggle V4L2/simple_capture device discovery and re-enumerate
                 // so the device dropdown reflects the new setting immediately.
+                // On a net client the setting is the server's (it re-enumerates
+                // when it applies the /set); enumerating here would replace the
+                // mirrored device list with this machine's.
                 app->settings.discover_simple_capture = !app->settings.discover_simple_capture;
                 gui_settings_save(&app->settings);
-                gui_app_enumerate_devices(app);
+                if (!gui_net_is_client(app)) gui_app_enumerate_devices(app);
                 gui_app_set_status(app, app->settings.discover_simple_capture
                     ? "V4L2 device discovery enabled"
                     : "V4L2 device discovery disabled");
@@ -7889,9 +8181,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 bool ab_swap_supported_backend = !(ab_swap_cxadc || ab_swap_fx3 || ab_swap_ddd);
                 if (!ab_swap_supported_backend) {
                     gui_app_set_status(app, "MISRC V1.5/V2.5 A/B swap applies only to HSDAOH/Simple Capture");
-                } else if (app->is_recording) {
+                } else if (gui_app_effective_recording(app)) {
                     gui_app_set_status(app, "MISRC V1.5/V2.5 A/B swap is locked while recording");
+                } else if (gui_net_is_client(app) && !gui_net_client_peer_settings_valid(app)) {
+                    gui_app_set_status(app, "Not connected to a server");
                 } else {
+                    /* On a client app->settings is the server's copy here; the
+                     * view swap turns this flip into a /set. */
                     app->settings.misrc_v15_v25_ab_swap = !app->settings.misrc_v15_v25_ab_swap;
                     gui_settings_save(&app->settings);
                     gui_app_set_status(app, app->settings.misrc_v15_v25_ab_swap
@@ -8372,7 +8668,19 @@ void gui_handle_interactions(gui_app_t *app) {
             } else if (mode_toggle_is_ddd) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
             } else if (gui_net_is_client(app)) {
-                gui_app_set_status(app, "Client mode mirrors server capture mode; change mode on server");
+                if (gui_ui_settings_locked(app)) {
+                    gui_app_set_status(app, gui_net_client_peer_recording(app)
+                        ? "Capture mode is locked while the server is recording"
+                        : "Not connected to a server");
+                } else {
+                    /* app->settings is the server's copy during this pass;
+                     * the view swap turns the flip into a /set. */
+                    app->settings.misrc_mode = !app->settings.misrc_mode;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.misrc_mode
+                        ? "Requested MISRC mode on the server"
+                        : "Requested HSDAOH mode on the server");
+                }
             } else if (app->is_recording) {
                 TraceLog(LOG_INFO,
                          "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=1",
@@ -8410,7 +8718,15 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_settings_locked(app) &&
             Clay_PointerOver(CLAY_ID("SettingsPanel"))) {
             gui_ui_clear_text_edit();
-            gui_app_set_status(app, "Settings are locked while recording is active");
+            if (!gui_net_is_client(app)) {
+                gui_app_set_status(app, "Settings are locked while recording is active");
+            } else if (gui_net_client_peer_recording(app)) {
+                gui_app_set_status(app, "Settings are locked while the server is recording");
+            } else if (gui_net_client_server_settings_support(app) == 0) {
+                gui_app_set_status(app, "This server has no /settings (older build); change settings on the server");
+            } else {
+                gui_app_set_status(app, "Not connected to a server; nothing to edit");
+            }
             gui_ui_set_click_consumed();
             return;
         }
@@ -8475,14 +8791,17 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            if (app->is_capturing) {
-                if (gui_record_is_finalizing()) {
-                    gui_app_set_status(app, "Finalizing previous recording...");
-                } else if (app->is_recording) {
+            // On a client this is the server's capture and recording state:
+            // a client could never send record-off before, because its own
+            // is_recording is never set.
+            if (gui_app_control_capturing(app)) {
+                if (gui_app_effective_recording(app)) {
                     gui_app_stop_recording(app);
                 } else {
                     gui_app_start_recording(app);
                 }
+            } else if (gui_net_is_client(app)) {
+                gui_app_set_status(app, "Server is not capturing; press Connect first");
             }
         }
 
