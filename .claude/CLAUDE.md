@@ -113,9 +113,15 @@ callback-gating edits have silently broken GUI feeds before):
 
 Fork-side:
 
-- FLAC ≥ 1.5.0 is a hard floor in `misrc_tools/meson.build`. `flac_writer` reserves a 4096-byte
-  PADDING block so post-capture tags are an in-place write (a 143 GB rewrite died at 71 GB
-  once), and sets STREAMINFO `total_samples` to 0 past 2^36 (libFLAC wraps; ~28.6 min at 40 MSps).
+- FLAC ≥ 1.5.0 is a hard floor in `misrc_tools/meson.build`. `flac_writer` emits STREAMINFO →
+  SEEKTABLE → VORBIS_COMMENT → PADDING(4096) so post-capture tags are an in-place write (a 143 GB
+  rewrite died at 71 GB once). The padding must stay both last (libFLAC's chain API, which
+  `flac_writer_embed_tags` uses, only trims a trailing PADDING) and right after the VC block
+  (the simple-iterator API only grows into the next block); the "FLAC STREAMINFO total_samples
+  runtime" guard fails on any other order. STREAMINFO `total_samples` stays the true Hz-domain
+  count, 0 past 2^36 (libFLAC wraps; ~28.6 min at 40 MSps). Upstream's finalize (9997eca)
+  scales it to kHz, which truncates decodes in readers that trust it: on every sync keep the
+  fork's `gui_record` finalize and resolve only `flac_writer.c` toward upstream.
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
   `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate switch.

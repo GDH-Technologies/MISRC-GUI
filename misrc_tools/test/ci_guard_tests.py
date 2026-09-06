@@ -1703,6 +1703,55 @@ def check_streaming_writes_are_private(repo_root: Path) -> int:
     return 0
 
 
+def check_net_controls_publish_effective_mode(repo_root: Path) -> int:
+    """A net-mode client runs its own extraction on the raw /rf stream, so its
+    A/B swap decision must equal the server's. The server's decision is the
+    effective mode (capture_mode_runtime_misrc while recording, else
+    user_capture_mode_misrc), which the UI sync and the capture-settings clamp
+    force off for CXADC devices while deliberately leaving settings.misrc_mode
+    alone. /controls used to publish the setting, so a client of a CXADC server
+    swapped channels the server did not. The V1.5/V2.5 wiring flag inverts the
+    swap wherever it is applied, so it has to travel with the mode and the
+    client has to mirror it."""
+    net_c = repo_root / "misrc_tools/misrc_gui/net/gui_net.c"
+    if not net_c.exists():
+        return fail(f"missing {net_c}")
+    code = strip_c_comments(read_text(net_c))
+
+    m = re.search(r"static void server_build_controls\s*\([^)]*\)\s*\{", code)
+    if not m:
+        return fail("gui_net.c: server_build_controls() not found")
+    end = code.find("\n}\n", m.end())
+    body = code[m.end():end if end >= 0 else len(code)]
+    if "settings.misrc_mode" in body:
+        return fail(
+            "gui_net.c: server_build_controls() publishes settings.misrc_mode. Publish the "
+            "effective mode (capture_mode_runtime_misrc while recording, else "
+            "user_capture_mode_misrc); a CXADC server runs with the setting left on."
+        )
+    for needle in (
+        "capture_mode_runtime_misrc",
+        "user_capture_mode_misrc",
+        '\\"misrc_v15_v25_ab_swap\\"',
+        "settings.misrc_v15_v25_ab_swap",
+    ):
+        if needle not in body:
+            return fail(f"gui_net.c: server_build_controls() no longer references {needle}")
+
+    m2 = re.search(r'client_get\s*\([^;]*"/controls"', code)
+    if not m2:
+        return fail("gui_net.c: the client /controls poll was not found")
+    window = code[m2.end():m2.end() + 2500]
+    if not re.search(r'json_bool\s*\(\s*\w+\s*,\s*"misrc_mode"', window):
+        return fail("gui_net.c: the client /controls poll does not mirror misrc_mode")
+    if not re.search(
+        r'app->settings\.misrc_v15_v25_ab_swap\s*=\s*json_bool\s*\(\s*\w+\s*,\s*"misrc_v15_v25_ab_swap"',
+        window,
+    ):
+        return fail("gui_net.c: the client /controls poll does not mirror misrc_v15_v25_ab_swap")
+    return 0
+
+
 def check_url_open_is_whitelisted(repo_root: Path) -> int:
     """raylib's OpenURL() builds a shell command and runs it through system(),
     rejecting only the single quote. Ctrl+click on a reader URL reaches it, and in
@@ -2842,6 +2891,7 @@ def main() -> int:
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
+        ("net controls publish the effective mode", lambda: check_net_controls_publish_effective_mode(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
