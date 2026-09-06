@@ -1,11 +1,11 @@
 /*
  * MISRC GUI - Settings Persistence
  * 16/02/25 - Remediate Win settings not saving - %appdata%
- * Handles loading/saving settings to JSON file and provides defaults
+ * Handles the settings file's location and I/O, plus the folder/file pickers.
+ * What the file contains is the descriptor table in gui_settings_table.c.
  */
 
-#include "../core/gui_app.h"
-#include "../ui/gui_ui_scale.h"
+#include "gui_settings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +22,7 @@
 #define CloseWindow Win32_CloseWindow
 #define ShowCursor Win32_ShowCursor
 #include <shlobj.h>
-#include <shobjidl.h> 
+#include <shobjidl.h>
 #undef ShowCursor
 #undef CloseWindow
 #undef Rectangle
@@ -32,7 +32,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-static bool gui_settings_path_is_dir(const char *path) {
+bool gui_settings_path_is_dir(const char *path) {
     struct stat st;
     if (!path || !path[0]) return false;
     if (stat(path, &st) != 0) return false;
@@ -101,7 +101,7 @@ bool gui_settings_override_active(void) {
 static const char* get_settings_file_path(void) {
     static char settings_path[512];
     static bool initialized = false;
-    
+
     if (s_override_settings_path && s_override_settings_path[0]) {
         // --config <path> override: use it directly (no platform logic).
         snprintf(settings_path, sizeof(settings_path), "%s", s_override_settings_path);
@@ -167,14 +167,14 @@ static const char* get_settings_file_path(void) {
 #endif
         initialized = true;
     }
-    
+
     return settings_path;
 }
 
 const char* gui_settings_get_desktop_path(void) {
     static char desktop_path[512];
     static bool initialized = false;
-    
+
     if (!initialized) {
 #if defined(__ANDROID__)
         // Android 11+: use the scoped-storage-exempt external files dir handed
@@ -212,508 +212,43 @@ const char* gui_settings_get_desktop_path(void) {
 #endif
         initialized = true;
     }
-    
+
     return desktop_path;
-}
-
-static uint8_t clamp_rf_bits_flac(uint8_t bits) {
-    if (bits == 8 || bits == 12 || bits == 16) return bits;
-    return 16;
-}
-
-static uint8_t rf_bits_for_raw(uint8_t requested) {
-    // RAW supports 8/16 only; treat 12 as 16.
-    return (requested == 8) ? 8 : 16;
-}
-
-static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {
-    if (!dst || dst_len == 0) return;
-    uint32_t khz_u = (uint32_t)(khz + 0.5f);
-    if ((khz_u % 1000U) == 0U) {
-        snprintf(dst, dst_len, "%umsps", khz_u / 1000U);
-    } else {
-        snprintf(dst, dst_len, "%.1fmsps", (double)khz / 1000.0);
-    }
-}
-
-static void sanitize_tag(char *dst, size_t dst_len, const char *src) {
-    if (!dst || dst_len == 0) return;
-    dst[0] = '\0';
-    if (!src || !src[0]) return;
-
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
-        char c = src[i];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
-            dst[j++] = c;
-        } else if (c == ' ' || c == '\t') {
-            dst[j++] = '-';
-        }
-    }
-    dst[j] = '\0';
-
-    while (j > 0 && dst[j - 1] == '-') {
-        dst[--j] = '\0';
-    }
-}
-
-// Keep derived filenames in sync with current auto-naming settings.
-// This refresh does NOT append capture-start timestamp (that is applied when recording starts).
-static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
-    if (!settings) return;
-    if (!settings->auto_names_enabled) return;
-
-    const char *base = settings->output_base_name[0] ? settings->output_base_name : "capture";
-
-    if (settings->use_flac) {
-        uint8_t bits_a = clamp_rf_bits_flac(settings->rf_bits_a);
-        uint8_t bits_b = clamp_rf_bits_flac(settings->rf_bits_b);
-        char rate_tag_a[32] = {0};
-        char rate_tag_b[32] = {0};
-        char rf_tag_a[40] = {0};
-        char rf_tag_b[40] = {0};
-        if (settings->enable_resample_a) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), settings->resample_rate_a);
-        if (settings->enable_resample_b) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), settings->resample_rate_b);
-        sanitize_tag(rf_tag_a, sizeof(rf_tag_a), settings->rf_channel_tags[0]);
-        sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
-
-        if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
-        } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
-        } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
-        } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
-        }
-        if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
-        } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
-        } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
-        } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
-        }
-    } else {
-        uint8_t bits_a = rf_bits_for_raw(settings->rf_bits_a);
-        uint8_t bits_b = rf_bits_for_raw(settings->rf_bits_b);
-        char rate_tag_a[32] = {0};
-        char rate_tag_b[32] = {0};
-        char rf_tag_a[40] = {0};
-        char rf_tag_b[40] = {0};
-        if (settings->enable_resample_a) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), settings->resample_rate_a);
-        if (settings->enable_resample_b) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), settings->resample_rate_b);
-        sanitize_tag(rf_tag_a, sizeof(rf_tag_a), settings->rf_channel_tags[0]);
-        sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
-
-        if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
-        } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_a, (unsigned)bits_a);
-        } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.raw", base, (unsigned)bits_a, rate_tag_a);
-        } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.raw", base, (unsigned)bits_a);
-        }
-        if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
-        } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_b, (unsigned)bits_b);
-        } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.raw", base, (unsigned)bits_b, rate_tag_b);
-        } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.raw", base, (unsigned)bits_b);
-        }
-    }
-
-    char audio_tag_4ch[40] = {0};
-    char audio_tag_12[40] = {0};
-    char audio_tag_34[40] = {0};
-    sanitize_tag(audio_tag_4ch, sizeof(audio_tag_4ch), settings->audio_output_tags[0]);
-    sanitize_tag(audio_tag_12, sizeof(audio_tag_12), settings->audio_output_tags[1]);
-    sanitize_tag(audio_tag_34, sizeof(audio_tag_34), settings->audio_output_tags[2]);
-
-    if (audio_tag_4ch[0]) {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
-    } else {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
-    }
-    if (audio_tag_12[0]) {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
-    } else {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_stereo_ch1_ch2.wav", base);
-    }
-    if (audio_tag_34[0]) {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
-    } else {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_stereo_ch3_ch4.wav", base);
-    }
-
-    for (int i = 0; i < 4; i++) {
-        char tag[40];
-        sanitize_tag(tag, sizeof(tag), settings->audio_1ch_labels[i]);
-        if (tag[0]) {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_%s_audio_ch%d.wav", base, tag, i + 1);
-        } else {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_audio_ch%d.wav", base, i + 1);
-        }
-    }
-}
-void gui_settings_init_defaults(gui_settings_t *settings) {
-    if (!settings) return;
-    
-    // Zero out the structure
-    memset(settings, 0, sizeof(gui_settings_t));
-    
-    // Basic settings
-    settings->device_index = 0;
-    settings->capture_a = true;
-    settings->capture_b = true;
-    
-    // Set default save path to Desktop
-    strncpy(settings->output_path, gui_settings_get_desktop_path(), MAX_FILENAME_LEN - 1);
-    settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
-    
-    // Auto naming defaults
-    settings->auto_names_enabled = true;
-    strcpy(settings->output_base_name, "capture");
-
-    // Timestamp behavior
-    settings->append_timestamp_on_capture_start = false;
-
-    // Duration limits: removed from UI, force to 0 (unlimited)
-    settings->capture_limit_seconds = 0;
-    settings->record_limit_seconds = 0;
-
-    // Default filenames (used when auto naming is disabled)
-    strcpy(settings->output_filename_a, "rfA_capture.flac");
-    strcpy(settings->output_filename_b, "rfB_capture.flac");
-    strcpy(settings->aux_filename, "aux_data.bin");
-    strcpy(settings->raw_filename, "raw_data.bin");
-    strcpy(settings->audio_4ch_filename, "quad_4ch.wav");
-    strcpy(settings->audio_2ch_12_filename, "stereo_ch1_ch2.wav");
-    strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
-
-    // RF bit depth defaults (per-channel)
-    settings->rf_bits_a = 16;
-    settings->rf_bits_b = 16;
-    settings->cxadc_tenbit_mode_card[0] = false;
-    settings->cxadc_tenbit_mode_card[1] = false;
-    
-    // Individual channel filenames
-    for (int i = 0; i < 4; i++) {
-        snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "audio_ch%d.wav", i + 1);
-    }
-
-    // Per-channel audio labels (optional, used for auto naming)
-    for (int i = 0; i < 4; i++) {
-        settings->audio_1ch_labels[i][0] = '\0';
-    }
-    // Optional tags for non-mono audio outputs
-    for (int i = 0; i < 3; i++) {
-        settings->audio_output_tags[i][0] = '\0';
-    }
-    settings->ingest_project[0] = '\0';
-    settings->ingest_tape_id[0] = '\0';
-    settings->ingest_tape_format[0] = '\0';
-    settings->ingest_tape_size[0] = '\0';
-    settings->ingest_tape_speed[0] = '\0';
-    settings->ingest_tape_condition[0] = '\0';
-    settings->ingest_operator[0] = '\0';
-    settings->ingest_location[0] = '\0';
-    settings->ingest_notes[0] = '\0';
-    // Optional per-channel RF tags
-    for (int i = 0; i < 2; i++) {
-        settings->rf_channel_tags[i][0] = '\0';
-    }
-    
-    // Capture control defaults
-    settings->sample_count = 0; // Infinite
-    strcpy(settings->capture_time, ""); // Empty = infinite
-    settings->overwrite_files = false;
-    
-    // Processing options
-    settings->pad_lower_bits = false;
-    settings->show_peak_levels = true;
-    settings->suppress_clip_a = false;
-    settings->suppress_clip_b = false;
-    settings->reduce_8bit_a = false;
-    settings->reduce_8bit_b = false;
-    
-    // Resampling defaults
-    settings->enable_resample_a = false;
-    settings->enable_resample_b = false;
-    settings->resample_rate_a = 4000.0f;  // 4 MHz
-    settings->resample_rate_b = 4000.0f;  // 4 MHz
-    settings->resample_quality_a = 3;     // High quality
-    settings->resample_quality_b = 3;     // High quality
-    settings->resample_gain_a = 0.0f;     // No gain
-    settings->resample_gain_b = 0.0f;     // No gain
-#ifdef ENABLE_DDD
-    settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
-#endif
-    
-    // FLAC defaults
-    settings->use_flac = true;
-    settings->flac_12bit = false;
-    settings->flac_level = 4;             // Balanced compression
-    settings->flac_verification = false;  // Faster
-    settings->flac_threads = 0;           // Auto
-    settings->flac_affinity_enabled = false;
-    settings->flac_affinity_cpu_list[0] = '\0';
-    
-    // Audio output defaults
-    settings->enable_audio_4ch = false;
-    settings->enable_audio_2ch_12 = false;
-    settings->enable_audio_2ch_34 = false;
-    for (int i = 0; i < 4; i++) {
-        settings->enable_audio_1ch[i] = false;
-    }
-
-    // Audio monitoring defaults
-    settings->audio_monitor_playback = false;
-    settings->audio_monitor_ch34 = false;  // Default to CH1/2
-    settings->misrc_mode = true;           // Default to MISRC mode (A/B swapped)
-    settings->misrc_v15_v25_ab_swap = false;
-    settings->stop_on_dropout = false;
-
-    // Level autostop defaults (tape-end detection). Disabled by default.
-    // Defaults mirror PR #11: 33% threshold, 5.0s sustain.
-    settings->level_autostop_enabled = false;
-    strcpy(settings->level_autostop_level_str, "33");
-    strcpy(settings->level_autostop_duration_str, "5.0");
-    
-    // Display settings
-    settings->show_grid = true;
-    settings->time_scale = 1.0f;
-    settings->amplitude_scale = 1.0f;
-    settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
-
-    // V4L2/simple_capture device discovery is opt-in (disabled by default).
-    settings->discover_simple_capture = false;
-    // Core-pinning controls are hidden by default; users can enable from info page.
-    settings->show_core_pinning_in_settings = false;
-    // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
-    // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
-    settings->memory_budget_gb = 4;
-    settings->update_last_check_unix_s = 0;
-    settings->update_last_release_tag[0] = '\0';
-    settings->update_available_cached = false;
-
-    // RTL-SDR defaults (only relevant when an RTL-SDR device is selected)
-    settings->rtlsdr_freq_hz = 100000000ULL;   // 100.0 MHz (FM broadcast band)
-    settings->rtlsdr_gain_mode = 0;             // 0 = auto, 1 = manual
-    settings->rtlsdr_gain_tenths_db = 0;        // manual gain (tenths dB); unused in auto mode
-    settings->rtlsdr_sample_rate_hz = 2400000U;  // 2.4 MSPS (highest widely-stable)
-    settings->rtlsdr_agc = true;                // RTL2832 AGC on
-    settings->rtlsdr_offset_corr = false;       // RTL offset tuning correction off
-
-    // Demod view defaults (device-agnostic; apply to the Demod panel)
-    settings->demod_mode = 0;                   // 0=WFM,1=NFM,2=AM,3=USB,4=LSB
-    settings->demod_bandwidth_hz = 0;           // 0 = use mode default bandwidth
-    settings->demod_squelch = 0.0f;             // 0.0 = squelch open
-    settings->demod_volume = 1.0f;              // 1.0 = unity gain
-    settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
-
-    // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
-    // is Local (no networking). Default port 8080 mirrors the reference server.
-    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
-    settings->net_server_port = 8080;
-    snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
-             (unsigned)settings->net_server_port);
-    settings->net_client_host[0] = '\0';
-    settings->net_client_port = 8080;
-    snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
-             (unsigned)settings->net_client_port);
 }
 
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
 void gui_settings_save(const gui_settings_t *settings) {
     if (!settings) return;
-    
+    if (gui_settings_save_suspended()) {
+        /* A caller is editing a scratch copy; it saves once when it is done. */
+        gui_settings_note_save_requested();
+        return;
+    }
+
     const char* path = get_settings_file_path();
     if (!gui_settings_ensure_parent_dirs(path)) {
         return;
     }
-    FILE *f = fopen(path, "w");
-    if (!f) {
+    char *text = malloc(GUI_SETTINGS_MAX_FILE_BYTES);
+    if (!text) {
         return;
     }
-    
-    fprintf(f, "{\n");
-    fprintf(f, "  \"device_index\": %d,\n", settings->device_index);
-    fprintf(f, "  \"output_path\": \"%s\",\n", settings->output_path);
-    fprintf(f, "  \"auto_names_enabled\": %s,\n", settings->auto_names_enabled ? "true" : "false");
-    fprintf(f, "  \"output_base_name\": \"%s\",\n", settings->output_base_name);
-    fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
-    fprintf(f, "  \"rf_bits_a\": %u,\n", (unsigned)settings->rf_bits_a);
-    fprintf(f, "  \"rf_bits_b\": %u,\n", (unsigned)settings->rf_bits_b);
-    fprintf(f, "  \"cxadc_tenbit_mode_a\": %s,\n", settings->cxadc_tenbit_mode_card[0] ? "true" : "false");
-    fprintf(f, "  \"cxadc_tenbit_mode_b\": %s,\n", settings->cxadc_tenbit_mode_card[1] ? "true" : "false");
-    fprintf(f, "  \"rf_tag_a\": \"%s\",\n", settings->rf_channel_tags[0]);
-    fprintf(f, "  \"rf_tag_b\": \"%s\",\n", settings->rf_channel_tags[1]);
-    fprintf(f, "  \"output_filename_a\": \"%s\",\n", settings->output_filename_a);
-    fprintf(f, "  \"output_filename_b\": \"%s\",\n", settings->output_filename_b);
-    fprintf(f, "  \"capture_a\": %s,\n", settings->capture_a ? "true" : "false");
-    fprintf(f, "  \"capture_b\": %s,\n", settings->capture_b ? "true" : "false");
-    fprintf(f, "  \"sample_count\": %llu,\n", (unsigned long long)settings->sample_count);
-    fprintf(f, "  \"capture_time\": \"%s\",\n", settings->capture_time);
-    fprintf(f, "  \"overwrite_files\": %s,\n", settings->overwrite_files ? "true" : "false");
-    fprintf(f, "  \"aux_filename\": \"%s\",\n", settings->aux_filename);
-    fprintf(f, "  \"raw_filename\": \"%s\",\n", settings->raw_filename);
-
-    // Audio filenames + enables (mirror CLI options)
-    fprintf(f, "  \"audio_4ch_filename\": \"%s\",\n", settings->audio_4ch_filename);
-    fprintf(f, "  \"audio_2ch_12_filename\": \"%s\",\n", settings->audio_2ch_12_filename);
-    fprintf(f, "  \"audio_2ch_34_filename\": \"%s\",\n", settings->audio_2ch_34_filename);
-    fprintf(f, "  \"audio_1ch_1_filename\": \"%s\",\n", settings->audio_1ch_filenames[0]);
-    fprintf(f, "  \"audio_1ch_2_filename\": \"%s\",\n", settings->audio_1ch_filenames[1]);
-    fprintf(f, "  \"audio_1ch_3_filename\": \"%s\",\n", settings->audio_1ch_filenames[2]);
-    fprintf(f, "  \"audio_1ch_4_filename\": \"%s\",\n", settings->audio_1ch_filenames[3]);
-    fprintf(f, "  \"audio_1ch_1_label\": \"%s\",\n", settings->audio_1ch_labels[0]);
-    fprintf(f, "  \"audio_1ch_2_label\": \"%s\",\n", settings->audio_1ch_labels[1]);
-    fprintf(f, "  \"audio_1ch_3_label\": \"%s\",\n", settings->audio_1ch_labels[2]);
-    fprintf(f, "  \"audio_1ch_4_label\": \"%s\",\n", settings->audio_1ch_labels[3]);
-    fprintf(f, "  \"audio_tag_4ch\": \"%s\",\n", settings->audio_output_tags[0]);
-    fprintf(f, "  \"audio_tag_2ch_12\": \"%s\",\n", settings->audio_output_tags[1]);
-    fprintf(f, "  \"audio_tag_2ch_34\": \"%s\",\n", settings->audio_output_tags[2]);
-
-    fprintf(f, "  \"enable_audio_4ch\": %s,\n", settings->enable_audio_4ch ? "true" : "false");
-    fprintf(f, "  \"enable_audio_2ch_12\": %s,\n", settings->enable_audio_2ch_12 ? "true" : "false");
-    fprintf(f, "  \"enable_audio_2ch_34\": %s,\n", settings->enable_audio_2ch_34 ? "true" : "false");
-    fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
-    fprintf(f, "  \"audio_monitor_ch34\": %s,\n", settings->audio_monitor_ch34 ? "true" : "false");
-    fprintf(f, "  \"misrc_mode\": %s,\n", settings->misrc_mode ? "true" : "false");
-    fprintf(f, "  \"misrc_v15_v25_ab_swap\": %s,\n", settings->misrc_v15_v25_ab_swap ? "true" : "false");
-    fprintf(f, "  \"stop_on_dropout\": %s,\n", settings->stop_on_dropout ? "true" : "false");
-    fprintf(f, "  \"level_autostop_enabled\": %s,\n", settings->level_autostop_enabled ? "true" : "false");
-    fprintf(f, "  \"level_autostop_level_str\": \"%s\",\n", settings->level_autostop_level_str);
-    fprintf(f, "  \"level_autostop_duration_str\": \"%s\",\n", settings->level_autostop_duration_str);
-    fprintf(f, "  \"ingest_project\": \"%s\",\n", settings->ingest_project);
-    fprintf(f, "  \"ingest_tape_id\": \"%s\",\n", settings->ingest_tape_id);
-    fprintf(f, "  \"ingest_tape_format\": \"%s\",\n", settings->ingest_tape_format);
-    fprintf(f, "  \"ingest_tape_size\": \"%s\",\n", settings->ingest_tape_size);
-    fprintf(f, "  \"ingest_tape_speed\": \"%s\",\n", settings->ingest_tape_speed);
-    fprintf(f, "  \"ingest_tape_condition\": \"%s\",\n", settings->ingest_tape_condition);
-    fprintf(f, "  \"ingest_operator\": \"%s\",\n", settings->ingest_operator);
-    fprintf(f, "  \"ingest_location\": \"%s\",\n", settings->ingest_location);
-    fprintf(f, "  \"ingest_notes\": \"%s\",\n", settings->ingest_notes);
-    fprintf(f, "  \"enable_audio_1ch_1\": %s,\n", settings->enable_audio_1ch[0] ? "true" : "false");
-    fprintf(f, "  \"enable_audio_1ch_2\": %s,\n", settings->enable_audio_1ch[1] ? "true" : "false");
-    fprintf(f, "  \"enable_audio_1ch_3\": %s,\n", settings->enable_audio_1ch[2] ? "true" : "false");
-    fprintf(f, "  \"enable_audio_1ch_4\": %s,\n", settings->enable_audio_1ch[3] ? "true" : "false");
-
-    fprintf(f, "  \"pad_lower_bits\": %s,\n", settings->pad_lower_bits ? "true" : "false");
-    fprintf(f, "  \"show_peak_levels\": %s,\n", settings->show_peak_levels ? "true" : "false");
-    fprintf(f, "  \"suppress_clip_a\": %s,\n", settings->suppress_clip_a ? "true" : "false");
-    fprintf(f, "  \"suppress_clip_b\": %s,\n", settings->suppress_clip_b ? "true" : "false");
-    fprintf(f, "  \"reduce_8bit_a\": %s,\n", settings->reduce_8bit_a ? "true" : "false");
-    fprintf(f, "  \"reduce_8bit_b\": %s,\n", settings->reduce_8bit_b ? "true" : "false");
-    fprintf(f, "  \"enable_resample_a\": %s,\n", settings->enable_resample_a ? "true" : "false");
-    fprintf(f, "  \"enable_resample_b\": %s,\n", settings->enable_resample_b ? "true" : "false");
-    fprintf(f, "  \"resample_rate_a\": %.1f,\n", settings->resample_rate_a);
-    fprintf(f, "  \"resample_rate_b\": %.1f,\n", settings->resample_rate_b);
-    fprintf(f, "  \"resample_quality_a\": %d,\n", settings->resample_quality_a);
-    fprintf(f, "  \"resample_quality_b\": %d,\n", settings->resample_quality_b);
-    fprintf(f, "  \"resample_gain_a\": %.1f,\n", settings->resample_gain_a);
-    fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
-#ifdef ENABLE_DDD
-    fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
-#endif
-    fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
-    fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
-    fprintf(f, "  \"flac_level\": %d,\n", settings->flac_level);
-    fprintf(f, "  \"flac_verification\": %s,\n", settings->flac_verification ? "true" : "false");
-    fprintf(f, "  \"flac_threads\": %d,\n", settings->flac_threads);
-    fprintf(f, "  \"flac_affinity_enabled\": %s,\n", settings->flac_affinity_enabled ? "true" : "false");
-    fprintf(f, "  \"flac_affinity_cpu_list\": \"%s\",\n", settings->flac_affinity_cpu_list);
-    fprintf(f, "  \"enable_resample_a\": %s,\n", settings->enable_resample_a ? "true" : "false");
-    fprintf(f, "  \"enable_resample_b\": %s,\n", settings->enable_resample_b ? "true" : "false");
-    fprintf(f, "  \"resample_rate_a\": %.1f,\n", settings->resample_rate_a);
-    fprintf(f, "  \"resample_rate_b\": %.1f,\n", settings->resample_rate_b);
-    fprintf(f, "  \"resample_quality_a\": %d,\n", settings->resample_quality_a);
-    fprintf(f, "  \"resample_quality_b\": %d,\n", settings->resample_quality_b);
-    fprintf(f, "  \"resample_gain_a\": %.1f,\n", settings->resample_gain_a);
-    fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
-    fprintf(f, "  \"overwrite_files\": %s,\n", settings->overwrite_files ? "true" : "false");
-    fprintf(f, "  \"show_grid\": %s,\n", settings->show_grid ? "true" : "false");
-    fprintf(f, "  \"time_scale\": %.2f,\n", settings->time_scale);
-    fprintf(f, "  \"amplitude_scale\": %.2f,\n", settings->amplitude_scale);
-    fprintf(f, "  \"ui_scale_percent\": %d,\n", settings->ui_scale_percent);
-    fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
-    fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
-    fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
-    fprintf(f, "  \"update_last_check_unix_s\": %llu,\n", (unsigned long long)settings->update_last_check_unix_s);
-    fprintf(f, "  \"update_last_release_tag\": \"%s\",\n", settings->update_last_release_tag);
-    fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
-    fprintf(f, "  \"rtlsdr_freq_hz\": %llu,\n", (unsigned long long)settings->rtlsdr_freq_hz);
-    fprintf(f, "  \"rtlsdr_gain_mode\": %d,\n", settings->rtlsdr_gain_mode);
-    fprintf(f, "  \"rtlsdr_gain_tenths_db\": %d,\n", settings->rtlsdr_gain_tenths_db);
-    fprintf(f, "  \"rtlsdr_sample_rate_hz\": %u,\n", (unsigned)settings->rtlsdr_sample_rate_hz);
-    fprintf(f, "  \"rtlsdr_agc\": %s,\n", settings->rtlsdr_agc ? "true" : "false");
-    fprintf(f, "  \"rtlsdr_offset_corr\": %s,\n", settings->rtlsdr_offset_corr ? "true" : "false");
-    fprintf(f, "  \"demod_mode\": %d,\n", settings->demod_mode);
-    fprintf(f, "  \"demod_bandwidth_hz\": %d,\n", settings->demod_bandwidth_hz);
-    fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
-    fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
-    fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
-    // Server/Client networking (cxadc_vhs_server-style peer mode).
-    fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
-    fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
-    fprintf(f, "  \"net_server_port_str\": \"%s\",\n", settings->net_server_port_str);
-    fprintf(f, "  \"net_client_host\": \"%s\",\n", settings->net_client_host);
-    fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
-    fprintf(f, "  \"net_client_port_str\": \"%s\",\n", settings->net_client_port_str);
-    fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
-    fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
-    fprintf(f, "}\n");
-    
-    fclose(f);
-}
-
-// Simple parser for our JSON-like format
-static char* find_value(const char* content, const char* key) {
-    static char value[512];
-    char search_key[256];
-    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
-    
-    char* pos = strstr(content, search_key);
-    if (!pos) return NULL;
-    
-    pos += strlen(search_key);
-    while (*pos == ' ' || *pos == '\t') pos++; // Skip whitespace
-    
-    if (*pos == '"') {
-        // String value
-        pos++;
-        char* end = strchr(pos, '"');
-        if (!end) return NULL;
-        
-        size_t len = end - pos;
-        if (len >= sizeof(value)) len = sizeof(value) - 1;
-        strncpy(value, pos, len);
-        value[len] = '\0';
-        return value;
-    } else {
-        // Number or boolean
-        char* end = strpbrk(pos, ",\n}");
-        if (!end) return NULL;
-        
-        size_t len = end - pos;
-        if (len >= sizeof(value)) len = sizeof(value) - 1;
-        strncpy(value, pos, len);
-        value[len] = '\0';
-        
-        // Trim trailing whitespace
-        while (len > 0 && (value[len-1] == ' ' || value[len-1] == '\t')) {
-            value[--len] = '\0';
-        }
-        
-        return value;
+    size_t needed = gui_settings_format_file(settings, text, GUI_SETTINGS_MAX_FILE_BYTES);
+    if (needed >= GUI_SETTINGS_MAX_FILE_BYTES) {
+        /* Never write a file the loader would refuse. */
+        free(text);
+        return;
     }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(text);
+        return;
+    }
+    fwrite(text, 1, needed, f);
+    fclose(f);
+    free(text);
+    gui_settings_bump_generation();
 }
 
 // Helpers
@@ -722,35 +257,6 @@ static void trim_newlines(char *s) {
     size_t len = strlen(s);
     while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
         s[--len] = '\0';
-    }
-}
-
-// Backward-compat migration:
-// Earlier builds could permanently prefix output_base_name with a timestamp like:
-// - "yy.mm.dd_hh.mm.ss_<name>"
-// - "yyyy.mm.dd_hh.mm.ss_<name>"
-// That is no longer desired (timestamp is now appended at capture start only for derived filenames).
-static void strip_timestamp_prefix_inplace(char *s) {
-    if (!s) return;
-
-    // yy.mm.dd_hh.mm.ss_
-    const size_t len_yy = 18;
-    // yyyy.mm.dd_hh.mm.ss_
-    const size_t len_yyyy = 20;
-
-    size_t n = strlen(s);
-    if (n <= len_yy) return;
-
-    bool match_yy = (n > len_yy) &&
-        (s[2] == '.' && s[5] == '.' && s[8] == '_' && s[11] == '.' && s[14] == '.' && s[17] == '_');
-
-    bool match_yyyy = (n > len_yyyy) &&
-        (s[4] == '.' && s[7] == '.' && s[10] == '_' && s[13] == '.' && s[16] == '.' && s[19] == '_');
-
-    if (match_yyyy) {
-        memmove(s, s + len_yyyy, n - len_yyyy + 1);
-    } else if (match_yy) {
-        memmove(s, s + len_yy, n - len_yy + 1);
     }
 }
 
@@ -898,475 +404,36 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
 
 void gui_settings_load(gui_settings_t *settings) {
     if (!settings) return;
-    
+
     // Start with defaults
     gui_settings_init_defaults(settings);
-    
+
     const char* path = get_settings_file_path();
     FILE* f = fopen(path, "r");
     if (!f) return; // No settings file, use defaults
-    
+
     // Read entire file
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    
-    if (size <= 0 || size > 32768) { // Sanity check
+
+    if (size <= 0 || size > GUI_SETTINGS_MAX_FILE_BYTES) { // Sanity check
         fclose(f);
         return;
     }
-    
+
     char* content = malloc(size + 1);
     if (!content) {
         fclose(f);
         return;
     }
-    
+
     size_t read_size = fread(content, 1, size, f);
     content[read_size] = '\0';
     fclose(f);
-    
-    // Parse values
-    char* value;
-    
-    if ((value = find_value(content, "device_index")) != NULL) {
-        settings->device_index = atoi(value);
-    }
-    
-    if ((value = find_value(content, "output_path")) != NULL) {
-        strncpy(settings->output_path, value, MAX_FILENAME_LEN - 1);
-        settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    
-    // Auto naming
-    if ((value = find_value(content, "auto_names_enabled")) != NULL) {
-        settings->auto_names_enabled = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "output_base_name")) != NULL) {
-        strncpy(settings->output_base_name, value, MAX_FILENAME_LEN - 1);
-        settings->output_base_name[MAX_FILENAME_LEN - 1] = '\0';
-        strip_timestamp_prefix_inplace(settings->output_base_name);
-    }
-    if ((value = find_value(content, "append_timestamp_on_capture_start")) != NULL) {
-        settings->append_timestamp_on_capture_start = (strcmp(value, "true") == 0);
-    }
-    // Duration limits: feature removed, ignore saved values and force to 0
-    settings->capture_limit_seconds = 0;
-    settings->record_limit_seconds = 0;
-    if ((value = find_value(content, "rf_bits_a")) != NULL) {
-        settings->rf_bits_a = (uint8_t)atoi(value);
-    }
-    if ((value = find_value(content, "rf_bits_b")) != NULL) {
-        settings->rf_bits_b = (uint8_t)atoi(value);
-    }
-    bool cxadc_mode_legacy_loaded = false;
-    if ((value = find_value(content, "cxadc_tenbit_mode")) != NULL) {
-        bool mode = (strcmp(value, "true") == 0);
-        settings->cxadc_tenbit_mode_card[0] = mode;
-        settings->cxadc_tenbit_mode_card[1] = mode;
-        cxadc_mode_legacy_loaded = true;
-    }
-    if ((value = find_value(content, "cxadc_tenbit_mode_a")) != NULL) {
-        settings->cxadc_tenbit_mode_card[0] = (strcmp(value, "true") == 0);
-        cxadc_mode_legacy_loaded = true;
-    }
-    if ((value = find_value(content, "cxadc_tenbit_mode_b")) != NULL) {
-        settings->cxadc_tenbit_mode_card[1] = (strcmp(value, "true") == 0);
-        cxadc_mode_legacy_loaded = true;
-    }
-    if (!cxadc_mode_legacy_loaded) {
-        settings->cxadc_tenbit_mode_card[0] = false;
-        settings->cxadc_tenbit_mode_card[1] = false;
-    }
-    if ((value = find_value(content, "rf_tag_a")) != NULL) {
-        strncpy(settings->rf_channel_tags[0], value, sizeof(settings->rf_channel_tags[0]) - 1);
-        settings->rf_channel_tags[0][sizeof(settings->rf_channel_tags[0]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "rf_tag_b")) != NULL) {
-        strncpy(settings->rf_channel_tags[1], value, sizeof(settings->rf_channel_tags[1]) - 1);
-        settings->rf_channel_tags[1][sizeof(settings->rf_channel_tags[1]) - 1] = '\0';
-    }
 
-    if ((value = find_value(content, "output_filename_a")) != NULL) {
-        strncpy(settings->output_filename_a, value, MAX_FILENAME_LEN - 1);
-        settings->output_filename_a[MAX_FILENAME_LEN - 1] = '\0';
-    }
-
-    if ((value = find_value(content, "output_filename_b")) != NULL) {
-        strncpy(settings->output_filename_b, value, MAX_FILENAME_LEN - 1);
-        settings->output_filename_b[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    
-    if ((value = find_value(content, "capture_a")) != NULL) {
-        settings->capture_a = (strcmp(value, "true") == 0);
-    }
-    
-    if ((value = find_value(content, "capture_b")) != NULL) {
-        settings->capture_b = (strcmp(value, "true") == 0);
-    }
-    
-    if ((value = find_value(content, "use_flac")) != NULL) {
-        settings->use_flac = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "flac_12bit")) != NULL) {
-        settings->flac_12bit = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "flac_verification")) != NULL) {
-        settings->flac_verification = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "flac_threads")) != NULL) {
-        settings->flac_threads = atoi(value);
-    }
-    if ((value = find_value(content, "flac_affinity_enabled")) != NULL) {
-        settings->flac_affinity_enabled = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "flac_affinity_cpu_list")) != NULL) {
-        strncpy(settings->flac_affinity_cpu_list, value, sizeof(settings->flac_affinity_cpu_list) - 1);
-        settings->flac_affinity_cpu_list[sizeof(settings->flac_affinity_cpu_list) - 1] = '\0';
-    }
-
-    if ((value = find_value(content, "flac_level")) != NULL) {
-        settings->flac_level = atoi(value);
-    }
-
-    if ((value = find_value(content, "enable_resample_a")) != NULL) {
-        settings->enable_resample_a = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "enable_resample_b")) != NULL) {
-        settings->enable_resample_b = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "resample_rate_a")) != NULL) {
-        settings->resample_rate_a = (float)atof(value);
-    }
-
-    if ((value = find_value(content, "resample_rate_b")) != NULL) {
-        settings->resample_rate_b = (float)atof(value);
-    }
-
-    if ((value = find_value(content, "resample_quality_a")) != NULL) {
-        settings->resample_quality_a = atoi(value);
-    }
-
-    if ((value = find_value(content, "resample_quality_b")) != NULL) {
-        settings->resample_quality_b = atoi(value);
-    }
-
-    if ((value = find_value(content, "resample_gain_a")) != NULL) {
-        settings->resample_gain_a = (float)atof(value);
-    }
-
-#ifdef ENABLE_DDD
-    if ((value = find_value(content, "ddd_decimation")) != NULL) {
-        uint8_t factor = (uint8_t)atoi(value);
-        if (ddd_decimation_is_supported(factor)) {
-            settings->ddd_decimation = factor;
-        }
-    }
-#endif
-
-    if ((value = find_value(content, "resample_gain_b")) != NULL) {
-        settings->resample_gain_b = (float)atof(value);
-    }
-
-    if ((value = find_value(content, "overwrite_files")) != NULL) {
-        settings->overwrite_files = (strcmp(value, "true") == 0);
-    }
-    
-    if ((value = find_value(content, "show_grid")) != NULL) {
-        settings->show_grid = (strcmp(value, "true") == 0);
-    }
-    
-    if ((value = find_value(content, "time_scale")) != NULL) {
-        settings->time_scale = (float)atof(value);
-    }
-    
-    if ((value = find_value(content, "amplitude_scale")) != NULL) {
-        settings->amplitude_scale = (float)atof(value);
-    }
-    if ((value = find_value(content, "ui_scale_percent")) != NULL) {
-        settings->ui_scale_percent = gui_ui_scale_parse_percent(value);
-    }
-    if ((value = find_value(content, "discover_simple_capture")) != NULL) {
-        settings->discover_simple_capture = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "show_core_pinning_in_settings")) != NULL) {
-        settings->show_core_pinning_in_settings = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "memory_budget_gb")) != NULL) {
-        long gb = atol(value);
-        if (gb < 1) gb = 4;
-        if (gb > 16) gb = 16;
-        settings->memory_budget_gb = (uint32_t)gb;
-    }
-    if ((value = find_value(content, "update_last_check_unix_s")) != NULL) {
-        settings->update_last_check_unix_s = (uint64_t)strtoull(value, NULL, 10);
-    }
-    if ((value = find_value(content, "update_last_release_tag")) != NULL) {
-        strncpy(settings->update_last_release_tag, value, sizeof(settings->update_last_release_tag) - 1);
-        settings->update_last_release_tag[sizeof(settings->update_last_release_tag) - 1] = '\0';
-    }
-    if ((value = find_value(content, "update_available_cached")) != NULL) {
-        settings->update_available_cached = (strcmp(value, "true") == 0);
-    }
-
-    if ((value = find_value(content, "reduce_8bit_a")) != NULL) {
-        settings->reduce_8bit_a = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "reduce_8bit_b")) != NULL) {
-        settings->reduce_8bit_b = (strcmp(value, "true") == 0);
-    }
-
-    // Audio filenames + enables
-    if ((value = find_value(content, "audio_4ch_filename")) != NULL) {
-        strncpy(settings->audio_4ch_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_4ch_filename[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_2ch_12_filename")) != NULL) {
-        strncpy(settings->audio_2ch_12_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_2ch_12_filename[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_2ch_34_filename")) != NULL) {
-        strncpy(settings->audio_2ch_34_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_2ch_34_filename[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_1_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[0], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[0][MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_2_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[1], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[1][MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_3_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[2], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[2][MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_4_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[3], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[3][MAX_FILENAME_LEN - 1] = '\0';
-    }
-
-    // Per-channel audio labels (optional)
-    if ((value = find_value(content, "audio_1ch_1_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[0], value, sizeof(settings->audio_1ch_labels[0]) - 1);
-        settings->audio_1ch_labels[0][sizeof(settings->audio_1ch_labels[0]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_2_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[1], value, sizeof(settings->audio_1ch_labels[1]) - 1);
-        settings->audio_1ch_labels[1][sizeof(settings->audio_1ch_labels[1]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_3_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[2], value, sizeof(settings->audio_1ch_labels[2]) - 1);
-        settings->audio_1ch_labels[2][sizeof(settings->audio_1ch_labels[2]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_1ch_4_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[3], value, sizeof(settings->audio_1ch_labels[3]) - 1);
-        settings->audio_1ch_labels[3][sizeof(settings->audio_1ch_labels[3]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_tag_4ch")) != NULL) {
-        strncpy(settings->audio_output_tags[0], value, sizeof(settings->audio_output_tags[0]) - 1);
-        settings->audio_output_tags[0][sizeof(settings->audio_output_tags[0]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_tag_2ch_12")) != NULL) {
-        strncpy(settings->audio_output_tags[1], value, sizeof(settings->audio_output_tags[1]) - 1);
-        settings->audio_output_tags[1][sizeof(settings->audio_output_tags[1]) - 1] = '\0';
-    }
-    if ((value = find_value(content, "audio_tag_2ch_34")) != NULL) {
-        strncpy(settings->audio_output_tags[2], value, sizeof(settings->audio_output_tags[2]) - 1);
-        settings->audio_output_tags[2][sizeof(settings->audio_output_tags[2]) - 1] = '\0';
-    }
-
-    if ((value = find_value(content, "enable_audio_4ch")) != NULL) {
-        settings->enable_audio_4ch = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "enable_audio_2ch_12")) != NULL) {
-        settings->enable_audio_2ch_12 = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "enable_audio_2ch_34")) != NULL) {
-        settings->enable_audio_2ch_34 = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "audio_monitor_playback")) != NULL) {
-        settings->audio_monitor_playback = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "audio_monitor_ch34")) != NULL) {
-        settings->audio_monitor_ch34 = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "misrc_mode")) != NULL) {
-        settings->misrc_mode = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "misrc_v15_v25_ab_swap")) != NULL) {
-        settings->misrc_v15_v25_ab_swap = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "stop_on_dropout")) != NULL) {
-        settings->stop_on_dropout = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "level_autostop_enabled")) != NULL) {
-        settings->level_autostop_enabled = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "level_autostop_level_str")) != NULL) {
-        strncpy(settings->level_autostop_level_str, value, sizeof(settings->level_autostop_level_str) - 1);
-        settings->level_autostop_level_str[sizeof(settings->level_autostop_level_str) - 1] = '\0';
-    }
-    if ((value = find_value(content, "level_autostop_duration_str")) != NULL) {
-        strncpy(settings->level_autostop_duration_str, value, sizeof(settings->level_autostop_duration_str) - 1);
-        settings->level_autostop_duration_str[sizeof(settings->level_autostop_duration_str) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_project")) != NULL) {
-        strncpy(settings->ingest_project, value, sizeof(settings->ingest_project) - 1);
-        settings->ingest_project[sizeof(settings->ingest_project) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_id")) != NULL) {
-        strncpy(settings->ingest_tape_id, value, sizeof(settings->ingest_tape_id) - 1);
-        settings->ingest_tape_id[sizeof(settings->ingest_tape_id) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_format")) != NULL) {
-        strncpy(settings->ingest_tape_format, value, sizeof(settings->ingest_tape_format) - 1);
-        settings->ingest_tape_format[sizeof(settings->ingest_tape_format) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_size")) != NULL) {
-        strncpy(settings->ingest_tape_size, value, sizeof(settings->ingest_tape_size) - 1);
-        settings->ingest_tape_size[sizeof(settings->ingest_tape_size) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_speed")) != NULL) {
-        strncpy(settings->ingest_tape_speed, value, sizeof(settings->ingest_tape_speed) - 1);
-        settings->ingest_tape_speed[sizeof(settings->ingest_tape_speed) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_condition")) != NULL) {
-        strncpy(settings->ingest_tape_condition, value, sizeof(settings->ingest_tape_condition) - 1);
-        settings->ingest_tape_condition[sizeof(settings->ingest_tape_condition) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_operator")) != NULL) {
-        strncpy(settings->ingest_operator, value, sizeof(settings->ingest_operator) - 1);
-        settings->ingest_operator[sizeof(settings->ingest_operator) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_location")) != NULL) {
-        strncpy(settings->ingest_location, value, sizeof(settings->ingest_location) - 1);
-        settings->ingest_location[sizeof(settings->ingest_location) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_notes")) != NULL) {
-        strncpy(settings->ingest_notes, value, sizeof(settings->ingest_notes) - 1);
-        settings->ingest_notes[sizeof(settings->ingest_notes) - 1] = '\0';
-    }
-    if ((value = find_value(content, "enable_audio_1ch_1")) != NULL) {
-        settings->enable_audio_1ch[0] = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "enable_audio_1ch_2")) != NULL) {
-        settings->enable_audio_1ch[1] = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "enable_audio_1ch_3")) != NULL) {
-        settings->enable_audio_1ch[2] = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "enable_audio_1ch_4")) != NULL) {
-        settings->enable_audio_1ch[3] = (strcmp(value, "true") == 0);
-    }
-
-    // Playback files
-    if ((value = find_value(content, "playback_file_a")) != NULL) {
-        strncpy(settings->playback_file_a, value, MAX_FILENAME_LEN - 1);
-        settings->playback_file_a[MAX_FILENAME_LEN - 1] = '\0';
-    }
-    if ((value = find_value(content, "playback_file_b")) != NULL) {
-        strncpy(settings->playback_file_b, value, MAX_FILENAME_LEN - 1);
-        settings->playback_file_b[MAX_FILENAME_LEN - 1] = '\0';
-    }
-
-    // RTL-SDR settings
-    if ((value = find_value(content, "rtlsdr_freq_hz")) != NULL) {
-        settings->rtlsdr_freq_hz = (uint64_t)strtoull(value, NULL, 10);
-    }
-    if ((value = find_value(content, "rtlsdr_gain_mode")) != NULL) {
-        settings->rtlsdr_gain_mode = atoi(value);
-    }
-    if ((value = find_value(content, "rtlsdr_gain_tenths_db")) != NULL) {
-        settings->rtlsdr_gain_tenths_db = atoi(value);
-    }
-    if ((value = find_value(content, "rtlsdr_sample_rate_hz")) != NULL) {
-        settings->rtlsdr_sample_rate_hz = (uint32_t)strtoul(value, NULL, 10);
-    }
-    if ((value = find_value(content, "rtlsdr_agc")) != NULL) {
-        settings->rtlsdr_agc = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "rtlsdr_offset_corr")) != NULL) {
-        settings->rtlsdr_offset_corr = (strcmp(value, "true") == 0);
-    }
-    // Demod view settings
-    if ((value = find_value(content, "demod_mode")) != NULL) {
-        settings->demod_mode = atoi(value);
-    }
-    if ((value = find_value(content, "demod_bandwidth_hz")) != NULL) {
-        settings->demod_bandwidth_hz = atoi(value);
-    }
-    if ((value = find_value(content, "demod_squelch")) != NULL) {
-        settings->demod_squelch = (float)atof(value);
-    }
-    if ((value = find_value(content, "demod_volume")) != NULL) {
-        settings->demod_volume = (float)atof(value);
-    }
-    if ((value = find_value(content, "demod_output_pair")) != NULL) {
-        settings->demod_output_pair = atoi(value);
-    }
-
-    // Server/Client networking (cxadc_vhs_server-style peer mode).
-    if ((value = find_value(content, "net_mode")) != NULL) {
-        int mode = atoi(value);
-        if (mode < 0 || mode > 2) mode = 0;
-        settings->net_mode = mode;
-    }
-    if ((value = find_value(content, "net_server_port")) != NULL) {
-        long p = atol(value);
-        if (p < 1 || p > 65535) p = 8080;
-        settings->net_server_port = (uint16_t)p;
-    }
-    if ((value = find_value(content, "net_server_port_str")) != NULL) {
-        strncpy(settings->net_server_port_str, value, sizeof(settings->net_server_port_str) - 1);
-        settings->net_server_port_str[sizeof(settings->net_server_port_str) - 1] = '\0';
-    }
-    if ((value = find_value(content, "net_client_host")) != NULL) {
-        strncpy(settings->net_client_host, value, sizeof(settings->net_client_host) - 1);
-        settings->net_client_host[sizeof(settings->net_client_host) - 1] = '\0';
-    }
-    if ((value = find_value(content, "net_client_port")) != NULL) {
-        long p = atol(value);
-        if (p < 1 || p > 65535) p = 8080;
-        settings->net_client_port = (uint16_t)p;
-    }
-    if ((value = find_value(content, "net_client_port_str")) != NULL) {
-        strncpy(settings->net_client_port_str, value, sizeof(settings->net_client_port_str) - 1);
-        settings->net_client_port_str[sizeof(settings->net_client_port_str) - 1] = '\0';
-    }
-    // Re-sync port string mirrors if the numeric port was loaded but the
-    // string mirror was absent/empty (older settings files).
-    if (settings->net_server_port_str[0] == '\0') {
-        snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
-                 (unsigned)settings->net_server_port);
-    }
-    if (settings->net_client_port_str[0] == '\0') {
-        snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
-                 (unsigned)settings->net_client_port);
-    }
-
-    // Backward-compat migration:
-    // - If rf_bits_* not present, derive from legacy flags.
-    if (settings->rf_bits_a != 8 && settings->rf_bits_a != 12 && settings->rf_bits_a != 16) {
-        settings->rf_bits_a = settings->reduce_8bit_a ? 8 : (settings->use_flac && settings->flac_12bit ? 12 : 16);
-    }
-    if (settings->rf_bits_b != 8 && settings->rf_bits_b != 12 && settings->rf_bits_b != 16) {
-        settings->rf_bits_b = settings->reduce_8bit_b ? 8 : (settings->use_flac && settings->flac_12bit ? 12 : 16);
-    }
-
-    // Default auto naming to ON if missing.
-    // (If the key is not present, defaults already set it true.)
-    if (settings->output_base_name[0] == '\0') {
-        strcpy(settings->output_base_name, "capture");
-    }
-
-    // Keep auto-derived names in sync on startup (RF prefixes are conditional on empty RF tags).
-    gui_settings_refresh_auto_names(settings);
+    // Parse values (every key the table knows), then the post-load migrations.
+    gui_settings_parse_text(settings, content);
 
     free(content);
 }

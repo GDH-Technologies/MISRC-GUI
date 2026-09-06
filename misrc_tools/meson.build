@@ -376,6 +376,7 @@ if raylib_dep.found()
     # Core
     'misrc_gui/core/misrc_gui.c',
     'misrc_gui/core/gui_settings.c',
+    'misrc_gui/core/gui_settings_table.c',
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
