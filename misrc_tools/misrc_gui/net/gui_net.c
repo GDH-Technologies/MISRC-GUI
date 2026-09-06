@@ -462,13 +462,25 @@ static void server_build_devices(gui_app_t *app, char *buf, size_t len) {
 }
 
 static void server_build_controls(gui_app_t *app, char *buf, size_t len) {
+    /* Publish the mode the extraction thread is actually running, not the
+     * saved setting. The two diverge on purpose: for a CXADC device the UI
+     * sync and the capture-settings clamp force the effective mode off
+     * (card 0 -> A, card 1 -> B) while leaving settings.misrc_mode alone, so
+     * a client mirroring the setting swapped A/B against a server that did
+     * not. While recording the runtime latch is what the record path uses.
+     * The V1.5/V2.5 wiring flag inverts the swap on whichever side applies
+     * it, so it must travel with the mode. */
+    bool effective_misrc = app->is_recording ? app->capture_mode_runtime_misrc
+                                             : app->user_capture_mode_misrc;
     snprintf(buf, len,
-        "{\"misrc_mode\":%s,\"rf_bits_a\":%u,\"rf_bits_b\":%u,"
+        "{\"misrc_mode\":%s,\"misrc_v15_v25_ab_swap\":%s,"
+        "\"rf_bits_a\":%u,\"rf_bits_b\":%u,"
         "\"cxadc_tenbit_a\":%s,\"cxadc_tenbit_b\":%s,"
         "\"resample_a\":%s,\"resample_b\":%s,"
         "\"resample_rate_a\":%.1f,\"resample_rate_b\":%.1f,"
         "\"use_flac\":%s,\"flac_level\":%d}",
-        app->settings.misrc_mode ? "true" : "false",
+        effective_misrc ? "true" : "false",
+        app->settings.misrc_v15_v25_ab_swap ? "true" : "false",
         (unsigned)app->settings.rf_bits_a, (unsigned)app->settings.rf_bits_b,
         app->settings.cxadc_tenbit_mode_card[0] ? "true" : "false",
         app->settings.cxadc_tenbit_mode_card[1] ? "true" : "false",
@@ -1403,6 +1415,9 @@ static int client_worker_thread(void *arg) {
                 bool mm = json_bool(cj, "misrc_mode", false);
                 app->settings.misrc_mode = mm;
                 app->user_capture_mode_misrc = mm;
+                /* The extraction swap is misrc_mode inverted by this wiring
+                 * flag; it describes the server's hardware, so follow it. */
+                app->settings.misrc_v15_v25_ab_swap = json_bool(cj, "misrc_v15_v25_ab_swap", false);
                 int rba = json_int(cj, "rf_bits_a", 16);
                 int rbb = json_int(cj, "rf_bits_b", 16);
                 if (rba == 8 || rba == 12 || rba == 16) app->settings.rf_bits_a = (uint8_t)rba;
