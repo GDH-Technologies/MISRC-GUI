@@ -1434,35 +1434,218 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
     return 0
 
 
+# Every key the hand-written settings writer emitted at v1.1.8, before the
+# descriptor table replaced it. The table may add keys (an old build ignores
+# what it does not know) but must never rename or drop one: a file written by
+# the new build has to load in the previous one, or a rollback loses settings.
+SETTINGS_KEYS_V1_1_8 = (
+    "device_index", "output_path", "auto_names_enabled", "output_base_name",
+    "append_timestamp_on_capture_start", "rf_bits_a", "rf_bits_b", "cxadc_tenbit_mode_a",
+    "cxadc_tenbit_mode_b", "rf_tag_a", "rf_tag_b", "output_filename_a", "output_filename_b",
+    "capture_a", "capture_b", "sample_count", "capture_time", "overwrite_files", "aux_filename",
+    "raw_filename", "audio_4ch_filename", "video_filename", "video_output_tag", "ffmpeg_path",
+    "audio_2ch_12_filename", "audio_2ch_34_filename", "audio_1ch_1_filename",
+    "audio_1ch_2_filename", "audio_1ch_3_filename", "audio_1ch_4_filename", "audio_1ch_1_label",
+    "audio_1ch_2_label", "audio_1ch_3_label", "audio_1ch_4_label", "audio_tag_4ch",
+    "audio_tag_2ch_12", "audio_tag_2ch_34", "enable_audio_4ch", "video_record_enabled",
+    "video_record_codec", "preview_device_path", "rtsp_stream_enabled", "rtsp_stream_lan",
+    "rtsp_stream_port", "rtsp_stream_encoder", "rtsp_stream_bitrate_kbps",
+    "rtsp_stream_deinterlace", "rtsp_lan_acknowledged", "rtsp_stream_password", "mediamtx_path",
+    "rtsp_audio_device", "enable_audio_2ch_12", "enable_audio_2ch_34", "audio_monitor_playback",
+    "audio_monitor_ch34", "misrc_mode", "misrc_v15_v25_ab_swap", "stop_on_dropout",
+    "level_autostop_enabled", "level_autostop_level_str", "level_autostop_duration_str",
+    "ingest_project", "ingest_tape_id", "ingest_tape_format", "ingest_tape_size",
+    "ingest_tape_speed", "ingest_tape_condition", "ingest_operator", "ingest_location",
+    "ingest_notes", "enable_audio_1ch_1", "enable_audio_1ch_2", "enable_audio_1ch_3",
+    "enable_audio_1ch_4", "pad_lower_bits", "show_peak_levels", "suppress_clip_a",
+    "suppress_clip_b", "reduce_8bit_a", "reduce_8bit_b", "enable_resample_a", "enable_resample_b",
+    "resample_rate_a", "resample_rate_b", "resample_quality_a", "resample_quality_b",
+    "resample_gain_a", "resample_gain_b", "ddd_decimation", "use_flac", "flac_12bit", "flac_level",
+    "flac_verification", "flac_threads", "flac_affinity_enabled", "flac_affinity_cpu_list",
+    "show_grid", "time_scale", "amplitude_scale", "ui_scale_percent", "ui_scale_auto",
+    "discover_simple_capture", "show_core_pinning_in_settings", "memory_budget_gb",
+    "update_last_check_unix_s", "update_last_release_tag", "update_available_cached",
+    "rtlsdr_freq_hz", "rtlsdr_gain_mode", "rtlsdr_gain_tenths_db", "rtlsdr_sample_rate_hz",
+    "rtlsdr_agc", "rtlsdr_offset_corr", "demod_mode", "demod_bandwidth_hz", "demod_squelch",
+    "demod_volume", "demod_output_pair", "net_mode", "net_server_port", "net_server_port_str",
+    "net_client_host", "net_client_port", "net_client_port_str", "playback_file_a",
+    "playback_file_b",
+)
+
+# Fields that describe the machine running this GUI rather than the capture,
+# so a net client keeps its own and never sends them to a server.
+SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
+    "audio_monitor_playback", "audio_monitor_ch34", "show_grid", "time_scale", "amplitude_scale",
+    "ui_scale_percent", "ui_scale_auto", "show_core_pinning_in_settings", "memory_budget_gb",
+    "update_last_check_unix_s", "update_last_release_tag", "update_available_cached",
+    "demod_mode", "demod_bandwidth_hz", "demod_squelch", "demod_volume", "demod_output_pair",
+    "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
+    "net_client_port_str", "playback_file_a", "playback_file_b",
+))
+
+# Struct fields deliberately not persisted (the duration limits are forced to
+# 0 on every load; the feature left the UI).
+SETTINGS_UNPERSISTED_FIELDS = frozenset(("capture_limit_seconds", "record_limit_seconds"))
+
+
+def check_settings_table_covers_struct(repo_root: Path) -> int:
+    """gui_settings_t is written, read, published and set through the one
+    descriptor table in gui_settings_table.c. A field added to the struct but
+    not the table is the old failure in a new place: it looks like a setting,
+    it is never saved, and it is quietly the default after every restart. So:
+    every struct field has a table row (or is in the explicit unpersisted
+    list), every row names a real field, keys are unique, the v1.1.8 key set
+    is still written (a rename or a drop breaks rollback), the client-local
+    set is exactly the agreed one, and the DdD row stays under ENABLE_DDD."""
+    header = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.h")
+    table = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
+
+    m = re.search(r"typedef struct \{(.*?)\} gui_settings_t;", header, re.S)
+    if not m:
+        return fail("gui_settings.h no longer defines gui_settings_t")
+    body = strip_c_comments(m.group(1))
+    members = re.findall(
+        r"^\s*[A-Za-z_][A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)*;",
+        body, re.M)
+    if len(members) < 100:
+        return fail(f"gui_settings.h: parsed only {len(members)} gui_settings_t fields; the parser is stale")
+
+    rows = []
+    for line in strip_c_comments(table).splitlines():
+        r = re.match(r'\s*GS_[A-Z0-9]+\s*\(\s*"([a-z0-9_]+)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)(.*)\)\s*,?\s*$', line)
+        if r:
+            rows.append((r.group(1), r.group(2), r.group(3)))
+    if len(rows) < 100:
+        return fail(f"gui_settings_table.c: parsed only {len(rows)} table rows; the parser is stale")
+
+    keys = [k for k, _, _ in rows]
+    dups = sorted({k for k in keys if keys.count(k) > 1})
+    if dups:
+        return fail(f"gui_settings_table.c has duplicate keys: {', '.join(dups)}")
+
+    struct_fields = set(members)
+    row_fields = {f for _, f, _ in rows}
+    unknown = sorted(row_fields - struct_fields)
+    if unknown:
+        return fail(f"gui_settings_table.c names fields gui_settings_t does not have: {', '.join(unknown)}")
+    missing = sorted(struct_fields - row_fields - SETTINGS_UNPERSISTED_FIELDS)
+    if missing:
+        return fail(
+            f"gui_settings_t fields with no table row: {', '.join(missing)}. Add a GS_* row to "
+            "gui_settings_table.c (or, if the field must never persist, to SETTINGS_UNPERSISTED_FIELDS)."
+        )
+
+    written = {k for k, _, rest in rows if "GS_LOAD_ONLY" not in rest}
+    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - written)
+    if dropped:
+        return fail(
+            f"settings keys written at v1.1.8 are no longer written: {', '.join(dropped)}. "
+            "A rename or a drop breaks loading the new file in an older build."
+        )
+
+    local = {k for k, _, rest in rows if ("GS_CLIENT_LOCAL" in rest or "GS_LOCAL" in rest)}
+    if local != SETTINGS_CLIENT_LOCAL_KEYS:
+        extra = sorted(local - SETTINGS_CLIENT_LOCAL_KEYS)
+        lost = sorted(SETTINGS_CLIENT_LOCAL_KEYS - local)
+        return fail(
+            "the client-local key set drifted from the agreed one: "
+            f"unexpectedly local: {extra or 'none'}; no longer local: {lost or 'none'}"
+        )
+
+    ddd_blocks = re.findall(r"#ifdef ENABLE_DDD(.*?)#endif", table, re.S)
+    if not any('"ddd_decimation"' in block for block in ddd_blocks):
+        return fail("gui_settings_table.c: the ddd_decimation row must sit inside #ifdef ENABLE_DDD")
+    return 0
+
+
+def check_settings_roundtrip_runtime(repo_root: Path) -> int:
+    """Compiles gui_settings_table.c standalone (no raylib) and drives it with
+    a settings file in the exact format the hand-written writer produced at
+    v1.1.8: load -> save -> load must be a fixed point, every key written once
+    (the old writer emitted nine twice), unknown keys dropped, the load-time
+    clamps and migrations intact, the JSON snapshot lossless, and the strict
+    (network) parser refusing what the raw file dialect cannot hold. This is
+    what lets the table replace the writer without an existing settings file
+    changing meaning."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: settings round-trip runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the settings round-trip runtime guard")
+        print("SKIP: settings round-trip runtime guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_settings_roundtrip_harness.c"
+    table_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"
+    scale_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui_scale.c"
+    fixture_path = repo_root / "misrc_tools/test/fixtures/settings_v1_1_8.json"
+    for required in (harness_path, table_path, scale_path, fixture_path):
+        if not required.exists():
+            return fail(f"Settings round-trip guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_settings_rt_guard_") as temp_root:
+        exe_path = Path(temp_root) / "settings_roundtrip_guard"
+        # No -Werror: the auto-name formatter's snprintf calls are bounded by
+        # MAX_FILENAME_LEN on purpose and trip -Wformat-truncation.
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{table_path.parent}",
+            f"-I{scale_path.parent}",
+            str(harness_path),
+            str(table_path),
+            str(scale_path),
+            "-lm",
+            "-o",
+            str(exe_path),
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Settings round-trip harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path), str(fixture_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Settings round-trip harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
-    """gui_settings.c keeps defaults, the writer and the parser in three
-    separate places. A field added to two of them is silent: the setting
-    appears to work until it is reloaded, and then it is quietly the default
-    again. Assert every stream setting exists in all three."""
-    struct_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
-    settings_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
+    """The settings table (gui_settings_table.c) is what the file writer, the
+    file reader and the network snapshot all walk, but a field still needs a
+    default and a table row, written in two places. A field with one and not
+    the other is silent: the setting appears to work until it is reloaded,
+    and then it is quietly the default again. Assert every stream setting has
+    both."""
+    struct_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.h")
+    table_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
 
     fields = sorted(set(
         re.findall(r"\b(rtsp_[a-z0-9_]+|mediamtx_path|preview_device_path)\b(?:\[\d+\])?\s*;",
                    struct_src)
     ))
     if not fields:
-        return fail("gui_app.h declares no rtsp_* stream settings")
+        return fail("gui_settings.h declares no rtsp_* stream settings")
 
     for field in fields:
-        # The three sites, checked as the three distinct shapes they take.
-        # The writer escapes its quotes, so its key looks like \\"field\\" in source.
-        defaulted = re.search(rf"settings->{field}(\[0\])?\s*=", settings_src) is not None
-        written = f'\\"{field}\\"' in settings_src
-        parsed = f'find_value(content, "{field}")' in settings_src
+        defaulted = re.search(rf"settings->{field}(\[0\])?\s*=", table_src) is not None
+        tabled = re.search(rf'GS_[A-Z0-9]+\s*\(\s*"{field}"\s*,\s*{field}\b', table_src) is not None
 
         missing = [name for name, ok in
-                   (("a default", defaulted), ("a writer line", written),
-                    ("a find_value() parse", parsed)) if not ok]
+                   (("a default", defaulted), ("a table row", tabled)) if not ok]
         if missing:
             return fail(
-                f"gui_settings.c is missing {' and '.join(missing)} for {field}. "
-                "A setting present in only some of the three sites is silent: it "
+                f"gui_settings_table.c is missing {' and '.join(missing)} for {field}. "
+                "A setting present in only one of the two sites is silent: it "
                 "appears to work until it is reloaded as the default."
             )
     return 0
@@ -1945,7 +2128,7 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
     failure check_rtsp_settings_roundtrip exists for, one level down: not a
     missing site, but two sites that disagree."""
     ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
-    settings = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c"))
+    settings = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"))
 
     bounds = {}
     for name in ("RTSP_BITRATE_MIN_KBPS", "RTSP_BITRATE_MAX_KBPS",
@@ -1959,7 +2142,7 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
         r"rtsp_stream_bitrate_kbps\s*=\s*\(b == 0 \|\| \(b >= (\d+) && b <= (\d+)\)\)",
         settings)
     if not m:
-        return fail("could not read the bitrate clamp in gui_settings.c; if its shape "
+        return fail("could not read the bitrate clamp in gui_settings_table.c; if its shape "
                     "changed, this guard must be updated with it")
     lo, hi = int(m.group(1)), int(m.group(2))
 
@@ -2727,7 +2910,10 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
                                         meson_path: Path) -> int:
     gui_c = read_text(gui_c_path)
     settings_c = read_text(gui_settings_c_path)
-    gui_app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    # The struct and the table moved out of gui_app.h / gui_settings.c so the
+    # settings code compiles without raylib; the contract follows them.
+    settings_table_c = read_text(gui_settings_c_path.with_name("gui_settings_table.c"))
+    gui_settings_h = read_text(gui_settings_c_path.with_name("gui_settings.h"))
     gui_ui_h = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h")
     gui_ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
     popup_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_popup.c")
@@ -2739,10 +2925,11 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     meson = read_text(meson_path)
 
     required_snippets = [
-        (gui_app_h, "int ui_scale_percent;", "persisted settings field"),
-        (settings_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
-        (settings_c, '\\"ui_scale_percent\\": %d', "settings save key"),
-        (settings_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (gui_settings_h, "int ui_scale_percent;", "persisted settings field"),
+        (settings_table_c, "settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;", "100% default"),
+        (settings_table_c, '"ui_scale_percent",', "settings table key"),
+        (settings_table_c, "gui_ui_scale_parse_percent(value)", "validated settings load"),
+        (settings_c, "GUI_SETTINGS_MAX_FILE_BYTES", "settings file written through the table"),
         (meson, "'misrc_gui/ui/gui_ui_scale.c'", "UI scale policy product source"),
         (gui_c, "gui_ui_zoom_process(&ui_zoom_state", "single wheel routing policy"),
         (gui_c, "IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)", "100% reset shortcut"),
@@ -2892,6 +3079,7 @@ def main() -> int:
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
         ("net controls publish the effective mode", lambda: check_net_controls_publish_effective_mode(repo_root)),
+        ("every settings field is in the table", lambda: check_settings_table_covers_struct(repo_root)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
@@ -2909,6 +3097,7 @@ def main() -> int:
         checks.insert(9, ("ringbuffer mirror runtime", lambda: check_ringbuffer_mirror_runtime(repo_root)))
         checks.insert(10, ("net fanout runtime", lambda: check_net_fanout_runtime(repo_root)))
         checks.insert(11, ("buffer manager write tap runtime", lambda: check_bufmgr_write_tap_runtime(repo_root)))
+        checks.insert(12, ("settings round-trip runtime", lambda: check_settings_roundtrip_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("FLAC STREAMINFO total_samples runtime", lambda: check_flac_streaminfo_total_samples_runtime(repo_root)))
         checks.insert(11, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))

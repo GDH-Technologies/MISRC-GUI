@@ -90,7 +90,7 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 55
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 60
   registered checks, several of which compile and run C harnesses in
   `misrc_tools/test/*_harness.c`. Meson has only three `test()` targets (DdD).
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
@@ -147,6 +147,15 @@ Fork-side:
   root on a host-owned mount; a failed run can leave `.deps`, `.tmp`, `.ci-artifacts` root-owned.
 - mediamtx ports are canonical+100 (RTSP 8654) so the fork never collides with capture-node's
   `tier×10000+8554` instances on the same hosts.
+- Settings live in one descriptor table (`misrc_gui/core/gui_settings_table.c`); the struct is
+  in `gui_settings.h` so the table compiles without raylib. A new field needs a default and a
+  `GS_*` row, with `GS_CLIENT_LOCAL` if it describes the machine rather than the capture; the
+  "every settings field is in the table" guard fails otherwise, and the v1.1.8 key list in the
+  suite must never lose a key (rollback loads the new file in the old build).
+- Headless modes that call `gui_settings_load`/`save` without `--config` hit the LIVE settings
+  file of whoever runs them: `--auto-record` saves defaults before the override applies, and
+  `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
+  file is the running server's; never run those bare on a host with a live GUI.
 
 ## Worktrees and git hygiene
 

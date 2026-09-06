@@ -2313,11 +2313,27 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
  * are separate implementations that must agree, and the only sanctioned
  * difference is the record-start timestamp -- so with timestamping off they
  * must match exactly, and with it on they must differ only by that segment. */
-/* Round-trips the reference-video settings through the on-disk file. Point
- * XDG_CONFIG_HOME at a scratch directory before running, or this rewrites the
- * real settings file. */
+/* Round-trips the reference-video settings through the on-disk file. Runs
+ * against a scratch file unless --config already points the settings at one:
+ * this used to rewrite the real settings file with its probe values. */
 int gui_record_video_settings_test_main(void)
 {
+    static char scratch_path[512];
+    if (!gui_settings_override_active()) {
+#if defined(_WIN32) || defined(_WIN64)
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !tmp[0]) tmp = ".";
+        snprintf(scratch_path, sizeof(scratch_path), "%s\\misrc_video_settings_test.json", tmp);
+#else
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0]) tmp = "/tmp";
+        snprintf(scratch_path, sizeof(scratch_path), "%s/misrc_video_settings_test.json", tmp);
+#endif
+        remove(scratch_path);
+        gui_settings_set_override_path(scratch_path);
+        printf("settings file: %s (scratch)\n", scratch_path);
+    }
+
     gui_settings_t a;
     memset(&a, 0, sizeof(a));
     gui_settings_load(&a);
@@ -2365,6 +2381,7 @@ int gui_record_video_settings_test_main(void)
     }
 
     printf("%s\n", rc ? "SETTINGS TEST FAILED" : "settings test passed");
+    if (scratch_path[0]) remove(scratch_path);
     return rc;
 }
 
