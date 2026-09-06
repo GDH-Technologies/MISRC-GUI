@@ -133,8 +133,11 @@ jobs:
             echo "::error::could not fetch harrypm/MISRC-GUI release tags to base the GDH tag on"
             exit 1
           fi
+          # Both pipelines below end in grep, which exits 1 on no match; under pipefail
+          # that would abort the step silently (it did, on the first run after #57, when
+          # no v1.1.9-gdh.* tag existed yet). An empty result is handled explicitly.
           base="$(git tag --merged HEAD --list 'v[0-9]*' \
-                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
           if [ -z "$base" ]; then
             echo "::error::no upstream vX.Y.Z tag reachable from HEAD to base a GDH release tag on"
             exit 1
@@ -142,7 +145,7 @@ jobs:
 
           # One past the highest -gdh.N already minted on that base, wherever it sits.
           n="$(git tag --list "${base}-gdh.*" | sed "s/^${base}-gdh\.//" \
-               | grep -E '^[0-9]+$' | sort -n | tail -n 1)"
+               | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)"
           n=$(( ${n:-0} + 1 ))
           next="${base}-gdh.${n}"
 
