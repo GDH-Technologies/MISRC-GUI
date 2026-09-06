@@ -8,11 +8,14 @@ disagree, the scripts and `.github/workflows/selfhosted-deploy.yml` are ground t
 
 ## Direction
 
-GDH is consolidating on MISRC-GUI as its capture engine and operator seat, retiring the
-Python `capture-node` service in stages (dev environment → capture-node's fate → decouple
-`digitization-toolkit` → adapt the toolkit to MISRC-GUI). `../capture-node/docs/
-misrc-gui-comparison.md` is the prior analysis. Keep GDH specifics (hostnames, fleet,
-archival policy) out of any code that could go upstream.
+GDH is consolidating on MISRC-GUI as its capture engine and operator seat and retiring the
+Python `capture-node` service. The order was reset on 2026-09-04: `digitization-toolkit`
+was decoupled from capture-node first (`digitization-toolkit/docs/plans/
+capture-node-retirement/{design,plan}.md`, all landed 2026-09-06), capture-node is in
+maintenance mode, and what remains is adapting the toolkit to MISRC-GUI. That plan's
+`design.md` supersedes `../capture-node/docs/misrc-gui-comparison.md` as the analysis of
+record. Keep GDH specifics (hostnames, fleet, archival policy) out of any code that could
+go upstream.
 
 Fork-only surfaces: `misrc_tools/misrc_gui/streaming/`, `misrc_tools/misrc_gui/input/
 gui_preview_v4l2.c`, `misrc_tools/misrc_gui/output/gui_video_record.c`,
