@@ -273,6 +273,19 @@ exists before either leg checks out, so both resolve the same version.
 'skipped')` — without the `skipped` arm, every event other than a push to `main` would skip
 the build too.
 
+**Which base the tag gets.** The bump takes the *highest* of harrypm's plain `vX.Y.Z` tags
+that `HEAD` contains and mints `${base}-gdh.N` with `N` one past the highest already minted
+on that base. It fetches those tags from `harrypm/MISRC-GUI` for the step (`--no-tags`,
+`refs/tags/v*` only): the fork's remote deliberately carries none of them, because pushing
+a plain `v*` tag to the fork would fire this workflow's tag trigger and install upstream's
+tree on every machine. It does **not** use `git describe --abbrev=0`, which picks the
+*nearest* tag by commit distance: a sync merge brings a handful of upstream commits, so it
+sits closer to the previous `-gdh` tag than to the new upstream tag, and the base never
+advanced — the v1.1.9 merge (#56) was minted `v1.1.8-gdh.22`. The first push to `main`
+after that fix minted `v1.1.9-gdh.1`; the stray `v1.1.8-gdh.22` on the merge commit is
+harmless to the bump (it counts only tags on the current base) but reads wrong in
+`git log`, so it may be deleted.
+
 ## Runner group access — invisible in the tree
 
 cs0 and cs1 live in the org runner group **`capture-nodes`**, which is `visibility:
