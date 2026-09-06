@@ -260,6 +260,8 @@ typedef struct {
     char published_status[256];
     uint32_t published_status_seq;
     char published_pending[512];    /* the overwrite prompt's text while it waits, else "" */
+    bool published_rec_pending;     /* with the text above, so one /stats is self-consistent */
+    bool published_rec_finalizing;
     uint64_t published_disk_free;
     bool published_once;            /* main thread only */
     double published_disk_time;     /* main thread only */
@@ -523,8 +525,12 @@ static void server_publish(net_server_t *srv, gui_app_t *app) {
     bool status_changed = strncmp(srv->published_status, app->status_message,
                                   sizeof(srv->published_status) - 1) != 0;
     const char *pending = gui_record_pending_message();
+    bool rec_pending = gui_record_is_pending();
+    bool rec_finalizing = gui_record_is_finalizing();
     bool pending_changed = strncmp(srv->published_pending, pending,
-                                   sizeof(srv->published_pending) - 1) != 0;
+                                   sizeof(srv->published_pending) - 1) != 0 ||
+                           rec_pending != srv->published_rec_pending ||
+                           rec_finalizing != srv->published_rec_finalizing;
     double now = net_now_s();
     bool disk_due = (now - srv->published_disk_time) >= 1.0;
     if (srv->published_once && gen == srv->published_generation &&
@@ -549,6 +555,8 @@ static void server_publish(net_server_t *srv, gui_app_t *app) {
     }
     if (pending_changed || !srv->published_once) {
         snprintf(srv->published_pending, sizeof(srv->published_pending), "%s", pending);
+        srv->published_rec_pending = rec_pending;
+        srv->published_rec_finalizing = rec_finalizing;
     }
     srv->published_disk_free = disk_free;
     srv->published_once = true;
@@ -590,8 +598,10 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     uint64_t comp_b = atomic_load(&app->recording_compressed_b);
     uint32_t rec_drops = (uint32_t)(atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops) +
                                     atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops));
-    bool rec_pending = gui_record_is_pending();
-    bool rec_finalizing = gui_record_is_finalizing();
+    /* rec_pending, its text, rec_finalizing and the status line come from one
+     * publish, so a reader never sees the flag cleared before the text and
+     * the "cancelled" status that go with it (a 20 ms window otherwise). */
+    bool rec_pending, rec_finalizing;
     char status_esc[600];
     char pending_esc[1100];   /* 511 chars, every one possibly escaped */
     uint32_t status_seq, gen;
@@ -599,6 +609,8 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     net_mutex_lock(&srv->pub_mtx);
     gui_settings_json_escape(srv->published_status, status_esc, sizeof(status_esc));
     gui_settings_json_escape(srv->published_pending, pending_esc, sizeof(pending_esc));
+    rec_pending = srv->published_rec_pending;
+    rec_finalizing = srv->published_rec_finalizing;
     status_seq = srv->published_status_seq;
     gen = srv->published_generation;
     disk_free = srv->published_disk_free;
