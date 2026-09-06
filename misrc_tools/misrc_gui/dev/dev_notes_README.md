@@ -228,3 +228,24 @@ Recent capture regressions showed that small callback-gating changes can silentl
 - Validation (local, Linux Mint): `scripts/build-local.sh` build + smoke OK (pre-existing warnings only); `misrc_tools/test/ci_guard_tests.py` 34/34 PASS; `meson test -C build-local` 3/3 OK; user real-world GUI confirmation of the right-side clip fix and general behavior.
 - Commits: `a552e7e` (status bar clipping + toolbar dead-space-first + Audio Mon measured fit), `42b845c` (status bar measured-fit compaction + hysteresis) on `capture-server-client-modes`.
 - Session log: `PROMPT_STATUSBAR_README.md` (repo root); restore-point zip `statusbar-rightside-fix-2026-09-02.zip` on the host (untracked, predates later follow-ups).
+
+## 2026-09-06 FLAC finalize metadata rewrite elimination
+
+- Symptom (user-reported): a massive duplicate `flac.metadata` temp file (~ the full FLAC size) was created at recording stop, wasting disk space and adding large amounts of extra working time to finalize.
+- Root cause: at recording stop, `gui_record_finalize_stop_sync()` called two post-encode metadata functions in `gui_record.c`:
+  - `gui_record_update_flac_streaminfo_duration()` used `FLAC__metadata_chain_read`/`chain_write`. libFLAC's chain API always rewrites the ENTIRE FLAC file to a temp copy and renames it over the original - even for a 34-byte STREAMINFO block change.
+  - `gui_record_embed_flac_duration_metadata()` used `FLAC__metadata_simple_iterator_insert_block_after()`. With no PADDING block in the encoder output, any new block insertion also forces a full-file rewrite via the padding/temp path.
+  - The encoder (`flac_writer.c` `configure_encoder`) created only a SEEKTABLE metadata block - no VORBIS_COMMENT, no PADDING - so neither update had room to land in place.
+- Fix (in-place finalize, no temp file):
+  - `misrc_tools/common/flac_writer.c`: the encoder now emits metadata in the order STREAMINFO -> VORBIS_COMMENT -> PADDING(4096 bytes) -> SEEKTABLE -> audio. The VORBIS_COMMENT block is provided explicitly so the encoder does not auto-append one after the seektable (which would put it out of padding range). The 4096-byte PADDING block sits adjacent to the VC block so the post-encode duration tags can grow the VC block in place by consuming the padding. Cleanup paths (`flac_writer_finish`, `flac_writer_abort`, both create error paths) free the new `vorbis_comment` and `padding` blocks.
+  - `misrc_tools/misrc_gui/output/gui_record.c`: replaced both old functions with a single `gui_record_finalize_flac_metadata()` that opens the file once with `FLAC__Metadata_SimpleIterator`:
+    1. STREAMINFO update (first block, fixed 34-byte size) via `set_block(use_padding=false)` - pure in-place write.
+    2. Walk to the existing VORBIS_COMMENT block, append DURATION_SECONDS/LENGTH/RF_TOTAL_SAMPLES/RF_SAMPLE_RATE/RF_SAMPLE_RATE_KHZ, `set_block(use_padding=true)` - grows into the adjacent PADDING in place.
+  - Call site in `gui_record_finalize_stop_sync()` now calls the single combined function per channel instead of the two chain/insert functions.
+- Effect: finalize is now a few bytes of in-place I/O per FLAC file instead of copying the entire multi-GB file to a temp copy. Eliminates the duplicate `flac.metadata` temp file and the extra working time at recording stop.
+- Compatibility note: FLAC files recorded BEFORE this change do not contain the PADDING block, so their VC tag insertion would still need a one-time rewrite; the STREAMINFO in-place update still works. The combined function handles a missing VC block gracefully (logs a WARN, leaves STREAMINFO updated). New recordings get the full in-place benefit.
+- Files changed:
+  - `misrc_tools/common/flac_writer.c` (struct, `configure_encoder`, both create functions, `flac_writer_finish`, `flac_writer_abort`).
+  - `misrc_tools/misrc_gui/output/gui_record.c` (replaced `gui_record_embed_flac_duration_metadata` + `gui_record_update_flac_streaminfo_duration` with `gui_record_finalize_flac_metadata`; updated call site).
+- Validation (local, Linux Mint): `scripts/build-local.sh` build + smoke OK (libFLAC 1.5.0 multithreading; pre-existing warnings only); `misrc_tools/test/ci_guard_tests.py` 34/34 PASS; `meson test -C build-local` 3/3 OK.
+- Not yet validated: real multi-GB FLAC recording + finalize against live hardware - confirm (a) no large `flac.metadata`/temp file appears in the output directory during finalize, (b) finalize completes in seconds not minutes, (c) the written FLAC still reports correct duration in a player/Audacity and the DURATION_SECONDS/LENGTH/etc. Vorbis comment tags are present.
