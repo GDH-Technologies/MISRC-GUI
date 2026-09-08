@@ -98,7 +98,13 @@ typedef struct {
     uint64_t output_bytes;      /* stat(), 1 Hz */
     uint32_t caption_lines;     /* data lines in the finished file */
     bool     captions_seen;     /* grew past the SCC header */
-    double   start_offset_s;    /* spawn completed minus recording start */
+    double   start_offset_s;    /* seconds from gui_cc_record_start() to the spawn
+                                 * completing. The caller adds its own delta from
+                                 * the recording start; this module cannot know it.
+                                 * Logged so the sidecar's offset is a measured
+                                 * number rather than a guess -- but note the
+                                 * hardware itself contributes about one frame,
+                                 * so nothing here is frame-accurate. */
 } gui_cc_record_status_t;
 
 /* Spawns ffmpeg. Copies its arguments, so the caller's may be stack

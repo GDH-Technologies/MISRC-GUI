@@ -95,6 +95,7 @@ static void print_usage(const char *program_name) {
             "  --preview-dump-frame <device> <out.ppm>\n"
             "  --video-probe | --video-settings-test | --video-name-test\n"
             "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
+            "  --cc-record-test <device> <dir> [secs] [kill|hang|bad-args|busy]\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
@@ -536,6 +537,13 @@ int main(int argc, char **argv) {
             bool live = (i + 1 < argc) && strcmp(argv[i + 1], "--live") == 0;
             gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
             return gui_cc_record_probe_main(live);
+        }
+        if (strcmp(argv[i], "--cc-record-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
+            const char *inject = (i + 4 < argc) ? argv[i + 4] : NULL;
+            return gui_cc_record_test_main(dev, dir, secs, inject);
         }
         if (strcmp(argv[i], "--cc-argv-dump") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;

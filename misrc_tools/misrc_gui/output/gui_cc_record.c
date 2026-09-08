@@ -21,11 +21,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
+#include <spawn.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 #define CC_PROBE_TTL_S   2.0
 #define CC_MAX_VBI_NODES 8
@@ -33,6 +39,20 @@
 /* Wall-clock ceiling for the --cc-probe --live self-test. See cc_live_selftest()
  * for why a stream-time -t cannot bound it on its own. */
 #define CC_LIVE_WALL_LIMIT_S 12
+
+/* Long enough for ffmpeg to open the node, fail, and say why; short enough
+ * that a refusal still feels immediate. Nothing is learned synchronously --
+ * every interesting failure (EBUSY, unknown format, unwritable output) happens
+ * after exec -- and sleeping this long on the render thread IS a frozen
+ * window, so the verdict is resolved from the frame loop instead. */
+#define CC_VERIFY_DELAY_S   1.5
+#define CC_STAT_INTERVAL_S  1.0
+#define CC_REAP_LIMIT_S     8.0
+#define CC_TERM_LIMIT_S     2.0
+
+/* The child is tiny -- 30 packets of 6 bytes a second -- so this is about the
+ * house rule that no ffmpeg child competes with the RF writers, not about load. */
+#define CC_CHILD_NICE 5
 
 static struct {
     /* --- tier A: per resolved ffmpeg binary. Two popens, then never again. --- */
@@ -56,7 +76,27 @@ static struct {
 
     /* --- child, so the probe can decline to fight its own recording --- */
     int    child_pid;
+    char   ffmpeg_log[600];
+    bool   stop_requested;      /* we asked; a 255 exit is therefore expected */
+    double verify_at;           /* 0 = no startup verdict pending */
+    double next_stat_at;
+    double spawn_wall;          /* for start_offset_s */
+    cc_inject_t inject;
+    bool   inited;
+    int    busy_fd;             /* CC_INJECT_BUSY_DEVICE holds the node here */
+
+    gui_cc_record_status_t status;
 } cc;
+
+/* The struct is static, so every field starts at zero -- and zero is a VALID
+ * file descriptor. Without this, releasing an unheld busy_fd would close
+ * stdin. */
+static void cc_init(void)
+{
+    if (cc.inited) return;
+    cc.inited = true;
+    cc.busy_fd = -1;
+}
 
 static double cc_now(void)
 {
@@ -162,27 +202,59 @@ static bool cc_sysfs_parent(const char *devnode, char *out, size_t cap)
     return true;
 }
 
-/* Open as the availability test, then close immediately. Returns 0 on
- * success, or the errno that explains the refusal. */
-static int cc_try_open(const char *node)
+/* The availability test. Returns 0 if the node is usable RIGHT NOW, or the
+ * errno explaining why not.
+ *
+ * Opening is NOT sufficient, and assuming it was is a trap this code fell into
+ * once: open() succeeds perfectly well while another process is streaming from
+ * the node. Exclusivity is enforced when buffers are allocated -- measured, a
+ * second reader fails with "ioctl(VIDIOC_REQBUFS): Device or resource busy"
+ * while its open() had already returned a valid fd. So the test has to go as
+ * far as REQBUFS, or the probe reports a healthy device, the preflight passes,
+ * and ffmpeg fails at record time instead: precisely the failure the preflight
+ * exists to prevent.
+ *
+ * Asking for one buffer and immediately releasing it is the smallest thing
+ * that actually answers the question. When keep_fd is non-NULL the claim is
+ * HELD and the fd returned instead, which is how the busy-device fault
+ * injection makes a real EBUSY rather than a simulated one. */
+static int cc_try_claim(const char *node, int *keep_fd)
 {
+    if (keep_fd) *keep_fd = -1;
+
     int fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return errno ? errno : ENOENT;
 
     struct v4l2_capability capbuf;
     memset(&capbuf, 0, sizeof(capbuf));
-    int rc = 0;
-    if (ioctl(fd, VIDIOC_QUERYCAP, &capbuf) < 0) {
-        rc = ENOTTY;
-    } else if (!(capbuf.device_caps & V4L2_CAP_VBI_CAPTURE)) {
-        /* device_caps, NOT capabilities: the VBI node's device-wide
-         * capabilities field also advertises VIDEO_CAPTURE for the sibling
-         * video node, so testing the wrong field accepts anything. A
-         * sliced-only node is also not what the demuxer wants. */
-        rc = ENODEV;
+    if (ioctl(fd, VIDIOC_QUERYCAP, &capbuf) < 0) { close(fd); return ENOTTY; }
+
+    /* device_caps, NOT capabilities: this node's device-wide capabilities
+     * field also advertises VIDEO_CAPTURE on behalf of the sibling video node,
+     * so testing the wrong field accepts anything the dongle exposes. A
+     * sliced-only node is also not what the demuxer wants. */
+    if (!(capbuf.device_caps & V4L2_CAP_VBI_CAPTURE)) { close(fd); return ENODEV; }
+
+    struct v4l2_requestbuffers rb;
+    memset(&rb, 0, sizeof(rb));
+    rb.count = 1;
+    rb.type = V4L2_BUF_TYPE_VBI_CAPTURE;
+    rb.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
+        int rc = errno ? errno : EBUSY;
+        close(fd);
+        return rc;
     }
+
+    if (keep_fd) { *keep_fd = fd; return 0; }
+
+    /* Hand the buffers back, or we become the thing that makes the node busy. */
+    memset(&rb, 0, sizeof(rb));
+    rb.type = V4L2_BUF_TYPE_VBI_CAPTURE;
+    rb.memory = V4L2_MEMORY_MMAP;
+    ioctl(fd, VIDIOC_REQBUFS, &rb);
     close(fd);
-    return rc;
+    return 0;
 }
 
 static void cc_resolve_device(void)
@@ -196,7 +268,7 @@ static void cc_resolve_device(void)
     /* An explicit setting is the only candidate: if the operator named a node,
      * silently using a different one would be worse than failing. */
     if (cc.override_dev[0]) {
-        cc.dev_errno = cc_try_open(cc.override_dev);
+        cc.dev_errno = cc_try_claim(cc.override_dev, NULL);
         if (cc.dev_errno == 0) snprintf(cc.dev_path, sizeof(cc.dev_path), "%s", cc.override_dev);
         return;
     }
@@ -214,7 +286,7 @@ static void cc_resolve_device(void)
         snprintf(node, sizeof(node), "/dev/vbi%d", i);
         if (access(node, F_OK) != 0) continue;
 
-        int err = cc_try_open(node);
+        int err = cc_try_claim(node, NULL);
         if (err != 0) {
             /* Remember the most interesting refusal: a node that exists but is
              * busy or forbidden explains far more than "nothing found". */
@@ -295,6 +367,7 @@ static void cc_set_hint(cc_probe_state_t st)
 
 cc_probe_state_t gui_cc_record_probe(void)
 {
+    cc_init();
     cc_probe_ffmpeg();
 
     cc_probe_state_t st;
@@ -403,39 +476,414 @@ int gui_cc_record_build_argv_test(const char *device, const char *out_path,
     return cc_build_argv(device, out_path, buf, buf_cap, argv_out, argv_cap, false);
 }
 
-/* --------------------------------------------------- lifecycle (step 3) */
+/* -------------------------------------------------------------- lifecycle */
+
+void gui_cc_record_set_inject(cc_inject_t what) { cc.inject = what; }
+
+/* Read only the TAIL of the log. gui_rtsp_stream.c reads the head, which on a
+ * long-running child would miss the failure entirely; seeking to the end is
+ * the fix. Classify over the whole tail, but SHOW the last non-empty line --
+ * ffmpeg's final line is a generic summary while the line naming the cause
+ * sits several above it. */
+static void cc_log_tail(char *out, size_t cap, char *last_line, size_t line_cap)
+{
+    out[0] = '\0';
+    if (last_line && line_cap) last_line[0] = '\0';
+
+    FILE *f = fopen(cc.ffmpeg_log, "r");
+    if (!f) return;
+    if (fseek(f, -(long)(cap - 1), SEEK_END) != 0) fseek(f, 0, SEEK_SET);
+    size_t used = fread(out, 1, cap - 1, f);
+    out[used] = '\0';
+    fclose(f);
+
+    if (!last_line || !line_cap) return;
+    const char *line = out;
+    while (line && *line) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        if (len > 0 && len < line_cap) {
+            memcpy(last_line, line, len);
+            last_line[len] = '\0';
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+}
+
+static void cc_classify_exit(char *err, size_t err_cap)
+{
+    char tail[4096];
+    char reason[256];
+    cc_log_tail(tail, sizeof(tail), reason, sizeof(reason));
+
+    if (strstr(tail, "Device or resource busy")) {
+        snprintf(err, err_cap,
+                 "%s is held by another program; captions were not recorded", cc.status.device);
+    } else if (strstr(tail, "Permission denied")) {
+        snprintf(err, err_cap,
+                 "%s: permission denied (add your user to the 'video' group)", cc.status.device);
+    } else if (strstr(tail, "Unknown input format")) {
+        snprintf(err, err_cap,
+                 "this ffmpeg has no v4l2vbi input device; captions cannot be recorded with it");
+    } else if (strstr(tail, "No such file or directory")) {
+        snprintf(err, err_cap, "no VBI device at %s", cc.status.device);
+    } else if (strstr(tail, "No space left")) {
+        snprintf(err, err_cap, "out of disk space writing the caption sidecar");
+    } else {
+        snprintf(err, err_cap, "ffmpeg exited at startup: %s",
+                 reason[0] ? reason : "see the log beside the sidecar");
+    }
+}
+
+static void cc_set_error(const char *text)
+{
+    cc.status.error = true;
+    snprintf(cc.status.err_text, sizeof(cc.status.err_text), "%s", text);
+}
 
 int gui_cc_record_start(const char *device, const char *out_path,
                         char *err, size_t err_cap)
 {
-    (void)device; (void)out_path;
-    snprintf(err, err_cap, "caption recording is not wired up yet");
-    return -1;
+    cc_init();
+    double entry_t0 = cc_now();
+    if (err && err_cap) err[0] = '\0';
+    if (cc.child_pid > 0) return 0;             /* already running */
+    if (!out_path || !out_path[0]) {
+        snprintf(err, err_cap, "no caption output path");
+        return -1;
+    }
+
+    const char *dev = (device && device[0]) ? device : gui_cc_record_device();
+    if (!dev || !dev[0]) {
+        snprintf(err, err_cap, "no raw VBI device to record captions from");
+        return -1;
+    }
+
+    memset(&cc.status, 0, sizeof(cc.status));
+    snprintf(cc.status.device, sizeof(cc.status.device), "%s", dev);
+    snprintf(cc.status.path, sizeof(cc.status.path), "%s", out_path);
+    snprintf(cc.ffmpeg_log, sizeof(cc.ffmpeg_log), "%s.ffmpeg.log", out_path);
+    cc.stop_requested = false;
+
+    /* Claim the node's BUFFERS, not merely an fd on it: holding an open fd
+     * does not make the device busy -- another process opens it happily and
+     * only fails at REQBUFS. Claiming for real is what makes ffmpeg hit the
+     * same EBUSY a competing reader would cause. */
+    if (cc.inject == CC_INJECT_BUSY_DEVICE && cc.busy_fd < 0)
+        cc_try_claim(dev, &cc.busy_fd);
+
+    char buf[2048];
+    const char *argv_c[48];
+    int n = cc_build_argv(dev, out_path, buf, sizeof(buf), argv_c, 48,
+                          cc.inject == CC_INJECT_BAD_ARGS);
+    if (n < 0) {
+        snprintf(err, err_cap, "could not build the caption command line");
+        return -1;
+    }
+    /* posix_spawn's prototype is char *const[], and it does not modify these. */
+    char *argv[48];
+    for (int i = 0; i < n; i++) argv[i] = (char *)argv_c[i];
+    argv[n] = NULL;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    /* stdin from /dev/null, not merely -nostdin: the child must not be able to
+     * consume the terminal's input under any circumstances. */
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    /* O_NOFOLLOW and 0600: this lands in a user-chosen output directory, so it
+     * costs nothing to refuse to follow a symlink into somewhere else. */
+    posix_spawn_file_actions_addopen(&fa, 2, cc.ffmpeg_log,
+                                     O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                                     S_IRUSR | S_IWUSR);
+
+    pid_t pid = 0;
+    /* posix_spawn because this process has display, audio, capture and libusb
+     * threads plus a live GL context: only async-signal-safe calls are legal
+     * between fork and exec. It returns the error directly, and does NOT set
+     * errno. */
+    int rc = posix_spawn(&pid, cc.ffmpeg, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+
+    if (rc != 0) {
+        /* Distinguish the common case from the confusing one: if the log could
+         * not be created, the output directory is the problem, not ffmpeg. */
+        if (rc == EACCES || rc == EROFS || rc == ENOENT)
+            snprintf(err, err_cap,
+                     "could not start ffmpeg or create %s: %s", cc.ffmpeg_log, strerror(rc));
+        else
+            snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
+        if (cc.busy_fd >= 0) { close(cc.busy_fd); cc.busy_fd = -1; }
+        return -1;
+    }
+
+    cc.child_pid = (int)pid;
+    cc.spawn_wall = cc_now();
+    cc.verify_at = cc.spawn_wall + CC_VERIFY_DELAY_S;
+    cc.next_stat_at = cc.spawn_wall + CC_STAT_INTERVAL_S;
+    cc.status.child_pid = (int)pid;
+    cc.status.running = true;
+    cc.status.starting = true;
+    cc.status.start_offset_s = cc.spawn_wall - entry_t0;
+
+    setpriority(PRIO_PROCESS, (id_t)pid, CC_CHILD_NICE);
+
+    if (cc.inject == CC_INJECT_KILL)      kill(pid, SIGKILL);
+    else if (cc.inject == CC_INJECT_HANG) kill(pid, SIGSTOP);
+    return 0;
 }
 
-void gui_cc_record_poll(void) { }
-void gui_cc_record_request_stop(void) { }
-void gui_cc_record_finish(void) { }
-void gui_cc_record_shutdown(void) { }
-void gui_cc_record_set_inject(cc_inject_t what) { (void)what; }
-
-gui_cc_record_status_t gui_cc_record_get_status(void)
+void gui_cc_record_poll(void)
 {
-    gui_cc_record_status_t s;
-    memset(&s, 0, sizeof(s));
-    snprintf(s.device, sizeof(s.device), "%s", cc.dev_path);
-    return s;
+    if (cc.child_pid <= 0) return;
+
+    int wstatus = 0;
+    pid_t r = waitpid(cc.child_pid, &wstatus, WNOHANG);
+    if (r == cc.child_pid) {
+        /* It died on its own. Whether that is a fault depends entirely on
+         * whether we asked -- see gui_cc_record_finish() for the 255 rule. */
+        bool expected = cc.stop_requested &&
+                        WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 255;
+        if (!expected) {
+            char text[192];
+            cc_classify_exit(text, sizeof(text));
+            cc_set_error(text);
+        }
+        cc.child_pid = 0;
+        cc.status.child_pid = 0;
+        cc.status.running = false;
+        cc.status.starting = false;
+        cc.verify_at = 0.0;
+        if (cc.busy_fd >= 0) { close(cc.busy_fd); cc.busy_fd = -1; }
+        return;
+    }
+
+    double now = cc_now();
+    if (cc.verify_at > 0.0 && now >= cc.verify_at) {
+        /* Still alive past the window: the open succeeded and it is recording.
+         * A tape with no captions still looks exactly like this. */
+        cc.verify_at = 0.0;
+        cc.status.starting = false;
+    }
+    if (now >= cc.next_stat_at) {
+        cc.next_stat_at = now + CC_STAT_INTERVAL_S;
+        struct stat sb;
+        if (stat(cc.status.path, &sb) == 0) cc.status.output_bytes = (uint64_t)sb.st_size;
+    }
 }
 
-uint64_t gui_cc_record_output_bytes(void) { return 0; }
+void gui_cc_record_request_stop(void)
+{
+    if (cc.child_pid <= 0 || cc.stop_requested) return;
+    cc.stop_requested = true;
+    /* SIGCONT first, or a SIGSTOPped child queues the SIGINT and never acts. */
+    kill(cc.child_pid, SIGCONT);
+    kill(cc.child_pid, SIGINT);
+}
+
+/* Count data lines and decide whether anything was actually captioned.
+ *
+ * captions_seen is a plain size comparison because the SCC muxer writes NO
+ * null padding -- measured, not assumed. The consequence is that a tape
+ * carrying no captions leaves a header-only file, which is indistinguishable
+ * from an ffmpeg whose v4l2vbi is too old to emit a full cc_data header byte.
+ * Neither is an error, and this function must not pretend to tell them apart;
+ * --cc-probe --live is what does that. */
+static void cc_tally(void)
+{
+    struct stat sb;
+    if (stat(cc.status.path, &sb) != 0) {
+        cc_set_error("the caption sidecar was never created");
+        return;
+    }
+    cc.status.output_bytes = (uint64_t)sb.st_size;
+    cc.status.captions_seen = sb.st_size > CC_SCC_HEADER_BYTES;
+
+    FILE *f = fopen(cc.status.path, "r");
+    if (!f) return;
+    char line[512];
+    uint32_t lines = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strchr(line, '\t')) lines++;
+    fclose(f);
+    cc.status.caption_lines = lines;
+}
+
+void gui_cc_record_finish(void)
+{
+    if (cc.child_pid <= 0) {
+        if (cc.status.path[0] && !cc.status.error) cc_tally();
+        return;
+    }
+
+    /* SIGCONT unconditionally: a SIGSTOPped child cannot act on anything else,
+     * so without this the ladder always falls through to SIGKILL. */
+    kill(cc.child_pid, SIGCONT);
+
+    /* Deliberately NOT idempotent. A second SIGINT arriving during shutdown
+     * makes ffmpeg abandon its trailer -- "Error submitting a packet to the
+     * muxer: Immediate exit requested", "Error writing trailer" -- where a
+     * single one is completely silent. Since the normal path always calls
+     * request_stop() first, re-sending here would produce those errors on
+     * every capture. */
+    if (!cc.stop_requested) {
+        cc.stop_requested = true;
+        kill(cc.child_pid, SIGINT);
+    }
+
+    int wstatus = 0;
+    bool reaped = false;
+    double deadline = cc_now() + CC_REAP_LIMIT_S;
+    while (cc_now() < deadline) {
+        if (waitpid(cc.child_pid, &wstatus, WNOHANG) == cc.child_pid) { reaped = true; break; }
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (!reaped) {
+        kill(cc.child_pid, SIGTERM);
+        deadline = cc_now() + CC_TERM_LIMIT_S;
+        while (cc_now() < deadline) {
+            if (waitpid(cc.child_pid, &wstatus, WNOHANG) == cc.child_pid) { reaped = true; break; }
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    if (!reaped) {
+        kill(cc.child_pid, SIGKILL);
+        waitpid(cc.child_pid, &wstatus, 0);
+    }
+
+    /* ffmpeg exits 255 on its signal path. Without this the NORMAL stop of
+     * EVERY capture would raise an error, and the operator would stop reading
+     * the log -- which is the real damage. */
+    bool clean = (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) ||
+                 (cc.stop_requested && WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 255) ||
+                 (cc.stop_requested && WIFSIGNALED(wstatus));
+    if (!clean && !cc.status.error) {
+        char text[192];
+        cc_classify_exit(text, sizeof(text));
+        cc_set_error(text);
+    }
+
+    cc.child_pid = 0;
+    cc.status.child_pid = 0;
+    cc.status.running = false;
+    cc.status.starting = false;
+    cc.verify_at = 0.0;
+    if (cc.busy_fd >= 0) { close(cc.busy_fd); cc.busy_fd = -1; }
+
+    if (!cc.status.error) cc_tally();
+}
+
+void gui_cc_record_shutdown(void)
+{
+    if (cc.child_pid > 0) {
+        gui_cc_record_request_stop();
+        gui_cc_record_finish();
+    }
+    if (cc.busy_fd >= 0) { close(cc.busy_fd); cc.busy_fd = -1; }
+}
+
+gui_cc_record_status_t gui_cc_record_get_status(void) { return cc.status; }
+uint64_t gui_cc_record_output_bytes(void) { return cc.status.output_bytes; }
 bool     gui_cc_record_is_running(void)   { return cc.child_pid > 0; }
+
+/* ------------------------------------------------------------- record test */
 
 int gui_cc_record_test_main(const char *device, const char *out_dir,
                             int seconds, const char *inject_spec)
 {
-    (void)device; (void)out_dir; (void)seconds; (void)inject_spec;
-    fprintf(stderr, "caption recording is not wired up yet\n");
-    return 2;
+    gui_cc_record_set_ffmpeg(getenv("MISRC_FFMPEG") ? getenv("MISRC_FFMPEG")
+                                                    : "/usr/local/bin/ffmpeg");
+    if (device && device[0]) gui_cc_record_set_device(device);
+
+    cc_probe_state_t st = gui_cc_record_probe();
+    /* A BUSY_DEVICE run is supposed to fail, so the probe refusing it is the
+     * expected state, not a reason to bail out before we have tested it. */
+    bool want_busy = inject_spec && strstr(inject_spec, "busy");
+    if (st != CC_PROBE_OK && !want_busy) {
+        printf("cc record test: probe refused: %s\n", gui_cc_record_probe_hint());
+        return 1;
+    }
+
+    cc_inject_t inject = CC_INJECT_NONE;
+    if (inject_spec && inject_spec[0]) {
+        if (strstr(inject_spec, "kill"))      inject = CC_INJECT_KILL;
+        else if (strstr(inject_spec, "hang")) inject = CC_INJECT_HANG;
+        else if (strstr(inject_spec, "bad"))  inject = CC_INJECT_BAD_ARGS;
+        else if (want_busy)                   inject = CC_INJECT_BUSY_DEVICE;
+    }
+    gui_cc_record_set_inject(inject);
+
+    char out[600];
+    snprintf(out, sizeof(out), "%s/cc_record_test.scc",
+             (out_dir && out_dir[0]) ? out_dir : ".");
+
+    char err[192];
+    if (gui_cc_record_start(NULL, out, err, sizeof(err)) != 0) {
+        printf("cc record test: start refused: %s\n", err);
+        /* For the busy case that refusal IS the pass condition. */
+        return want_busy ? 0 : 1;
+    }
+    printf("cc record test: pid=%d device=%s -> %s\n",
+           gui_cc_record_get_status().child_pid, gui_cc_record_get_status().device, out);
+
+    int secs = seconds > 0 ? seconds : 10;
+    double t0 = cc_now();
+    double next_report = t0 + 1.0;
+    while (cc_now() - t0 < (double)secs) {
+        gui_cc_record_poll();          /* a headless run has no frame loop */
+        if (!gui_cc_record_is_running()) {
+            printf("cc record test: child exited early\n");
+            break;
+        }
+        if (cc_now() >= next_report) {
+            next_report += 1.0;
+            printf("  t=%2.0fs bytes=%llu\n", cc_now() - t0,
+                   (unsigned long long)gui_cc_record_output_bytes());
+        }
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+
+    double stop_t0 = cc_now();
+    gui_cc_record_request_stop();
+    gui_cc_record_finish();
+    double stop_s = cc_now() - stop_t0;
+
+    gui_cc_record_status_t s = gui_cc_record_get_status();
+    printf("cc record test: stop took %.2fs, bytes=%llu lines=%u captions_seen=%s\n",
+           stop_s, (unsigned long long)s.output_bytes, s.caption_lines,
+           s.captions_seen ? "yes" : "no");
+    if (s.error) printf("cc record test: error: %s\n", s.err_text);
+
+    int rc = 0;
+    if (inject == CC_INJECT_NONE) {
+        /* A tape with no captions is NOT a failure, so the assertion is about
+         * the process, not the content. */
+        if (s.error) { printf("FAIL: clean run reported an error\n"); rc = 1; }
+        if (stop_s > CC_REAP_LIMIT_S) { printf("FAIL: stop exceeded the reap deadline\n"); rc = 1; }
+    } else {
+        /* Under injection the pass condition is that the fault was DETECTED
+         * and the child still went away inside the deadline. */
+        if (stop_s > CC_REAP_LIMIT_S + CC_TERM_LIMIT_S + 1.0) {
+            printf("FAIL: reap exceeded the escalation deadline\n");
+            rc = 1;
+        }
+        if (inject == CC_INJECT_BAD_ARGS && !s.error) {
+            printf("FAIL: bad arguments were not detected\n");
+            rc = 1;
+        }
+        /* The point of the busy case is that a node another reader has claimed
+         * is REPORTED, not quietly recorded around. A run that succeeded means
+         * the claim never took hold and the test proved nothing. */
+        if (inject == CC_INJECT_BUSY_DEVICE && !s.error) {
+            printf("FAIL: a busy device was not detected (the claim did not take)\n");
+            rc = 1;
+        }
+    }
+    printf("%s\n", rc ? "CC RECORD TEST FAILED" : "cc record test passed");
+    return rc;
 }
 
 /* ---------------------------------------------------------- headless modes */
