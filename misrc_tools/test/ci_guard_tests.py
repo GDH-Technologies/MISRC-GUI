@@ -1135,6 +1135,71 @@ def check_preview_tap_mux_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_cc_record_argv_runtime(repo_root: Path) -> int:
+    """The closed-caption ffmpeg command line, asserted token by token, because
+    every way of getting it wrong is silent. The VBI node is EXCLUSIVE, so a
+    second -i would mean a second open and an EBUSY that costs the capture its
+    captions. -raw_timestamps would unrebase the sidecar from t=0 so it no
+    longer lines up with the recording -- and it is exactly what someone
+    reaches for when trying to 'fix' the constant one-frame offset. A missing
+    -y makes ffmpeg block on its own overwrite question with a record session
+    open behind it. An input option that drifted after -i silently becomes an
+    output option.
+
+    Compiling gui_cc_record.c standalone -- no raylib, no other project source
+    -- is itself part of the contract: that module has no project includes, and
+    a guard that had to spawn ffmpeg to inspect a command line could not run in
+    CI."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: closed-caption argv guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the closed-caption argv guard")
+        print("SKIP: closed-caption argv guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_cc_record_argv_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    module_include = repo_root / "misrc_tools/misrc_gui/output"
+
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"Closed-caption argv guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_cc_argv_guard_") as temp_root:
+        exe_path = Path(temp_root) / "cc_argv_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{module_include}",
+            str(harness_path),
+            str(module_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(
+                "Closed-caption argv harness failed to compile -- if this names a "
+                "missing project header, gui_cc_record.c has grown an include it "
+                f"must not have:\n{built.stderr.strip()}"
+            )
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Closed-caption argv harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_mediamtx_config_runtime(repo_root: Path) -> int:
     """The generated mediamtx.yml carries the design's hard requirement: this
     instance must not disturb capture-node's three on the same host. Two ways to
@@ -3370,6 +3435,7 @@ def main() -> int:
         checks.insert(11, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
         checks.insert(12, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(13, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
+        checks.insert(14, ("closed-caption argv contract", lambda: check_cc_record_argv_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode

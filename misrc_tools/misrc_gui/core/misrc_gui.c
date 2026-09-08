@@ -25,6 +25,7 @@
 #include "../input/gui_capture.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../output/gui_video_record.h"
+#include "../output/gui_cc_record.h"
 #include "../streaming/gui_mediamtx.h"
 #include "../streaming/gui_rtsp_stream.h"
 #include "../processing/gui_extract.h"
@@ -93,6 +94,7 @@ static void print_usage(const char *program_name) {
             "Diagnostics (headless, no window):\n"
             "  --preview-dump-frame <device> <out.ppm>\n"
             "  --video-probe | --video-settings-test | --video-name-test\n"
+            "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
@@ -526,6 +528,20 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
+        }
+        /* The caption module never resolves ffmpeg itself -- it is handed the
+         * one gui_video_record already found, so the two can never disagree
+         * about which binary they are using. */
+        if (strcmp(argv[i], "--cc-probe") == 0) {
+            bool live = (i + 1 < argc) && strcmp(argv[i + 1], "--live") == 0;
+            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            return gui_cc_record_probe_main(live);
+        }
+        if (strcmp(argv[i], "--cc-argv-dump") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
+            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            return gui_cc_record_argv_dump_main(dev, dir);
         }
         if (strcmp(argv[i], "--rtsp-soak") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;

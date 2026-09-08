@@ -454,6 +454,7 @@ if raylib_dep.found()
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_video_record.c',
+    'misrc_gui/output/gui_cc_record.c',
     'misrc_gui/output/gui_audio.c',
     'common/extract.c',
     'common/ringbuffer.c',
