@@ -103,7 +103,7 @@ static void print_usage(const char *program_name) {
             "  --rtsp-fault-test <device> <none|kill|hang|bad-args|no-audio|busy-audio> [seconds]\n"
             "  --rtsp-soak <device> <rf-device> [seconds-per-half]\n"
             "  --video-tap-test <device> [seconds]\n"
-            "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
+            "  --auto-record <dir> [seconds] [video|novideo] [flac|raw] [cc]\n"
             "  --config <path> --net-serve [seconds]      (the net server, no window)\n"
             "  --net-client-probe <host> <port> [seconds] (mirror a server, print its settings)\n"
             "\n"
@@ -520,7 +520,12 @@ int main(int argc, char **argv) {
             int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 5;
             bool wv  = (i + 3 < argc) && strcmp(argv[i + 3], "video") == 0;
             bool flac = !((i + 4 < argc) && strcmp(argv[i + 4], "raw") == 0);
-            return gui_record_auto_record_main(dir, secs, wv, flac);
+            /* Captions are opt-in here so the same mode can produce the
+             * captions-on and captions-off runs whose RF output must be
+             * byte-identical. --config does not reach this mode: it builds
+             * its settings from defaults on purpose, for reproducibility. */
+            bool wcc = (i + 5 < argc) && strcmp(argv[i + 5], "cc") == 0;
+            return gui_record_auto_record_main(dir, secs, wv, flac, wcc);
         }
         if (strcmp(argv[i], "--video-settings-test") == 0) {
             return gui_record_video_settings_test_main();
@@ -1070,6 +1075,12 @@ int main(int argc, char **argv) {
         /* Finishes a stream start that was deliberately left unfinished: the
          * click handler spawns and returns, so the window never freezes. */
         gui_rtsp_stream_poll();
+        /* Same pattern: the caption spawn returns immediately and its startup
+         * verdict is resolved here, so a refusal never blocks the render
+         * thread. Handed the binary gui_video_record resolved, so the two
+         * cannot disagree about which ffmpeg they are using. */
+        gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+        gui_cc_record_poll();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
@@ -1379,6 +1390,7 @@ int main(int argc, char **argv) {
     gui_settings_save(&app.settings);
     
     gui_video_record_shutdown();
+    gui_cc_record_shutdown();
     /* Publisher before server: the publisher holds a preview hold and a tap,
      * and mediamtx is the thing it publishes into. */
     gui_rtsp_stream_shutdown();

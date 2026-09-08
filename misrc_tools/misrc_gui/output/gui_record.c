@@ -9,6 +9,7 @@
 
 #include "gui_record.h"
 #include "gui_video_record.h"
+#include "gui_cc_record.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
@@ -386,6 +387,8 @@ static thrd_t s_finalize_thread;
 static atomic_bool s_finalize_thread_running = ATOMIC_VAR_INIT(false);
 static char s_record_path_video[600];
 static char s_video_start_msg[480];
+static char s_record_path_cc[600];
+static char s_cc_start_msg[480];
 static atomic_bool s_record_stop_finalizing = ATOMIC_VAR_INIT(false);
 static atomic_bool s_record_stop_finalize_done = ATOMIC_VAR_INIT(false);
 static atomic_flag s_capture_log_lock = ATOMIC_FLAG_INIT;
@@ -463,6 +466,8 @@ struct gui_record_session {
     bool capture_a, capture_b;
     bool video_started;
     char path_video[600];
+    bool cc_started;
+    char path_cc[600];
 
     FILE *file_a, *file_b;
     char path_a[512], path_b[512];
@@ -2154,6 +2159,18 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
         gui_record_log_write_line_locked("INFO", msg);
     }
 
+    /* Settings only, for the same FLAC-vs-RAW ordering reason as above. */
+    snprintf(msg, sizeof(msg), "Closed captions: enabled=%s device=%s",
+             app->settings.cc_record_enabled ? "on" : "off",
+             app->settings.cc_vbi_device[0] ? app->settings.cc_vbi_device : "(auto)");
+    gui_record_log_write_line_locked("INFO", msg);
+
+    if (app->settings.cc_record_enabled && app->settings.cc_filename[0]) {
+        snprintf(msg, sizeof(msg), "CC_FILE_PATH: %s/%s",
+                 app->settings.output_path, app->settings.cc_filename);
+        gui_record_log_write_line_locked("INFO", msg);
+    }
+
     if (app->settings.enable_audio_4ch && app->settings.audio_4ch_filename[0]) {
         snprintf(msg, sizeof(msg), "AUDIO_4CH_FILE_PATH: %s/%s",
                  app->settings.output_path, app->settings.audio_4ch_filename);
@@ -2534,6 +2551,50 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
              pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0);
 }
 
+/* Spawn the caption sidecar. Unlike the reference video this takes no preview
+ * hold and needs no geometry: ffmpeg opens the VBI node itself, and that node
+ * is independent of /dev/videoN -- captions do not require a picture, and
+ * coupling them to one would be a false dependency. */
+static void gui_record_start_cc_if_enabled(gui_app_t *app)
+{
+    if (!app->settings.cc_record_enabled) return;
+
+    snprintf(s_record_path_cc, sizeof(s_record_path_cc), "%s/%s",
+             app->settings.output_path, app->settings.cc_filename);
+
+    char err[256] = {0};
+    if (gui_cc_record_start(app->settings.cc_vbi_device, s_record_path_cc,
+                            err, sizeof(err)) != 0) {
+        /* Not fatal, for the same reason the reference video is not: the RF
+         * writers are already running. Preflight is where a missing device or
+         * ffmpeg refuses. */
+        char msg[320];
+        snprintf(msg, sizeof(msg), "Closed captions failed to start: %s", err);
+        gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
+        gui_app_set_status(app, msg);
+        s_record_path_cc[0] = '\0';
+        return;
+    }
+
+    s_active->cc_started = true;
+    snprintf(s_active->path_cc, sizeof(s_active->path_cc), "%s", s_record_path_cc);
+    gui_cc_record_status_t cs = gui_cc_record_get_status();
+    /* Stashed, not logged: same FLAC-vs-RAW session-log ordering as above. */
+    gui_app_set_status(app, "Closed-caption recording started");
+    snprintf(s_cc_start_msg, sizeof(s_cc_start_msg),
+             "Closed captions started: %s (device %s, spawn %.2fs; "
+             "about one frame behind the RF, not frame-accurate)",
+             s_record_path_cc, cs.device, cs.start_offset_s);
+}
+
+static void gui_record_flush_cc_start_log(gui_app_t *app)
+{
+    if (!s_cc_start_msg[0]) return;
+    if (!s_active || !s_active->log_file) return;
+    gui_record_log_capture_event(app, "INFO", s_cc_start_msg, GUI_ERROR_CLASS_NONE, 0);
+    s_cc_start_msg[0] = '\0';
+}
+
 /* Emit whatever the video spawn stashed. Called from a point in each branch
  * where the session log is known to be open. */
 static void gui_record_flush_video_start_log(gui_app_t *app)
@@ -2554,7 +2615,7 @@ static void gui_record_flush_video_start_log(gui_app_t *app)
  * run with it OFF. That is the proof that the video path cannot perturb the
  * capture it sits beside. */
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
-                                bool use_flac)
+                                bool use_flac, bool with_cc)
 {
     static gui_app_t app;
     memset(&app, 0, sizeof(app));
@@ -2569,6 +2630,7 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
     app.settings.capture_a = true;
     app.settings.capture_b = true;
     app.settings.video_record_enabled = with_video;
+    app.settings.cc_record_enabled = with_cc;
     app.settings.enable_audio_4ch = false;
     app.settings.enable_audio_2ch_12 = false;
     app.settings.enable_audio_2ch_34 = false;
@@ -2763,6 +2825,13 @@ int gui_record_start(gui_app_t *app) {
     snprintf(path_video, sizeof(path_video), "%s/%s",
              app->settings.output_path, app->settings.video_filename);
     bool file_v_exists = app->settings.video_record_enabled && (stat(path_video, &stat_v) == 0);
+    /* Same reasoning as the reference video above: an output missing from this
+     * set is an output silently clobbered. */
+    struct stat stat_cc;
+    char path_cc[600];
+    snprintf(path_cc, sizeof(path_cc), "%s/%s",
+             app->settings.output_path, app->settings.cc_filename);
+    bool file_cc_exists = app->settings.cc_record_enabled && (stat(path_cc, &stat_cc) == 0);
 
     // A finalizing session still owns its output files; refuse to reuse them.
     if (s_finalizing) {
@@ -2772,14 +2841,16 @@ int gui_record_start(gui_app_t *app) {
             (app->settings.capture_b && s_finalizing->path_b[0] &&
              strcmp(path_b, s_finalizing->path_b) == 0) ||
             (app->settings.video_record_enabled && s_finalizing->path_video[0] &&
-             strcmp(path_video, s_finalizing->path_video) == 0);
+             strcmp(path_video, s_finalizing->path_video) == 0) ||
+            (app->settings.cc_record_enabled && s_finalizing->path_cc[0] &&
+             strcmp(path_cc, s_finalizing->path_cc) == 0);
         if (clash) {
             gui_app_set_status(app, "Previous recording is still finalizing these files");
             return RECORD_ERROR;
         }
     }
 
-    if (file_a_exists || file_b_exists || file_v_exists) {
+    if (file_a_exists || file_b_exists || file_v_exists || file_cc_exists) {
         // Build detailed message with file info
         char message[512];
         char size_buf[32];
@@ -2798,6 +2869,21 @@ int gui_record_start(gui_app_t *app) {
             format_file_size_u64((uint64_t)stat_b.st_size, size_buf, sizeof(size_buf));
             offset += snprintf(message + offset, sizeof(message) - offset,
                 "CH B: %s (%s)\n", path_b, size_buf);
+        }
+
+        /* The reference video was already counted above but never named, so
+         * the dialog could say "the following files will be overwritten" and
+         * then not list one of them. Naming both is the point of the prompt. */
+        if (file_v_exists) {
+            format_file_size_u64((uint64_t)stat_v.st_size, size_buf, sizeof(size_buf));
+            offset += snprintf(message + offset, sizeof(message) - offset,
+                "VIDEO: %s (%s)\n", path_video, size_buf);
+        }
+
+        if (file_cc_exists) {
+            format_file_size_u64((uint64_t)stat_cc.st_size, size_buf, sizeof(size_buf));
+            offset += snprintf(message + offset, sizeof(message) - offset,
+                "CAPTIONS: %s (%s)\n", path_cc, size_buf);
         }
 
         // Show confirmation popup with detailed info
@@ -2986,6 +3072,35 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                      "Reference video is on but the preview is not running: %s. "
                      "Turn Reference video off to record without it.",
                      pv.err_text[0] ? pv.err_text : "not connected");
+            gui_app_set_status(app, msg);
+            return RECORD_ERROR;
+        }
+    }
+
+    /* Closed-caption preflight. Same position and same reason as the
+     * reference-video preflight above: before any output file is opened and
+     * before the session exists, so a refusal leaves nothing to unwind.
+     *
+     * Deliberately does NOT require the preview to be connected, unlike the
+     * video preflight: the VBI node is a separate fd from /dev/videoN, and
+     * demanding a picture in order to record captions would be a coupling the
+     * hardware does not have. */
+    s_record_path_cc[0] = '\0';
+    s_cc_start_msg[0] = '\0';
+    if (app->settings.cc_record_enabled) {
+        /* Hand it the binary gui_video_record already resolved, so the two can
+         * never disagree about which ffmpeg they are using. */
+        gui_video_record_set_ffmpeg_path(app->settings.ffmpeg_path);
+        gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+        gui_cc_record_set_preview_device(app->settings.preview_device_path);
+        gui_cc_record_set_device(app->settings.cc_vbi_device);
+        gui_cc_record_invalidate_probe();   /* a stale OK must not arm a recording */
+        if (gui_cc_record_probe() != CC_PROBE_OK) {
+            char msg[380];
+            snprintf(msg, sizeof(msg),
+                     "Closed captions are on but cannot start: %s. "
+                     "Turn Closed captions off to record without them.",
+                     gui_cc_record_probe_hint());
             gui_app_set_status(app, msg);
             return RECORD_ERROR;
         }
@@ -3216,6 +3331,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                 /* Removes the tap and asks the writer to drain. Does not join --
                  * this is the render thread; the join happens in finalize. */
                 if (ses->video_started) gui_video_record_request_stop();
+                if (ses->cc_started) gui_cc_record_request_stop();
 
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (ses->flac_a) { flac_writer_abort(ses->flac_a); ses->flac_a = NULL; }
@@ -3256,7 +3372,9 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->writer_threads_running = started_a || started_b;
 
         gui_record_start_video_if_enabled(app);
+        gui_record_start_cc_if_enabled(app);
         gui_record_flush_video_start_log(app);
+        gui_record_flush_cc_start_log(app);
 #if defined(__APPLE__)
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
@@ -3394,7 +3512,9 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->writer_threads_running = started_a || started_b;
 
         gui_record_start_video_if_enabled(app);
+        gui_record_start_cc_if_enabled(app);
         gui_record_flush_video_start_log(app);
+        gui_record_flush_cc_start_log(app);
 #if defined(__APPLE__)
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
@@ -3411,6 +3531,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         gui_audio_start(app, &app->buffers);
         gui_record_open_session_log(app, path_a, path_b);
         gui_record_flush_video_start_log(app);   /* RAW: log opens last */
+        gui_record_flush_cc_start_log(app);
 
         gui_app_set_status(app, "Recording (RAW)...");
     }
@@ -3452,6 +3573,39 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
             char emsg[256];
             snprintf(emsg, sizeof(emsg), "Reference video error: %s", vs.err_text);
             gui_record_log_capture_event(app, "ERROR", emsg, GUI_ERROR_CLASS_SYSTEM, 1);
+        }
+    }
+
+    if (ses->cc_started) {
+        gui_cc_record_finish();
+        gui_cc_record_status_t cs = gui_cc_record_get_status();
+        ses->cc_started = false;
+
+        /* _ses, not gui_record_log_capture_event: by the time finalize runs,
+         * s_active has been handed over to s_finalizing, and that helper only
+         * writes when `s_active && app == s_active->app`. The session's log
+         * file is still open here -- it is closed after this function returns
+         * -- so the session-scoped writer is the one that actually lands the
+         * line. (The reference-video summary above has the same problem and
+         * silently loses its line; not fixed here to keep this change to
+         * captions.) */
+        gui_record_log_writef_ses(ses, cs.error ? "ERROR" : "INFO",
+                 "Closed captions: device=%s lines=%u bytes=%llu spawn_offset=%.2fs",
+                 cs.device, cs.caption_lines,
+                 (unsigned long long)cs.output_bytes, cs.start_offset_s);
+        if (cs.error && cs.err_text[0]) {
+            gui_record_log_writef_ses(ses, "ERROR", "Closed-caption error: %s", cs.err_text);
+            /* Still route the error through the counter path, so a caption
+             * failure shows in the session's system-error tally like any other. */
+            gui_record_log_capture_event(app, "ERROR", cs.err_text, GUI_ERROR_CLASS_SYSTEM, 1);
+        } else if (!cs.captions_seen) {
+            /* The SCC muxer writes no padding, so a tape carrying no captions
+             * leaves a header-only file -- which looks identical to an ffmpeg
+             * whose v4l2vbi is too old to emit a full cc_data header byte.
+             * Name both and accuse neither; --cc-probe --live tells them apart. */
+            gui_record_log_writef_ses(ses, "INFO", "%s",
+                "Closed captions: none were present on this tape (this is not a fault). "
+                "If you expected some, run --cc-probe --live to check the decoder.");
         }
     }
     {
@@ -3645,6 +3799,12 @@ void gui_record_stop(gui_app_t *app) {
     // drain mode independently of any new recording's state.
     app->is_recording = false;
     atomic_store(&ses->recording, false);
+
+    /* Ask the caption child to quit here, on the caller's thread, rather than
+     * waiting for finalize: it is the child that produces the sidecar's
+     * timestamps, so this is what makes the captions end when the RF does.
+     * Non-blocking -- the reap happens in the finalize path. */
+    if (ses->cc_started) gui_cc_record_request_stop();
 
     // Stop audio output/monitoring and restart monitor-only path if still capturing.
     gui_audio_stop(app);

@@ -99,6 +99,7 @@ int gui_record_name_test_main(void);
 int gui_record_video_settings_test_main(void);
 int gui_record_cc_settings_test_main(void);
 
-int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video, bool use_flac);
+int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
+                                bool use_flac, bool with_cc);
 
 #endif // GUI_RECORD_H
