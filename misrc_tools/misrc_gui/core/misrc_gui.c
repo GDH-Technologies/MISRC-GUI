@@ -96,6 +96,7 @@ static void print_usage(const char *program_name) {
             "  --video-probe | --video-settings-test | --video-name-test\n"
             "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
             "  --cc-record-test <device> <dir> [secs] [kill|hang|bad-args|busy]\n"
+            "  --cc-settings-test\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
@@ -523,6 +524,9 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--video-settings-test") == 0) {
             return gui_record_video_settings_test_main();
+        }
+        if (strcmp(argv[i], "--cc-settings-test") == 0) {
+            return gui_record_cc_settings_test_main();
         }
         if (strcmp(argv[i], "--video-name-test") == 0) {
             return gui_record_name_test_main();

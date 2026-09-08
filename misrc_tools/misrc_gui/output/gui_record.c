@@ -2287,6 +2287,18 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
     } else {
         snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
     }
+    /* Closed captions. Must stay in lockstep with the same block in
+     * gui_settings_refresh_auto_names(); the only intended difference there is
+     * that base already carries the record-start timestamp. Keep the two
+     * blocks textually identical so a diff of them is empty. */
+    char cc_tag[40] = {0};
+    sanitize_tag(cc_tag, sizeof(cc_tag), app->settings.cc_output_tag);
+    if (cc_tag[0]) {
+        snprintf(app->settings.cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+    } else {
+        snprintf(app->settings.cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+    }
+
     if (audio_tag_12[0]) {
         snprintf(app->settings.audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
@@ -2382,6 +2394,86 @@ int gui_record_video_settings_test_main(void)
     }
 
     printf("%s\n", rc ? "SETTINGS TEST FAILED" : "settings test passed");
+    if (scratch_path[0]) remove(scratch_path);
+    return rc;
+}
+
+int gui_record_cc_settings_test_main(void)
+{
+    /* Same scratch discipline as the video test above, and for the same
+     * reason: without --config, gui_settings_load/save hit the LIVE settings
+     * file, which on a capture host belongs to a running GUI. This mode
+     * writing probe values into it would be a real fault, not a test detail. */
+    static char scratch_path[512];
+    if (!gui_settings_override_active()) {
+#if defined(_WIN32) || defined(_WIN64)
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !tmp[0]) tmp = ".";
+        snprintf(scratch_path, sizeof(scratch_path), "%s\\misrc_cc_settings_test.json", tmp);
+#else
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0]) tmp = "/tmp";
+        snprintf(scratch_path, sizeof(scratch_path), "%s/misrc_cc_settings_test.json", tmp);
+#endif
+        remove(scratch_path);
+        gui_settings_set_override_path(scratch_path);
+        printf("settings file: %s (scratch)\n", scratch_path);
+    }
+
+    gui_settings_t a;
+    memset(&a, 0, sizeof(a));
+    gui_settings_load(&a);
+
+    /* Deliberately unlike every default, so a field that is silently not
+     * persisted shows up as a mismatch rather than a coincidence. The tag
+     * carries characters a filename must not, to prove sanitising happens. */
+    a.cc_record_enabled = true;
+    snprintf(a.cc_output_tag, sizeof(a.cc_output_tag), "cc test/2");
+    snprintf(a.cc_vbi_device, sizeof(a.cc_vbi_device), "/dev/vbi7");
+    a.auto_names_enabled = true;
+    snprintf(a.output_base_name, sizeof(a.output_base_name), "TESTTAPE");
+    gui_settings_save(&a);
+
+    gui_settings_t b;
+    memset(&b, 0, sizeof(b));
+    gui_settings_load(&b);
+
+    int rc = 0;
+    printf("round-trip:\n");
+    printf("  cc_record_enabled : %d -> %d\n", a.cc_record_enabled, b.cc_record_enabled);
+    printf("  cc_output_tag     : %s -> %s\n", a.cc_output_tag, b.cc_output_tag);
+    printf("  cc_vbi_device     : %s -> %s\n", a.cc_vbi_device, b.cc_vbi_device);
+    printf("  cc_filename       : %s\n", b.cc_filename);
+
+    if (a.cc_record_enabled != b.cc_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
+    if (strcmp(a.cc_output_tag, b.cc_output_tag))   { printf("FAIL: tag\n"); rc = 1; }
+    if (strcmp(a.cc_vbi_device, b.cc_vbi_device))   { printf("FAIL: vbi device\n"); rc = 1; }
+
+    /* The load path re-runs the namer, so the tag must have reached the name,
+     * sanitised, and the extension must still be the one the muxer writes. */
+    if (!strstr(b.cc_filename, "cc-test")) {
+        printf("FAIL: sanitised tag did not reach the generated filename\n"); rc = 1;
+    }
+    if (strstr(b.cc_filename, "/")) {
+        printf("FAIL: the tag's path separator survived into the filename\n"); rc = 1;
+    }
+    size_t n = strlen(b.cc_filename);
+    if (n < 4 || strcmp(b.cc_filename + n - 4, ".scc") != 0) {
+        printf("FAIL: generated caption filename does not end in .scc\n"); rc = 1;
+    }
+
+    /* An empty device means "derive it from the preview device", and must
+     * survive as empty rather than being helpfully filled in on save. */
+    gui_settings_t c = b;
+    c.cc_vbi_device[0] = '\0';
+    gui_settings_save(&c);
+    gui_settings_t d;
+    memset(&d, 0, sizeof(d));
+    gui_settings_load(&d);
+    printf("  empty cc_vbi_device -> '%s' (must stay empty = auto)\n", d.cc_vbi_device);
+    if (d.cc_vbi_device[0]) { printf("FAIL: empty device did not survive\n"); rc = 1; }
+
+    printf("%s\n", rc ? "CC SETTINGS TEST FAILED" : "cc settings test passed");
     if (scratch_path[0]) remove(scratch_path);
     return rc;
 }
@@ -2548,6 +2640,7 @@ int gui_record_name_test_main(void)
 
     snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "tapetest");
     snprintf(app.settings.video_output_tag, sizeof(app.settings.video_output_tag), "ref cam");
+    snprintf(app.settings.cc_output_tag, sizeof(app.settings.cc_output_tag), "cc one");
     snprintf(app.settings.rf_channel_tags[0], sizeof(app.settings.rf_channel_tags[0]), "luma");
     snprintf(app.settings.audio_output_tags[0], sizeof(app.settings.audio_output_tags[0]), "quad");
     app.settings.auto_names_enabled = true;
@@ -2560,9 +2653,11 @@ int gui_record_name_test_main(void)
     app.settings.append_timestamp_on_capture_start = false;
     gui_settings_refresh_auto_names(&app.settings);
     char s_video[MAX_FILENAME_LEN], s_a[MAX_FILENAME_LEN], s_4ch[MAX_FILENAME_LEN];
+    char s_cc[MAX_FILENAME_LEN];
     snprintf(s_video, sizeof(s_video), "%s", app.settings.video_filename);
     snprintf(s_a, sizeof(s_a), "%s", app.settings.output_filename_a);
     snprintf(s_4ch, sizeof(s_4ch), "%s", app.settings.audio_4ch_filename);
+    snprintf(s_cc, sizeof(s_cc), "%s", app.settings.cc_filename);
 
     gui_record_apply_auto_names(&app);
     printf("no timestamp:\n");
@@ -2582,6 +2677,14 @@ int gui_record_name_test_main(void)
     if (strcmp(s_4ch, app.settings.audio_4ch_filename) != 0) {
         printf("FAIL: 4ch names diverge with timestamping off\n"); rc = 1;
     }
+    printf("  settings namer cc    : %s\n", s_cc);
+    printf("  record   namer cc    : %s\n", app.settings.cc_filename);
+    if (strcmp(s_cc, app.settings.cc_filename) != 0) {
+        printf("FAIL: caption names diverge with timestamping off\n"); rc = 1;
+    }
+    if (strstr(s_cc, "cc-one") == NULL) {
+        printf("FAIL: caption tag was not sanitised (%s)\n", s_cc); rc = 1;
+    }
 
     /* Pass 2: timestamping on -- the record namer must differ, and only by
      * inserting the timestamp after the base name. */
@@ -2594,6 +2697,13 @@ int gui_record_name_test_main(void)
     } else if (strncmp(app.settings.video_filename, "tapetest_", 9) != 0 ||
                strstr(app.settings.video_filename, "_ref-cam_video.mkv") == NULL) {
         printf("FAIL: timestamped video name is not base + timestamp + tag + suffix\n"); rc = 1;
+    }
+
+    if (strcmp(s_cc, app.settings.cc_filename) == 0) {
+        printf("FAIL: timestamping had no effect on the caption name\n"); rc = 1;
+    } else if (strncmp(app.settings.cc_filename, "tapetest_", 9) != 0 ||
+               strstr(app.settings.cc_filename, "_cc-one_captions.scc") == NULL) {
+        printf("FAIL: timestamped caption name is not base + timestamp + tag + suffix\n"); rc = 1;
     }
 
     /* The tag contained a space; sanitize_tag must map it to '-' rather than

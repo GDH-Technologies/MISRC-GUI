@@ -62,6 +62,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     strcpy(settings->raw_filename, "raw_data.bin");
     strcpy(settings->audio_4ch_filename, "quad_4ch.wav");
     strcpy(settings->video_filename, "video.mkv");
+    strcpy(settings->cc_filename, "captions.scc");
     strcpy(settings->audio_2ch_12_filename, "stereo_ch1_ch2.wav");
     strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
 
@@ -138,6 +139,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->video_record_enabled = false;
     settings->video_record_codec = 0;        /* H.264 */
     settings->video_output_tag[0] = '\0';
+    settings->cc_record_enabled = false;
+    settings->cc_output_tag[0] = '\0';
+    settings->cc_vbi_device[0] = '\0';       /* auto: the dongle the preview is on */
     settings->ffmpeg_path[0] = '\0';
     settings->preview_device_path[0] = '\0';
     settings->rtsp_stream_enabled = false;
@@ -353,6 +357,18 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     } else {
         snprintf(settings->video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
     }
+    /* Closed captions. Must stay in lockstep with the same block in
+     * gui_record_apply_auto_names(); the only intended difference there is
+     * that base already carries the record-start timestamp. Keep the two
+     * blocks textually identical so a diff of them is empty. */
+    char cc_tag[40] = {0};
+    sanitize_tag(cc_tag, sizeof(cc_tag), settings->cc_output_tag);
+    if (cc_tag[0]) {
+        snprintf(settings->cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+    } else {
+        snprintf(settings->cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+    }
+
     if (audio_tag_12[0]) {
         snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
@@ -858,6 +874,18 @@ static const gui_setting_desc_t s_table[] = {
     GS_S  ("net_client_port_str",              net_client_port_str,         GS_LOCAL),
     GS_S  ("playback_file_a",                  playback_file_a,             GS_LOCAL),
     GS_S  ("playback_file_b",                  playback_file_b,             GS_LOCAL),
+    /* Closed captions. APPENDED, not filed next to the reference-video rows
+     * where they would read better: this table's order IS the file-write
+     * order, and the round-trip harness compares the fixture against the saved
+     * file positionally. Inserting a row mid-table shifts every key after it
+     * and fails the comparison for reasons that look nothing like the cause.
+     * New rows go on the end.
+     *
+     * cc_vbi_device is deliberately NOT GS_LOCAL -- see gui_settings.h. */
+    GS_B  ("cc_record_enabled",                cc_record_enabled,           0),
+    GS_S  ("cc_filename",                      cc_filename,                 0),
+    GS_S  ("cc_output_tag",                    cc_output_tag,               GS_NAME),
+    GS_S  ("cc_vbi_device",                    cc_vbi_device,               0),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

@@ -97,6 +97,7 @@ bool gui_record_get_output_free_space_bytes(const gui_app_t *app, uint64_t *free
 int gui_record_name_test_main(void);
 
 int gui_record_video_settings_test_main(void);
+int gui_record_cc_settings_test_main(void);
 
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video, bool use_flac);
 
