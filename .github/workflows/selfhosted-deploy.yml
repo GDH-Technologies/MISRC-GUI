@@ -74,6 +74,106 @@ concurrency:
 
 jobs:
   # --------------------------------------------------------------------------------
+  # Is this commit even buildable content? A change confined to docs, Markdown, .claude/
+  # or editor config cannot change a single byte of misrc_gui, yet before this job every
+  # such commit built and installed on up to four machines -- wm, cs0, air0 and win0 --
+  # and minted a release tag for the privilege.
+  #
+  # This is a JOB with `if:` gates on its dependants rather than a workflow-level
+  # `paths-ignore`, for two reasons. A `paths-ignore` under `on.push` would apply to the
+  # tags: ['v*'] half of that same trigger, where path filtering against a newly created
+  # ref is not something GitHub contracts to evaluate the way it does for a branch push
+  # -- and a release tag that silently builds nothing is a far worse failure than a
+  # wasted build. And should this workflow's checks ever be made required, a filtered-out
+  # workflow reports no check runs at all, wedging every PR as "Expected" forever.
+  #
+  # Fail-closed: every shape that does not carry a trustworthy file list -- a dispatch, a
+  # force push, a branch or TAG creation (before is all zeros), an API error, an empty
+  # listing, the compare endpoint's 300-file cap -- classifies as code and builds. The
+  # cost of over-building is a wasted run; the cost of under-building is a machine left
+  # holding a stale binary with nothing to say so.
+  #
+  # Adapted from digitization-toolkit .github/workflows/commit-checks.yml.
+  # --------------------------------------------------------------------------------
+  changes:
+    name: Setup-only or code?
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Classify the change
+        id: classify
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          set -euo pipefail
+          run_everything() {
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+            echo "$1"
+            exit 0
+          }
+          files=""
+          if [ "${EVENT}" = "pull_request" ]; then
+            for page in $(seq 1 30); do
+              if ! chunk="$(curl -sSf \
+                  -H "Authorization: Bearer ${API_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100&page=${page}" \
+                  | jq -r '.[].filename')"; then
+                run_everything "::warning::Could not list PR files; assuming code changed."
+              fi
+              [ -n "${chunk}" ] || break
+              files="${files}${chunk}"$'\n'
+            done
+          elif [ "${EVENT}" = "push" ]; then
+            zero="0000000000000000000000000000000000000000"
+            if [ "${FORCED}" = "true" ] || [ -z "${BEFORE}" ] || [ "${BEFORE}" = "${zero}" ]; then
+              run_everything "Push range not cleanly diffable (forced=${FORCED:-}); building. A tag push lands here."
+            fi
+            if ! compare="$(curl -sSf \
+                -H "Authorization: Bearer ${API_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/compare/${BEFORE}...${AFTER}")"; then
+              run_everything "::warning::Could not compare ${BEFORE}...${AFTER}; assuming code changed."
+            fi
+            count="$(printf '%s' "${compare}" | jq '(.files // []) | length')"
+            if [ "${count}" -ge 300 ]; then
+              run_everything "Push range hits the compare files cap (${count}); building."
+            fi
+            files="$(printf '%s' "${compare}" | jq -r '(.files // [])[].filename')"
+          else
+            run_everything "Non-diffable trigger (${EVENT}); building."
+          fi
+          if [ -z "${files}" ]; then
+            run_everything "::warning::Empty file listing for ${EVENT}; assuming code changed."
+          fi
+          # The setup-only set. .claude/** is ignored WHOLESALE here, unlike in the
+          # toolkit and capture-node where the hooks are a ruff target and settings.json
+          # is asserted by a test: nothing in this repo's CI reads .claude/ at all (the
+          # guard suite is misrc_tools/test/ci_guard_tests.py). .clangd is LSP config that
+          # no build step consults. NOT here, deliberately: misrc_tools/**, third_party/**
+          # and CMakeLists.txt, all of which change what gets built.
+          non_docs="$(printf '%s' "${files}" | grep -vE '^docs/|\.md$|^\.claude/|^\.vscode/|^\.clangd$|^[^/]*\.code-workspace$|^\.gitignore$|^\.gitattributes$' || true)"
+          if [ -n "${non_docs}" ]; then
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+            echo "Buildable changes present; building and installing."
+          else
+            echo "code=false" >> "${GITHUB_OUTPUT}"
+            echo "Setup-only change; no tag bump, no build, no install."
+          fi
+
+  # --------------------------------------------------------------------------------
   # Bump the GDH release tag, so a merge to main produces a real version instead of
   # dev-<date>-<sha>. The version script resolves a version only from an EXACT tag at
   # HEAD, so the tag has to be created before anything builds.
@@ -98,7 +198,12 @@ jobs:
   # --------------------------------------------------------------------------------
   bump-tag:
     name: Bump GDH release tag
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [changes]
+    # A setup-only merge mints no tag: the version string exists to identify a binary,
+    # and no new binary is produced. The next real merge bumps from the same base.
+    if: >-
+      needs.changes.outputs.code == 'true' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64, wm]
     steps:
       - name: Checkout
@@ -157,12 +262,16 @@ jobs:
 
   build-and-deploy:
     name: Build, test and install (${{ matrix.runner.name }})
-    needs: [bump-tag]
+    needs: [changes, bump-tag]
     # bump-tag runs only for pushes to main; on every other event it is SKIPPED, and a
     # skipped dependency would skip this job too. Accept success or skipped, while still
     # honouring cancellation and a genuine failure of the bump.
+    #
+    # The `changes` gate is a separate clause, not folded into the bump-tag one: bump-tag
+    # is skipped on a PR for a reason unrelated to path classification, so reading its
+    # result cannot tell a setup-only change from a PR event.
     if: >-
-      !cancelled() &&
+      !cancelled() && needs.changes.outputs.code == 'true' &&
       (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
     # runners. wm and win0 build every event; cs0 and air0 join only for the refs that
