@@ -24,6 +24,7 @@
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../output/gui_video_record.h"
+#include "../output/gui_cc_record.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../streaming/gui_rtsp_stream.h"
 #include "../streaming/gui_mediamtx.h"
@@ -641,6 +642,7 @@ typedef enum {
     UI_TEXT_FIELD_RF_TAG_B,
     UI_TEXT_FIELD_AUDIO_TAG_4CH,
     UI_TEXT_FIELD_VIDEO_TAG,
+    UI_TEXT_FIELD_CC_TAG,
     UI_TEXT_FIELD_AUDIO_TAG_12,
     UI_TEXT_FIELD_AUDIO_TAG_34,
     UI_TEXT_FIELD_AUDIO_LABEL_1,
@@ -2248,6 +2250,10 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.video_output_tag;
             *cap = sizeof(app->settings.video_output_tag);
             return true;
+        case UI_TEXT_FIELD_CC_TAG:
+            *dst = app->settings.cc_output_tag;
+            *cap = sizeof(app->settings.cc_output_tag);
+            return true;
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
             *dst = app->settings.audio_output_tags[0];
             *cap = sizeof(app->settings.audio_output_tags[0]);
@@ -2399,6 +2405,7 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_RF_TAG_A:
         case UI_TEXT_FIELD_RF_TAG_B:
         case UI_TEXT_FIELD_VIDEO_TAG:
+        case UI_TEXT_FIELD_CC_TAG:
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
         case UI_TEXT_FIELD_AUDIO_TAG_12:
         case UI_TEXT_FIELD_AUDIO_TAG_34:
@@ -3559,6 +3566,46 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");
                         }
                         CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
+                    }
+
+                    // Closed captions: EIA-608 line-21 data read off the capture
+                    // dongle's RAW VBI node by ffmpeg. Not from the RF, and not
+                    // from the preview picture -- the chip clamps capture to 480
+                    // active lines, so line 21 is never in a frame we could see.
+                    // Greyed out unless the whole chain probes clean, so the
+                    // toggle cannot be armed into a state that would refuse a
+                    // recording. The probe is cached; this costs a compare.
+                    gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+                    gui_cc_record_set_preview_device(app->settings.preview_device_path);
+                    gui_cc_record_set_device(app->settings.cc_vbi_device);
+                    bool cc_ok = (gui_cc_record_probe() == CC_PROBE_OK);
+                    CLAY(CLAY_ID("ToggleRowCaptions"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                        Color cc_bg = app->settings.cc_record_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                        if (!cc_ok) cc_bg = ui_disabled_color(cc_bg);
+                        CLAY(CLAY_ID("ToggleCcRecord"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cc_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT((app->settings.cc_record_enabled && cc_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cc_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        }
+                        CLAY_TEXT(CLAY_STRING("Closed captions"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cc_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                        Color ctag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
+                        Color ctag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                        CLAY(CLAY_ID("CcTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(ctag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            const char *ctag = app->settings.cc_output_tag[0] ? app->settings.cc_output_tag : "(tag)";
+                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_CC_TAG) && app->settings.auto_names_enabled) {
+                                gui_ui_render_active_text(UI_TEXT_FIELD_CC_TAG, ctag, FONT_SIZE_STATS, 1, ctag_fg);
+                            } else {
+                                CLAY_TEXT(make_string(ctag), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(ctag_fg) }));
+                            }
+                        }
+                    }
+                    // Names the node, or says exactly which link in the chain is
+                    // missing -- ffmpeg, the v4l2vbi input device, the scc muxer,
+                    // the node itself, or another program already holding it.
+                    CLAY(CLAY_ID("CaptionsHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+                        /* static: Clay draws text from this pointer after layout
+                         * returns, so an automatic buffer would be a dangling read. */
+                        static char cc_hint[240];
+                        snprintf(cc_hint, sizeof(cc_hint), "%s", gui_cc_record_probe_hint());
+                        CLAY_TEXT(make_string(cc_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(cc_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
                     }
 
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -10885,6 +10932,21 @@ void gui_handle_interactions(gui_app_t *app) {
                     app->settings.video_record_enabled = !app->settings.video_record_enabled;
                     gui_settings_save(&app->settings);
                 }
+            }
+            if (Clay_PointerOver(CLAY_ID("ToggleCcRecord"))) {
+                /* Refuse rather than arm: the same probe gates the record
+                 * preflight, so arming here would only move the refusal to
+                 * the moment the operator presses RECORD. The hint says
+                 * which link in the chain is missing. */
+                if (gui_cc_record_probe() != CC_PROBE_OK) {
+                    gui_app_set_status(app, gui_cc_record_probe_hint());
+                } else {
+                    app->settings.cc_record_enabled = !app->settings.cc_record_enabled;
+                    gui_settings_save(&app->settings);
+                }
+            }
+            if (Clay_PointerOver(CLAY_ID("CcTagField")) && app->settings.auto_names_enabled) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_CC_TAG, CLAY_ID("CcTagField"), 6.0f, 6.0f);
             }
             if (Clay_PointerOver(CLAY_ID("PreviewRescanBtn"))) {
                 gui_preview_refresh_devices();
