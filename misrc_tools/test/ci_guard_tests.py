@@ -2657,6 +2657,44 @@ def check_release_version_resolution_contract(repo_root: Path, workflow_path: Pa
     return 0
 
 
+def check_ci_only_tier_contract(deploy_workflow_path: Path) -> int:
+    """The CI-only tier must stay wired, and must stay fail-closed.
+
+    A change under .github/ alone produces a bit-identical binary, so since 2026-09-08 it
+    runs this guard suite instead of the four-machine build. Two ways that goes wrong
+    silently: the `guards` job is dropped or renamed, leaving such a change with NO check
+    at all; or the fail-closed arm is lost, so an unclassifiable change (dispatch, force
+    push, API error) takes the narrow path and skips the build it needed.
+    """
+    if not deploy_workflow_path.exists():
+        return fail(f"Fork deploy workflow is missing: {deploy_workflow_path}")
+    text = read_text(deploy_workflow_path)
+    required = [
+        # The classifier emits the tier, and run_everything forces it off.
+        "ci_only=true",
+        "ci_only=false",
+        # The job that IS the tier's only check.
+        "  guards:",
+        "ci_guard_tests.py --static-only",
+        "needs.changes.outputs.ci_only == 'true'",
+        # The build and the tag bump must both stand down for it.
+        "needs.changes.outputs.ci_only != 'true'",
+    ]
+    for snippet in required:
+        if snippet not in text:
+            return fail(f"CI-only tier contract is missing required snippet: {snippet}")
+    # run_everything is the fail-closed path. Slice to the closing brace at its own
+    # indentation, not the first "}" -- the body is full of "${GITHUB_OUTPUT}".
+    body = text[text.index("run_everything() {") :]
+    run_everything = body[: body.index("\n          }")]
+    if 'echo "ci_only=false"' not in run_everything:
+        return fail(
+            "run_everything must force ci_only=false: an unclassifiable change may "
+            "never take the narrow path and skip the build"
+        )
+    return 0
+
+
 def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
     if not build_workflow_path.exists():
         return fail(f"Build workflow entrypoint is missing: {build_workflow_path}")
@@ -3352,6 +3390,8 @@ def main() -> int:
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
         ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
+        ("CI-only tier contract",
+         lambda: check_ci_only_tier_contract(repo_root / ".github/workflows/selfhosted-deploy.yml")),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
