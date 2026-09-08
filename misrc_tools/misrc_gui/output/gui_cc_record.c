@@ -65,6 +65,7 @@ static struct {
     double dev_checked_at;     /* 0 = never */
     char   dev_path[64];       /* resolved node, "" if none */
     int    dev_errno;          /* 0, EBUSY, EACCES, ENOENT */
+    bool   dev_uncorrelated;   /* usable, but not on the previewed dongle */
 
     /* --- injected --- */
     char   override_dev[64];   /* settings cc_vbi_device; "" = auto */
@@ -264,6 +265,7 @@ static void cc_resolve_device(void)
     cc.dev_checked_at = now;
     cc.dev_path[0] = '\0';
     cc.dev_errno = ENOENT;
+    cc.dev_uncorrelated = false;
 
     /* An explicit setting is the only candidate: if the operator named a node,
      * silently using a different one would be worse than failing. */
@@ -311,12 +313,24 @@ static void cc_resolve_device(void)
         return;
     }
 
-    /* Correlation found nothing. Do NOT silently fall back to a VBI node on
-     * some other device: with the preview on a dongle that has no VBI sibling,
-     * "no VBI node" is the truthful answer and grabbing an unrelated one would
-     * caption the wrong source. */
-    if (have_parent) {
-        cc.dev_errno = first_ok[0] ? ENODEV : first_err;
+    /* Correlation found no VBI node on the previewed dongle. Fall back to a
+     * usable one elsewhere rather than refusing.
+     *
+     * Refusing was the first behaviour here and it was wrong: a rig can quite
+     * reasonably take its picture from one capture device and its captions
+     * from another -- composite into a dongle with no VBI transport at all,
+     * S-Video into one that has it -- and both come off the same tape. Worse,
+     * a device whose video node this program cannot open is still invisible to
+     * the correlation while its VBI node works perfectly, so refusing greys the
+     * toggle out with a node sitting right there.
+     *
+     * The fallback is flagged, not hidden: the hint says the captions come from
+     * a different device than the picture, so an operator who did NOT intend
+     * that can see it. */
+    if (first_ok[0]) {
+        snprintf(cc.dev_path, sizeof(cc.dev_path), "%s", first_ok);
+        cc.dev_errno = 0;
+        cc.dev_uncorrelated = have_parent;
         return;
     }
     cc.dev_errno = first_err;
@@ -331,6 +345,10 @@ static void cc_set_hint(cc_probe_state_t st)
     case CC_PROBE_OK:
         if (cc.child_pid > 0)
             snprintf(cc.hint, sizeof(cc.hint), "recording captions from %s", dev);
+        else if (cc.dev_uncorrelated)
+            snprintf(cc.hint, sizeof(cc.hint),
+                     "captions: %s -- a different device than the preview; "
+                     "NTSC/525 only, about one frame late", dev);
         else
             snprintf(cc.hint, sizeof(cc.hint),
                      "captions: %s -- NTSC/525 only, about one frame late", dev);
