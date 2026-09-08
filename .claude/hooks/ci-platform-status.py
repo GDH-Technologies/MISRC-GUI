@@ -30,12 +30,19 @@ GitHub tooling rot into listing labels that did not exist.
 
 ## As a hook
 
-With no arguments and JSON on stdin, this runs as a `PreToolUse` hook. It fires when a
-tool call is about to read or act on CI state — `gh run`/`gh workflow`, a PR check-status
-read, a merge — and stays **completely silent** when the platform is healthy. Only a
-degraded or undetermined verdict produces output, as `additionalContext`. It never blocks.
+With no arguments and JSON on stdin, this runs as a `PostToolUseFailure` hook. It fires
+after a tool call that reads or acts on CI state — `gh run`/`gh workflow`, a PR
+check-status read, a merge — has FAILED, and stays **completely silent** when the platform
+is healthy. Only a degraded or undetermined verdict produces output, as
+`additionalContext`. It never blocks. A user abort (`is_interrupt`) is ignored.
 
 The verdict is cached briefly so back-to-back CI calls cost nothing.
+
+It was a `PreToolUse` hook until 2026-09-08. Moving it to the failure event is a deliberate
+narrowing, and it costs the tk#222 signal: an Actions outage that creates NO runs produces
+no failing tool call to fire on, so nothing here will volunteer it any more. That case is
+now only caught by running this file as a command (see below) — do that before trusting a
+quiet CI, and whenever a push seems not to have landed a run.
 
 ## As a command
 
@@ -337,6 +344,15 @@ class DeploySpec:
         trigger targets `production` — that is the one whose fleet state this hook (and
         its dispatch hint) actually needs to reason about. A single match, e.g. in a repo
         that has not migrated, is returned as-is.
+
+        A repo may declare no `DEPLOY_CANDIDATES` at all: MISRC-GUI's `selfhosted-deploy.yml`
+        expresses its runner set as a `matrix.runner` instead. Returning None there is not
+        harmless — the caller's `branch` property then falls back to `production`, and in a
+        repo with no such branch every CI-sensitive tool call got a permanent, false
+        UNDETERMINED verdict ("not a green light"). So fall back to a push-triggered
+        workflow, preferring a deploy-shaped filename: `build.yml` sorts first
+        alphabetically but on that fork is the DISABLED upstream workflow, and picking it
+        would answer for the wrong pipeline.
         """
         directory = root / ".github" / "workflows"
         try:
@@ -345,16 +361,21 @@ class DeploySpec:
             )
         except OSError:
             return None
-        candidates: list[tuple[Path, str]] = []
+        readable: list[tuple[Path, str]] = []
         for path in files:
             try:
-                text = path.read_text(encoding="utf-8")
+                readable.append((path, path.read_text(encoding="utf-8")))
             except OSError:
                 continue
-            if "DEPLOY_CANDIDATES" in text:
-                candidates.append((path, text))
+        candidates = [(path, text) for path, text in readable if "DEPLOY_CANDIDATES" in text]
         if not candidates:
-            return None
+            pushers = [(path, text) for path, text in readable if _extract_push_branch(text)]
+            if not pushers:
+                return None
+            for path, _ in pushers:
+                if "deploy" in path.stem:
+                    return path
+            return pushers[0][0]
         if len(candidates) == 1:
             return candidates[0][0]
         for path, text in candidates:
@@ -676,6 +697,11 @@ def hook_context(payload: dict) -> str | None:
     if not is_ci_sensitive(payload.get("tool_name", ""), payload.get("tool_input") or {}):
         return None
 
+    # A user abort is not evidence about the platform, and answering one with an outage
+    # playbook would be noise on exactly the call the user chose to stop.
+    if payload.get("is_interrupt"):
+        return None
+
     # Built up front, not just on a cache miss: the guidance text is repo-specific and has
     # to match this repo even when the verdict itself came from the cache.
     root = repo_root()
@@ -772,10 +798,14 @@ def main(argv: list[str]) -> int:
         return 0
 
     if context:
+        # Echoed from the payload, never hardcoded: this hook is registered on
+        # PostToolUseFailure, and an output whose hookEventName does not match the event
+        # that fired is discarded — which is silent, so it would look like a healthy
+        # platform rather than a broken hook.
         json.dump(
             {
                 "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
+                    "hookEventName": payload.get("hook_event_name") or "PostToolUseFailure",
                     "additionalContext": context,
                 }
             },
