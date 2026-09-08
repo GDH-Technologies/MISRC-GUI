@@ -25,6 +25,7 @@
 #include "../input/gui_capture.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../output/gui_video_record.h"
+#include "../output/gui_cc_record.h"
 #include "../streaming/gui_mediamtx.h"
 #include "../streaming/gui_rtsp_stream.h"
 #include "../processing/gui_extract.h"
@@ -93,13 +94,16 @@ static void print_usage(const char *program_name) {
             "Diagnostics (headless, no window):\n"
             "  --preview-dump-frame <device> <out.ppm>\n"
             "  --video-probe | --video-settings-test | --video-name-test\n"
+            "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
+            "  --cc-record-test <device> <dir> [secs] [kill|hang|bad-args|busy]\n"
+            "  --cc-settings-test\n"
             "  --video-record-test <device> <out> [seconds] [codec]\n"
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
             "  --rtsp-fault-test <device> <none|kill|hang|bad-args|no-audio|busy-audio> [seconds]\n"
             "  --rtsp-soak <device> <rf-device> [seconds-per-half]\n"
             "  --video-tap-test <device> [seconds]\n"
-            "  --auto-record <dir> [seconds] [video|novideo] [flac|raw]\n"
+            "  --auto-record <dir> [seconds] [video|novideo] [flac|raw] [cc]\n"
             "  --config <path> --net-serve [seconds]      (the net server, no window)\n"
             "  --net-client-probe <host> <port> [seconds] (mirror a server, print its settings)\n"
             "\n"
@@ -516,16 +520,45 @@ int main(int argc, char **argv) {
             int secs = (i + 2 < argc) ? atoi(argv[i + 2]) : 5;
             bool wv  = (i + 3 < argc) && strcmp(argv[i + 3], "video") == 0;
             bool flac = !((i + 4 < argc) && strcmp(argv[i + 4], "raw") == 0);
-            return gui_record_auto_record_main(dir, secs, wv, flac);
+            /* Captions are opt-in here so the same mode can produce the
+             * captions-on and captions-off runs whose RF output must be
+             * byte-identical. --config does not reach this mode: it builds
+             * its settings from defaults on purpose, for reproducibility. */
+            bool wcc = (i + 5 < argc) && strcmp(argv[i + 5], "cc") == 0;
+            return gui_record_auto_record_main(dir, secs, wv, flac, wcc);
         }
         if (strcmp(argv[i], "--video-settings-test") == 0) {
             return gui_record_video_settings_test_main();
+        }
+        if (strcmp(argv[i], "--cc-settings-test") == 0) {
+            return gui_record_cc_settings_test_main();
         }
         if (strcmp(argv[i], "--video-name-test") == 0) {
             return gui_record_name_test_main();
         }
         if (strcmp(argv[i], "--video-probe") == 0) {
             return gui_video_record_probe_main();
+        }
+        /* The caption module never resolves ffmpeg itself -- it is handed the
+         * one gui_video_record already found, so the two can never disagree
+         * about which binary they are using. */
+        if (strcmp(argv[i], "--cc-probe") == 0) {
+            bool live = (i + 1 < argc) && strcmp(argv[i + 1], "--live") == 0;
+            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            return gui_cc_record_probe_main(live);
+        }
+        if (strcmp(argv[i], "--cc-record-test") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
+            int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
+            const char *inject = (i + 4 < argc) ? argv[i + 4] : NULL;
+            return gui_cc_record_test_main(dev, dir, secs, inject);
+        }
+        if (strcmp(argv[i], "--cc-argv-dump") == 0) {
+            const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
+            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            return gui_cc_record_argv_dump_main(dev, dir);
         }
         if (strcmp(argv[i], "--rtsp-soak") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -1042,6 +1075,12 @@ int main(int argc, char **argv) {
         /* Finishes a stream start that was deliberately left unfinished: the
          * click handler spawns and returns, so the window never freezes. */
         gui_rtsp_stream_poll();
+        /* Same pattern: the caption spawn returns immediately and its startup
+         * verdict is resolved here, so a refusal never blocks the render
+         * thread. Handed the binary gui_video_record resolved, so the two
+         * cannot disagree about which ffmpeg they are using. */
+        gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+        gui_cc_record_poll();
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
@@ -1351,6 +1390,7 @@ int main(int argc, char **argv) {
     gui_settings_save(&app.settings);
     
     gui_video_record_shutdown();
+    gui_cc_record_shutdown();
     /* Publisher before server: the publisher holds a preview hold and a tap,
      * and mediamtx is the thing it publishes into. */
     gui_rtsp_stream_shutdown();

@@ -61,6 +61,7 @@ typedef struct {
     char raw_filename[MAX_FILENAME_LEN];
     char audio_4ch_filename[MAX_FILENAME_LEN];
     char video_filename[MAX_FILENAME_LEN];   // reference video (MKV)
+    char cc_filename[MAX_FILENAME_LEN];      // closed-caption sidecar (Scenarist SCC)
     char audio_2ch_12_filename[MAX_FILENAME_LEN];
     char audio_2ch_34_filename[MAX_FILENAME_LEN];
     char audio_1ch_filenames[4][MAX_FILENAME_LEN]; // Individual channel files
@@ -103,6 +104,7 @@ typedef struct {
     // alongside the RF. The RF stays the archival master; this is for QC.
     bool video_record_enabled;
     int  video_record_codec;                 // 0 = H.264 (default), 1 = FFV1
+    bool cc_record_enabled;                  // EIA-608 line-21 sidecar, off by default
     bool enable_audio_2ch_12;
     bool enable_audio_2ch_34;
     bool enable_audio_1ch[4];                  // Individual channel enables
@@ -126,6 +128,7 @@ typedef struct {
     // Optional tags for non-mono audio outputs: [0]=4ch, [1]=stereo ch1/2, [2]=stereo ch3/4
     char audio_output_tags[3][32];
     char video_output_tag[32];
+    char cc_output_tag[32];
     char ffmpeg_path[512];                   // empty = resolve automatically
     // RTSP stream: publishes the preview picture and the dongle's own audio so
     // a tape can be watched from another machine. Monitoring only -- the RF
@@ -134,6 +137,13 @@ typedef struct {
     // again at launch. Stored by path rather than index: /dev/videoN survives a
     // reboot, an enumeration order does not.
     char preview_device_path[40];
+    /* Raw VBI node captions are read from. Empty means "derive it from
+     * preview_device_path by sysfs correlation" -- the VBI node on the same
+     * dongle whose picture is being previewed. Not GS_CLIENT_LOCAL, for the
+     * same reason preview_device_path and rtsp_audio_device are not: in net
+     * mode the server owns the capture hardware, and a client that could not
+     * name the server's node could not configure captions at all. */
+    char cc_vbi_device[64];
     bool rtsp_stream_enabled;
     bool rtsp_stream_lan;                    // false = loopback only (default)
     int  rtsp_stream_port;                   // 0 = the built-in default (8654)

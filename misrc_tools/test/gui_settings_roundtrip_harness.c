@@ -193,14 +193,35 @@ int main(int argc, char **argv) {
         if (!d || (d->flags & GS_LOAD_ONLY)) continue;
         expect[nexp++] = fx[i];
     }
-    bool same_keys = (nexp == nsv);
+    /* The fixture is an OLD settings file, and the build under test may know
+     * keys it does not carry. So the requirement is not equality -- that would
+     * make every new setting fail this check -- but that the fixture's keys
+     * come first, in order, and anything extra is genuinely new and appended.
+     *
+     * That is exactly the table's own rule: its row order IS the file-write
+     * order, so a row inserted mid-table shifts every key after it. When that
+     * happens the positional value comparison below reports a mismatch on some
+     * unrelated key, which looks nothing like the cause. New rows go on the end. */
+    bool same_keys = (nsv >= nexp);
+    if (!same_keys)
+        fprintf(stderr, "  saved %zu keys, fewer than the %zu the fixture expects\n", nsv, nexp);
     for (size_t i = 0; same_keys && i < nexp; i++) {
         if (strcmp(expect[i].key, sv[i].key) != 0) {
             fprintf(stderr, "  key order differs at %zu: expected %s, saved %s\n", i, expect[i].key, sv[i].key);
+            fprintf(stderr, "  (a new table row inserted mid-table rather than appended does this)\n");
             same_keys = false;
         }
     }
-    check(same_keys, "saved keys are the fixture's keys, in order, once each, unknown keys dropped");
+    for (size_t i = nexp; same_keys && i < nsv; i++) {
+        for (size_t j = 0; j < nfx; j++) {
+            if (strcmp(fx[j].key, sv[i].key) == 0) {
+                fprintf(stderr, "  key %s is in the fixture but was written after the new keys\n", sv[i].key);
+                same_keys = false;
+                break;
+            }
+        }
+    }
+    check(same_keys, "the fixture's keys are written first, in order, once each, unknown keys dropped, new keys appended");
     bool no_dups = true;
     for (size_t i = 0; i < nsv && no_dups; i++)
         for (size_t j = i + 1; j < nsv; j++)

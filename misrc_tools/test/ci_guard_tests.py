@@ -1135,6 +1135,251 @@ def check_preview_tap_mux_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_cc_record_argv_runtime(repo_root: Path) -> int:
+    """The closed-caption ffmpeg command line, asserted token by token, because
+    every way of getting it wrong is silent. The VBI node is EXCLUSIVE, so a
+    second -i would mean a second open and an EBUSY that costs the capture its
+    captions. -raw_timestamps would unrebase the sidecar from t=0 so it no
+    longer lines up with the recording -- and it is exactly what someone
+    reaches for when trying to 'fix' the constant one-frame offset. A missing
+    -y makes ffmpeg block on its own overwrite question with a record session
+    open behind it. An input option that drifted after -i silently becomes an
+    output option.
+
+    Compiling gui_cc_record.c standalone -- no raylib, no other project source
+    -- is itself part of the contract: that module has no project includes, and
+    a guard that had to spawn ffmpeg to inspect a command line could not run in
+    CI."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: closed-caption argv guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the closed-caption argv guard")
+        print("SKIP: closed-caption argv guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_cc_record_argv_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    module_include = repo_root / "misrc_tools/misrc_gui/output"
+
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"Closed-caption argv guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_cc_argv_guard_") as temp_root:
+        exe_path = Path(temp_root) / "cc_argv_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{module_include}",
+            str(harness_path),
+            str(module_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(
+                "Closed-caption argv harness failed to compile -- if this names a "
+                "missing project header, gui_cc_record.c has grown an include it "
+                f"must not have:\n{built.stderr.strip()}"
+            )
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Closed-caption argv harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
+def check_cc_record_is_subprocess_only(repo_root: Path) -> int:
+    """The caption recorder feeds ffmpeg nothing -- ffmpeg opens the exclusive
+    VBI node itself -- so it has no ring, no thread, no preview tap and no
+    buffer-manager hook. That is the whole reason captions cannot stall the
+    capture thread or the RF writers, and it is a property that would be lost
+    quietly: someone adding a drain thread or a tap 'for symmetry' with
+    gui_video_record.c would reintroduce exactly the coupling this design
+    avoids.
+
+    Also asserts the module includes nothing from the rest of the project. That
+    is what lets the argv guard compile it standalone, and it is the invariant
+    that rots first -- one convenience include and the guard stops building."""
+    rel = "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    code = strip_c_comments(read_text(repo_root / rel))
+    for banned, why in (
+        ("pthread_create", "a thread"),
+        ("preview_tap_t", "a preview tap"),
+        ("gui_preview_mux_add", "a preview tap"),
+        ("gui_preview_hold_acquire", "a preview hold"),
+        ("bufmgr_", "a buffer-manager hook"),
+        ("BUF_RECORD", "a record ringbuffer"),
+        ("socketpair", "a socket transport"),
+        ("eventfd", "an eventfd"),
+    ):
+        if banned in code:
+            return fail(
+                f"gui_cc_record.c references {banned}: it has grown {why}. The caption "
+                "child opens its own device; nothing is fed to it, and nothing in this "
+                "module may be able to block the capture path."
+            )
+    includes = re.findall(r'#include\s+"([^"]+)"', code)
+    stray = [i for i in includes if i != "gui_cc_record.h"]
+    if stray:
+        return fail(
+            f"gui_cc_record.c includes {stray} from the project. It must include only its "
+            "own header, or the standalone argv guard can no longer compile it."
+        )
+    return 0
+
+
+def check_cc_record_probes_never_assumes(repo_root: Path) -> int:
+    """v4l2vbi is not a stock ffmpeg input device. A rebuild without it makes
+    the device vanish with no other symptom, so its presence is probed and
+    never assumed -- and specifically NOT probed with `ffmpeg -h demuxer=...`,
+    which exits 0 even for a format that does not exist and would therefore arm
+    the toggle on every host where the device is absent.
+
+    The UI render window and the record preflight must both consult the probe:
+    the first so the toggle cannot be armed into a state that would refuse a
+    recording, the second so a stale OK cannot start one."""
+    rel = "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    code = strip_c_comments(read_text(repo_root / rel))
+    if "-devices" not in code:
+        return fail("gui_cc_record.c never interrogates ffmpeg -devices")
+    if '" v4l2vbi "' not in code:
+        return fail(
+            'gui_cc_record.c must match " v4l2vbi " with its surrounding spaces, or a '
+            "future v4l2vbi_something would satisfy the probe"
+        )
+    if "-h demuxer=" in code:
+        return fail(
+            "gui_cc_record.c probes with `-h demuxer=`, which exits 0 for formats that do "
+            "not exist; use -devices"
+        )
+    if "install.sh" in code:
+        return fail(
+            "gui_cc_record.c references install.sh, a path that exists on no other "
+            "machine; this module is upstream-bound and must probe ffmpeg directly"
+        )
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    if "gui_cc_record_probe()" not in ui:
+        return fail("gui_ui.c never calls gui_cc_record_probe(); the toggle cannot grey out")
+    rec = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
+    if "gui_cc_record_probe()" not in rec:
+        return fail("gui_record.c never probes before starting captions")
+    return 0
+
+
+def check_cc_preflight_refuses_before_files(repo_root: Path) -> int:
+    """Both optional output streams are preflighted before the session is
+    allocated, so a refusal leaves nothing to unwind -- no file open, no writer
+    thread, no session log, no child. Moving either check after the session
+    exists would mean adding teardown to every failure path below it, and the
+    cost of getting that wrong is a half-started recording."""
+    code = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
+    start = code.find("gui_record_start_confirmed")
+    if start < 0:
+        return fail("gui_record_start_confirmed not found")
+    body = code[start:]
+    alloc = body.find("calloc(1, sizeof(*ses))")
+    if alloc < 0:
+        return fail("the session allocation was not found in gui_record_start_confirmed")
+    for field, what in (
+        ("settings.cc_record_enabled", "closed captions"),
+        ("settings.video_record_enabled", "reference video"),
+    ):
+        at = body.find(field)
+        if at < 0:
+            return fail(f"gui_record_start_confirmed never preflights {what}")
+        if at > alloc:
+            return fail(
+                f"the {what} preflight runs AFTER the session is allocated, so a refusal "
+                "would have to unwind an open file and a live writer thread"
+            )
+    return 0
+
+
+def check_cc_sidecar_in_overwrite_set(repo_root: Path) -> int:
+    """Every output the recorder will write must be in the overwrite prompt's
+    stat() set and named in its message. An output missing from it is an output
+    silently clobbered -- which happened to the reference video once already,
+    and the prompt still said 'the following files will be overwritten' while
+    listing only the RF channels."""
+    code = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
+    start = code.find("int gui_record_start(gui_app_t *app)")
+    if start < 0:
+        return fail("gui_record_start not found")
+    body = code[start:start + 12000]
+    if "settings.cc_filename" not in body:
+        return fail("gui_record_start never builds the caption path for the overwrite check")
+    if "file_cc_exists" not in body:
+        return fail("gui_record_start never stat()s the caption sidecar")
+    if "path_cc, s_finalizing->path_cc" not in body.replace("\n", " ").replace("  ", " "):
+        if "s_finalizing->path_cc" not in body:
+            return fail(
+                "a finalizing session's caption path is not checked, so a new recording "
+                "could reuse a file the previous one is still writing"
+            )
+    if "CAPTIONS:" not in body:
+        return fail("the overwrite prompt does not name the caption sidecar it would replace")
+    if "VIDEO:" not in body:
+        return fail("the overwrite prompt does not name the reference video it would replace")
+    return 0
+
+
+def check_cc_settings_have_defaults_and_rows(repo_root: Path) -> int:
+    """A settings field with a default and no table row, or a row and no
+    default, is silent: it appears to work until the file is reloaded and is
+    then quietly the default again. The generic coverage guard catches a
+    missing row; this names the caption fields so a half-added setting cannot
+    hide behind a passing suite."""
+    header = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.h")
+    table = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
+    for field, key in (
+        ("cc_record_enabled", "cc_record_enabled"),
+        ("cc_filename", "cc_filename"),
+        ("cc_output_tag", "cc_output_tag"),
+        ("cc_vbi_device", "cc_vbi_device"),
+    ):
+        if field not in header:
+            return fail(f"gui_settings.h has no {field}")
+        if f'"{key}"' not in table:
+            return fail(f"gui_settings_table.c has no row for {key}")
+        if f"settings->{field}" not in table:
+            return fail(f"gui_settings_init_defaults never sets {field}")
+    # Both auto-namers derive the caption name, and each has a tagged and an
+    # untagged branch. Requiring merely "an .scc appears somewhere" would let one
+    # branch drift to another extension unnoticed -- so check EVERY occurrence,
+    # and that both branches are present in both files. The muxer writes
+    # Scenarist SCC; a name with any other extension is a lie about the content.
+    rec = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
+    for rel, text, fn in (
+        ("gui_settings_table.c", table, "gui_settings_refresh_auto_names"),
+        ("gui_record.c", rec, "gui_record_apply_auto_names"),
+    ):
+        exts = re.findall(r"_captions\.(\w+)", text)
+        if len(exts) < 2:
+            return fail(
+                f"{rel}: {fn} has {len(exts)} caption-name branch(es), expected 2 "
+                "(tagged and untagged)"
+            )
+        wrong = sorted({e for e in exts if e != "scc"})
+        if wrong:
+            return fail(
+                f"{rel}: {fn} derives a caption filename ending in {wrong}, but the "
+                "muxer writes Scenarist SCC"
+            )
+    return 0
+
+
 def check_mediamtx_config_runtime(repo_root: Path) -> int:
     """The generated mediamtx.yml carries the design's hard requirement: this
     instance must not disturb capture-node's three on the same host. Two ways to
@@ -1660,6 +1905,7 @@ def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
     for rel, define in (
         ("misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c", "RS_CHILD_NICE"),
         ("misrc_tools/misrc_gui/streaming/gui_mediamtx.c", "MTX_CHILD_NICE"),
+        ("misrc_tools/misrc_gui/output/gui_cc_record.c", "CC_CHILD_NICE"),
     ):
         code = strip_c_comments(read_text(repo_root / rel))
         m = re.search(rf"#define\s+{define}\s+(\d+)", code)
@@ -3381,6 +3627,11 @@ def main() -> int:
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
         ("net controls publish the effective mode", lambda: check_net_controls_publish_effective_mode(repo_root)),
+        ("caption recorder is a subprocess and nothing else", lambda: check_cc_record_is_subprocess_only(repo_root)),
+        ("v4l2vbi is probed, never assumed", lambda: check_cc_record_probes_never_assumes(repo_root)),
+        ("optional-output preflights refuse before any file is opened", lambda: check_cc_preflight_refuses_before_files(repo_root)),
+        ("caption sidecar is in the overwrite set", lambda: check_cc_sidecar_in_overwrite_set(repo_root)),
+        ("caption settings have defaults and table rows", lambda: check_cc_settings_have_defaults_and_rows(repo_root)),
         ("every settings field is in the table", lambda: check_settings_table_covers_struct(repo_root)),
         ("net settings protocol contract", lambda: check_net_settings_protocol(repo_root)),
         ("record button follows the effective recording state", lambda: check_record_parity(repo_root)),
@@ -3410,6 +3661,7 @@ def main() -> int:
         checks.insert(11, ("preview tap mux runtime", lambda: check_preview_tap_mux_runtime(repo_root)))
         checks.insert(12, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(13, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
+        checks.insert(14, ("closed-caption argv contract", lambda: check_cc_record_argv_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
