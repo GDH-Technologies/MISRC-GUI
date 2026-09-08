@@ -939,12 +939,25 @@ static int cc_live_selftest(void)
     char scc[300], srt[300], cmd[1400];
     snprintf(scc, sizeof(scc), "%s/probe.scc", tmpl);
     snprintf(srt, sizeof(srt), "%s/probe.srt", tmpl);
-    /* The wall-clock bound is not belt-and-braces: ffmpeg's -t counts STREAM
-     * time, and this device advances stream time only as VBI buffers arrive.
-     * With no signal on the input -- a stopped tape, an unplugged dongle --
-     * none arrive, -t never fires and ffmpeg blocks indefinitely. Measured:
-     * a `-t 3` run sat for over two minutes until signal returned, then
-     * exited after its three seconds. So the diagnostic bounds itself. */
+    /* The wall-clock bound is load-bearing, not belt-and-braces: with TWO
+     * outputs from this one subtitle stream, -t does not terminate ffmpeg at
+     * all. Measured, with signal present and data reaching both files
+     * throughout:
+     *
+     *   two outputs, -t after -i (output option)   -> ran to a 30s hard limit
+     *   two outputs, -t before -i (input option)   -> ran to a 30s hard limit
+     *   single .scc output, -t after -i            -> exited cleanly at 3.2s
+     *   single .srt output, -t after -i            -> exited cleanly at 4.4s
+     *
+     * So it is the second output that defeats -t, not its position and not a
+     * stalled input. The dual output is the whole point of this diagnostic --
+     * cues in the SRT beside a header-only SCC is the one signature that
+     * separates "this tape has no captions" from "this ffmpeg cannot write
+     * SCC" -- and sampling the two sequentially would compare different
+     * moments of tape. So the pairing stays and the timeout is what ends it.
+     *
+     * -t is kept as a secondary bound in case that behaviour ever changes.
+     * The RECORD path is unaffected: one output, and no -t at all. */
     snprintf(cmd, sizeof(cmd),
              "timeout -k 2 %d \"%s\" -hide_banner -nostdin -nostats -loglevel error -y "
              "-f v4l2vbi -fill_nulls 1 -i %s -t 3 "
@@ -952,8 +965,10 @@ static int cc_live_selftest(void)
              "-map 0:s:0 -c:s srt  -f srt -flush_packets 1 %s 2>&1",
              CC_LIVE_WALL_LIMIT_S, cc.ffmpeg, dev, scc, srt);
 
-    printf("live: capturing 3s from %s (wall-clock limit %ds) ...\n",
-           dev, CC_LIVE_WALL_LIMIT_S);
+    /* Says "up to": with two outputs the -t never fires, so this runs the full
+     * wall-clock limit every time. Promising 3s would be a lie the operator
+     * would sit through. */
+    printf("live: capturing from %s (up to %ds) ...\n", dev, CC_LIVE_WALL_LIMIT_S);
     FILE *fp = popen(cmd, "r");
     if (fp) {
         char line[256];
