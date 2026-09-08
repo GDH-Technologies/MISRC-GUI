@@ -104,6 +104,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      ci_only: ${{ steps.classify.outputs.ci_only }}
     steps:
       - name: Classify the change
         id: classify
@@ -120,6 +121,7 @@ jobs:
           set -euo pipefail
           run_everything() {
             echo "code=true" >> "${GITHUB_OUTPUT}"
+            echo "ci_only=false" >> "${GITHUB_OUTPUT}"
             echo "$1"
             exit 0
           }
@@ -172,6 +174,35 @@ jobs:
             echo "code=false" >> "${GITHUB_OUTPUT}"
             echo "Setup-only change; no tag bump, no build, no install."
           fi
+          # THIRD tier, between "skip everything" and "build on four machines": a change
+          # whose non-setup-only files are ALL under .github/ produces a BIT-IDENTICAL
+          # binary -- there is nothing new to install, and no tag worth minting -- but it
+          # can still break this workflow, which is the deploy. So it runs the static
+          # guard suite (misrc_tools/test/ci_guard_tests.py --static-only), whose whole
+          # purpose is substring-matching this file, instead of the build matrix.
+          #
+          # .claude/ needs no arm here: it is already inside the setup-only set above,
+          # unlike the toolkit and capture-node where hooks are linted and tested.
+          #
+          # The tradeoff, stated plainly: the static guards cannot prove the workflow
+          # still EXECUTES, only that its load-bearing strings survived. A workflow edit
+          # that breaks a build step merges green and is caught by the next code change
+          # rather than by its own PR. That is a deferral, not a blind spot -- and the
+          # binary is unchanged either way, so nothing ships broken in the meantime.
+          #
+          # Fail-closed like every other arm: run_everything forces ci_only=false, and a
+          # single file outside .github/ restores the full build.
+          if [ -n "${non_docs}" ]; then
+            outside="$(printf '%s' "${non_docs}" | grep -vE '^\.github/' || true)"
+            if [ -z "${outside}" ]; then
+              echo "ci_only=true" >> "${GITHUB_OUTPUT}"
+              echo "CI-only change (.github/); running the static guards, not the build."
+            else
+              echo "ci_only=false" >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            echo "ci_only=false" >> "${GITHUB_OUTPUT}"
+          fi
 
   # --------------------------------------------------------------------------------
   # Bump the GDH release tag, so a merge to main produces a real version instead of
@@ -200,9 +231,11 @@ jobs:
     name: Bump GDH release tag
     needs: [changes]
     # A setup-only merge mints no tag: the version string exists to identify a binary,
-    # and no new binary is produced. The next real merge bumps from the same base.
+    # and no new binary is produced. The next real merge bumps from the same base. A
+    # CI-only merge (.github/ alone) is the same case for the same reason.
     if: >-
       needs.changes.outputs.code == 'true' &&
+      needs.changes.outputs.ci_only != 'true' &&
       github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64, wm]
     steps:
@@ -260,6 +293,30 @@ jobs:
           git push origin "$next"
           echo "tagged $next"
 
+  # The CI-only tier's whole check. ci_guard_tests.py --static-only is a raw substring
+  # matcher over selfhosted-deploy.yml, meson.build, the build scripts and git-version.sh
+  # -- exactly the files this tier covers -- so it is the one suite a .github/-only change
+  # can actually invalidate. Runs on wm only: the guards read the tree, not a binary, so
+  # there is nothing for a second machine to add. Same suite the guards-on-edit hook runs
+  # locally, and the same one the build matrix runs post-build with a --gui-path.
+  guards:
+    name: Static guards (CI-only change)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.ci_only == 'true'
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Static guard suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 misrc_tools/test/ci_guard_tests.py --static-only
+
   build-and-deploy:
     name: Build, test and install (${{ matrix.runner.name }})
     needs: [changes, bump-tag]
@@ -270,8 +327,13 @@ jobs:
     # The `changes` gate is a separate clause, not folded into the bump-tag one: bump-tag
     # is skipped on a PR for a reason unrelated to path classification, so reading its
     # result cannot tell a setup-only change from a PR event.
+    #
+    # ci_only is its own clause for the same reason: a .github/-only change produces a
+    # bit-identical binary, so the four-machine build and install would reinstall what is
+    # already there. The `guards` job below covers that change instead.
     if: >-
       !cancelled() && needs.changes.outputs.code == 'true' &&
+      needs.changes.outputs.ci_only != 'true' &&
       (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
     # runners. wm and win0 build every event; cs0 and air0 join only for the refs that
