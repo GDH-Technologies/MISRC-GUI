@@ -108,9 +108,10 @@ typedef struct {
 static ddd_v1_fifo_store_t s_fifo_store;
 static ddd_fifo_telemetry_totals_t s_fifo_totals;
 
-_Static_assert(GUI_DDD_ASYNC_TRANSFER_BYTES ==
-                   (size_t)DDD_SEQUENCE_SAMPLES_PER_MARKER * sizeof(uint16_t),
-               "DDD 3.1 transfer must contain one sequence-marker block");
+/* Firmware 3.2 marker boundaries move through USB transfers. The validator
+ * carries their position across callbacks; only USB packets must align. */
+_Static_assert(GUI_DDD_ASYNC_TRANSFER_BYTES % DDD_STREAM_MAX_PACKET_SIZE == 0,
+               "DdD transfers must contain whole USB packets");
 _Static_assert(DDD_V1_STARTUP_DISCARD_BYTES %
                    GUI_DDD_ASYNC_TRANSFER_BYTES == 0,
                "DDD 3.1 startup discard must contain whole transfers");

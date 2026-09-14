@@ -77,7 +77,11 @@ extern "C" {
 #define DDD_STREAM_MAX_PACKET_SIZE       UINT16_C(1024)
 
 #define DDD_SEQUENCE_MARKER_COUNT        UINT8_C(63)
-#define DDD_SEQUENCE_SAMPLES_PER_MARKER  UINT32_C(65536)
+/* Firmware 3.2 uses an odd block length to expose packet-aligned loss.
+ * Learn either shipped length from the first complete marker, then lock it. */
+#define DDD_SEQUENCE_SAMPLES_PER_MARKER   UINT32_C(65535)
+#define DDD_SEQUENCE_LEGACY_SAMPLES_PER_MARKER UINT32_C(65536)
+#define DDD_SEQUENCE_MAX_SAMPLES_PER_MARKER DDD_SEQUENCE_LEGACY_SAMPLES_PER_MARKER
 #define DDD_TEST_RAMP_NEW_WRAP           UINT16_C(1021)
 #define DDD_TEST_RAMP_LEGACY_WRAP        UINT16_C(1024)
 #define DDD_STABLE_ID_MAX                128u
@@ -298,6 +302,7 @@ typedef struct ddd_sequence_validator {
     bool marker_seen;
     uint8_t marker;
     uint32_t samples_in_marker;
+    uint32_t samples_per_marker; /* 0 until the first complete marker ends. */
     uint64_t samples_seen;
     uint64_t error_sample_index;
     uint8_t expected_marker;

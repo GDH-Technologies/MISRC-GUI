@@ -664,10 +664,13 @@ ddd_validation_result_t ddd_sequence_validator_feed(
     const uint16_t *sample_words,
     size_t sample_count)
 {
+    uint32_t marker_limit;
     if (!state || (sample_count != 0 && !sample_words)) {
         return DDD_VALIDATION_INVALID_ARGUMENT;
     }
     if (state->phase == DDD_SEQUENCE_FAILED) return DDD_VALIDATION_MISMATCH;
+    marker_limit = state->samples_per_marker != 0
+        ? state->samples_per_marker : DDD_SEQUENCE_MAX_SAMPLES_PER_MARKER;
     for (size_t i = 0; i < sample_count; ++i) {
         uint8_t actual = (uint8_t)((sample_words[i] >> 10) & 0x3Fu);
         if (actual >= DDD_SEQUENCE_MARKER_COUNT) {
@@ -682,7 +685,7 @@ ddd_validation_result_t ddd_sequence_validator_feed(
         }
         if (state->phase == DDD_SEQUENCE_SYNCHRONIZING) {
             if (actual == state->marker) {
-                if (state->samples_in_marker == DDD_SEQUENCE_SAMPLES_PER_MARKER) {
+                if (state->samples_in_marker == marker_limit) {
                     return ddd_sequence_fail(
                         state, ddd_next_sequence_marker(state->marker), actual);
                 }
@@ -700,18 +703,30 @@ ddd_validation_result_t ddd_sequence_validator_feed(
             continue;
         }
         if (actual == state->marker) {
-            if (state->samples_in_marker == DDD_SEQUENCE_SAMPLES_PER_MARKER) {
+            if (state->samples_in_marker == marker_limit) {
                 return ddd_sequence_fail(
                     state, ddd_next_sequence_marker(state->marker), actual);
             }
             ++state->samples_in_marker;
         } else {
-            if (state->samples_in_marker != DDD_SEQUENCE_SAMPLES_PER_MARKER) {
+            bool length_matches = state->samples_per_marker != 0
+                ? state->samples_in_marker == state->samples_per_marker
+                : (state->samples_in_marker == DDD_SEQUENCE_SAMPLES_PER_MARKER ||
+                   state->samples_in_marker == DDD_SEQUENCE_LEGACY_SAMPLES_PER_MARKER);
+            if (!length_matches) {
                 return ddd_sequence_fail(state, state->marker, actual);
             }
             uint8_t expected = ddd_next_sequence_marker(state->marker);
             if (actual != expected) {
                 return ddd_sequence_fail(state, expected, actual);
+            }
+            /* The initial partial marker cannot identify the wire length.
+             * Only a complete run followed by the correct next marker can.
+             * Once learned, never reinterpret a later short/long run as a
+             * firmware change: it is missing or duplicated capture data. */
+            if (state->samples_per_marker == 0) {
+                state->samples_per_marker = state->samples_in_marker;
+                marker_limit = state->samples_per_marker;
             }
             state->marker = actual;
             state->samples_in_marker = 1;
