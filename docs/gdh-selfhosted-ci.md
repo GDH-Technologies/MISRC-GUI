@@ -381,8 +381,14 @@ sudoers lines: `scripts/gdh-host/README.md`):
 
 | Host | The GUI | CI runner | Also |
 |---|---|---|---|
-| wm | user@ drop-in: `LimitRTPRIO=99`, `LimitNICE=-20` | `LimitRTPRIO=5`, `LimitNICE=25` | — |
+| wm | user@ drop-in: `LimitRTPRIO=99`, `LimitNICE=-20` | `LimitRTPRIO=5`, `LimitNICE=25`, plus `OOMPolicy=continue` and `Restart=on-failure` | — |
 | cs0 | the same drop-in | the same | `misrc-server.service` runs `--net-serve` with the GUI's limits and CPU/IO weight 10000; the deploy restarts it onto a new binary only when `/settings` reports `"state": 0` |
+
+A runner that the kernel's OOM killer touches used to disappear: on 2026-09-15 a global OOM on
+wm killed one small process inside the runner's unit, systemd's default `OOMPolicy=stop` stopped
+the whole unit, `Restart=no` left it stopped, and every fork PR's CI queued at "Setup-only or
+code?", which only runs on wm. `OOMPolicy=continue` keeps the runner listening through a child's
+kill; `Restart=on-failure` covers the listener itself dying.
 
 The runner gets exactly what the priority guards lower themselves to, so they run in CI
 instead of reporting SKIP, and no more. Before this, capture-node's `capture-limits.conf`

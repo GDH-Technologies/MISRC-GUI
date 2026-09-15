@@ -78,9 +78,19 @@ runner_limits() {
 # more, so a PR's code cannot take SCHED_FIFO 99 on this host, where RT
 # throttling is off. LimitNICE=25 is the raw rlimit: nice down to -5.
 # Applies when the runner next starts; never restart it from a job.
+#
+# OOMPolicy/Restart: on 2026-09-15 a global OOM on wm killed one small process
+# inside the runner's unit; systemd's default OOMPolicy=stop then stopped the
+# whole runner, Restart=no left it stopped, and every fork PR's CI queued at the
+# first job, which only runs on wm. Measured with transient units on wm:
+# OOMPolicy=continue keeps the unit running through a child's kill, and
+# Restart=on-failure brings it back if the listener itself dies.
 [Service]
 LimitRTPRIO=5
 LimitNICE=25
+OOMPolicy=continue
+Restart=on-failure
+RestartSec=30
 EOF
 }
 

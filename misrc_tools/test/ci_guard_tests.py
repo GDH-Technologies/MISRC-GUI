@@ -2049,6 +2049,18 @@ def check_gdh_host_installer(repo_root: Path) -> int:
             if got.get("LimitRTPRIO") != "5" or got.get("LimitNICE") != "25":
                 return fail(f"install.sh {host}: {key} must set LimitRTPRIO=5 and "
                             f"LimitNICE=25, got {got}")
+            # 2026-09-15: a global OOM killed one small process inside the wm runner's
+            # unit; systemd's default OOMPolicy=stop then took the whole runner down
+            # and Restart=no left it there, so every fork PR's CI queued. Measured:
+            # OOMPolicy=continue keeps the unit running through a child's kill, and
+            # Restart=on-failure brings it back when the listener itself dies.
+            if got.get("OOMPolicy") != "continue":
+                return fail(f"install.sh {host}: {key} must set OOMPolicy=continue so a "
+                            f"child's OOM kill does not stop the runner, got {got.get('OOMPolicy')}")
+            if got.get("Restart") != "on-failure" or not got.get("RestartSec", "").rstrip("s").isdigit():
+                return fail(f"install.sh {host}: {key} must set Restart=on-failure with a "
+                            f"RestartSec, got Restart={got.get('Restart')} "
+                            f"RestartSec={got.get('RestartSec')}")
     if unit in wm:
         return fail("install.sh wm installs misrc-server.service; the unit is cs0's only")
     if unit not in cs0:

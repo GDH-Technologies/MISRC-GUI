@@ -6,7 +6,7 @@ needs, and gives cs0 a supervised headless capture server. It never goes upstrea
 | File it installs (under `/etc/systemd/system`) | Hosts | What it does |
 |---|---|---|
 | `user@.service.d/misrc-limits.conf` | wm, cs0 | `LimitRTPRIO=99`, `LimitNICE=-20` for every user manager: a GUI started from a desktop session or a user service can take SCHED_FIFO 99 and nice -20 (`common/threading.h` takes whatever the limits allow). Sorts after capture-node's `capture-limits.conf`, so it wins. |
-| `<actions.runner.*>.service.d/misrc-guard-limits.conf` | wm, cs0 | `LimitRTPRIO=5`, `LimitNICE=25` for each Actions runner: exactly what the priority guards lower themselves to, so they run in CI instead of reporting SKIP, and no more — a PR's code cannot take FIFO 99 on a host where RT throttling is off. |
+| `<actions.runner.*>.service.d/misrc-guard-limits.conf` | wm, cs0 | `LimitRTPRIO=5`, `LimitNICE=25` for each Actions runner: exactly what the priority guards lower themselves to, so they run in CI instead of reporting SKIP, and no more — a PR's code cannot take FIFO 99 on a host where RT throttling is off. Also `OOMPolicy=continue` and `Restart=on-failure`: on 2026-09-15 a global OOM killed one small process inside wm's runner unit, systemd's default `OOMPolicy=stop` took the whole runner down, and `Restart=no` left it down until someone noticed the queued jobs. |
 | `misrc-server.service` | cs0 | `misrc_gui --config ~/.config/misrc/server.json --net-serve` as the capture user, with the GUI's limits, `CPUWeight`/`IOWeight` 10000, `Restart=on-failure`, `TimeoutStopSec=900` (a legacy FLAC finalize on stop takes minutes). Skipped cleanly while `server.json` is missing. |
 
 `./install.sh --print wm|cs0` prints all of it without root; the "GDH host installer" guard
