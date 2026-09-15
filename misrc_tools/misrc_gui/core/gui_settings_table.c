@@ -221,6 +221,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->net_client_port = 8080;
     snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
              (unsigned)settings->net_client_port);
+    settings->net_client_record_local = false;  // a client's Record drives the server's
 }
 
 /* ============================================================================
@@ -963,6 +964,9 @@ static const gui_setting_desc_t s_table[] = {
     GS_IH ("waveform_scale_mode",              waveform_scale_mode,         GS_LOCAL, hook_waveform_scale_mode),
     GS_FH ("level_autostop_vpp",               level_autostop_vpp,          3, 0, hook_vpp),
     GS_FH ("level_autostop_vpp_hsdaoh",        level_autostop_vpp_hsdaoh,   3, 0, hook_vpp),
+    /* Where a net client records (server or this machine): it describes this
+     * machine, so a client keeps its own and never sends it. */
+    GS_B  ("net_client_record_local",          net_client_record_local,     GS_LOCAL),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

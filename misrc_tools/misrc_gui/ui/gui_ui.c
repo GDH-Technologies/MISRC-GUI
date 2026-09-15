@@ -2025,8 +2025,9 @@ static void update_status_free_space(gui_app_t *app)
     s_status_free_space_last_update_s = now;
 
     uint64_t free_bytes = 0;
-    if (gui_net_is_client(app)) {
-        /* The bar describes the server's output folder on a client. */
+    if (gui_net_is_client(app) && !app->is_recording) {
+        /* The bar describes the server's output folder on a client, unless
+         * the client is recording the server's feed onto its own disk. */
         free_bytes = gui_net_client_peer_disk_free(app);
         s_status_free_space_cached_bytes = free_bytes;
         s_status_free_space_valid = (free_bytes > 0);
@@ -2419,9 +2420,12 @@ static bool gui_ui_settings_locked(const gui_app_t *app)
 {
     if (!app) return false;
     /* A client edits the server's settings: locked while the server records
-     * (the server would refuse anyway) and until its settings have arrived. */
+     * (the server would refuse anyway), while this machine records the
+     * server's feed locally (a capture-side change would alter the stream
+     * mid-file), and until the server's settings have arrived. */
     if (gui_net_is_client(app)) {
-        return gui_net_client_peer_recording(app) || !gui_net_client_peer_settings_valid(app);
+        return app->is_recording || gui_net_client_peer_recording(app) ||
+               !gui_net_client_peer_settings_valid(app);
     }
     return app->is_recording;
 }
@@ -5635,6 +5639,33 @@ static void render_version_info_window(gui_app_t *app)
                 CLAY_TEXT(CLAY_STRING("toggle client connection"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
+            // Where Record records while connected: on the server (default) or
+            // on this machine, from the RF and audio the server streams.
+            CLAY(CLAY_ID("VersionInfoNetClientRecordRow"), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+            }) {
+                CLAY(CLAY_ID("VersionInfoNetClientRecordLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
+                    CLAY_TEXT(CLAY_STRING("Record on:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                bool record_local = app->settings.net_client_record_local;
+                bool record_locked = gui_app_effective_recording(app);
+                CLAY(CLAY_ID("VersionInfoNetClientRecordButton"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(record_locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(record_local ? "This machine" : "Server"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(record_locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+                }
+                CLAY_TEXT(make_string(record_local
+                        ? "this machine's output folder, from the network feed: gaps possible"
+                        : "Record drives the server's recording"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(record_local ? COLOR_METER_YELLOW : COLOR_TEXT_DIM) }));
+            }
         }
 
         // Network status line.
@@ -8096,13 +8127,22 @@ static bool render_main_panels(gui_app_t *app) {
      * anything this client has said. The capture/record path stays the only
      * writer of the bar on either machine; this is its reader picking the
      * machine. The client's own ingest health keeps the buffer readouts. */
-    bool status_is_client = gui_net_is_client(app);
+    /* The exception is a client recording the server's feed on this machine
+     * (net_client_record_local): the bar then describes THIS machine's
+     * recording and carries a standing warning that the file is only as
+     * complete as the network feed. */
+    bool status_local_client_rec = gui_net_is_client(app) && app->is_recording;
+    bool status_is_client = gui_net_is_client(app) && !status_local_client_rec;
     bool status_recording = gui_app_effective_recording(app);
     static char status_peer_message[300];
     const char *status_source_message = app->status_message;
     if (status_is_client && app->net_peer_status[0] &&
         app->net_peer_status_time > app->status_message_time) {
         snprintf(status_peer_message, sizeof(status_peer_message), "server: %s", app->net_peer_status);
+        status_source_message = status_peer_message;
+    } else if (status_local_client_rec) {
+        snprintf(status_peer_message, sizeof(status_peer_message),
+                 "Recording here from the network feed (gaps possible): %s", app->status_message);
         status_source_message = status_peer_message;
     }
     gui_ui_status_layout_mode_t status_layout =
@@ -10201,6 +10241,23 @@ void gui_handle_interactions(gui_app_t *app) {
                         return;
                     }
                 }
+            }
+            // Record-on toggle (server / this machine). Refused while anything
+            // is recording, so a running recording never changes machine.
+            if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientRecordButton")) &&
+                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                gui_ui_clear_text_edit();
+                if (gui_app_effective_recording(app)) {
+                    gui_app_set_status(app, "Stop recording before changing where the client records");
+                } else {
+                    app->settings.net_client_record_local = !app->settings.net_client_record_local;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.net_client_record_local
+                        ? "Client records on this machine, from the network feed (gaps possible)"
+                        : "Client records on the server");
+                }
+                gui_ui_set_click_consumed();
+                return;
             }
             // Connect/Disconnect button: toggles the client worker while
             // staying in Client mode (discovery remains active when disconnected).

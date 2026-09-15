@@ -1103,7 +1103,8 @@ int main(int argc, char **argv) {
 
             // On a net client both keys act on the SERVER's state: its own
             // is_capturing only means the ingest is up, and its is_recording
-            // is never set (see gui_app_effective_recording).
+            // is set only by a local recording of the server's feed
+            // (net_client_record_local; see gui_app_effective_recording).
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 if (gui_app_control_capturing(&app)) {
                     // Refuse to disconnect via space-bar while recording:
@@ -1402,11 +1403,16 @@ int main(int argc, char **argv) {
 
         EndDrawing();
         gui_net_client_view_end(&app);
+        /* A net client's local record start/stop, queued by the UI pass, runs
+         * here: outside the view app->settings is this machine's own, so the
+         * files are named from its own output settings. */
+        gui_app_service_local_record_request(&app);
     }
 
     // Cleanup
     if (app.is_recording) {
         gui_app_stop_recording(&app);
+        gui_app_service_local_record_request(&app);  /* a client's local stop is queued */
     }
     if (app.is_capturing) {
         gui_app_stop_capture(&app);

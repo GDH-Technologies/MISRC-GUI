@@ -2654,8 +2654,27 @@ void gui_app_stop_capture(gui_app_t *app) {
 // Note: Audio buffer now accessed via app->buffers (buffer_manager)
 // Use BUF_CAPTURE_AUDIO with bufmgr_read_begin/bufmgr_read_end
 
+// A net client records in one of two places, chosen by the client-local
+// net_client_record_local: on the server (the default: Record drives the
+// server's recording) or on this machine, from the RF and audio the server
+// streams. The local file is only as complete as the network feed: /rf drops
+// the oldest data when the link cannot keep up. A local recording that is
+// already running stays in charge until it stops, whatever the setting says.
+static bool gui_app_client_records_here(const gui_app_t *app) {
+    return gui_net_is_client(app) &&
+           (app->is_recording || app->settings.net_client_record_local);
+}
+
 // Recording wrappers - delegate to gui_record module
 int gui_app_start_recording(gui_app_t *app) {
+    if (gui_app_client_records_here(app)) {
+        // Queued: during the UI pass app->settings is the SERVER's copy, and
+        // gui_record_start() must name files from this machine's own output
+        // settings. gui_app_service_local_record_request() runs it after
+        // gui_net_client_view_end().
+        app->net_local_record_request = 1;
+        return 0;
+    }
     // Client mode: forward record-on to the server (master controls recording).
     if (gui_net_is_client(app)) {
         gui_net_client_request_record(app, true);
@@ -2666,6 +2685,10 @@ int gui_app_start_recording(gui_app_t *app) {
 }
 
 void gui_app_stop_recording(gui_app_t *app) {
+    if (gui_app_client_records_here(app)) {
+        app->net_local_record_request = -1;
+        return;
+    }
     // Client mode: forward record-off to the server.
     if (gui_net_is_client(app)) {
         gui_net_client_request_record(app, false);
@@ -2675,8 +2698,20 @@ void gui_app_stop_recording(gui_app_t *app) {
     gui_record_stop(app);
 }
 
+void gui_app_service_local_record_request(gui_app_t *app) {
+    if (!app) return;
+    int request = app->net_local_record_request;
+    app->net_local_record_request = 0;
+    if (request > 0 && !app->is_recording) {
+        (void)gui_record_start(app);
+    } else if (request < 0 && app->is_recording) {
+        gui_record_stop(app);
+    }
+}
+
 bool gui_app_effective_recording(const gui_app_t *app) {
     if (!app) return false;
+    if (gui_app_client_records_here(app)) return app->is_recording;
     if (gui_net_is_client(app)) return gui_net_client_peer_recording(app);
     return app->is_recording;
 }

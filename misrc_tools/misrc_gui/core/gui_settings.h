@@ -244,6 +244,11 @@ typedef struct {
     char net_client_host[128];                // Host to connect to when Client.
     char net_client_port_str[16];             // Editable string mirror of net_client_port.
     uint16_t net_client_port;                 // Port to connect to when Client.
+    // Where a Client's Record button records: false = on the server (default;
+    // it drives the server's recording), true = on this machine, from the RF
+    // and audio the server streams. /rf drops the oldest data when the link
+    // cannot keep up, so a local file can have gaps: monitoring grade.
+    bool net_client_record_local;
 } gui_settings_t;
 
 /* ----------------------------------------------------------------------------
