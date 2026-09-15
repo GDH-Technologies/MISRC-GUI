@@ -162,7 +162,7 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
         case GUI_DROPOUT_DISK_SPACE:
             return "Capture stopped: low disk space (dynamic guard)";
         case GUI_DROPOUT_LOW_SIGNAL:
-            return "Capture stopped: sustained low/no signal (tape end)";
+            return "Recording stopped: sustained low/no signal (tape end)";
         case GUI_DROPOUT_NONE:
         default:
             return "Capture stopped: dropout detected";
@@ -1106,7 +1106,18 @@ int main(int argc, char **argv) {
             // is never set (see gui_app_effective_recording).
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 if (gui_app_control_capturing(&app)) {
-                    gui_app_stop_capture(&app);
+                    // Refuse to disconnect via space-bar while recording:
+                    // tearing capture down mid-recording races the async record
+                    // finalize thread and can corrupt/truncate the capture file.
+                    // Force the user to stop recording first (mirrors the
+                    // Disconnect-button guard and the "settings locked while
+                    // recording" pattern). This protects a file on THIS
+                    // machine, so it reads the local is_recording.
+                    if (app.is_recording) {
+                        gui_app_set_status(&app, "Stop recording before disconnecting (protects the capture file)");
+                    } else {
+                        gui_app_stop_capture(&app);
+                    }
                 } else {
                     gui_app_start_capture(&app);
                 }
@@ -1147,25 +1158,39 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // Level autostop: stop capture when the RF signal level stays below a
-        // configurable percentage for a configurable duration (tape-end detection).
-        // This is independent from the digital dropout (frame error/missed frame)
-        // logic above, which is unchanged. Gated only by level_autostop_enabled.
+        // Level autostop: stop RECORDING (not capture) when the RF signal level
+        // stays below a configurable normalized level (0.1-0.8) for a
+        // configurable duration (tape-end detection). The device stays connected
+        // and streaming so the user can start a new recording without
+        // reconnecting — unlike the digital-dropout path above, which tears down
+        // capture because the stream itself is broken. Gated only by
+        // level_autostop_enabled.
+        //
+        // The threshold is a normalized 0.X magnitude applied to the larger of
+        // channel A's positive/negative peak. Peak atomics are NOT on a common
+        // scale across backends (12-bit/2048 container for most, 512 for DdD,
+        // 128 for 8-bit playback), so the comparison uses the device-aware peak
+        // full-scale from gui_app_level_autostop_full_scale(). This is the
+        // bit-depth offset correction: 0.4 means 0.4 of the active backend's
+        // full scale regardless of 12/10/8-bit depth.
         if (app.is_capturing && app.is_recording && app.settings.level_autostop_enabled) {
-            // Parse the configured level (percent) and sustain duration (seconds).
-            float level_pct = (float)atof(app.settings.level_autostop_level_str);
+            // Parse the configured level (normalized 0.1-0.8) and sustain duration (seconds).
+            float level = (float)atof(app.settings.level_autostop_level_str);
             float sustain_s = (float)atof(app.settings.level_autostop_duration_str);
-            if (level_pct < 1.0f)   level_pct = 1.0f;
-            if (level_pct > 99.0f)  level_pct = 99.0f;
-            if (sustain_s < 0.1f)   sustain_s = 0.1f;
+            if (level < 0.1f)      level = 0.1f;
+            if (level > 0.8f)      level = 0.8f;
+            if (sustain_s < 0.1f)  sustain_s = 0.1f;
 
-            // Peak is stored as 0-2047 unsigned. Use the larger of pos/neg on channel A.
+            // Peak is stored as unsigned magnitude (0..full_scale). Use the larger of pos/neg on channel A.
             uint16_t peak_pos = (uint16_t)atomic_load(&app.peak_a_pos);
             uint16_t peak_neg = (uint16_t)atomic_load(&app.peak_a_neg);
             uint16_t peak = (peak_pos > peak_neg) ? peak_pos : peak_neg;
 
-            // Threshold counts = level% of 2048 full scale.
-            uint16_t threshold = (uint16_t)((level_pct / 100.0f) * 2048.0f);
+            // Threshold counts = level * active backend's peak full scale.
+            // (e.g. 0.4 * 2048 = 819 for hsdaoh, 0.4 * 512 = 205 for DdD,
+            //  0.4 * 128 = 51 for 8-bit playback.)
+            float peak_full_scale_f = (float)gui_app_level_autostop_full_scale(&app);
+            uint16_t threshold = (uint16_t)(level * peak_full_scale_f);
             if (threshold < 1) threshold = 1;
 
             if (!app.low_signal_armed) {
@@ -1178,9 +1203,14 @@ int main(int argc, char **argv) {
                 if (peak < threshold) {
                     app.low_signal_time += dt;
                     if (app.low_signal_time >= sustain_s) {
-                        gui_app_stop_capture(&app);
-                        app.reconnect_pending = false;
-                        app.reconnect_attempts = 0;
+                        // Stop recording only — keep the capture/device
+                        // connection alive (tape end != device disconnect).
+                        // Reset low_signal state so a future recording re-arms
+                        // only after a real signal is seen again.
+                        gui_record_log_capture_event(&app, "INFO",
+                            "Level autostop: sustained low signal (tape end); stopping recording",
+                            GUI_ERROR_CLASS_NONE, 0);
+                        gui_app_stop_recording(&app);
                         app.low_signal_time = 0.0f;
                         app.low_signal_armed = false;
                         gui_app_set_status(&app, gui_dropout_reason_status(GUI_DROPOUT_LOW_SIGNAL));

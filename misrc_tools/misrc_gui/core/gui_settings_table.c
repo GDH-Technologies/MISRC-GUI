@@ -168,10 +168,14 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->stop_on_dropout = false;
 
     // Level autostop defaults (tape-end detection). Disabled by default.
-    // Defaults mirror PR #11: 33% threshold, 5.0s sustain.
+    // Stock config: trigger level 0.2 (normalized 0.1-0.8), sustain 30 seconds.
+    // Vpp defaults to 2.0 (hsdaoh/CXADC/DdD); FX3 overrides to 1.0 on device
+    // change. level_autostop_vpp_hsdaoh remembers the hsdaoh 1/2 Vpp jumper.
     settings->level_autostop_enabled = false;
-    strcpy(settings->level_autostop_level_str, "33");
-    strcpy(settings->level_autostop_duration_str, "5.0");
+    strcpy(settings->level_autostop_level_str, "0.2");
+    strcpy(settings->level_autostop_duration_str, "30");
+    settings->level_autostop_vpp = 2.0f;
+    settings->level_autostop_vpp_hsdaoh = 2.0f;
 
     // Display settings
     settings->ui_scale_auto = true;
@@ -179,6 +183,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
     settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+    settings->waveform_scale_mode = 0;  // Basic (0.X, majors only +-0.5/0) by default
 
     // V4L2/simple_capture device discovery is opt-in (disabled by default).
     settings->discover_simple_capture = false;
@@ -716,6 +721,68 @@ static bool hook_port(const gui_setting_desc_t *d, gui_settings_t *s, const char
     return true;
 }
 
+/* Level threshold: migrate a legacy integer percent (1-99, e.g. "33") to the
+ * normalized 0.X fraction (0.1-0.8) and clamp into range. Reformatted with up
+ * to 2 decimals and no trailing zeros (legacy "33" -> "0.33"); idempotent for
+ * a value already saved as 0.X. Upstream does this in its hand-written loader
+ * (gui_settings_normalize_level_autostop_level). */
+static bool hook_level_autostop_level(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                                      bool strict, char *err, size_t errcap) {
+    char buf[sizeof(s->level_autostop_level_str)];
+    if (!store_string(buf, sizeof(buf), value, strict, err, errcap)) return false;
+    char *end = NULL;
+    double v = strtod(buf, &end);
+    if (end == buf) v = 0.2;  /* unparseable: the stock threshold */
+    bool has_dot = (strchr(buf, '.') != NULL);
+    if (!has_dot && end != buf && *end == '\0') {
+        long pct = strtol(buf, NULL, 10);
+        if (pct >= 1 && pct <= 99) v = (double)pct / 100.0;
+    }
+    if (v < 0.1) v = 0.1;
+    if (v > 0.8) v = 0.8;
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%.2f", v);
+    size_t len = strlen(tmp);
+    while (len > 0 && tmp[len - 1] == '0') tmp[--len] = '\0';
+    if (len > 0 && tmp[len - 1] == '.') tmp[--len] = '\0';
+    if (tmp[0] == '\0') snprintf(tmp, sizeof(tmp), "0.1");
+    snprintf(s->level_autostop_level_str, sizeof(s->level_autostop_level_str), "%s", tmp);
+    (void)d;
+    return true;
+}
+
+/* ADC full-scale Vpp for the level-autostop mV readout: anything not above
+ * 0.1 V (including NaN) falls back to 2.0. */
+static bool hook_vpp(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                     bool strict, char *err, size_t errcap) {
+    float v;
+    if (!parse_float_text(value, strict, &v, err, errcap)) return false;
+    if (!(v > 0.1f)) v = 2.0f;
+    *(float *)field_ptr(s, d) = v;
+    return true;
+}
+
+static bool hook_waveform_scale_mode(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                                     bool strict, char *err, size_t errcap) {
+    long long ll;
+    if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
+    s->waveform_scale_mode = (ll >= 0 && ll <= 4) ? (int)ll : 0;
+    (void)d;
+    return true;
+}
+
+/* Legacy "waveform_scale_mv" bool: false -> 0 (Basic), true -> 4 (mV/2Vpp).
+ * Its row sits before waveform_scale_mode's, so a file carrying both keeps the
+ * newer key. */
+static bool hook_waveform_scale_mv_alias(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                                         bool strict, char *err, size_t errcap) {
+    bool mv;
+    if (!parse_bool_text(value, strict, &mv, err, errcap)) return false;
+    s->waveform_scale_mode = mv ? 4 : 0;
+    (void)d;
+    return true;
+}
+
 /* ============================================================================
  * The table. Order = the order the file has always been written.
  * ============================================================================ */
@@ -731,6 +798,7 @@ static bool hook_port(const gui_setting_desc_t *d, gui_settings_t *s, const char
 #define GS_U32H(k, member, fl, fn) GS_ENTRY(k, GS_U32,   0, fl, member, 0, fn)
 #define GS_U64(k, member, fl)      GS_ENTRY(k, GS_U64,   0, fl, member, 0, NULL)
 #define GS_F(k, member, p, fl)     GS_ENTRY(k, GS_FLOAT, p, fl, member, 0, NULL)
+#define GS_FH(k, member, p, fl, fn) GS_ENTRY(k, GS_FLOAT, p, fl, member, 0, fn)
 #define GS_S(k, member, fl)        GS_ENTRY(k, GS_STR,   0, fl, member, sizeof(((gui_settings_t *)0)->member), NULL)
 #define GS_SH(k, member, fl, fn)   GS_ENTRY(k, GS_STR,   0, fl, member, sizeof(((gui_settings_t *)0)->member), fn)
 #define GS_BH(k, member, fl, fn)   GS_ENTRY(k, GS_BOOL,  0, fl, member, 0, fn)
@@ -803,7 +871,7 @@ static const gui_setting_desc_t s_table[] = {
     GS_B  ("misrc_v15_v25_ab_swap",            misrc_v15_v25_ab_swap,       0),
     GS_B  ("stop_on_dropout",                  stop_on_dropout,             0),
     GS_B  ("level_autostop_enabled",           level_autostop_enabled,      0),
-    GS_S  ("level_autostop_level_str",         level_autostop_level_str,    0),
+    GS_SH ("level_autostop_level_str",         level_autostop_level_str,    0, hook_level_autostop_level),
     GS_S  ("level_autostop_duration_str",      level_autostop_duration_str, 0),
     GS_S  ("ingest_project",                   ingest_project,              0),
     GS_S  ("ingest_tape_id",                   ingest_tape_id,              0),
@@ -886,6 +954,15 @@ static const gui_setting_desc_t s_table[] = {
     GS_S  ("cc_filename",                      cc_filename,                 0),
     GS_S  ("cc_output_tag",                    cc_output_tag,               GS_NAME),
     GS_S  ("cc_vbi_device",                    cc_vbi_device,               0),
+    /* Upstream v1.2.0's level-autostop mV readout and waveform scale dropdown.
+     * Appended for the same reason as the caption rows. The legacy
+     * waveform_scale_mv alias precedes waveform_scale_mode so the newer key
+     * wins when a file carries both. waveform_scale_mode is a view preference
+     * (like amplitude_scale); the Vpp pair describes the capture hardware. */
+    GS_BH ("waveform_scale_mv",                waveform_scale_mode,         GS_LOAD_ONLY, hook_waveform_scale_mv_alias),
+    GS_IH ("waveform_scale_mode",              waveform_scale_mode,         GS_LOCAL, hook_waveform_scale_mode),
+    GS_FH ("level_autostop_vpp",               level_autostop_vpp,          3, 0, hook_vpp),
+    GS_FH ("level_autostop_vpp_hsdaoh",        level_autostop_vpp_hsdaoh,   3, 0, hook_vpp),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

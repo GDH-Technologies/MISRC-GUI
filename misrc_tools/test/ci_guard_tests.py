@@ -1726,6 +1726,7 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     "demod_mode", "demod_bandwidth_hz", "demod_squelch", "demod_volume", "demod_output_pair",
     "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
     "net_client_port_str", "playback_file_a", "playback_file_b",
+    "waveform_scale_mode",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to

@@ -13,6 +13,7 @@
 #include "../signal/gui_cvbs.h"
 #include "../output/gui_record.h"
 #include "../net/gui_net.h"
+#include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for ADC range
 #include <string.h>
 #include <stdatomic.h>
 #include <stdlib.h>

@@ -250,6 +250,11 @@ extern volatile atomic_int do_exit;
 #define CXADC_MAX_CARDS 2
 #define CXADC_SAMPLE_RATE_8BIT_HZ 40000000U
 #define CXADC_SAMPLE_RATE_TENBIT_HZ 20000000U
+// Stock CXADC card crystal is 28.636 MHz (8-bit 28.6 MSPS / 10-bit 14.3 MSPS).
+// Used as the fallback when the real rate can't be detected (Windows, no
+// sysfs). The 40/20 MSPS constants above are the CXADC Clockgen Mod baseline.
+#define CXADC_STOCK_RATE_8BIT_HZ 28636363U
+#define CXADC_STOCK_RATE_TENBIT_HZ 14318181U
 #define CXADC_READ_CHUNK_BYTES 65536
 #define CXADC_AUDIO_SAMPLE_RATE_HZ 46875U
 #define CXADC_AUDIO_CHANNEL_COUNT 3
@@ -526,8 +531,79 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 #endif
 }
 
-static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
+// --- Hardware sample-rate detection ---
+// cxadc has no sample_rate sysfs param; the rate is derived from crystal +
+// tenxfsc + tenbit. We present rates per the cxadc card reality:
+//   - 8-bit + tenxfsc=1 (crystal*10/8 = 35.8 on stock) is just upsampling the
+//     crystal, so it is NOT presented: report the crystal rate (28.6) instead.
+//   - 10-bit + tenxfsc=1 (crystal*5/8 = 17.9 on stock) IS exposed as a real
+//     rate (the one useful tier above the 14.3 stock-10-bit floor).
+//   - tenxfsc=2 forces 40 MSPS; tenxfsc=3 is broken in HW but the driver maps
+//     it to 40 MSPS, so treat both as 40 (20 in 10-bit).
+//   - A 54 MHz crystal mod with tenxfsc=0 yields 54 MSPS (27 in 10-bit).
+// crystal + tenxfsc are tenbit-independent, so they're cached per card with a
+// short TTL; the caller passes its intended tenbit so a just-toggled mode is
+// reflected immediately.
+#define CXADC_RATE_CACHE_TTL_S 1.0
+#define CXADC_DEFAULT_CRYSTAL_HZ 28636363U
+static uint32_t s_cxadc_crystal_cache_hz[CXADC_MAX_CARDS] = { 0, 0 };
+static int s_cxadc_tenxfsc_cache[CXADC_MAX_CARDS] = { -1, -1 };
+static bool s_cxadc_param_cache_valid[CXADC_MAX_CARDS] = { false, false };
+static double s_cxadc_param_cache_time_s = 0.0;
+
+bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out)
 {
+    if (!rate_hz_out) return false;
+    *rate_hz_out = 0;
+    if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS) return false;
+#if defined(_WIN32)
+    // CxadcWin PowerShell config doesn't expose tenxfsc/crystal; callers use
+    // the 40/20 MSPS clockgen baseline.
+    return false;
+#else
+    double now = GetTime();
+    if (!s_cxadc_param_cache_valid[card_idx] ||
+        (now - s_cxadc_param_cache_time_s) >= CXADC_RATE_CACHE_TTL_S) {
+        int tenxfsc = 0, crystal = 0;
+        bool have_tenxfsc = (cxadc_sysfs_read_int_param(card_idx, "tenxfsc", &tenxfsc) == 0);
+        bool have_crystal = (cxadc_sysfs_read_int_param(card_idx, "crystal", &crystal) == 0);
+        if (!have_tenxfsc && !have_crystal) {
+            return false;  // no cxadcN node / sysfs missing
+        }
+        if (!have_tenxfsc) tenxfsc = 0;
+        if (!have_crystal || crystal <= 0) crystal = (int)CXADC_DEFAULT_CRYSTAL_HZ;
+        s_cxadc_crystal_cache_hz[card_idx] = (uint32_t)crystal;
+        s_cxadc_tenxfsc_cache[card_idx] = tenxfsc;
+        s_cxadc_param_cache_valid[card_idx] = true;
+        s_cxadc_param_cache_time_s = now;
+    }
+
+    uint32_t crystal_hz = s_cxadc_crystal_cache_hz[card_idx];
+    int tenxfsc = s_cxadc_tenxfsc_cache[card_idx];
+    uint32_t rate_hz;
+
+    if (tenxfsc == 2 || tenxfsc == 3) {
+        rate_hz = 40000000U;
+        if (tenbit) rate_hz /= 2;
+    } else if (tenxfsc == 1) {
+        if (tenbit) {
+            rate_hz = (crystal_hz * 5U) / 8U;  // 17.9 on stock — expose
+        } else {
+            rate_hz = crystal_hz;  // 8-bit: 35.8 is upsampled → present crystal
+        }
+    } else {
+        rate_hz = crystal_hz;  // tenxfsc=0: crystal (28.6 stock / 40 mod / 54 mod)
+        if (tenbit) rate_hz /= 2;
+    }
+
+    *rate_hz_out = rate_hz;
+    return true;
+#endif
+}
+
+static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool enabled[CXADC_MAX_CARDS])
+{
+    if (!app) return -1;
     if (card_count < 1) card_count = 1;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     for (int i = 0; i < card_count; i++) {
@@ -553,16 +629,21 @@ static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
                     i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
-            // If the write was denied for permissions AND the requested mode
-            // is 8-bit (the driver default), don't abort the whole capture:
-            // the card is already in 8-bit (we either read it above or can't
-            // read it, in which case read-only capture is still better than
-            // refusing to start). Only abort when the user explicitly asked
-            // for 10-bit and we can't set it (sample rate/format would be
-            // wrong, so capture would be silently misconfigured).
-            if ((saved_errno == EACCES || saved_errno == EPERM) && !mode) {
-                fprintf(stderr, "[CXADC] 8-bit mode requested, sysfs write denied; "
-                                "continuing with card default (no chgrp setup needed for 8-bit)\n");
+            // If the write was denied for permissions, fall back to 8-bit
+            // (the driver default) instead of aborting the whole capture.
+            // 8-bit needs no sysfs write; 10-bit does, but degrading to
+            // 8-bit is better than refusing to start. Revert this card's
+            // tenbit flag so the live sample-rate readout matches reality.
+            if (saved_errno == EACCES || saved_errno == EPERM) {
+                fprintf(stderr, "[CXADC] sysfs write denied; falling back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/* for 10-bit)\n");
+                if (mode) {
+                    s_cxadc.tenbit_mode[i] = false;
+                    app->settings.cxadc_tenbit_mode_card[i] = false;
+                    if (i == 0) app->settings.rf_bits_a = 8;
+                    else app->settings.rf_bits_b = 8;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
+                }
                 continue;
             }
 #else
@@ -1949,9 +2030,20 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             mode = false;
         }
         s_cxadc.tenbit_mode[i] = mode;
-        s_cxadc.card_sample_rate_hz[i] = mode
-            ? CXADC_SAMPLE_RATE_TENBIT_HZ
-            : CXADC_SAMPLE_RATE_8BIT_HZ;
+        // Resolve the card's real hardware rate. The CXADC Clockgen Mod
+        // (card_count > 1) drives the cards at a true 40 MHz base regardless
+        // of the sysfs crystal param, so force 40/20 for it. A single stock
+        // card (card_count == 1) runs at 28.6 MHz; detect the real rate from
+        // sysfs and fall back to the stock 28.6/14.3 baseline when
+        // undetectable (Windows, missing sysfs) so the live sample-rate
+        // readout matches the card instead of always 40.
+        uint32_t detected_hz = 0;
+        if (card_count > 1) {
+            detected_hz = mode ? CXADC_SAMPLE_RATE_TENBIT_HZ : CXADC_SAMPLE_RATE_8BIT_HZ;
+        } else if (!gui_cxadc_get_sample_rate_hz(i, mode, &detected_hz) || detected_hz == 0) {
+            detected_hz = mode ? CXADC_STOCK_RATE_TENBIT_HZ : CXADC_STOCK_RATE_8BIT_HZ;
+        }
+        s_cxadc.card_sample_rate_hz[i] = detected_hz;
     }
     s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
 #if defined(_WIN32)
@@ -1981,7 +2073,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // Skip CXADC card programming/open when there are no RF cards (audio-only
     // MISRC Clockgen). tenbit/center-offset sysfs writes would fail and abort.
     if (card_count > 0) {
-        if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+        if (cxadc_apply_tenbit_modes(app, card_count, s_cxadc.tenbit_mode) != 0) {
 #if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s): %s (errno %d)\n",

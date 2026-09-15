@@ -974,8 +974,32 @@ static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *
             int n = net_fanout_read(&sub, buf, sizeof(buf), 1000);
             if (n < 0) break;                  /* fanout shut down: server stopping */
             if (n == 0) {
-                /* Nothing captured for 1 s (server idle). Keep the connection. */
+                /* Nothing captured for 1 s (server idle). Stop with the server. */
                 if (atomic_load(&srv->stop_flag)) break;
+                /* Otherwise probe the socket so a disconnected client
+                 * is detected even when the server has no data to push
+                 * (standby/idle feed). select() for read-ready: if the peer
+                 * closed, recv would return 0 (read-ready, no data); if the
+                 * socket is still open and idle, select times out (not
+                 * read-ready). Without this the /rf thread lingered forever
+                 * holding the subscription until a hard app close. */
+                fd_set rset;
+                FD_ZERO(&rset);
+                FD_SET(fd, &rset);
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+                int sr = select((int)fd + 1, &rset, NULL, NULL, &tv);
+                if (sr > 0 && FD_ISSET(fd, &rset)) {
+                    char probe[1];
+#ifdef _WIN32
+                    int pn = recv(fd, probe, 1, 0 /* normal */);
+                    if (pn == 0 || pn == SOCKET_ERROR) break;
+#else
+                    ssize_t pn = recv(fd, probe, 1, MSG_PEEK);
+                    if (pn == 0 || (pn < 0 && errno != EINTR)) break;
+#endif
+                }
                 continue;
             }
             if (net_send_all(fd, buf, (size_t)n) != 0) break;   /* client went away */
@@ -1570,8 +1594,10 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
      * if the buffer isn't initialized yet (lazy init), so ensure_init first. */
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF);
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO);
+    (void)bufmgr_ensure_init(&app->buffers, BUF_DISPLAY);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_RF);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_AUDIO);
+    bufmgr_reset(&app->buffers, BUF_DISPLAY);
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
     atomic_store(&app->total_samples, 0);
     atomic_store(&app->samples_a, 0);
@@ -2438,7 +2464,11 @@ void gui_net_poll_mirror(gui_app_t *app) {
         } else if (!want && active) {
             client_stop_ingest(app, s_client);
         }
-        /* Mirror peer sample rate into app for display. */
+        /* Mirror peer sample rate into app for display. The local capture
+         * path updates app->sample_rate from stream metadata every frame;
+         * the network client only gets the rate from /stats, so update it
+         * every mirror poll (not just at ingest start) so the display time
+         * axis stays 1:1 with the server when the server's feed rate changes. */
         int psr = atomic_load(&s_client->peer_sample_rate);
         if (psr > 0) atomic_store(&app->sample_rate, (uint32_t)psr);
 

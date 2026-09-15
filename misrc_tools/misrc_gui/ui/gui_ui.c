@@ -243,11 +243,161 @@ static bool gui_ui_selected_device_is_misrc_clockgen(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_MISRC_CLOCKGEN;
 }
 
+static void format_msps_label(char *dst, size_t dst_len, float khz);
+static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz);
 static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 {
-    if (!app) return 40000.0f;
+    if (!app) return 28636.0f;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
-    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 20000.0f : 40000.0f;
+    bool tenbit = app->settings.cxadc_tenbit_mode_card[card_idx];
+    // CXADC Clockgen Mod (2-card entry, index > 1): always 40/20 MSPS
+    // (40 8-bit, 20 10-bit) — the clockgen drives a true 40 MHz base.
+    // Stock single card: always 28.6 MSPS base (the 8-bit crystal rate),
+    // NOT halved to 14.3 for 10-bit. 8-bit is the assumed stock default.
+    bool clockgen = false;
+    if (gui_ui_selected_device_is_cxadc(app, &clockgen) && clockgen) {
+        return tenbit ? 20000.0f : 40000.0f;
+    }
+    // Stock: detect the card's 8-bit rate; fall back to 28.6 MHz. Never
+    // return 14.3 (the 10-bit half) as the base — stock is always 28.6.
+    uint32_t detected_hz = 0;
+    if (gui_cxadc_get_sample_rate_hz(card_idx, false, &detected_hz) &&
+        detected_hz > 0) {
+        return (float)detected_hz / 1000.0f;
+    }
+    return 28636.0f;
+}
+// Tenbit-aware hardware rate: the actual capture rate for the card's current
+// tenbit mode. Clockgen mod forces 40/20; stock detects or falls back to
+// 28.6 (8-bit) / 14.3 (10-bit). Used as the resample baseline and cycle max.
+static float gui_ui_cxadc_hw_rate_for_tenbit(const gui_app_t *app, int card_idx, bool tenbit)
+{
+    if (!app) return 28636.0f;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    bool clockgen = false;
+    if (gui_ui_selected_device_is_cxadc(app, &clockgen) && clockgen) {
+        return tenbit ? 20000.0f : 40000.0f;
+    }
+    uint32_t detected_hz = 0;
+    if (gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &detected_hz) &&
+        detected_hz > 0) {
+        return (float)detected_hz / 1000.0f;
+    }
+    return tenbit ? 14318.0f : 28636.0f;
+}
+static float gui_ui_cxadc_hw_rate_khz(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 28636.0f;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx,
+        app->settings.cxadc_tenbit_mode_card[card_idx]);
+}
+// Format a CXADC HW-mode rate label as "HW <number> MSPS".
+static void format_cxadc_hw_label(char *dst, size_t dst_len, float khz)
+{
+    float msps = khz / 1000.0f;
+    if (fabsf(msps - roundf(msps)) < 1e-3f)
+        snprintf(dst, dst_len, "HW %d MSPS", (int)lroundf(msps));
+    else
+        snprintf(dst, dst_len, "HW %.1f MSPS", msps);
+}
+// CXADC rate-box cycle: dedicated HW and SW mode options.
+//   HW 8-bit (resample off, tenbit=false, rate=HW 8-bit rate)
+//   HW 10-bit (resample off, tenbit=true, rate=HW 10-bit rate)
+//   SW <rates> (resample on, tenbit unchanged, rate=downsample target)
+// The box is always clickable (never greyed). HW modes show "HW <rate> MSPS";
+// SW modes show "<rate> MSPS" via format_msps_label.
+// Uses an explicit static position counter so the cycle can't break on
+// rate collisions (e.g. SW 20 == HW 10-bit rate on clockgen).
+static int s_cxadc_rate_pos[2] = { 0, 0 };
+static int s_cxadc_rate_total[2] = { 0, 0 };
+
+static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
+{
+    if (!app) return;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    bool *tenbit_field = &app->settings.cxadc_tenbit_mode_card[card_idx];
+    bool *resample_field = (card_idx == 0) ? &app->settings.enable_resample_a : &app->settings.enable_resample_b;
+    float *rate_field = (card_idx == 0) ? &app->settings.resample_rate_a : &app->settings.resample_rate_b;
+    uint8_t *bits_field = (card_idx == 0) ? &app->settings.rf_bits_a : &app->settings.rf_bits_b;
+
+    float hw_8bit = gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx, false);
+    float hw_10bit = gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx, true);
+
+    // SW downsample targets, filtered by card type.
+    float sw_presets[8];
+    int sw_count = 0;
+    bool stock_base = (hw_8bit < 40000.0f - 0.5f);
+    if (stock_base) {
+        sw_presets[sw_count++] = 5000.0f;
+        sw_presets[sw_count++] = 14300.0f;
+        sw_presets[sw_count++] = 17900.0f;
+        sw_presets[sw_count++] = 28636.0f;
+    } else {
+        sw_presets[sw_count++] = 5000.0f;
+        sw_presets[sw_count++] = 10000.0f;
+        sw_presets[sw_count++] = 20000.0f;
+        if (hw_8bit >= 54000.0f - 0.5f) sw_presets[sw_count++] = 27000.0f;
+        sw_presets[sw_count++] = 40000.0f;
+        if (hw_8bit >= 54000.0f - 0.5f) sw_presets[sw_count++] = 54000.0f;
+    }
+
+    int total = 2 + sw_count;
+
+    // If the option set changed (card type / crystal mod), re-sync the
+    // position to the current state instead of advancing.
+    if (s_cxadc_rate_total[card_idx] != total) {
+        s_cxadc_rate_total[card_idx] = total;
+        if (!*resample_field) {
+            s_cxadc_rate_pos[card_idx] = *tenbit_field ? 1 : 0;
+        } else {
+            int found = 2;
+            for (int i = 0; i < sw_count; i++) {
+                if (fabsf(*rate_field - sw_presets[i]) < 1.0f) { found = 2 + i; break; }
+            }
+            s_cxadc_rate_pos[card_idx] = found;
+        }
+        return; // re-sync this frame; advance next click
+    }
+
+    int next_pos = (s_cxadc_rate_pos[card_idx] + 1) % total;
+    s_cxadc_rate_pos[card_idx] = next_pos;
+
+    // Apply next option.
+    if (next_pos == 0) {
+        *tenbit_field = false;
+        *resample_field = false;
+        *rate_field = hw_8bit;
+        *bits_field = 8;
+    } else if (next_pos == 1) {
+        *tenbit_field = true;
+        *resample_field = false;
+        *rate_field = hw_10bit;
+        *bits_field = 16;
+    } else {
+        // SW resample modes always use 8-bit (tenbit=false) so the
+        // downsample operates on the 8-bit HW stream.
+        *tenbit_field = false;
+        *bits_field = 8;
+        *resample_field = true;
+        *rate_field = sw_presets[next_pos - 2];
+    }
+    gui_settings_save(&app->settings);
+
+    const char *ch = (card_idx == 0) ? "A" : "B";
+    char label[24];
+    if (!*resample_field) {
+        format_cxadc_hw_label(label, sizeof(label), *rate_field);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "CH %c: %s %s", ch, label, *tenbit_field ? "10-bit" : "8-bit");
+        gui_app_set_status(app, msg);
+    } else {
+        format_msps_label(label, sizeof(label), *rate_field);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "CH %c: %s SW", ch, label);
+        gui_app_set_status(app, msg);
+    }
+    gui_ui_warn_low_rate(app, *rate_field);
 }
 static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
 {
@@ -415,17 +565,18 @@ static void gui_ui_toggle_rtsp_stream(gui_app_t *app)
 static void gui_ui_apply_cxadc_bit_mode_clamp(gui_app_t *app, int card_idx)
 {
     uint8_t cxadc_bits = gui_ui_cxadc_rf_bits(app, card_idx);
-    float cxadc_base_rate_khz = gui_ui_cxadc_base_rate_khz(app, card_idx);
+    // Switching bit depth changes the hardware rate; use the hardware rate
+    // mode (resample OFF) by default so capture leverages native hardware
+    // processing. The rate box hard-cycles between the two HW rates.
+    float cxadc_hw_rate_khz = gui_ui_cxadc_hw_rate_khz(app, card_idx);
     if (card_idx == 0) {
         app->settings.rf_bits_a = cxadc_bits;
-        if (!app->settings.enable_resample_a || app->settings.resample_rate_a > cxadc_base_rate_khz) {
-            app->settings.resample_rate_a = cxadc_base_rate_khz;
-        }
+        app->settings.enable_resample_a = false;
+        app->settings.resample_rate_a = cxadc_hw_rate_khz;
     } else {
         app->settings.rf_bits_b = cxadc_bits;
-        if (!app->settings.enable_resample_b || app->settings.resample_rate_b > cxadc_base_rate_khz) {
-            app->settings.resample_rate_b = cxadc_base_rate_khz;
-        }
+        app->settings.enable_resample_b = false;
+        app->settings.resample_rate_b = cxadc_hw_rate_khz;
     }
 }
 
@@ -438,6 +589,9 @@ static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
     gui_settings_save(&app->settings);
     const char *card_label = (card_idx == 0) ? "A" : "B";
     bool enabled = app->settings.cxadc_tenbit_mode_card[card_idx];
+    float cxadc_hw_rate_khz = gui_ui_cxadc_hw_rate_khz(app, card_idx);
+    char hw_rate_label[24];
+    format_msps_label(hw_rate_label, sizeof(hw_rate_label), cxadc_hw_rate_khz);
     if (app->is_capturing) {
         gui_app_set_status(app, enabled
             ? ((card_idx == 0) ? "CXADC card A 10-bit mode enabled (applies on next capture start)"
@@ -446,10 +600,10 @@ static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
                                : "CXADC card B 8-bit mode enabled (applies on next capture start)"));
     } else {
         char msg[128];
-        snprintf(msg, sizeof(msg), "CXADC card %s %s (%s base)",
+        snprintf(msg, sizeof(msg), "CXADC card %s %s (%s HW rate)",
                  card_label,
                  enabled ? "10-bit mode enabled" : "8-bit mode enabled",
-                 enabled ? "20 MSPS" : "40 MSPS");
+                 hw_rate_label);
         gui_app_set_status(app, msg);
     }
 }
@@ -548,6 +702,44 @@ static bool gui_ui_selected_device_is_fx3(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_FX3;
 }
 #endif
+
+// --- Level autostop backend classification ---
+// Last device type seen by the Vpp reconcile so we re-default level_autostop_vpp
+// only when the active backend actually changes (not every frame).
+static int s_level_autostop_vpp_last_type = -1;
+
+// True if the active backend is hsdaoh (MISRC v1.5/2.5), which uses the
+// hardware-selectable 1/2 Vpp jumper toggle instead of a free-edit Vpp box.
+static bool gui_ui_level_autostop_is_hsdaoh(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_HSDAOH;
+}
+
+// Per-frame reconcile: when the active capture backend type changes, re-default
+// level_autostop_vpp to the new backend's default (hsdaoh uses the stored 1/2
+// hardware-jumper memory). Keeps the mV readout correct per-backend without a
+// global custom flag leaking across backends.
+static void gui_ui_level_autostop_reconcile_vpp(gui_app_t *app)
+{
+    if (!app) return;
+    int cur_type = DEVICE_TYPE_HSDAOH;
+    if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+        cur_type = (int)app->devices[app->selected_device].type;
+    }
+    if (cur_type == s_level_autostop_vpp_last_type) return;
+    s_level_autostop_vpp_last_type = cur_type;
+    if (gui_ui_level_autostop_is_hsdaoh(app)) {
+        app->settings.level_autostop_vpp = app->settings.level_autostop_vpp_hsdaoh;
+    } else {
+        app->settings.level_autostop_vpp = gui_app_level_autostop_default_vpp(app);
+    }
+    if (!(app->settings.level_autostop_vpp > 0.1f)) {
+        app->settings.level_autostop_vpp = 2.0f;
+    }
+    gui_settings_save(&app->settings);
+}
 
 #ifdef ENABLE_RTLSDR
 // Generic SDR device check. True for any I/Q-providing SDR backend (today
@@ -649,7 +841,7 @@ typedef enum {
     UI_TEXT_FIELD_AUDIO_LABEL_2,
     UI_TEXT_FIELD_AUDIO_LABEL_3,
     UI_TEXT_FIELD_AUDIO_LABEL_4,
-    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold percent
+    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold (normalized 0.1-0.8)
     UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION,  // Level autostop sustain seconds
     UI_TEXT_FIELD_INGEST_PROJECT,
     UI_TEXT_FIELD_INGEST_TAPE_ID,
@@ -1524,8 +1716,8 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
         bool cxadc_settings_changed = false;
         uint8_t cxadc_rf_bits_a = gui_ui_cxadc_rf_bits(app, 0);
         uint8_t cxadc_rf_bits_b = gui_ui_cxadc_rf_bits(app, cxadc_has_channel_b ? 1 : 0);
-        float cxadc_base_rate_a_khz = gui_ui_cxadc_base_rate_khz(app, 0);
-        float cxadc_base_rate_b_khz = gui_ui_cxadc_base_rate_khz(app, cxadc_has_channel_b ? 1 : 0);
+        float cxadc_base_rate_a_khz = gui_ui_cxadc_hw_rate_khz(app, 0);
+        float cxadc_base_rate_b_khz = gui_ui_cxadc_hw_rate_khz(app, cxadc_has_channel_b ? 1 : 0);
         // Single-card CXADC has no RF-B source.
         if (!cxadc_has_channel_b && app->settings.capture_b) {
             app->settings.capture_b = false;
@@ -1540,23 +1732,21 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
             app->settings.rf_bits_b = cxadc_rf_bits_b;
             cxadc_settings_changed = true;
         }
+        // In HW mode (resample off), sync the rate to the HW rate.
+        // In SW mode (resample on), leave the user's downsample target
+        // alone - the cycle sets it explicitly and the sync must not
+        // override it back to the HW rate.
         if (!app->settings.enable_resample_a) {
             if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
                 app->settings.resample_rate_a = cxadc_base_rate_a_khz;
                 cxadc_settings_changed = true;
             }
-        } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
-            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
-            cxadc_settings_changed = true;
         }
         if (!app->settings.enable_resample_b) {
             if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
                 app->settings.resample_rate_b = cxadc_base_rate_b_khz;
                 cxadc_settings_changed = true;
             }
-        } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
-            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
-            cxadc_settings_changed = true;
         }
         if (cxadc_settings_changed) {
             gui_settings_save(&app->settings);
@@ -2087,16 +2277,37 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 static float cycle_resample_khz(float current_khz, float max_khz) {
-    // User-facing presets (stored as kHz), including 40 MSPS passthrough base.
-    static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 40000.0f };
-    const int n = (int)(sizeof(presets_khz) / sizeof(presets_khz[0]));
+    // User-facing presets (stored as kHz). The set depends on whether the
+    // card is stock (28.6 MHz base) or clockgen/modded (40+ MHz base):
+    //   Stock (base ~28.6): 5, 14.3, 17.9, 28.6
+    //   Clockgen/40-mod (base ~40): 5, 10, 20, 40  (no 14.3/17.9/28.6)
+    //   54-mod (base ~54): 5, 10, 20, 27, 40, 54  (no 14.3/17.9/28.6)
+    // 14.3/17.9 are stock-28.6 software modes, hidden when clockgen (40+)
+    // is detected. 5 = HiFi audio SW-resample (always available). 35.8
+    // (upsampled 28.6) is never offered. 8-bit is the assumed stock default.
     if (max_khz < 5000.0f) max_khz = 5000.0f;
+    bool stock_base = (max_khz < 40000.0f - 0.5f);
 
-    float allowed[n];
+    float presets[16];
+    int n = 0;
+    presets[n++] = 5000.0f;
+    if (stock_base) {
+        presets[n++] = 14300.0f;
+        presets[n++] = 17900.0f;
+        presets[n++] = 28636.0f;
+    } else {
+        presets[n++] = 10000.0f;
+        presets[n++] = 20000.0f;
+        if (max_khz >= 54000.0f - 0.5f) presets[n++] = 27000.0f;
+        presets[n++] = 40000.0f;
+        if (max_khz >= 54000.0f - 0.5f) presets[n++] = 54000.0f;
+    }
+
+    float allowed[16];
     int allowed_count = 0;
     for (int i = 0; i < n; i++) {
-        if (presets_khz[i] <= max_khz + 0.5f) {
-            allowed[allowed_count++] = presets_khz[i];
+        if (presets[i] <= max_khz + 0.5f) {
+            allowed[allowed_count++] = presets[i];
         }
     }
     if (allowed_count <= 0) {
@@ -2219,6 +2430,34 @@ bool gui_ui_text_edit_active(void)
 {
     return s_active_text_field != UI_TEXT_FIELD_NONE;
 }
+
+// One-time per-session low-rate warning: pops a dismissible info dialog
+// only when the resample cycle lands on the 14.3 MSPS stock 10-bit CXADC
+// rate. 5/10 MSPS are intentional SW-resample targets for HiFi audio-only
+// capture and don't trigger the warning.
+#define CXADC_LOW_RATE_WARN_KHZ 14300.0f
+static bool s_low_rate_warned_this_session = false;
+
+static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
+{
+    if (!app) return;
+    if (s_low_rate_warned_this_session) return;
+    if (fabsf(rate_khz - CXADC_LOW_RATE_WARN_KHZ) > 50.0f) return;
+    s_low_rate_warned_this_session = true;
+    char msg[384];
+    snprintf(msg, sizeof(msg),
+        "RF rate set to 14.3 MSPS - stock 10-bit CXADC rate.\n\n"
+        "Minimum bandwidths for reliable video decode:\n"
+        "  20 MSPS  - VHS / Video8 / Betamax\n"
+        "  24 MSPS+ - S-VHS / Hi8 / U-matic\n"
+        "  40 MSPS  - LaserDisc / 1\" SMPTE / 2\" Quad\n\n"
+        "HW rates: 14.3 / 20 / 28.6 / 40 / 54 MSPS.\n\n"
+        "Below 20 MSPS is not viable for archival video capture.");
+    gui_dropdown_close_all();
+    gui_ui_clear_text_edit();
+    gui_popup_info("Low RF sample rate", msg);
+}
+
 
 
 static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, char **dst, size_t *cap)
@@ -2542,8 +2781,9 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         return gui_ui_flac_affinity_char_allowed(ch);
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) {
-        // Integer percent only.
-        return (ch >= '0' && ch <= '9');
+        // Normalized 0.X level (0.1-0.8): digits and a single '.' (allow typing;
+        // parse clamps on commit).
+        return (ch >= '0' && ch <= '9') || ch == '.';
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) {
         // Decimal seconds: digits and a single '.' (allow typing; parse clamps).
@@ -2988,6 +3228,25 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
         unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
         if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
+    }
+    // Level-autostop level text field: clamp the edited 0.X into 0.1-0.8 on commit.
+    // The live string is allowed to be partial while typing; final clamping happens
+    // here so the saved value is always in range.
+    if (s_active_text_field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL &&
+        app->settings.level_autostop_level_str[0]) {
+        float lvl = (float)atof(app->settings.level_autostop_level_str);
+        if (lvl > 0.0f) {
+            if (lvl < 0.1f) lvl = 0.1f;
+            if (lvl > 0.8f) lvl = 0.8f;
+            char tmp[16];
+            snprintf(tmp, sizeof(tmp), "%.2f", (double)lvl);
+            size_t len = strlen(tmp);
+            while (len > 0 && tmp[len - 1] == '0') { tmp[--len] = '\0'; }
+            if (len > 0 && tmp[len - 1] == '.') { tmp[--len] = '\0'; }
+            if (tmp[0] == '\0') snprintf(tmp, sizeof(tmp), "0.1");
+            snprintf(app->settings.level_autostop_level_str,
+                     sizeof(app->settings.level_autostop_level_str), "%s", tmp);
+        }
     }
 
     bool changed = false;
@@ -3733,10 +3992,16 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             }
                             CLAY_TEXT(CLAY_STRING("Resample A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
 
-                            // Rate selector (kHz stored; display MSPS)
-                            format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
-                            Color rate_bg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                            Color rate_fg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            // Rate selector (kHz stored; display MSPS, or "HW <rate>" in HW mode)
+                            bool cxadc_hw_a = settings_cxadc_mode && !app->settings.enable_resample_a;
+                            if (cxadc_hw_a) {
+                                format_cxadc_hw_label(settings_resample_a_display,
+                                    sizeof(settings_resample_a_display), app->settings.resample_rate_a);
+                            } else {
+                                format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
+                            }
+                            Color rate_bg = (settings_cxadc_mode || app->settings.enable_resample_a) ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+                            Color rate_fg = (settings_cxadc_mode || app->settings.enable_resample_a) ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
                             CLAY(CLAY_ID("ResampleRateABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(settings_resample_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
                             }
@@ -3753,9 +4018,15 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                         CLAY_TEXT(settings_ddd_v1_mode ? CLAY_STRING("RF ChB") : CLAY_STRING("Resample B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
 
-                        format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
-                        Color rate_bg = (settings_b_controls_disabled || !app->settings.enable_resample_b) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rate_fg = (settings_b_controls_disabled || !app->settings.enable_resample_b) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        bool cxadc_hw_b = (settings_cxadc_mode && !settings_b_controls_disabled) && !app->settings.enable_resample_b;
+                        if (cxadc_hw_b) {
+                            format_cxadc_hw_label(settings_resample_b_display,
+                                sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                        } else {
+                            format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                        }
+                        Color rate_bg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color rate_fg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("ResampleRateBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_resample_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
                         }
@@ -4175,10 +4446,10 @@ static void render_record_limit_window(gui_app_t *app)
 {
     if (!s_record_limit_window_open) return;
 
-    int record_limit_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 420);
-    int record_limit_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 440);
-    int record_limit_min_width = gui_ui_clamp_int(record_limit_max_width, 1, 420);
-    int record_limit_min_height = gui_ui_clamp_int(record_limit_max_height, 1, 235);
+    // Fixed narrow width: window stays compact and can't scroll sideways.
+    int record_limit_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 340);
+    int record_limit_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 420);
+    int record_limit_min_height = gui_ui_clamp_int(record_limit_max_height, 1, 200);
 
     uint32_t parsed_seconds = 0;
     bool timecode_valid = parse_record_limit_timecode(s_record_limit_timecode, &parsed_seconds);
@@ -4219,7 +4490,7 @@ static void render_record_limit_window(gui_app_t *app)
     CLAY(CLAY_ID("RecordLimitWindow"), {
         .layout = {
             .sizing = {
-                CLAY_SIZING_FIT(.min = record_limit_min_width, .max = record_limit_max_width),
+                CLAY_SIZING_FIXED(record_limit_width),
                 CLAY_SIZING_FIT(.min = record_limit_min_height, .max = record_limit_max_height)
             },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
@@ -4231,7 +4502,7 @@ static void render_record_limit_window(gui_app_t *app)
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
         },
         .clip = {
-            .horizontal = true,
+            .horizontal = false,
             .vertical = true,
             .childOffset = Clay_GetScrollOffset()
         },
@@ -4413,11 +4684,17 @@ static void render_record_limit_window(gui_app_t *app)
         CLAY_TEXT(CLAY_STRING("Shorter changes are ignored until the next recording."),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
-        // Level autostop (tape-end detection): enable/disable + level box + duration box.
+        // Level autostop (tape-end detection): ON/OFF toggle on one row,
+        // then a tidy "Level: <box> Duration: <box>" row underneath — tight,
+        // centered, no extra readout text on the row.
         // Lives in the timer window alongside the record time limit. Independent from
         // the digital dropout (frame error/missed frame) logic in the main settings.
-        CLAY_TEXT(CLAY_STRING("Level autostop (tape end):"),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        // Level is a normalized 0.X value (0.1-0.8).
+        bool las_enabled = app->settings.level_autostop_enabled;
+        Color las_box_bg = las_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
+        Color las_box_fg = las_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+
+        // Row 1: ON/OFF toggle on the left, with the label text beside it.
         CLAY(CLAY_ID("LevelAutostopRow"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
@@ -4426,7 +4703,7 @@ static void render_record_limit_window(gui_app_t *app)
                 .childGap = 10
             }
         }) {
-            Color las_bg = app->settings.level_autostop_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            Color las_bg = las_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
             CLAY(CLAY_ID("LevelAutostopToggle"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(32) },
@@ -4435,53 +4712,62 @@ static void render_record_limit_window(gui_app_t *app)
                 .backgroundColor = to_clay_color(las_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                CLAY_TEXT(app->settings.level_autostop_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                CLAY_TEXT(las_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
             }
+            CLAY_TEXT(CLAY_STRING("Level autostop (tape end)"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            CLAY(CLAY_ID("LevelAutostopSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+        }
 
-            // Level percent box (click to edit)
-            Color lvl_box_bg = app->settings.level_autostop_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-            Color lvl_box_fg = app->settings.level_autostop_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+        // Row 2: "Level: [box] Duration: [box]" — tight, centered as one block,
+        // labels centered to boxes, no extra readout text on the line.
+        CLAY(CLAY_ID("LevelAutostopBoxesRow"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 6
+            }
+        }) {
+            CLAY(CLAY_ID("LevelAutostopBoxesPadLeft"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+            CLAY_TEXT(CLAY_STRING("Trigger Level:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopLevelField"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(56), CLAY_SIZING_FIXED(32) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
                     .padding = { 6, 6, 0, 0 }
                 },
-                .backgroundColor = to_clay_color(lvl_box_bg),
+                .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "33";
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) && app->settings.level_autostop_enabled) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL, lvl, FONT_SIZE_STATS, 1, lvl_box_fg);
+                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "0.2";
+                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) && las_enabled) {
+                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL, lvl, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
-                    CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(lvl_box_fg) }));
+                    CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            CLAY_TEXT(CLAY_STRING("% level"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-            CLAY(CLAY_ID("LevelAutostopSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
-
-            // Duration seconds box (click to edit)
-            Color dur_box_bg = app->settings.level_autostop_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-            Color dur_box_fg = app->settings.level_autostop_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+            CLAY_TEXT(CLAY_STRING("Trigger Time:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopDurationField"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(32) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
                     .padding = { 6, 6, 0, 0 }
                 },
-                .backgroundColor = to_clay_color(dur_box_bg),
+                .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                const char *dur = app->settings.level_autostop_duration_str[0] ? app->settings.level_autostop_duration_str : "5.0";
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) && app->settings.level_autostop_enabled) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION, dur, FONT_SIZE_STATS, 1, dur_box_fg);
+                const char *dur = app->settings.level_autostop_duration_str[0] ? app->settings.level_autostop_duration_str : "30";
+                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) && las_enabled) {
+                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION, dur, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
-                    CLAY_TEXT(make_string(dur), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(dur_box_fg) }));
+                    CLAY_TEXT(make_string(dur), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            CLAY_TEXT(CLAY_STRING("s below"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            CLAY(CLAY_ID("LevelAutostopBoxesPadRight"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
         }
     }
 }
@@ -9362,6 +9648,10 @@ void gui_handle_interactions(gui_app_t *app) {
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
     gui_ui_update_check_tick(app);
+    // Re-default level-autostop Vpp when the active backend type changes so the
+    // mV readout matches the selected hardware (hsdaoh uses its 1/2 Vpp jumper
+    // memory; other backends use their verified default Vpp).
+    gui_ui_level_autostop_reconcile_vpp(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
     if (playback_mode) {
         s_record_limit_window_open = false;
@@ -10135,6 +10425,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            // Vpp (ADC range) control lives on the waveform monitor's Layout
+            // dropdown (channel A) — see handle_layout_dropdown.
             if (Clay_PointerOver(CLAY_ID("RecordLimitWindow"))) {
                 gui_ui_set_click_consumed();
                 return;
@@ -10289,6 +10581,18 @@ void gui_handle_interactions(gui_app_t *app) {
                 control_capturing = gui_net_client_peer_capturing(app);
             }
             if (control_capturing) {
+                // Refuse to disconnect while recording: tearing capture down
+                // mid-recording races the async record finalize thread (which
+                // is still joining the writer threads draining BUF_RECORD_A/B)
+                // and can corrupt/truncate the capture file. Force the user to
+                // stop recording first via the Record button, which finalizes
+                // cleanly before this control becomes usable again. Mirrors the
+                // "settings locked while recording" pattern at gui_ui_settings_locked.
+                if (app->is_recording) {
+                    gui_app_set_status(app, "Stop recording before disconnecting (protects the capture file)");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
 #if defined(__ANDROID__)
                 /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
                  * hang joining libusb/libuvc threads; never block the render
@@ -10361,11 +10665,22 @@ void gui_handle_interactions(gui_app_t *app) {
                         ? "Requested MISRC mode on the server"
                         : "Requested HSDAOH mode on the server");
                 }
-            } else if (app->is_recording) {
+            } else if (app->is_recording || gui_record_is_finalizing()) {
+                // Mode switch is locked while recording is active AND while a
+                // recording finalize is still in flight. gui_record_stop() sets
+                // is_recording=false before the async finalize thread completes,
+                // so checking is_recording alone would re-enable the toggle
+                // mid-finalize — switching backend at that point would race the
+                // writer threads draining BUF_RECORD_A/B. Mirrors the Disconnect
+                // lockout and the "settings locked while recording" pattern.
                 TraceLog(LOG_INFO,
-                         "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=1",
-                         gui_ui_capture_mode_name(s_capture_mode_state_misrc));
-                gui_app_set_status(app, "Capture mode is locked while recording is active");
+                         "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=%d finalizing=%d",
+                         gui_ui_capture_mode_name(s_capture_mode_state_misrc),
+                         app->is_recording ? 1 : 0,
+                         gui_record_is_finalizing() ? 1 : 0);
+                gui_app_set_status(app, app->is_recording
+                    ? "Capture mode is locked while recording is active"
+                    : "Capture mode is locked while recording finalizes");
             } else {
                 gui_ui_set_capture_mode_state(app, !s_capture_mode_state_misrc);
                 gui_settings_save(&app->settings);
@@ -10594,9 +10909,9 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 #endif
             float settings_base_rate_a_khz = settings_cxadc_mode
-                ? gui_ui_cxadc_base_rate_khz(app, 0)
+                ? gui_ui_cxadc_hw_rate_khz(app, 0)
                 : settings_non_cxadc_base_rate_a_khz;
-            float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_base_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
+            float settings_base_rate_b_khz = settings_cxadc_mode ? gui_ui_cxadc_hw_rate_khz(app, settings_cxadc_has_channel_b ? 1 : 0) : 40000.0f;
             if (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton"))) {
                 app->settings_panel_open = false;
                 gui_ui_clear_text_edit();
@@ -10714,8 +11029,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 } else
 #endif
                 {
-                    app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
-                    gui_settings_save(&app->settings);
+                    if (settings_cxadc_mode) {
+                        gui_ui_cxadc_cycle_rate(app, 0);
+                    } else {
+                        app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
+                        gui_settings_save(&app->settings);
+                        gui_ui_warn_low_rate(app, app->settings.resample_rate_a);
+                    }
                 }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
@@ -10750,8 +11070,14 @@ void gui_handle_interactions(gui_app_t *app) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B resample settings");
                     }
                 } else {
-                    app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
-                    gui_settings_save(&app->settings);
+                    if (settings_cxadc_mode) {
+                        int bcard = settings_cxadc_has_channel_b ? 1 : 0;
+                        gui_ui_cxadc_cycle_rate(app, bcard);
+                    } else {
+                        app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
+                        gui_settings_save(&app->settings);
+                        gui_ui_warn_low_rate(app, app->settings.resample_rate_b);
+                    }
                 }
             }
 
