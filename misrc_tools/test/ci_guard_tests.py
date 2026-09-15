@@ -1200,6 +1200,60 @@ def check_cc_record_argv_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_cc_record_ioprio_runtime(repo_root: Path) -> int:
+    """The caption recorder's ffmpeg must run one I/O step below the RF writers
+    (best-effort level 1), and the thread that spawned it -- the render thread in
+    the app -- must keep its own class. Driven with a stand-in ffmpeg script, so
+    it needs no capture device and no real ffmpeg."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: closed-caption I/O class guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the closed-caption I/O class guard")
+        print("SKIP: closed-caption I/O class guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_cc_record_ioprio_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    module_include = repo_root / "misrc_tools/misrc_gui/output"
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"Closed-caption I/O class guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_cc_ioprio_guard_") as temp_root:
+        exe_path = Path(temp_root) / "cc_ioprio_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{module_include}",
+            str(harness_path),
+            str(module_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(
+                "Closed-caption I/O class harness failed to compile -- if this names a "
+                "missing project header, gui_cc_record.c has grown an include it "
+                f"must not have:\n{built.stderr.strip()}"
+            )
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True, timeout=60)
+        if ran.returncode != 0:
+            return fail(
+                "Closed-caption I/O class harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_cc_record_is_subprocess_only(repo_root: Path) -> int:
     """The caption recorder feeds ffmpeg nothing -- ffmpeg opens the exclusive
     VBI node itself -- so it has no ring, no thread, no preview tap and no
@@ -1924,6 +1978,51 @@ def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
                 f"{Path(rel).name} must nice the SPAWNED CHILD by pid; a 0 pid would "
                 "nice this process instead and slow the RF path it is protecting"
             )
+    return 0
+
+
+def check_capture_children_io_class(repo_root: Path) -> int:
+    """Every child process the GUI spawns carries an I/O class chosen for it. It
+    is set on the spawning thread right before posix_spawn -- the child inherits
+    it at fork, so the child's own threads cannot race it -- and taken back
+    right after, because that thread is the render thread. The recorders'
+    children (the ffmpeg reference video, the caption recorder) sit one step
+    below the RF writers, best-effort level 1; the stream's ffmpeg and mediamtx
+    take only idle disk time. The caption recorder and mediamtx also have
+    runtime checks; the other two need a V4L2 device to start."""
+    for rel, define, want in (
+        ("misrc_tools/misrc_gui/output/gui_video_record.c", "VR_CHILD_IOPRIO", (2 << 13) | 1),
+        ("misrc_tools/misrc_gui/output/gui_cc_record.c", "CC_CHILD_IOPRIO", (2 << 13) | 1),
+        ("misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c", "RS_CHILD_IOPRIO", 3 << 13),
+        ("misrc_tools/misrc_gui/streaming/gui_mediamtx.c", "MTX_CHILD_IOPRIO", 3 << 13),
+    ):
+        code = strip_c_comments(read_text(repo_root / rel))
+        name = Path(rel).name
+        m = re.search(rf"#define\s+{define}\s+\(([\d\s<|()]+)\)", code)
+        if not m:
+            return fail(f"{name} does not define {define}")
+        # "(class << 13) | level" or "class << 13", the kernel's ioprio encoding.
+        parts = re.fullmatch(r"(\d+)<<13(?:\|(\d+))?", re.sub(r"[\s()]", "", m.group(1)))
+        if not parts:
+            return fail(f"{name} writes {define} as '{m.group(1)}', not (class << 13) | level")
+        value = (int(parts.group(1)) << 13) | int(parts.group(2) or 0)
+        if value != want:
+            return fail(f"{name} sets {define} to {value}, want {want}")
+        spawns = [mm.start() for mm in re.finditer(r"\bposix_spawnp?\(", code)]
+        if not spawns:
+            return fail(f"{name} spawns no child any more; update this guard")
+        for at in spawns:
+            before, after = code[max(0, at - 400):at], code[at:at + 400]
+            if not re.search(rf"SYS_ioprio_set[^;]*{define}", before):
+                return fail(
+                    f"{name} spawns a child without setting {define} on the spawning "
+                    "thread first; the child would inherit the render thread's class"
+                )
+            if "SYS_ioprio_set" not in after:
+                return fail(
+                    f"{name} never gives the spawning thread its own I/O class back "
+                    "after posix_spawn; the render thread would keep the child's"
+                )
     return 0
 
 
@@ -3781,6 +3880,7 @@ def main() -> int:
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
         ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
+        ("capture children I/O class", lambda: check_capture_children_io_class(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
@@ -3820,6 +3920,7 @@ def main() -> int:
         checks.insert(12, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(13, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
         checks.insert(14, ("closed-caption argv contract", lambda: check_cc_record_argv_runtime(repo_root)))
+        checks.insert(15, ("closed-caption child I/O class", lambda: check_cc_record_ioprio_runtime(repo_root)))
         checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))

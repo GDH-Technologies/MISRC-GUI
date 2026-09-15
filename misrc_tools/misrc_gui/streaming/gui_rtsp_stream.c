@@ -21,6 +21,7 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +43,10 @@ extern char **environ;
 #define RS_REAP_LIMIT_S    8.0
 /* capture-node's posture for its ffmpeg children, for the same reason. */
 #define RS_CHILD_NICE      5
+/* Idle I/O class: the stream's encoder gets the disk only when nothing else
+ * wants it. Set on the spawning thread around posix_spawn, so the child
+ * inherits it at fork. */
+#define RS_CHILD_IOPRIO    (3 << 13)
 
 static struct {
     uint8_t  *slots[RS_RING_FRAMES];
@@ -537,7 +542,10 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
                                      S_IRUSR | S_IWUSR);
 
     pid_t pid = 0;
+    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    (void)syscall(SYS_ioprio_set, 1, 0, RS_CHILD_IOPRIO);
     int rc = posix_spawn(&pid, gui_video_record_ffmpeg_path(), &fa, NULL, argv, environ);
+    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
     posix_spawn_file_actions_destroy(&fa);
     close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
 

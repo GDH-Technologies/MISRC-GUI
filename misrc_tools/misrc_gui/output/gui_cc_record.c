@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 extern char **environ;
@@ -53,6 +54,10 @@ extern char **environ;
 /* The child is tiny -- 30 packets of 6 bytes a second -- so this is about the
  * house rule that no ffmpeg child competes with the RF writers, not about load. */
 #define CC_CHILD_NICE 5
+/* The caption file is a recording output: one I/O step below the RF writers
+ * (best-effort level 1 against their 0). Set on the spawning thread around
+ * posix_spawn, so the child inherits it at fork. */
+#define CC_CHILD_IOPRIO ((2 << 13) | 1)
 
 static struct {
     /* --- tier A: per resolved ffmpeg binary. Two popens, then never again. --- */
@@ -620,7 +625,10 @@ int gui_cc_record_start(const char *device, const char *out_path,
      * threads plus a live GL context: only async-signal-safe calls are legal
      * between fork and exec. It returns the error directly, and does NOT set
      * errno. */
+    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    (void)syscall(SYS_ioprio_set, 1, 0, CC_CHILD_IOPRIO);
     int rc = posix_spawn(&pid, cc.ffmpeg, &fa, NULL, argv, environ);
+    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
     posix_spawn_file_actions_destroy(&fa);
 
     if (rc != 0) {
