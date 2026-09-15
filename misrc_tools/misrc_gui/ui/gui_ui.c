@@ -389,12 +389,12 @@ static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
     if (!*resample_field) {
         format_cxadc_hw_label(label, sizeof(label), *rate_field);
         char msg[128];
-        snprintf(msg, sizeof(msg), "CH %c: %s %s", ch, label, *tenbit_field ? "10-bit" : "8-bit");
+        snprintf(msg, sizeof(msg), "CH %s: %s %s", ch, label, *tenbit_field ? "10-bit" : "8-bit");
         gui_app_set_status(app, msg);
     } else {
         format_msps_label(label, sizeof(label), *rate_field);
         char msg[128];
-        snprintf(msg, sizeof(msg), "CH %c: %s SW", ch, label);
+        snprintf(msg, sizeof(msg), "CH %s: %s SW", ch, label);
         gui_app_set_status(app, msg);
     }
     gui_ui_warn_low_rate(app, *rate_field);
