@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import getpass
 import os
 import re
 import shutil
@@ -1981,6 +1982,115 @@ def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
     return 0
 
 
+def check_gdh_host_installer(repo_root: Path) -> int:
+    """scripts/gdh-host/install.sh is what the GDH hosts run as root (from a
+    root-owned copy) to grant the scheduling limits the capture path needs. Run
+    it in --print mode -- no root, nothing written -- and check what it would
+    install: the user-manager drop-in lets the GUI's threads reach SCHED_FIFO 99
+    and nice -20; the runner drop-in gives CI exactly what the priority
+    harnesses lower to (RTPRIO 5, NICE 25) and no more, so a PR's code cannot
+    take FIFO 99 on a runner host; cs0's misrc-server unit runs --net-serve as
+    the invoking user with the GUI's limits, top CPU and I/O weight, and room
+    for a FLAC finalize on stop. It must refuse to install without root and
+    never restart a service: user@ and the runner would take the deploy down
+    with them."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: GDH host installer guard (Linux only)")
+        return 0
+    script = repo_root / "scripts/gdh-host/install.sh"
+    if not script.exists():
+        return fail(f"GDH host installer is missing: {script}")
+
+    def render(host: str):
+        ran = subprocess.run(["bash", str(script), "--print", host],
+                             capture_output=True, text=True)
+        if ran.returncode != 0:
+            return None, f"install.sh --print {host} exited {ran.returncode}: {ran.stderr.strip()}"
+        sections: Dict[str, List[str]] = {}
+        current = None
+        for line in ran.stdout.splitlines():
+            if line.startswith("== "):
+                current = line[3:].strip()
+                sections[current] = []
+            elif current is not None:
+                sections[current].append(line.strip())
+        return sections, None
+
+    def settings(lines: List[str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for line in lines:
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                out[key.strip()] = value.strip()
+        return out
+
+    cs0, err = render("cs0")
+    if err:
+        return fail(err)
+    wm, err = render("wm")
+    if err:
+        return fail(err)
+
+    user_dropin = "/etc/systemd/system/user@.service.d/misrc-limits.conf"
+    unit = "/etc/systemd/system/misrc-server.service"
+    for host, sections in (("cs0", cs0), ("wm", wm)):
+        got = settings(sections.get(user_dropin, []))
+        if got.get("LimitRTPRIO") != "99" or got.get("LimitNICE") != "-20":
+            return fail(f"install.sh {host}: {user_dropin} must set LimitRTPRIO=99 and "
+                        f"LimitNICE=-20, got {got}")
+        runner = [k for k in sections if "actions.runner." in k
+                  and k.endswith("/misrc-guard-limits.conf")]
+        if not runner:
+            return fail(f"install.sh {host} installs no runner drop-in (misrc-guard-limits.conf)")
+        for key in runner:
+            got = settings(sections[key])
+            # Exactly what priority_clamp_harness.c / flac_worker_priority_harness.c
+            # lower their soft limits to; anything higher hands PR code more.
+            if got.get("LimitRTPRIO") != "5" or got.get("LimitNICE") != "25":
+                return fail(f"install.sh {host}: {key} must set LimitRTPRIO=5 and "
+                            f"LimitNICE=25, got {got}")
+    if unit in wm:
+        return fail("install.sh wm installs misrc-server.service; the unit is cs0's only")
+    if unit not in cs0:
+        return fail("install.sh cs0 does not install misrc-server.service")
+    body = cs0[unit]
+    got = settings(body)
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+    exec_start = got.get("ExecStart", "")
+    problems = []
+    if "--net-serve" not in exec_start or "--config" not in exec_start:
+        problems.append(f"ExecStart must run --config ... --net-serve, got '{exec_start}'")
+    if any("%h" in line for line in body if not line.startswith("#")):
+        problems.append("uses %h, which is root's home in a system unit even with User=")
+    if got.get("User") != who:
+        problems.append(f"User={got.get('User')}, want the invoking user {who}")
+    for key, want in (("LimitRTPRIO", "99"), ("LimitNICE", "-20"), ("CPUWeight", "10000"),
+                      ("IOWeight", "10000"), ("Restart", "on-failure"),
+                      ("WantedBy", "multi-user.target")):
+        if got.get(key) != want:
+            problems.append(f"{key}={got.get(key)}, want {want}")
+    stop = got.get("TimeoutStopSec", "")
+    if not stop.isdigit() or int(stop) < 600:
+        problems.append(f"TimeoutStopSec={stop or 'unset'}; a legacy FLAC rewrite on stop "
+                        "takes minutes, give it at least 600")
+    if problems:
+        return fail("install.sh cs0: misrc-server.service " + "; ".join(problems))
+
+    bad = subprocess.run(["bash", str(script), "--print", "nosuchhost"],
+                         capture_output=True, text=True)
+    if bad.returncode == 0:
+        return fail("install.sh accepts an unknown host; it must take only wm or cs0")
+    if os.geteuid() != 0:
+        real = subprocess.run(["bash", str(script), "wm"], capture_output=True, text=True)
+        if real.returncode == 0:
+            return fail("install.sh installed without root; it must refuse")
+    source = strip_shell_comments(read_text(script))
+    if re.search(r"systemctl\s+(restart|try-restart|reload-or-restart|try-reload-or-restart)\b",
+                 source):
+        return fail("install.sh restarts a service; it may only enable, start and daemon-reload")
+    return 0
+
+
 def check_capture_children_io_class(repo_root: Path) -> int:
     """Every child process the GUI spawns carries an I/O class chosen for it. It
     is set on the spawning thread right before posix_spawn -- the child inherits
@@ -3881,6 +3991,7 @@ def main() -> int:
         ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
         ("capture children I/O class", lambda: check_capture_children_io_class(repo_root)),
+        ("GDH host installer", lambda: check_gdh_host_installer(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),

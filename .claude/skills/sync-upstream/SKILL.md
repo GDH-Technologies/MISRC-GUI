@@ -47,7 +47,7 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
   --invariant 'misrc_tools/misrc_gui/core/misrc_gui.c' --invariant 'misrc_tools/misrc_gui/output/gui_record.c' \
   --invariant 'misrc_tools/common/flac_writer.c' --invariant 'misrc_tools/test/gui_stats_layout_harness.c' \
   --fork-only '.claude/*' --fork-only '.clangd' --fork-only '.github/workflows/selfhosted-deploy.yml' \
-  --fork-only 'docs/gdh-*' --fork-only 'docs/superpowers/*' --fork-only 'scripts/fetch-mediamtx.sh' \
+  --fork-only 'docs/gdh-*' --fork-only 'docs/superpowers/*' --fork-only 'scripts/fetch-mediamtx.sh' --fork-only 'scripts/gdh-host/*' \
   --fork-only 'misrc_tools/misrc_gui/streaming/*' --fork-only 'misrc_tools/misrc_gui/input/gui_preview_v4l2.c' \
   --fork-only 'misrc_tools/misrc_gui/output/gui_video_record.*' --fork-only 'misrc_tools/misrc_gui/visualization/gui_preview_panel.*'
 ```

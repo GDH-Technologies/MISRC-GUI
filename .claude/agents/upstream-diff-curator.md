@@ -21,7 +21,7 @@ Run `git fetch upstream --quiet` first so the base is current.
    cherry-pick onto a fresh `upstream/<topic>` worktree.
 2. **Fork-only paths.** `git diff --name-only upstream/main...HEAD` must contain none of:
    `.claude/`, `.clangd`, `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
-   `scripts/fetch-mediamtx.sh`, `misrc_tools/misrc_gui/streaming/`, `gui_preview_v4l2.c`,
+   `scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `misrc_tools/misrc_gui/streaming/`, `gui_preview_v4l2.c`,
    `gui_preview_tap.h`, `gui_video_record.[ch]`, `gui_preview_panel.[ch]`. Cross-check
    against the list in `.claude/rules/upstream.md`; that file wins if they differ.
 3. **GDH identifiers.** `git diff upstream/main...HEAD | grep -nE 'gdh|GDH|cs0|cs1|air0|workflow-master|\bwm\b|192\.168\.|gdhvc|capture-node'`

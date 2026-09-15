@@ -362,6 +362,41 @@ GTX 1070 with `AllowEmptyInitialConfiguration`, not a bigger Xvfb.
 same GUI binary with no window, so a Mac can host a server the same way. The server still
 lives only in `misrc_gui`; `misrc_capture` and `misrc_extract` carry no HTTP server.
 
+## Scheduling priority and host provisioning
+
+The capture path asks for top priority itself (`common/threading.h`): capture ingest, the
+RF writers, extraction and the audio thread request SCHED_FIFO at the maximum and, when
+that is refused, take whatever `RLIMIT_RTPRIO` / `RLIMIT_NICE` allow (#64). libFLAC's
+encoder workers run in the normal class at the best nice allowed, never FIFO — RT
+throttling is off on these hosts (`sched_rt_runtime_us` equals the period, the kernel
+default), so a lagging realtime encode would starve everything — and the display, playback
+and render threads stay normal too. For the disk, the RF writers take best-effort I/O
+level 0, the ffmpeg reference video and the caption recorder level 1, the RTSP ffmpeg and
+mediamtx the idle class. I/O classes only count where the scheduler honours them: cs0's
+capture disk runs BFQ; wm records to an NVMe on `none`, where they do nothing.
+
+What each host grants is set by `scripts/gdh-host/install.sh`, run as root from a
+root-owned copy by the "Provision host (gdh-host)" deploy step (one-time setup and the
+sudoers lines: `scripts/gdh-host/README.md`):
+
+| Host | The GUI | CI runner | Also |
+|---|---|---|---|
+| wm | user@ drop-in: `LimitRTPRIO=99`, `LimitNICE=-20` | `LimitRTPRIO=5`, `LimitNICE=25` | — |
+| cs0 | the same drop-in | the same | `misrc-server.service` runs `--net-serve` with the GUI's limits and CPU/IO weight 10000; the deploy restarts it onto a new binary only when `/settings` reports `"state": 0` |
+
+The runner gets exactly what the priority guards lower themselves to, so they run in CI
+instead of reporting SKIP, and no more. Before this, capture-node's `capture-limits.conf`
+(`LimitRTPRIO=20`, `LimitNICE=-11`) was the ceiling and threading.h's all-or-nothing request
+failed under it: `[THREAD] Thread priority request 3 could not be elevated (rt_err=1,
+nice_err=13)`. The GUI's log now names the grant instead —
+`[THREAD] realtime priority 99 not permitted; using 20 (resource limit)` means the new
+limits are not live yet.
+
+Limits apply when a process starts, and the installer restarts nothing: the GUI gets them
+at the next login, a runner at its next restart (an idle moment, never from a job), cs0's
+server at its next idle restart. `misrc_tools/test/capture_priority_e2e.sh` checks the
+result thread by thread.
+
 ## Upstream's build.yml is DISABLED — as a repo setting, not a file edit
 
 `.github/workflows/build.yml` is byte-identical to `harrypm/MISRC-GUI` and must stay that

@@ -31,6 +31,7 @@ GUARD_PATHS = re.compile(
     r"|(^|/)misrc_tools/meson(\.build|_options\.txt)$"
     r"|(^|/)scripts/(build-[A-Za-z0-9-]+\.(sh|ps1)|fetch-mediamtx\.sh|publish-deps-cache\.sh)$"
     r"|(^|/)misrc_tools/git-version\.sh$"
+    r"|(^|/)scripts/gdh-host/[A-Za-z0-9_.-]+$"
     r"|(^|/)misrc_tools/test/(ci_guard_tests\.py|[A-Za-z0-9_]+_harness\.c)$"
 )
 SUITE = Path("misrc_tools") / "test" / "ci_guard_tests.py"
