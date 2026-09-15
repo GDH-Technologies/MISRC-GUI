@@ -92,9 +92,11 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 63
-  registered checks, several of which compile and run C harnesses in
-  `misrc_tools/test/*_harness.c`. Meson has only three `test()` targets (DdD).
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 70
+  checks in a Linux `--post-build` run (v1.2.0 sync), several of which compile and run C
+  harnesses in `misrc_tools/test/*_harness.c`. Meson has ten `test()` targets
+  (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
+  must keep the fork's `"Preview"` entry.
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
   touches the capture path; run it and quote the numbers.
 - Headless modes for automation (`misrc_gui --help`): `--auto-record`, `--config <path>`
@@ -144,10 +146,22 @@ Fork-side:
   fork's `gui_record` finalize and resolve only `flac_writer.c` toward upstream.
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
-  `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate switch.
-- Net mode (`misrc_gui/net/gui_net.c`): a client never sets its own `is_recording` (the
-  audio thread would start writing WAVs); every readout and control goes through
-  `gui_app_effective_recording` / `gui_app_control_capturing`. During the UI pass a client's
+  `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate
+  switch. Since v1.2.0 it ends the recording, not the capture, and its trigger is a
+  normalized 0.1-0.8 string; a legacy percent ("33") is migrated on load, so a rollback to
+  v1.1.9-gdh.4 or older reads a saved "0.2" as 0.2 %.
+- Recording locks (upstream v1.2.0, `PROMPT_WAVEFORM_READOUT_BUG.md`): `gui_app_cleanup` runs
+  `gui_record_cleanup()` before `bufmgr_cleanup()` (the async finalize still drains
+  `BUF_RECORD_A/B`); Disconnect and Space are refused while this machine records; the
+  capture-mode toggle stays locked while a recording finalizes. Keep all three on every sync.
+- Net mode (`misrc_gui/net/gui_net.c`): a client records on the server unless its
+  client-local `net_client_record_local` is on. Only then does it set its own `is_recording`
+  (through `gui_record.c`, the only writer), recording the `/rf` feed into its own output
+  folder, gaps possible. The local start/stop is queued and run by
+  `gui_app_service_local_record_request()` after `gui_net_client_view_end()`. Upstream's
+  `a7d1511` made local the only mode; the fork keeps both (`check_record_parity`). Every
+  readout and control goes through `gui_app_effective_recording` /
+  `gui_app_control_capturing`. During the UI pass a client's
   `app->settings` is the SERVER's copy (view swap in `misrc_gui.c`, held until `EndDrawing`
   because Clay draws text from pointers into it); code that runs off the main thread reads
   `capture_ab_swap_invert`, not a settings field. The server applies `/set` only on its main
@@ -164,7 +178,11 @@ Fork-side:
   in `gui_settings.h` so the table compiles without raylib. A new field needs a default and a
   `GS_*` row, with `GS_CLIENT_LOCAL` if it describes the machine rather than the capture; the
   "every settings field is in the table" guard fails otherwise, and the v1.1.8 key list in the
-  suite must never lose a key (rollback loads the new file in the old build).
+  suite must never lose a key (rollback loads the new file in the old build). Upstream still
+  adds fields to its hand-written struct in `gui_app.h` and its load/save in
+  `gui_settings.c`: on a sync take the fork's side of both and port each field into
+  `gui_settings.h`, a default, and a row APPENDED to the table (row order is the file's write
+  order and the round-trip harness compares positionally).
 - Headless modes that call `gui_settings_load`/`save` without `--config` hit the LIVE settings
   file of whoever runs them: `--auto-record` saves defaults before the override applies, and
   `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
