@@ -23,6 +23,9 @@
 #include <sched.h>
 #include <pthread.h>
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "threading.h"
+#endif
 
 static void flac_writer_set_affinity_error(
     char *error_message,
@@ -618,6 +621,35 @@ flac_writer_t *flac_writer_create_stream(FILE *output_file, const flac_writer_co
     return writer;
 }
 
+/* libFLAC starts its encoder workers inside FLAC__stream_encoder_process() --
+ * a few at a time, on the calling thread -- and each copies the caller's
+ * scheduling. The GUI and the CLI call in from a SCHED_FIFO writer, and nothing
+ * throttles a realtime encode that falls behind, so these calls run in the
+ * normal class (SCHED_OTHER at the strongest nice allowed) and the writer gets
+ * its own class back on return. A single-threaded encoder has no workers and
+ * keeps the writer's class. */
+typedef struct {
+#if defined(__linux__) && !defined(__ANDROID__)
+    thrd_sched_saved_t saved;
+#endif
+    bool active;
+} flac_worker_sched_t;
+
+static void flac_worker_sched_enter(const flac_writer_t *writer, flac_worker_sched_t *sched) {
+    sched->active = writer->config.num_threads != 1;
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (sched->active) thrd_sched_enter_normal(&sched->saved);
+#endif
+}
+
+static void flac_worker_sched_leave(const flac_worker_sched_t *sched) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (sched->active) thrd_sched_restore(&sched->saved);
+#else
+    (void)sched;
+#endif
+}
+
 /* ============================================================================
  * Process Samples (int32_t)
  * ============================================================================ */
@@ -628,7 +660,10 @@ int flac_writer_process(flac_writer_t *writer, const int32_t *samples, uint32_t 
     // For mono, we pass address of our single pointer
     const FLAC__int32 *channel_ptrs[1] = { samples };
 
+    flac_worker_sched_t sched;
+    flac_worker_sched_enter(writer, &sched);
     FLAC__bool ok = FLAC__stream_encoder_process(writer->encoder, channel_ptrs, num_samples);
+    flac_worker_sched_leave(&sched);
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg), "FLAC process error: %s",
@@ -685,7 +720,10 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer) {
 #endif
     }
 
+    flac_worker_sched_t sched;
+    flac_worker_sched_enter(writer, &sched);
     FLAC__bool ok = FLAC__stream_encoder_finish(writer->encoder);
+    flac_worker_sched_leave(&sched);
     flac_writer_error_t result = FLAC_WRITER_OK;
 
     if (!ok) {

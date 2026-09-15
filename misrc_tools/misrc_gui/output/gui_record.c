@@ -1235,6 +1235,10 @@ static int flac_writer_thread(void *ctx) {
 
     // Boost thread priority to avoid backpressure when window is minimized
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* Best-effort I/O level 0: head of the normal I/O queue wherever the
+     * scheduler honours priorities (BFQ, mq-deadline); threads started from
+     * here (libFLAC's workers) inherit it. */
+    thrd_set_io_priority(THRD_IOPRIO(THRD_IOPRIO_CLASS_BE, 0));
 
     // Scratch buffers
     int16_t *tmp_i16 = NULL;
@@ -1454,6 +1458,10 @@ static int raw_writer_thread(void *ctx) {
 
     // Boost thread priority to avoid backpressure when window is minimized
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* Best-effort I/O level 0: head of the normal I/O queue wherever the
+     * scheduler honours priorities (BFQ, mq-deadline); threads started from
+     * here (libFLAC's workers) inherit it. */
+    thrd_set_io_priority(THRD_IOPRIO(THRD_IOPRIO_CLASS_BE, 0));
 
 #if LIBSOXR_ENABLED
     int16_t *tmp_i16 = (int16_t *)aligned_alloc(32, GUI_RECORD_WRITER_BLOCK_SAMPLES * sizeof(int16_t));

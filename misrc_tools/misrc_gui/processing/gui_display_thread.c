@@ -33,7 +33,9 @@ static int display_thread_func(void *ctx) {
     display_thread_t *dt = (display_thread_t *)ctx;
     gui_app_t *app = dt->app;
     buffer_manager_t *bufmgr = dt->bufmgr;
-    thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* ABOVE, not CRITICAL: the display feed must never outrank capture and
+     * the RF writers. */
+    thrd_set_priority(THRD_PRIORITY_ABOVE);
 
     fprintf(stderr, "[DISPLAY] Display thread started\n");
 
@@ -169,7 +171,7 @@ int gui_display_thread_start(display_thread_t *dt,
     if (thrd_create_with_priority(thread,
                                   display_thread_func,
                                   dt,
-                                  THRD_PRIORITY_CRITICAL) != thrd_success) {
+                                  THRD_PRIORITY_ABOVE) != thrd_success) {
         fprintf(stderr, "[DISPLAY] Failed to create display thread\n");
         free(thread);
         atomic_store(&dt->running, false);

@@ -3484,6 +3484,132 @@ def check_flac_streaminfo_total_samples_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_priority_clamp_runtime(repo_root: Path) -> int:
+    """threading.h's realtime and nice requests must degrade to what
+    RLIMIT_RTPRIO / RLIMIT_NICE allow instead of failing outright. On hosts
+    capped at LimitRTPRIO=20 / LimitNICE=-11 the all-or-nothing request left
+    every capture thread SCHED_OTHER -- "[THREAD] Thread priority request 3
+    could not be elevated (rt_err=1, nice_err=13)" in the journal. Also covers
+    the per-thread I/O priority helper: set, restore, inherited by a spawned
+    child.
+
+    The clamp cases need a non-root user with a nonzero hard RLIMIT_RTPRIO /
+    RLIMIT_NICE. A runner service on systemd's defaults (both 0) or a root
+    container has neither, so those cases report SKIP and only the I/O case
+    runs -- the skips are printed so a green run never hides them."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: priority clamp guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the priority clamp guard")
+        print("SKIP: priority clamp guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/priority_clamp_harness.c"
+    include_dir = repo_root / "misrc_tools/common"
+    if not harness_path.exists():
+        return fail(f"Priority clamp harness source is missing: {harness_path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_priority_clamp_guard_") as temp_root:
+        exe_path = Path(temp_root) / "priority_clamp_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            # threading.h's thrd_create casts int(*)(void*) to pthread's
+            # void*(*)(void*); -Wextra flags that, and it is not this guard's concern.
+            "-Wno-cast-function-type",
+            "-D_GNU_SOURCE",
+            f"-I{include_dir}",
+            str(harness_path),
+            "-lpthread",
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"Priority clamp harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode != 0:
+            return fail(
+                "Priority clamp harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+        for line in ran.stdout.splitlines():
+            if line.startswith("SKIP:"):
+                print(f"SKIP: priority clamp case -{line[len('SKIP:'):]}")
+    return 0
+
+
+def check_flac_worker_priority_runtime(repo_root: Path) -> int:
+    """libFLAC starts its encoder workers lazily from inside
+    FLAC__stream_encoder_process(), on the calling thread, and a new thread
+    copies its creator's policy -- so the SCHED_FIFO RF writer would hand up to
+    eight CPU-bound workers per channel SCHED_FIFO, and with RT throttling off a
+    lagging encode starves the host. flac_writer must run every worker in the
+    strongest normal class and put the writer back on SCHED_FIFO afterwards.
+
+    Needs a writer that may become SCHED_FIFO (nonzero RLIMIT_RTPRIO, or root)
+    and libFLAC built with threads; otherwise it reports SKIP."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: FLAC worker priority guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    pkg_config = shutil.which("pkg-config")
+    if cc is None or pkg_config is None:
+        print("SKIP: FLAC worker priority guard (cc/pkg-config not available)")
+        return 0
+    flac_flags = subprocess.run(
+        [pkg_config, "--cflags", "--libs", "flac"], capture_output=True, text=True
+    )
+    if flac_flags.returncode != 0:
+        print("SKIP: FLAC worker priority guard (libFLAC not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/flac_worker_priority_harness.c"
+    flac_writer_path = repo_root / "misrc_tools/common/flac_writer.c"
+    include_dir = repo_root / "misrc_tools/common"
+    for required in (harness_path, flac_writer_path):
+        if not required.exists():
+            return fail(f"FLAC worker priority guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_flac_worker_priority_guard_") as temp_root:
+        exe_path = Path(temp_root) / "flac_worker_priority_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_GNU_SOURCE",
+            "-DLIBFLAC_ENABLED=1",
+            "-DHAVE_FLAC_THREADING=1",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(flac_writer_path),
+        ] + flac_flags.stdout.split() + [
+            "-lpthread",
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(f"FLAC worker priority harness failed to compile:\n{built.stderr.strip()}")
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True)
+        if ran.returncode == 2:
+            print(f"SKIP: FLAC worker priority guard -{ran.stdout.strip()[len('SKIP:'):]}")
+            return 0
+        if ran.returncode != 0:
+            return fail(
+                "FLAC worker priority harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
                                         gui_settings_c_path: Path,
                                         meson_path: Path) -> int:
@@ -3694,6 +3820,8 @@ def main() -> int:
         checks.insert(12, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(13, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
         checks.insert(14, ("closed-caption argv contract", lambda: check_cc_record_argv_runtime(repo_root)))
+        checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
+        checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode

@@ -214,6 +214,8 @@ static int audio_thread_main(void *ctx)
     size_t len = BUFFER_AUDIO_READ_SIZE;
     void *buf;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* Best-effort I/O level 0: this thread writes the WAV record. */
+    thrd_set_io_priority(THRD_IOPRIO(THRD_IOPRIO_CLASS_BE, 0));
     
     fprintf(stderr, "[AUDIO] Audio thread started\n");
 
