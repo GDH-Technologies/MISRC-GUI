@@ -43,3 +43,49 @@ __pycache__/
 
 # Claude worktrees are local scratch, never repo content
 **/.claude/worktrees/
+
+# clangd's background index. It persists parsed translation units as *.idx under
+# .cache/clangd/index/ so a restart does not reindex the whole tree
+# (https://clangd.llvm.org/design/indexing). Machine-local and regenerated on demand:
+# never repo content, and large enough to be worth keeping out of git status. The **/
+# prefix matters: a pattern with an embedded slash is anchored to this file's directory,
+# so a bare .cache/clangd/ would miss an editor opened on a subdirectory project root.
+**/.cache/clangd/
+
+# macOS Finder/system droppings. Every pattern here is deliberately unanchored (no
+# leading or embedded slash), which in gitignore means "match at any depth" -- these
+# files appear in whatever directory Finder happened to touch, not just the root.
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Finder droppings specific to network shares and removable volumes
+.AppleDB
+.AppleDesktop
+.apdisk
+Network Trash Folder
+Temporary Items
+
+# Deliberately NOT ignored: the custom-folder-icon file, usually written `Icon?` in
+# macOS ignore templates. The real artifact is "Icon" plus a literal CR, but `?` is a
+# single-character glob, so `Icon?` also matches assets/Icons/ -- a tracked directory
+# holding MISRC_Icon.png. Git does not descend into an ignored directory, so that
+# pattern would silently hide anything added there. Custom folder icons are rare and
+# only ever created by hand in Finder; the pattern is not worth the trap.
+
+# macOS toolchain artifacts. There is no Xcode project in this repo -- meson is the only
+# build system, and the macOS CI leg stages MISRC.app under $RUNNER_TEMP, outside the
+# tree -- so these only fire if someone opens the sources in Xcode or leaves debug
+# symbols outside one of the build-* dirs already ignored above.
+*.dSYM/
+DerivedData/
+xcuserdata/
+*.xcuserstate
