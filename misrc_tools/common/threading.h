@@ -99,6 +99,16 @@
     SetPriorityClass(GetCurrentProcess(), prio_class);
   }
 
+  /* Per-thread I/O priority is Linux-only (see the POSIX branch); no-ops here so
+   * callers need no platform guard. */
+  #define THRD_IOPRIO_CLASS_BE    2
+  #define THRD_IOPRIO_CLASS_IDLE  3
+  #define THRD_IOPRIO(cls, level) (((cls) << 13) | (level))
+  static inline int thrd_get_io_priority(void) { return 0; }
+  static inline int thrd_set_io_priority(int ioprio) { (void)ioprio; return 0; }
+  static inline int thrd_is_realtime(void) { return 0; }
+  static inline void thrd_leave_realtime(void) {}
+
   /* Get current time in milliseconds (for timeouts, elapsed time tracking) */
   static inline uint64_t get_time_ms(void) {
     extern __declspec(dllimport) unsigned long __stdcall GetTickCount(void);
@@ -221,6 +231,79 @@
     return setpriority(PRIO_PROCESS, 0, nice_target);
   }
 
+  /* Most negative nice this process may set without privilege: 20 - RLIMIT_NICE
+   * (31 allows -11, 40 allows -20). 20 means no negative nice at all, which is
+   * also the answer where the limit does not exist or cannot be read. */
+  static inline int thrd_nice_floor(void) {
+#if defined(RLIMIT_NICE)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NICE, &rl) != 0) return 20;
+    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= 40) return -20;
+    return 20 - (int)rl.rlim_cur;
+#else
+    return 20;
+#endif
+  }
+
+  /* Highest realtime priority this process may request without privilege
+   * (RLIMIT_RTPRIO), or -1 where there is no such limit to clamp to. */
+  static inline int thrd_rtprio_limit(void) {
+#if defined(RLIMIT_RTPRIO)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_RTPRIO, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) return -1;
+    return (int)rl.rlim_cur;
+#else
+    return -1;
+#endif
+  }
+
+  static inline void thrd_log_priority_clamp_once(const char *what, int wanted, int granted) {
+    static int logged_once = 0;
+    if (logged_once) return;
+    logged_once = 1;
+    fprintf(stderr, "[THREAD] %s %d not permitted; using %d (resource limit)\n",
+            what, wanted, granted);
+  }
+
+  /* Set this thread's nice; when the kernel refuses a value below the RLIMIT_NICE
+   * floor, take the floor instead of staying where it was (a request for -15
+   * under LimitNICE=-11 lands on -11, not on 0). */
+  static inline int thrd_set_nice_clamped(int nice_target) {
+    if (thrd_set_nice_target(nice_target) == 0) return 0;
+    int err = errno;
+    int nice_floor = thrd_nice_floor();
+    if ((err == EACCES || err == EPERM) && nice_floor < 0 && nice_floor > nice_target &&
+        thrd_set_nice_target(nice_floor) == 0) {
+      thrd_log_priority_clamp_once("nice", nice_target, nice_floor);
+      return 0;
+    }
+    errno = err;
+    return -1;
+  }
+
+  /* Whether the calling thread runs a realtime class (SCHED_FIFO / SCHED_RR). */
+  static inline int thrd_is_realtime(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    int policy = sched_getscheduler(0);
+    return policy == SCHED_FIFO || policy == SCHED_RR;
+#else
+    return 0;
+#endif
+  }
+
+  /* Put the calling thread back in the normal class if it runs a realtime one,
+   * leaving its nice as it is. A thread created from a realtime thread inherits
+   * its class (pthread_create, posix_spawn), so asking for a normal level has to
+   * leave realtime explicitly -- a nice value means nothing under SCHED_FIFO. */
+  static inline void thrd_leave_realtime(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (!thrd_is_realtime()) return;
+    struct sched_param normal;
+    normal.sched_priority = 0;
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+#endif
+  }
+
   static inline int thrd_priority_to_nice_target(int priority) {
     if (priority == THRD_PRIORITY_ABOVE) return -5;
     if (priority == THRD_PRIORITY_HIGH) return -10;
@@ -258,6 +341,18 @@
     }
 
     int rc = pthread_setschedparam(pthread_self(), policy, &param);
+    if (rc == EPERM) {
+      /* Unprivileged, the kernel grants any priority up to RLIMIT_RTPRIO: take
+       * the most it allows instead of nothing. A privileged caller never gets
+       * EPERM, so its request is unchanged. */
+      int limit = thrd_rtprio_limit();
+      if (limit >= min_prio && limit < param.sched_priority) {
+        int wanted = param.sched_priority;
+        param.sched_priority = limit;
+        rc = pthread_setschedparam(pthread_self(), policy, &param);
+        if (rc == 0) thrd_log_priority_clamp_once("realtime priority", wanted, limit);
+      }
+    }
     if (rc == 0) {
       return 0;
     }
@@ -606,9 +701,11 @@
     if (priority >= THRD_PRIORITY_HIGH) {
       rt_err = thrd_try_realtime(priority);
       if (rt_err == 0) return;
+    } else {
+      thrd_leave_realtime();
     }
 
-    if (thrd_set_nice_target(thrd_priority_to_nice_target(priority)) == 0) {
+    if (thrd_set_nice_clamped(thrd_priority_to_nice_target(priority)) == 0) {
       return;
     }
 
@@ -691,6 +788,16 @@
                                : (min_prio + ((max_prio - min_prio) * 3) / 4);
         if (sched_setscheduler(0, policy, &param) == 0) return;
         rt_err = (errno != 0) ? errno : EINVAL;
+        int limit = thrd_rtprio_limit();
+        if (rt_err == EPERM && limit >= min_prio && limit < param.sched_priority) {
+          int wanted = param.sched_priority;
+          param.sched_priority = limit;
+          if (sched_setscheduler(0, policy, &param) == 0) {
+            thrd_log_priority_clamp_once("realtime priority", wanted, limit);
+            return;
+          }
+          rt_err = (errno != 0) ? errno : EINVAL;
+        }
       } else {
         rt_err = ENOTSUP;
       }
@@ -708,9 +815,96 @@
     if (setpriority(PRIO_PROCESS, 0, nice_target) == 0) return;
 #endif
     nice_err = (errno != 0) ? errno : EINVAL;
+    int nice_floor = thrd_nice_floor();
+    if ((nice_err == EACCES || nice_err == EPERM) && nice_floor < 0 && nice_floor > nice_target) {
+#if defined(__linux__)
+      int clamped_rc = proc_set_nice_all_threads(nice_floor);
+#else
+      int clamped_rc = setpriority(PRIO_PROCESS, 0, nice_floor);
+#endif
+      if (clamped_rc == 0) {
+        thrd_log_priority_clamp_once("nice", nice_target, nice_floor);
+        return;
+      }
+      nice_err = (errno != 0) ? errno : EINVAL;
+    }
     if (priority >= PROC_PRIORITY_ABOVE) {
       thrd_log_priority_failure_once("Process", priority, rt_err, nice_err);
     }
+  }
+
+  /* Per-thread I/O priority: ioprio_get/ioprio_set on the calling thread's tid.
+   * The value is the kernel's encoding, THRD_IOPRIO(class, level); 0 means "none"
+   * (derived from the thread's nice), which is also what restoring a saved 0 puts
+   * back. Threads created and children spawned afterwards inherit it. Only I/O
+   * schedulers that implement priorities (BFQ, mq-deadline) act on it; a no-op
+   * off Linux and on Android. */
+  #define THRD_IOPRIO_CLASS_BE    2
+  #define THRD_IOPRIO_CLASS_IDLE  3
+  #define THRD_IOPRIO(cls, level) (((cls) << 13) | (level))
+
+  static inline int thrd_get_io_priority(void) {
+#if defined(__linux__) && !defined(__ANDROID__) && defined(SYS_ioprio_get) && defined(SYS_gettid)
+    return (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, (int)syscall(SYS_gettid));
+#else
+    return 0;
+#endif
+  }
+
+  static inline int thrd_set_io_priority(int ioprio) {
+#if defined(__linux__) && !defined(__ANDROID__) && defined(SYS_ioprio_set) && defined(SYS_gettid)
+    return (int)syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, (int)syscall(SYS_gettid), ioprio);
+#else
+    (void)ioprio;
+    return 0;
+#endif
+  }
+
+  /* CPU-bound work that must not run realtime -- and whose helper threads must
+   * not inherit realtime -- runs between thrd_sched_enter_normal() and
+   * thrd_sched_restore(): the calling thread drops to SCHED_OTHER at the
+   * strongest nice it may use (-20, else the RLIMIT_NICE floor), and threads it
+   * creates meanwhile copy that. libFLAC is the case: it starts its encoder
+   * workers inside FLAC__stream_encoder_process(), on the calling thread, a few
+   * at a time. Linux only; a no-op elsewhere. */
+  typedef struct {
+    int valid;
+    int policy;
+    int rt_priority;
+    int nice;
+  } thrd_sched_saved_t;
+
+  static inline void thrd_sched_enter_normal(thrd_sched_saved_t *saved) {
+    saved->valid = 0;
+#if defined(__linux__) && !defined(__ANDROID__) && defined(SYS_gettid)
+    struct sched_param param;
+    if (pthread_getschedparam(pthread_self(), &saved->policy, &param) != 0) return;
+    saved->rt_priority = param.sched_priority;
+    errno = 0;
+    saved->nice = getpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid));
+    if (saved->nice == -1 && errno != 0) return;
+    saved->valid = 1;
+    if (saved->policy != SCHED_OTHER) {
+      struct sched_param normal;
+      normal.sched_priority = 0;
+      (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+    }
+    (void)thrd_set_nice_clamped(-20);
+#endif
+  }
+
+  static inline void thrd_sched_restore(const thrd_sched_saved_t *saved) {
+#if defined(__linux__) && !defined(__ANDROID__) && defined(SYS_gettid)
+    if (!saved->valid) return;
+    (void)thrd_set_nice_target(saved->nice);
+    if (saved->policy != SCHED_OTHER) {
+      struct sched_param param;
+      param.sched_priority = saved->rt_priority;
+      (void)pthread_setschedparam(pthread_self(), saved->policy, &param);
+    }
+#else
+    (void)saved;
+#endif
   }
 
   /* Get current time in milliseconds (for timeouts, elapsed time tracking) */

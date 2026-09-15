@@ -93,6 +93,9 @@ static int extraction_thread(void *ctx) {
     uint16_t peak[2] = {0, 0};
     uint32_t frame_count = 0;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* Best-effort I/O level 0: this thread writes the record spill file when
+     * the writers fall behind. */
+    thrd_set_io_priority(THRD_IOPRIO(THRD_IOPRIO_CLASS_BE, 0));
 
     fprintf(stderr, "[EXTRACT] Continuous extraction thread started\n");
 
