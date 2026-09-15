@@ -1189,6 +1189,11 @@ static int server_start(gui_app_t *app, uint16_t port) {
         free(srv);
         return -1;
     }
+    /* Publish before the first request can arrive. The main loop refreshes the
+     * published copy from gui_net_poll_commands(), but only after startup has
+     * finished (device enumeration comes first), and until then /settings
+     * served a zeroed snapshot at generation 0. */
+    server_publish(srv, app);
     if (thrd_create(&srv->listen_thread, server_listen_thread, srv) != thrd_success) {
         net_close(srv->listen_fd);
         free(srv);
