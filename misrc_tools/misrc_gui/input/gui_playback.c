@@ -1480,7 +1480,9 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
 static int playback_thread_func(void *ctx_ptr) {
     playback_ctx_t *ctx = (playback_ctx_t *)ctx_ptr;
     gui_app_t *app = ctx->app;
-    thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    /* ABOVE, not CRITICAL: file playback has no realtime deadline, and at 2x
+     * and MAX it never sleeps, so as SCHED_FIFO it would hold a whole CPU. */
+    thrd_set_priority(THRD_PRIORITY_ABOVE);
 
     fprintf(stderr, "[PLAYBACK] Playback thread started (writing to BUF_CAPTURE_RF)\n");
 
@@ -1983,7 +1985,7 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
     if (thrd_create_with_priority(&thread,
                                   playback_thread_func,
                                   &s_playback,
-                                  THRD_PRIORITY_CRITICAL) != thrd_success) {
+                                  THRD_PRIORITY_ABOVE) != thrd_success) {
         fprintf(stderr, "[PLAYBACK] Failed to create playback thread\n");
         // Stop extraction thread before cleanup
         gui_extract_stop();

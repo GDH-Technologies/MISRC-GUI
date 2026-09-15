@@ -1830,8 +1830,25 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 }
 
 
-// Start capture (+60ln from orig adding upstream callbk)
+static int gui_app_start_capture_inner(gui_app_t *app);
+
+/* The hardware start paths below promote their caller -- the render thread, or
+ * the headless --net-serve loop -- with thrd_set_priority(CRITICAL), so the
+ * transport threads hsdaoh/libusb/libuvc spawn during open/start inherit it.
+ * On Linux that is a real SCHED_FIFO class, and nothing below drops it again:
+ * the render loop, and every thread or child it starts later (the display
+ * thread, ffmpeg, mediamtx), would stay SCHED_FIFO for the life of the process.
+ * Hand the caller back once the start returns; threads spawned inside keep what
+ * they inherited, and proc_set_priority's nice stays. */
 int gui_app_start_capture(gui_app_t *app) {
+    int caller_was_realtime = thrd_is_realtime();
+    int rc = gui_app_start_capture_inner(app);
+    if (!caller_was_realtime) thrd_leave_realtime();
+    return rc;
+}
+
+// Start capture (+60ln from orig adding upstream callbk)
+static int gui_app_start_capture_inner(gui_app_t *app) {
     fprintf(stderr, "[GUI] gui_app_start_capture called\n");
 
     // Client mode (network slave): forward the request to the server instead

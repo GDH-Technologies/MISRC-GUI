@@ -116,6 +116,65 @@ static int case_proc_rt_clamped_to_rlimit(void)
     return CASE_PASS;
 }
 
+/* A thread that became SCHED_FIFO (directly, or by being created from one --
+ * pthread_create copies the creator's policy) and then asks for ABOVE must end
+ * up in the normal class at nice -5. Setting only the nice would leave it
+ * SCHED_FIFO, where nice means nothing: that is how the display thread, started
+ * from the promoted render thread, kept outranking nothing but everything. */
+static int case_thread_leaves_realtime_for_lower_level(void)
+{
+    if (geteuid() == 0) { printf("  root: limits do not bind\n"); return CASE_SKIP; }
+    if (hard_limit_below(RLIMIT_RTPRIO, 5)) { printf("  hard RLIMIT_RTPRIO < 5\n"); return CASE_SKIP; }
+    if (hard_limit_below(RLIMIT_NICE, 25)) { printf("  hard RLIMIT_NICE < 25\n"); return CASE_SKIP; }
+    if (set_soft_limit(RLIMIT_RTPRIO, 5) != 0) { perror("  setrlimit RTPRIO"); return CASE_FAIL; }
+    if (set_soft_limit(RLIMIT_NICE, 25) != 0) { perror("  setrlimit NICE"); return CASE_FAIL; }
+
+    thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    if (sched_getscheduler(0) != SCHED_FIFO) {
+        printf("  precondition: CRITICAL did not give SCHED_FIFO\n");
+        return CASE_FAIL;
+    }
+
+    thrd_set_priority(THRD_PRIORITY_ABOVE);
+
+    errno = 0;
+    int nice_now = getpriority(PRIO_PROCESS, (id_t)self_tid());
+    int policy = sched_getscheduler(0);
+    if (policy != SCHED_OTHER || nice_now != -5) {
+        printf("  got policy %d nice %d, want SCHED_OTHER nice -5\n", policy, nice_now);
+        return CASE_FAIL;
+    }
+    return CASE_PASS;
+}
+
+/* gui_app_start_capture promotes its caller (the render thread) so transport
+ * threads spawned during device open inherit SCHED_FIFO, then hands the caller
+ * back with thrd_leave_realtime(): normal class again, with the nice that
+ * proc_set_priority gave it left alone. */
+static int case_leave_realtime_keeps_nice(void)
+{
+    if (geteuid() == 0) { printf("  root: limits do not bind\n"); return CASE_SKIP; }
+    if (hard_limit_below(RLIMIT_RTPRIO, 5)) { printf("  hard RLIMIT_RTPRIO < 5\n"); return CASE_SKIP; }
+    if (hard_limit_below(RLIMIT_NICE, 25)) { printf("  hard RLIMIT_NICE < 25\n"); return CASE_SKIP; }
+    if (set_soft_limit(RLIMIT_RTPRIO, 5) != 0) { perror("  setrlimit RTPRIO"); return CASE_FAIL; }
+    if (set_soft_limit(RLIMIT_NICE, 25) != 0) { perror("  setrlimit NICE"); return CASE_FAIL; }
+
+    if (thrd_is_realtime()) { printf("  a fresh process reports realtime\n"); return CASE_FAIL; }
+    thrd_set_priority(THRD_PRIORITY_CRITICAL);
+    if (setpriority(PRIO_PROCESS, (id_t)self_tid(), -3) != 0) { perror("  setpriority -3"); return CASE_FAIL; }
+    if (!thrd_is_realtime()) { printf("  CRITICAL thread does not report realtime\n"); return CASE_FAIL; }
+
+    thrd_leave_realtime();
+
+    errno = 0;
+    int nice_now = getpriority(PRIO_PROCESS, (id_t)self_tid());
+    if (thrd_is_realtime() || sched_getscheduler(0) != SCHED_OTHER || nice_now != -3) {
+        printf("  got policy %d nice %d, want SCHED_OTHER nice -3\n", sched_getscheduler(0), nice_now);
+        return CASE_FAIL;
+    }
+    return CASE_PASS;
+}
+
 /* Best-effort level 1 is (2 << 13) | 1 = 16385 in the kernel's encoding. It
  * applies to this thread, is inherited by a child spawned from it, and the
  * saved value restores exactly (PR B restores the render thread this way). */
@@ -178,6 +237,8 @@ int main(void)
     run_case("thread realtime clamped to RLIMIT_RTPRIO", case_thread_rt_clamped_to_rlimit);
     run_case("thread nice clamped to the RLIMIT_NICE floor", case_thread_nice_clamped_to_floor);
     run_case("process realtime clamped to RLIMIT_RTPRIO", case_proc_rt_clamped_to_rlimit);
+    run_case("thread leaves realtime for a lower level", case_thread_leaves_realtime_for_lower_level);
+    run_case("leaving realtime keeps the nice", case_leave_realtime_keeps_nice);
     run_case("I/O priority set, restored and inherited", case_io_priority_set_restore_inherit);
     return failures == 0 ? 0 : 1;
 }

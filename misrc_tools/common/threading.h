@@ -106,6 +106,8 @@
   #define THRD_IOPRIO(cls, level) (((cls) << 13) | (level))
   static inline int thrd_get_io_priority(void) { return 0; }
   static inline int thrd_set_io_priority(int ioprio) { (void)ioprio; return 0; }
+  static inline int thrd_is_realtime(void) { return 0; }
+  static inline void thrd_leave_realtime(void) {}
 
   /* Get current time in milliseconds (for timeouts, elapsed time tracking) */
   static inline uint64_t get_time_ms(void) {
@@ -277,6 +279,29 @@
     }
     errno = err;
     return -1;
+  }
+
+  /* Whether the calling thread runs a realtime class (SCHED_FIFO / SCHED_RR). */
+  static inline int thrd_is_realtime(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    int policy = sched_getscheduler(0);
+    return policy == SCHED_FIFO || policy == SCHED_RR;
+#else
+    return 0;
+#endif
+  }
+
+  /* Put the calling thread back in the normal class if it runs a realtime one,
+   * leaving its nice as it is. A thread created from a realtime thread inherits
+   * its class (pthread_create, posix_spawn), so asking for a normal level has to
+   * leave realtime explicitly -- a nice value means nothing under SCHED_FIFO. */
+  static inline void thrd_leave_realtime(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (!thrd_is_realtime()) return;
+    struct sched_param normal;
+    normal.sched_priority = 0;
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal);
+#endif
   }
 
   static inline int thrd_priority_to_nice_target(int priority) {
@@ -676,6 +701,8 @@
     if (priority >= THRD_PRIORITY_HIGH) {
       rt_err = thrd_try_realtime(priority);
       if (rt_err == 0) return;
+    } else {
+      thrd_leave_realtime();
     }
 
     if (thrd_set_nice_clamped(thrd_priority_to_nice_target(priority)) == 0) {
