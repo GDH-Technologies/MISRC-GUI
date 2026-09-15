@@ -135,6 +135,7 @@ static const char *const s_transformed[] = {
     "audio_2ch_12_filename", "audio_2ch_34_filename",
     "audio_1ch_1_filename", "audio_1ch_2_filename", "audio_1ch_3_filename", "audio_1ch_4_filename",
     "net_server_port_str",     /* re-synced from the numeric port when empty */
+    "level_autostop_level_str", /* legacy integer percent migrated to 0.X */
     NULL,
 };
 
@@ -245,8 +246,10 @@ int main(int argc, char **argv) {
           "empty net_server_port_str re-synced from net_server_port");
     check(strcmp(a.rf_channel_tags[0], "videoRF") == 0 && strcmp(a.audio_1ch_labels[2], "audio_1ch_3_label_v") == 0
               && a.cxadc_tenbit_mode_card[1] == true && a.enable_audio_1ch[3] == true && a.capture_b == false
-              && strcmp(a.level_autostop_level_str, "45") == 0 && strcmp(a.net_client_port_str, "8091") == 0,
+              && strcmp(a.net_client_port_str, "8091") == 0,
           "renamed and array keys land in the right elements");
+    check(strcmp(a.level_autostop_level_str, "0.45") == 0,
+          "a legacy integer-percent level threshold (\"45\") migrates to the normalized 0.X form");
     check(strcmp(a.output_path, "C:\\Captures\\Tape 01") == 0, "a Windows path with backslashes loads verbatim");
     check(a.ui_scale_percent == 150 && a.memory_budget_gb == 9 && a.flac_level == 6 && a.rf_bits_a == 8 && a.rf_bits_b == 12,
           "numeric fixture values load");

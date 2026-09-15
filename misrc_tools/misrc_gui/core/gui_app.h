@@ -397,6 +397,11 @@ typedef struct gui_app {
     char net_peer_status[256];
     uint32_t net_peer_status_seq;   // bumps when the server's message changes
     double net_peer_status_time;    // GetTime() when it last changed here
+
+    // A net client's local record start (+1) or stop (-1), queued by the UI
+    // pass and run by gui_app_service_local_record_request() after
+    // gui_net_client_view_end(). Main thread only.
+    int net_local_record_request;
 } gui_app_t;
 
 static inline void gui_app_count_parser_errors(gui_app_t *app, uint32_t count) {
@@ -429,9 +434,13 @@ int gui_app_capture_busy(void);
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
 void gui_app_stop_recording(gui_app_t *app);
+/* Runs a net client's queued local record start/stop (net_client_record_local).
+ * Main thread, outside the client's settings view. */
+void gui_app_service_local_record_request(gui_app_t *app);
 /* "Are we recording" for every readout and control: is_recording locally,
- * the server's recording state on a net client (which never sets its own
- * is_recording; that would start local WAV writers). */
+ * the server's recording state on a net client that records on the server,
+ * this machine's is_recording on one that records the server's feed locally
+ * (the only case in which a client sets its own is_recording). */
 bool gui_app_effective_recording(const gui_app_t *app);
 /* "Is there a capture the controls act on": is_capturing locally, the
  * server's capture state on a net client (where is_capturing only means the

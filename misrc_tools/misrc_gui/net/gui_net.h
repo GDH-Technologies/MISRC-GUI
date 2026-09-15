@@ -127,9 +127,10 @@ void gui_net_client_toggle_connection(gui_app_t *app);
 /* True when client mode is connected and the peer server reports capture/record
  * state active (peer /stats state >= 1). */
 bool gui_net_client_peer_capturing(const gui_app_t *app);
-/* True when connected and the peer reports recording (state == 2). A client
- * never sets its own is_recording (that would start local WAV writers), so
- * every "are we recording" readout goes through gui_app_effective_recording. */
+/* True when connected and the peer reports recording (state == 2). A client's
+ * own is_recording is set only by a local recording (net_client_record_local;
+ * gui_record.c is its only writer), so every "are we recording" readout goes
+ * through gui_app_effective_recording, which picks the machine. */
 bool gui_net_client_peer_recording(const gui_app_t *app);
 
 /* The server's settings on a client. The worker stages /settings; the main

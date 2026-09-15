@@ -1726,6 +1726,7 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     "demod_mode", "demod_bandwidth_hz", "demod_squelch", "demod_volume", "demod_output_pair",
     "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
     "net_client_port_str", "playback_file_a", "playback_file_b",
+    "waveform_scale_mode", "net_client_record_local",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to
@@ -2349,9 +2350,13 @@ def check_net_settings_protocol(repo_root: Path) -> int:
 
 def check_record_parity(repo_root: Path) -> int:
     """The Record button, its click and the R/Space keys read the effective
-    recording and capture state (the server's on a net client), and nothing
-    outside gui_record.c ever assigns is_recording: a client that set it would
-    start writing WAV files from its ingest."""
+    recording and capture state (the server's on a net client that records on
+    the server), and nothing outside gui_record.c ever assigns is_recording.
+    A client that records the server's feed on this machine
+    (net_client_record_local) queues the start/stop and runs it after
+    gui_net_client_view_end(), where app->settings is its own: during the UI
+    pass it is the server's copy and would name the files from the server's
+    output folder."""
     ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
     render_pos = ui.find('CLAY(CLAY_ID("RecordButton")')
     if render_pos < 0:
@@ -2384,6 +2389,33 @@ def check_record_parity(repo_root: Path) -> int:
         return fail("misrc_gui.c: the R hotkey does not use the effective recording and capture state")
     if "gui_app_control_capturing(&app)" not in main_c[key_space:key_space + 300]:
         return fail("misrc_gui.c: the Space hotkey does not use the effective capture state")
+
+    capture_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/input/gui_capture.c"))
+    try:
+        start_body = extract_function_body(capture_c, "int gui_app_start_recording(gui_app_t *app)")
+        stop_body = extract_function_body(capture_c, "void gui_app_stop_recording(gui_app_t *app)")
+        service_body = extract_function_body(capture_c, "void gui_app_service_local_record_request(gui_app_t *app)")
+    except RuntimeError as exc:
+        return fail(f"gui_capture.c: {exc} (a net client's two record targets)")
+    if "gui_net_client_request_record(app, true)" not in start_body or \
+       "gui_net_client_request_record(app, false)" not in stop_body:
+        return fail("gui_capture.c: a client that records on the server must still forward record on/off to it")
+    if "net_local_record_request" not in start_body or "net_local_record_request" not in stop_body:
+        return fail("gui_capture.c: a client that records locally must QUEUE the start/stop "
+                    "(net_local_record_request): during the UI pass app->settings is the server's copy")
+    if "gui_record_start(app)" not in service_body or "gui_record_stop(app)" not in service_body:
+        return fail("gui_capture.c: gui_app_service_local_record_request() must run the queued "
+                    "gui_record_start / gui_record_stop")
+    view_end_pos = main_c.find("gui_net_client_view_end(&app);")
+    service_pos = main_c.find("gui_app_service_local_record_request(&app);")
+    if view_end_pos < 0 or service_pos < view_end_pos:
+        return fail("misrc_gui.c: gui_app_service_local_record_request() must run after "
+                    "gui_net_client_view_end(), where app->settings is the client's own")
+    if main_c.count("gui_app_service_local_record_request(&app);") < 2:
+        return fail("misrc_gui.c: the exit path must service the queued local stop too, "
+                    "or a client's local recording is never finalized")
+    if "app->is_recording ||" not in lock:
+        return fail("gui_ui.c: gui_ui_settings_locked() does not consider a client's local recording")
 
     gui_root = repo_root / "misrc_tools/misrc_gui"
     for path in sorted(gui_root.rglob("*.c")):

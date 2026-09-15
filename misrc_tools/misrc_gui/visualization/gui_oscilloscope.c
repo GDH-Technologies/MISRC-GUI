@@ -12,8 +12,10 @@
 #include "../ui/gui_popup.h"
 #include "gui_text.h"
 #include "../ui/gui_ui.h"
+#include "../ui/gui_ui_scale.h"
 #include "gui_panel.h"
 #include "../ui/gui_dropdown.h"
+#include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,6 +93,16 @@ typedef struct {
     Rectangle trigger_mode_opts_rect[TRIGGER_MODE_COUNT + 1];        // +1 for \"Off\"
     Rectangle trigger_source_opts_rect[TRIGGER_SOURCE_COUNT];
     bool trigger_dropdown_open;
+
+    // Amplitude scale dropdown (left side, beside CH A/CH B). Options:
+    // Level (0.X, thinned), Basic (0.X, majors only), Full (0.X, all),
+    // mV w/2Vpp, mV w/1Vpp. Mirrors the render-mode dropdown machinery.
+    // scale_mode mirrors app->settings.waveform_scale_mode (synced in
+    // waveform_render, which has app) so render_overlay (no app) can read it.
+    int scale_mode;
+    Rectangle scale_btn_rect;
+    Rectangle scale_opts_rect[5];
+    bool scale_dropdown_open;
 
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
 
@@ -299,16 +311,48 @@ static void format_time_label(char *buf, size_t buf_size, double seconds) {
 // zoom_scale: samples per pixel, sample_rate: samples per second
 // trigger_enabled: if true, use trigger_display_pos as t=0 reference
 // trigger_display_pos: pixel position of trigger point (-1 if not triggered)
+// scale_mode: amplitude tick label format + density (0=Level thinned,
+// 1=Basic majors-only, 2=Full all, 3=mV w/2Vpp, 4=mV w/1Vpp).
+// channel: 0=A, 1=B (kept for ABI; unused now that the scale control is a
+// per-panel overlay dropdown rather than a per-channel button).
 void draw_channel_grid(float x, float y, float width, float height,
                        const char *label, Color channel_color, bool show_grid,
                        float zoom_scale, uint32_t sample_rate,
                        bool trigger_enabled, int trigger_display_pos,
-                       Rectangle *time_div_rect) {
+                       Rectangle *time_div_rect,
+                       int scale_mode, int channel) {
     if (time_div_rect) *time_div_rect = (Rectangle){0};
     // Background slightly darker than main bg
     DrawRectangle((int)x, (int)y, (int)width, (int)height, (Color){25, 25, 30, 255});
 
     float center_y = y + height / 2;
+
+    // Text measurements return physical pixels; bounds are logical (physical / scale).
+    // Scale text widths to logical so layout math is consistent at all UI zoom levels.
+    float text_scale = gui_ui_get_scale_factor();
+    float to_logical_w = 1.0f / text_scale;
+
+    // Channel label width (used to place the time/div label beside it).
+    int ch_label_w = (int)(gui_text_measure(label, FONT_SIZE_OSC_LABEL) * to_logical_w);
+    int ch_label_x = (int)x + 8;
+    int ch_label_y = (int)y + 4;
+    (void)channel;
+
+    // Resolve the tick set + label mode from scale_mode.
+    // scale_mode index: 0=Basic,1=Expanded,2=Full,3=mV/1Vpp,4=mV/2Vpp
+    // Basic (0): majors only (+-0.5/0).
+    // Expanded (1): thinned (+-0.1/0.3/0.5/0.8).
+    // Full (2): every 0.1 step from -0.8..+0.8.
+    // mV modes (3,4): thinned ticks + mV labels.
+    static const int basic_steps[]   = { -5, 0, 5 };
+    static const int thinned_steps[] = { -8, -5, -3, -1, 0, 1, 3, 5, 8 };
+    static const int full_steps[]   = { -8,-7,-6,-5,-4,-3,-2,-1, 0, 1,2,3,4,5,6,7,8 };
+    const int *steps; int n_steps;
+    if (scale_mode == 0) { steps = basic_steps;   n_steps = (int)(sizeof(basic_steps)/sizeof(basic_steps[0])); }
+    else if (scale_mode == 2) { steps = full_steps;  n_steps = (int)(sizeof(full_steps)/sizeof(full_steps[0])); }
+    else                     { steps = thinned_steps; n_steps = (int)(sizeof(thinned_steps)/sizeof(thinned_steps[0])); }
+    bool label_mv = (scale_mode == 3 || scale_mode == 4);
+    float vpp = (scale_mode == 3) ? 1.0f : 2.0f;  // mV/1Vpp vs mV/2Vpp (default 2 for level modes)
 
     if (show_grid) {
         // Time-based vertical grid lines (if we have sample rate info)
@@ -362,25 +406,50 @@ void draw_channel_grid(float x, float y, float width, float height,
                 if (gx > x + 40 && gx < x + width - 40) {
                     if (is_zero) {
                         // Draw "0" for the trigger point
-                        int label_w = gui_text_measure_mono("0", FONT_SIZE_OSC_SCALE);
+                        int label_w = (int)(gui_text_measure_mono("0", FONT_SIZE_OSC_SCALE) * to_logical_w);
                         gui_text_draw_mono("0", gx - label_w / 2, y + height - 16, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
                     } else {
                         format_time_label(time_buf, sizeof(time_buf), fabs(t));
-                        int label_w = gui_text_measure_mono(time_buf, FONT_SIZE_OSC_SCALE);
+                        int label_w = (int)(gui_text_measure_mono(time_buf, FONT_SIZE_OSC_SCALE) * to_logical_w);
                         gui_text_draw_mono(time_buf, gx - label_w / 2, y + height - 16, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
                     }
                 }
                 division_count++;
             }
 
-            // Show time per division in top-left corner (below channel label)
+            // Show time per division. Tiered collapse: the time/div label
+            // stays beside the CH A/CH B readout on wide panels, then moves
+            // below the channel label as the first collapse step when the
+            // panel narrows (before the Scale label hides or the Mode/Trig
+            // dropdowns wrap). This follows the existing overlay collapse order.
             format_time_label(time_buf, sizeof(time_buf), time_division);
             char div_label[48];
             snprintf(div_label, sizeof(div_label), "%s/div", time_buf);
-            gui_text_draw_mono(div_label, x + 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            int div_x = ch_label_x + ch_label_w + 8;
+            int div_label_w = (int)(gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV) * to_logical_w);
+            int div_y = ch_label_y;
+            // Measure the right-side overlay group (Scale + Mode + Trig
+            // labels + buttons + gaps + 8px margin) so the time/div collapse
+            // threshold is based on the actual space the right side needs.
+            int mode_prefix_w_meas = (int)(gui_text_measure("Mode:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+            int trig_prefix_w_meas = (int)(gui_text_measure("Trig:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+            int scale_prefix_w_meas = (int)(gui_text_measure("Scale:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+            int btn_w_logical = (int)(98 * to_logical_w);
+            int right_group_w = trig_prefix_w_meas + 4 + btn_w_logical + 4 + 8 +
+                               mode_prefix_w_meas + 4 + btn_w_logical + 4 + 8 +
+                               scale_prefix_w_meas + 4 + btn_w_logical + 4 + 8;
+            // time/div moves below when channel + time/div + right group
+            // can't all fit on one row. This is the first collapse step.
+            bool div_fits_beside =
+                (div_x + div_label_w + 8 + right_group_w) < (int)width;
+            if (!div_fits_beside) {
+                div_x = ch_label_x;
+                div_y = ch_label_y + FONT_SIZE_OSC_LABEL + 2;
+            }
+            gui_text_draw_mono(div_label, div_x, div_y, FONT_SIZE_OSC_DIV, COLOR_TEXT);
             if (time_div_rect) {
-                *time_div_rect = (Rectangle){x + 8, y + 26,
-                    gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV) + 1, FONT_SIZE_OSC_DIV};
+                *time_div_rect = (Rectangle){(float)div_x, (float)div_y,
+                    (float)div_label_w + 1, (float)FONT_SIZE_OSC_DIV};
             }
         } else {
             // Fallback: fixed divisions when no sample rate available
@@ -391,10 +460,17 @@ void draw_channel_grid(float x, float y, float width, float height,
             }
         }
 
-        // Horizontal grid lines (amplitude divisions)
-        for (int i = 1; i < GRID_DIVISIONS_Y; i++) {
-            float gy = y + (height * i / GRID_DIVISIONS_Y);
-            DrawLineV((Vector2){x, gy}, (Vector2){x + width, gy}, COLOR_GRID);
+        // Horizontal amplitude grid lines for the active scale mode's tick set.
+        // Major (0, +-0.5) uses COLOR_GRID_MAJOR; the rest use COLOR_GRID.
+        for (int si = 0; si < n_steps; si++) {
+            int step = steps[si];
+            float v = (float)step * 0.1f;
+            float frac = 0.5f - 0.5f * v;
+            if (frac < 0.0f || frac > 1.0f) continue;
+            float gy = y + height * frac;
+            bool is_major = (step == 0 || step == 5 || step == -5);
+            DrawLineV((Vector2){x, gy}, (Vector2){x + width, gy},
+                      is_major ? COLOR_GRID_MAJOR : COLOR_GRID);
         }
     }
 
@@ -404,19 +480,47 @@ void draw_channel_grid(float x, float y, float width, float height,
     // Border
     DrawRectangleLinesEx((Rectangle){x, y, width, height}, 1, COLOR_GRID_MAJOR);
 
-    // Amplitude scale ticks on left side (use mono font for numbers)
-    const char *tick_labels[] = { "+0.5", "0", "-0.5" };
-    float tick_positions[] = { 0.25f, 0.5f, 0.75f };
-    for (int i = 0; i < 3; i++) {
-        float tick_y = y + height * tick_positions[i];
-        // Tick mark
-        DrawLineEx((Vector2){x, tick_y}, (Vector2){x + 4, tick_y}, 1.0f, COLOR_GRID_MAJOR);
-        // Label (offset to not overlap with border)
-        gui_text_draw_mono(tick_labels[i], x + 6, tick_y - 7, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+    // Amplitude scale ticks for the active scale mode. Major ticks (+-0.5/0)
+    // use the major color; the rest use the minor grid color. Labels: 0.X level
+    // for modes 0-2, mV peak (level * Vpp/2 * 1000) for modes 3-4.
+    // On narrow panels the minor tick labels hide first (leaving 0, +-0.5),
+    // then all labels hide — same tiered collapse as the overlay dropdowns.
+    bool show_minor_labels = width >= 200;
+    bool show_major_labels = width >= 120;
+    for (int si = 0; si < n_steps; si++) {
+        int step = steps[si];
+        float v = (float)step * 0.1f;
+        float frac = 0.5f - 0.5f * v;
+        if (frac < 0.0f || frac > 1.0f) continue;
+        float tick_y = y + height * frac;
+        bool is_major = (step == 0 || step == 5 || step == -5);
+        Color tick_color = is_major ? COLOR_GRID_MAJOR : COLOR_GRID;
+        Color label_color = is_major ? COLOR_TEXT : COLOR_TEXT_DIM;
+        // Tick mark (always draw the mark; only the label hides)
+        DrawLineEx((Vector2){x, tick_y}, (Vector2){x + (is_major ? 4 : 3), tick_y},
+                   1.0f, tick_color);
+        // Label. Skip minor labels on narrow panels, and all labels on
+        // very narrow panels. 0 is "0" in both modes; mV modes show mV, else 0.X.
+        if (!show_major_labels) continue;
+        if (!is_major && !show_minor_labels) continue;
+        char label_buf[16];
+        if (step == 0) {
+            snprintf(label_buf, sizeof(label_buf), "0");
+        } else if (label_mv) {
+            int mv = (int)roundf(v * (vpp * 0.5f) * 1000.0f);
+            if (step > 0) snprintf(label_buf, sizeof(label_buf), "+%dmV", mv);
+            else snprintf(label_buf, sizeof(label_buf), "-%dmV", mv);
+        } else {
+            if (step > 0) snprintf(label_buf, sizeof(label_buf), "+0.%d", step);
+            else snprintf(label_buf, sizeof(label_buf), "-0.%d", -step);
+        }
+        gui_text_draw_mono(label_buf, x + 6, tick_y - 7, FONT_SIZE_OSC_SCALE, label_color);
     }
 
-    // Channel label in top-left corner
-    gui_text_draw(label, x + 8, y + 4, FONT_SIZE_OSC_LABEL, channel_color);
+    // Channel label in top-left corner (drawn last so it sits on top of the grid).
+    // The amplitude scale is now controlled by a dropdown drawn on the waveform
+    // panel overlay (see waveform_render_overlay), not a button here.
+    gui_text_draw(label, ch_label_x, ch_label_y, FONT_SIZE_OSC_LABEL, channel_color);
 }
 
 //-----------------------------------------------------------------------------
@@ -553,7 +657,8 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect);
+                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
+                      app->settings.waveform_scale_mode, channel);
 
     // Draw trigger level and position markers
     draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
@@ -604,7 +709,8 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect);
+                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
+                      app->settings.waveform_scale_mode, channel);
 
     // Draw trigger level and position markers
     draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
@@ -1021,6 +1127,8 @@ static void *waveform_create(void) {
     // UI state
     state->render_mode_dropdown_open = false;
     state->trigger_dropdown_open = false;
+    state->scale_dropdown_open = false;
+    state->scale_mode = 0;  // Basic (matches the settings default)
     state->dragging = false;
     atomic_flag_clear(&state->data_lock);
 
@@ -1104,44 +1212,90 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     float trig_btn_y = render_btn_y;
     Vector2 mouse = gui_ui_get_mouse_position();
 
+    // Text measurements return physical pixels; bounds are logical.
+    // Scale to logical for consistent layout at all UI zoom levels.
+    float text_scale = gui_ui_get_scale_factor();
+    float to_logical_w = 1.0f / text_scale;
+    #define TEXT_W(t, fs) ((int)(gui_text_measure(t, fs) * to_logical_w))
+
     // Reserve the widest label plus arrow/padding, not just the current value.
     // Both dropdowns keep the same width when the selection changes.
-    float button_width = 98;
+    // 98px is the physical-pixel floor; scale to logical so it stays
+    // the same visual size at all UI zoom levels.
+    float button_width = 98.0f * to_logical_w;
     for (int i = 0; i < WAVEFORM_MODE_COUNT; i++) {
         button_width = fmaxf(button_width,
-            gui_text_measure(s_render_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 24);
+            (float)TEXT_W(s_render_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 24);
     }
     for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
         button_width = fmaxf(button_width,
-            gui_text_measure(s_trigger_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 12);
+            (float)TEXT_W(s_trigger_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 12);
         for (int source = 0; source < TRIGGER_SOURCE_COUNT; source++) {
             char label[24];
             snprintf(label, sizeof(label), "%s/%s",
                      s_trigger_mode_short_labels[i], s_trigger_source_labels[source]);
             button_width = fmaxf(button_width,
-                gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) + 24);
+                (float)TEXT_W(label, FONT_SIZE_DROPDOWN_OPT) + 24);
         }
     }
     float trig_btn_w = button_width;
     float render_btn_w = button_width;
 
+    // Scale dropdown uses the same button width as Mode/Trig for a uniform look.
+    float scale_btn_w = button_width;
+
     const char *trig_prefix = "Trig:";
     const char *mode_prefix = "Mode:";
-    int trig_prefix_w = gui_text_measure(trig_prefix, FONT_SIZE_DROPDOWN_OPT);
-    int mode_prefix_w = gui_text_measure(mode_prefix, FONT_SIZE_DROPDOWN_OPT);
+    const char *scale_prefix = "Scale:";
+    int trig_prefix_w = TEXT_W(trig_prefix, FONT_SIZE_DROPDOWN_OPT);
+    int mode_prefix_w = TEXT_W(mode_prefix, FONT_SIZE_DROPDOWN_OPT);
+    int scale_prefix_w = TEXT_W(scale_prefix, FONT_SIZE_DROPDOWN_OPT);
+
+    // All three dropdowns are right-anchored as a unified group:
+    //   [Scale:] [Mode:] [Trig:]   (right to left)
     float trig_btn_x = bounds.x + bounds.width - trig_btn_w - 8;
-    float render_btn_x = trig_btn_x - trig_prefix_w - 8 - render_btn_w - 8;
+    float render_btn_x = trig_btn_x - trig_prefix_w - 4 - render_btn_w - 4;
+    float scale_btn_x = render_btn_x - mode_prefix_w - 4 - scale_btn_w - 4;
+    float scale_label_x = scale_btn_x - scale_prefix_w - 4;
     float mode_label_x = render_btn_x - mode_prefix_w - 4;
     float trig_label_x = trig_btn_x - trig_prefix_w - 4;
     float text_offset_y = (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2;
+    float scale_label_y = render_btn_y + text_offset_y;
     float mode_label_y = render_btn_y + text_offset_y;
     float trig_label_y = trig_btn_y + text_offset_y;
-    float channel_label_w = fmaxf(gui_text_measure("CH A", FONT_SIZE_OSC_LABEL),
-                                 gui_text_measure("CH B", FONT_SIZE_OSC_LABEL));
+    float channel_label_w = fmaxf((float)TEXT_W("CH A", FONT_SIZE_OSC_LABEL),
+                                 (float)TEXT_W("CH B", FONT_SIZE_OSC_LABEL));
 
-    // Wrap into aligned label/button columns. Only avoid the actual time/div
-    // label, not an empty strip across the full width of the waveform.
-    if (mode_label_x < bounds.x + 8 + channel_label_w + 8) {
+    // Fixed logical thresholds for label hiding. The dropdown BUTTONS
+    // always stay; only their text LABELS (Scale:/Mode:/Trig:) hide
+    // based on the panel's logical width. This triggers correctly at
+    // all UI zoom levels (e.g. 200% zoom halves the logical width,
+    // so labels hide on normal-size windows when zoomed in).
+    bool scale_label_hidden = (bounds.width < 600);
+    bool mode_label_hidden = (bounds.width < 500);
+    bool trig_label_hidden = (bounds.width < 400);
+
+    // Re-derive button x positions from the right edge, skipping
+    // hidden label gaps (buttons slide right to fill freed space).
+    float group_right = bounds.x + bounds.width - 8;
+    trig_btn_x = group_right - trig_btn_w;
+    render_btn_x = trig_btn_x - (trig_label_hidden ? 0 : (trig_prefix_w + 4)) - render_btn_w - 4;
+    scale_btn_x = render_btn_x - (mode_label_hidden ? 0 : (mode_prefix_w + 4)) - scale_btn_w - 4;
+    scale_label_x = scale_btn_x - (scale_label_hidden ? 0 : (scale_prefix_w + 4));
+    mode_label_x = render_btn_x - (mode_label_hidden ? 0 : (mode_prefix_w + 4));
+    trig_label_x = trig_btn_x - (trig_label_hidden ? 0 : (trig_prefix_w + 4));
+    if (scale_label_hidden) scale_label_x = -1;
+    if (mode_label_hidden) mode_label_x = -1;
+    if (trig_label_hidden) trig_label_x = -1;
+
+    // Clamp the Scale button so it stays inside the panel.
+    if (scale_btn_x < bounds.x + 8) {
+        scale_btn_x = bounds.x + 8;
+    }
+
+    // Wrap Mode/Trig to rows when the Mode button itself doesn't fit
+    // beside the CH label.
+    if (render_btn_x < bounds.x + 8 + channel_label_w + 8) {
         float row_gap = 2;
         float label_width = fmaxf(mode_prefix_w, trig_prefix_w);
         render_btn_x = bounds.x + bounds.width - render_btn_w - 8;
@@ -1158,6 +1312,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
             render_btn_y = state->time_div_rect.y + state->time_div_rect.height + row_gap;
         }
         mode_label_y = render_btn_y + text_offset_y;
+        scale_label_y = render_btn_y + text_offset_y;
         if (labels_above) {
             // Very narrow panels put the label above its dropdown as well.
             mode_label_x = bounds.x + 8;
@@ -1182,9 +1337,11 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     //-------------------------------------------------------------------------
     state->trigger_btn_rect = (Rectangle){trig_btn_x, trig_btn_y, trig_btn_w, btn_h};
 
-    // Draw "Trig:" label
-    gui_text_draw(trig_prefix, trig_label_x, trig_label_y,
-                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+    // Draw "Trig:" label (hidden on narrow panels)
+    if (!trig_label_hidden) {
+        gui_text_draw(trig_prefix, trig_label_x, trig_label_y,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+    }
 
     char trig_label_buf[24];
     const char *trig_label = "Off";
@@ -1196,11 +1353,13 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     }
     draw_dropdown_button(state->trigger_btn_rect, trig_label, state->trigger_dropdown_open);
 
-    // Draw both controls before either popup so a wrapped button cannot cover
+    // Draw all controls before any popup so a wrapped button cannot cover
     // an open menu. Mode is above trigger when the controls use separate rows.
     state->render_mode_btn_rect = (Rectangle){render_btn_x, render_btn_y, render_btn_w, btn_h};
-    gui_text_draw(mode_prefix, mode_label_x, mode_label_y,
-                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+    if (!mode_label_hidden) {
+        gui_text_draw(mode_prefix, mode_label_x, mode_label_y,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+    }
     const char *render_label = s_render_mode_labels[state->render_mode];
     draw_dropdown_button(state->render_mode_btn_rect, render_label, state->render_mode_dropdown_open);
 
@@ -1304,6 +1463,50 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
             gui_text_draw(opt_label, opt_text_x, opt_text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
         }
     }
+
+    //-------------------------------------------------------------------------
+    // Amplitude Scale Dropdown (part of the right-anchored group, left of Mode)
+    // Options: Basic / Expanded / Full / 1Vpp / 2Vpp. Same width + alignment as
+    // Mode/Trig. Hides entirely on narrow panels (handled by the wrap logic
+    // above which sets scale_btn_x < 0).
+    //-------------------------------------------------------------------------
+    static const char *s_scale_labels[5] = { "Basic", "Expanded", "Full", "1Vpp", "2Vpp" };
+    // Scale dropdown: button ALWAYS visible (never hidden).
+    // Only its "Scale:" text label hides on narrow panels.
+    bool scale_visible = true;
+    float scale_btn_y = render_btn_y;  // same row as Mode
+    if (scale_visible) {
+        if (!scale_label_hidden && scale_label_x >= 0) {
+            gui_text_draw(scale_prefix, scale_label_x, scale_label_y,
+                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+        }
+        state->scale_btn_rect = (Rectangle){scale_btn_x, scale_btn_y, scale_btn_w, btn_h};
+        const char *scale_cur = (state->scale_mode >= 0 && state->scale_mode < 5)
+            ? s_scale_labels[state->scale_mode] : s_scale_labels[0];
+        draw_dropdown_button(state->scale_btn_rect, scale_cur, state->scale_dropdown_open);
+
+        // Draw scale dropdown options if open
+        if (state->scale_dropdown_open) {
+            float opt_h = 20;
+            float opt_y = fmaxf(bounds.y, fminf(scale_btn_y + btn_h,
+                                bounds.y + bounds.height - opt_h * 5 - 4));
+            DrawRectangleRounded((Rectangle){scale_btn_x, opt_y, scale_btn_w, opt_h * 5},
+                                 0.1f, 4, COLOR_PANEL_BG);
+            for (int i = 0; i < 5; i++) {
+                Rectangle opt_rect = {scale_btn_x, opt_y + i * opt_h, scale_btn_w, opt_h};
+                state->scale_opts_rect[i] = opt_rect;
+                bool is_selected = (state->scale_mode == i);
+                bool hover = CheckCollisionPointRec(mouse, opt_rect);
+                DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
+                const char *opt_label = s_scale_labels[i];
+                int opt_w = gui_text_measure(opt_label, FONT_SIZE_DROPDOWN_OPT);
+                gui_text_draw(opt_label, scale_btn_x + scale_btn_w/2 - opt_w/2,
+                              opt_y + i * opt_h + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2,
+                              FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+            }
+        }
+    }
+#undef TEXT_W
 }
 
 //-----------------------------------------------------------------------------
@@ -1323,9 +1526,38 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     render_menu.height = WAVEFORM_MODE_COUNT * 20;
     Rectangle trigger_menu = state->trigger_mode_opts_rect[0];
     trigger_menu.height = (TRIGGER_MODE_COUNT + 2 + TRIGGER_SOURCE_COUNT) * 20;
+    Rectangle scale_menu = state->scale_opts_rect[0];
+    scale_menu.height = 5 * 20;
     bool click_on_menu =
         (state->render_mode_dropdown_open && CheckCollisionPointRec(click, render_menu)) ||
-        (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu));
+        (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu)) ||
+        (state->scale_dropdown_open && CheckCollisionPointRec(click, scale_menu));
+
+    //-------------------------------------------------------------------------
+    // Amplitude Scale Dropdown (left side)
+    //-------------------------------------------------------------------------
+    if (!click_on_menu && CheckCollisionPointRec(click, state->scale_btn_rect)) {
+        state->scale_dropdown_open = !state->scale_dropdown_open;
+        state->render_mode_dropdown_open = false;  // Close other dropdowns
+        state->trigger_dropdown_open = false;
+        return true;
+    }
+
+    if (state->scale_dropdown_open) {
+        for (int i = 0; i < 5; i++) {
+            Rectangle opt_rect = state->scale_opts_rect[i];
+            if (CheckCollisionPointRec(click, opt_rect)) {
+                app->settings.waveform_scale_mode = i;
+                state->scale_mode = i;
+                gui_settings_save(&app->settings);
+                state->scale_dropdown_open = false;
+                return true;
+            }
+        }
+        // Click outside closes dropdown
+        state->scale_dropdown_open = false;
+        return true;
+    }
 
     //-------------------------------------------------------------------------
     // Render Mode Dropdown
@@ -1333,6 +1565,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     if (!click_on_menu && CheckCollisionPointRec(click, state->render_mode_btn_rect)) {
         state->render_mode_dropdown_open = !state->render_mode_dropdown_open;
         state->trigger_dropdown_open = false;  // Close other dropdown
+        state->scale_dropdown_open = false;
         return true;
     }
 
@@ -1356,6 +1589,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     if (!click_on_menu && CheckCollisionPointRec(click, state->trigger_btn_rect)) {
         state->trigger_dropdown_open = !state->trigger_dropdown_open;
         state->render_mode_dropdown_open = false;  // Close other dropdown
+        state->scale_dropdown_open = false;
         return true;
     }
 
@@ -1524,6 +1758,10 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     if (!state->initialized) return;
     waveform_apply_channel_trigger_source_default(state, channel);
+
+    // Sync the global amplitude scale mode into the per-panel mirror so the
+    // overlay dropdown (which has no app pointer) can read + display it.
+    state->scale_mode = app->settings.waveform_scale_mode;
 
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);

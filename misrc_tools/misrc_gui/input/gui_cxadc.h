@@ -2,6 +2,7 @@
 #define GUI_CXADC_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct gui_app gui_app_t;
 // Marker serial values used by synthetic CXADC mode entries.
@@ -66,6 +67,16 @@ int gui_cxadc_get_tenbit(int card_idx, int *value_out);
 // Set per-card CXADC tenbit mode (false=8-bit, true=16-bit tenbit mode).
 // Returns 0 on success, -1 on error.
 int gui_cxadc_set_tenbit(int card_idx, bool enabled);
+
+// Resolve a card's real hardware sample rate (Hz) for the given tenbit mode.
+// Reads crystal + tenxfsc from sysfs (Linux) and applies the cxadc rate rule:
+//   8-bit + tenxfsc=1 (upsampled 35.8) is presented as the crystal rate;
+//   10-bit + tenxfsc=1 (17.9 on stock) is exposed as a real tier;
+//   tenxfsc=2/3 -> 40 MSPS (20 in 10-bit); tenxfsc=0 -> crystal (halved in 10-bit).
+// Supports stock 28.6, 40 MHz mod/clockgen, and 54 MHz crystal-mod cards.
+// Returns false when unreadable (Windows, no cxadcN node, missing sysfs) so
+// callers fall back to the 40/20 MSPS clockgen baseline.
+bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out);
 
 // Start CXADC capture mode (card_count: 1 or 2).
 // misrc_clockgen_mode selects MISRC v1.5 audio-device matching behavior.

@@ -116,12 +116,23 @@ typedef struct {
     bool misrc_v15_v25_ab_swap;               // If true, invert MISRC A/B mapping for V1.5/V2.5 hardware swap variants
     bool stop_on_dropout;                      // If true, automatically stop capture when stream dropout is detected
 
-    // Level autostop: stop capture/recording when signal level stays below a
-    // configurable percentage for a configurable duration (tape-end detection).
+    // Level autostop: stop the recording when signal level stays below a
+    // configurable threshold for a configurable duration (tape-end detection).
     // Independent from the digital dropout (frame error/missed frame) logic above.
     bool level_autostop_enabled;               // Enable/disable the level-based autostop
-    char level_autostop_level_str[16];         // Signal level threshold as a percent string (e.g. "33")
-    char level_autostop_duration_str[16];      // Sustain duration as a seconds string (e.g. "5.0")
+    // Level threshold as a normalized 0.X string (range 0.1-0.8). Historically
+    // an integer percent string (e.g. "33"); a loaded value is migrated to 0.X
+    // (hook_level_autostop_level in gui_settings_table.c).
+    char level_autostop_level_str[16];         // Normalized level threshold (e.g. "0.4")
+    char level_autostop_duration_str[16];      // Sustain duration as a seconds string (e.g. "30")
+    // ADC full-scale peak-to-peak voltage for the level-autostop mV readout.
+    // Device-specific (hsdaoh selectable 1/2 Vpp via hardware jumper, CXADC/DdD
+    // 2 Vpp, FX3 1 Vpp). Re-defaulted to the backend default when the selected
+    // device changes. level_autostop_vpp_hsdaoh remembers the hsdaoh hardware
+    // 1/2 jumper setting across backend switches so switching away and back
+    // restores the user's physical jumper value.
+    float level_autostop_vpp;                  // Effective ADC full-scale Vpp (e.g. 2.0)
+    float level_autostop_vpp_hsdaoh;           // hsdaoh hardware 1/2 Vpp jumper memory (1.0 or 2.0)
 
     // Per-channel audio labels (for auto naming, e.g. "linear", "baseband")
     char audio_1ch_labels[4][32];
@@ -178,6 +189,12 @@ typedef struct {
     // While true the scale follows the display the window is on. Any manual
     // zoom clears it, so a deliberate choice is never silently overridden.
     bool ui_scale_auto;
+    // Waveform amplitude scale mode (0=Basic majors-only, 1=Expanded thinned,
+    // 2=Full all 0.1-0.8, 3=mV/1Vpp, 4=mV/2Vpp). Selected via a dropdown
+    // on the waveform panel overlay beside the CH A/CH B label. Grid lines and
+    // waveform stay put; only the tick labels (and tick density) change. The
+    // mV modes also fix the ADC Vpp used by the level-autostop mV readout.
+    int waveform_scale_mode;
 
     // Device discovery: V4L2/simple_capture device enumeration is opt-in.
     // Disabled by default since most users use hsdaoh/CXADC/DdD/FX3 backends;
@@ -227,6 +244,11 @@ typedef struct {
     char net_client_host[128];                // Host to connect to when Client.
     char net_client_port_str[16];             // Editable string mirror of net_client_port.
     uint16_t net_client_port;                 // Port to connect to when Client.
+    // Where a Client's Record button records: false = on the server (default;
+    // it drives the server's recording), true = on this machine, from the RF
+    // and audio the server streams. /rf drops the oldest data when the link
+    // cannot keep up, so a local file can have gaps: monitoring grade.
+    bool net_client_record_local;
 } gui_settings_t;
 
 /* ----------------------------------------------------------------------------

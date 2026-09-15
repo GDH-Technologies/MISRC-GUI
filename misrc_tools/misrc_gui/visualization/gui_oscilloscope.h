@@ -45,11 +45,19 @@ void gui_waveform_close_overlays(void *state);
 
 // Draw grid with amplitude scale ticks and time labels. The optional output
 // reports the time/div label for overlay placement, or an empty rectangle.
+// scale_mode selects the amplitude tick label format + density:
+//   0 = Level (0.X, thinned 0.1/0.3/0.5/0.8)
+//   1 = Basic (0.X, majors only +-0.5/0)
+//   2 = Full  (0.X, all 0.1-0.8)
+//   3 = mV w/2Vpp (mV labels, thinned ticks, Vpp=2.0)
+//   4 = mV w/1Vpp (mV labels, thinned ticks, Vpp=1.0)
+// channel (0=A, 1=B) is for bounds caching (unused now but kept for ABI).
 void draw_channel_grid(float x, float y, float width, float height,
                        const char *label, Color channel_color, bool show_grid,
                        float zoom_scale, uint32_t sample_rate,
                        bool trigger_enabled, int trigger_display_pos,
-                       Rectangle *time_div_rect);
+                       Rectangle *time_div_rect,
+                       int scale_mode, int channel);
 
 //-----------------------------------------------------------------------------
 // Trigger Detection
