@@ -258,12 +258,19 @@ int gui_mediamtx_test_main(int seconds)
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 extern char **environ;
 
 #define MTX_TERM_GRACE_S  3.0
 #define MTX_KILL_GRACE_S  2.0
 #define MTX_CHILD_NICE    5
+/* Idle I/O class: serving viewers gets the disk only when nothing else wants
+ * it. Set on the spawning thread around posix_spawn (Linux), so the child
+ * inherits it at fork. */
+#define MTX_CHILD_IOPRIO  (3 << 13)
 
 static struct {
     int  child_pid;
@@ -533,7 +540,14 @@ int gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_c
 
     char *argv[] = { (char *)mtx_bin.path, mtx.config_path, NULL };
     pid_t pid = 0;
+#if defined(__linux__) && defined(SYS_ioprio_set)
+    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    (void)syscall(SYS_ioprio_set, 1, 0, MTX_CHILD_IOPRIO);
+#endif
     int rc = posix_spawn(&pid, mtx_bin.path, NULL, NULL, argv, environ);
+#if defined(__linux__) && defined(SYS_ioprio_set)
+    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
+#endif
     if (rc != 0) {
         if (err) snprintf(err, err_cap, "cannot spawn mediamtx: %s", strerror(rc));
         return -1;
@@ -856,6 +870,9 @@ int gui_mediamtx_test_main(int seconds)
         break;
     }
 
+#if defined(__linux__) && defined(SYS_ioprio_get)
+    int caller_io_before = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+#endif
     char err[256];
     if (gui_mediamtx_start(&cfg, err, sizeof(err)) != 0) {
         fprintf(stderr, "start failed: %s\n", err);
@@ -868,6 +885,16 @@ int gui_mediamtx_test_main(int seconds)
     mtx_sleep(1.0);
 
     int bad = 0;
+#if defined(__linux__) && defined(SYS_ioprio_get)
+    /* Serving viewers must never take disk time from the RF writers: the child
+     * runs in the idle I/O class (the kernel's encoding is 3 << 13), and the
+     * thread that spawned it -- the render thread, in the app -- keeps its own. */
+    bad |= mtx_expect((int)syscall(SYS_ioprio_get, 1,
+                                   gui_mediamtx_get_status().child_pid) == (3 << 13),
+                      "child runs in the idle I/O class");
+    bad |= mtx_expect((int)syscall(SYS_ioprio_get, 1, 0) == caller_io_before,
+                      "spawning thread keeps its own I/O class");
+#endif
     bad |= mtx_expect(mtx_port_is_bound(cfg.rtsp, SOCK_STREAM), "rtsp port bound");
     bad |= mtx_expect(mtx_port_is_bound(cfg.hls, SOCK_STREAM), "hls port bound");
     bad |= mtx_expect(mtx_port_is_bound(cfg.webrtc_http, SOCK_STREAM), "webrtc http port bound");

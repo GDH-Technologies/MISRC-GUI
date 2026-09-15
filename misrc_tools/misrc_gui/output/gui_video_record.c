@@ -28,7 +28,13 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+
+/* The reference-video ffmpeg records too, but RF comes first: it runs one I/O
+ * step below the RF writers (best-effort level 1 against their 0). Set on the
+ * spawning thread around posix_spawn, so the child inherits it at fork. */
+#define VR_CHILD_IOPRIO ((2 << 13) | 1)
 
 extern char **environ;
 
@@ -552,7 +558,10 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
      * display, audio, capture and libusb threads plus a live GL context, and
      * only async-signal-safe calls are legal between fork and exec. Note it
      * returns the error directly and does NOT set errno. */
+    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    (void)syscall(SYS_ioprio_set, 1, 0, VR_CHILD_IOPRIO);
     int rc = posix_spawn(&pid, ff.path, &fa, NULL, argv, environ);
+    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
     posix_spawn_file_actions_destroy(&fa);
     close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
 

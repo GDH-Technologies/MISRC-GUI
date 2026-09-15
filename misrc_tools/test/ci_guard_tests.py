@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import getpass
 import os
 import re
 import shutil
@@ -1200,6 +1201,60 @@ def check_cc_record_argv_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_cc_record_ioprio_runtime(repo_root: Path) -> int:
+    """The caption recorder's ffmpeg must run one I/O step below the RF writers
+    (best-effort level 1), and the thread that spawned it -- the render thread in
+    the app -- must keep its own class. Driven with a stand-in ffmpeg script, so
+    it needs no capture device and no real ffmpeg."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: closed-caption I/O class guard (Linux only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the closed-caption I/O class guard")
+        print("SKIP: closed-caption I/O class guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/gui_cc_record_ioprio_harness.c"
+    module_path = repo_root / "misrc_tools/misrc_gui/output/gui_cc_record.c"
+    module_include = repo_root / "misrc_tools/misrc_gui/output"
+    for required in (harness_path, module_path):
+        if not required.exists():
+            return fail(f"Closed-caption I/O class guard source is missing: {required}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_cc_ioprio_guard_") as temp_root:
+        exe_path = Path(temp_root) / "cc_ioprio_guard"
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+            f"-I{module_include}",
+            str(harness_path),
+            str(module_path),
+            "-o",
+            str(exe_path),
+        ]
+        built = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if built.returncode != 0:
+            return fail(
+                "Closed-caption I/O class harness failed to compile -- if this names a "
+                "missing project header, gui_cc_record.c has grown an include it "
+                f"must not have:\n{built.stderr.strip()}"
+            )
+        ran = subprocess.run([str(exe_path)], capture_output=True, text=True, timeout=60)
+        if ran.returncode != 0:
+            return fail(
+                "Closed-caption I/O class harness failed:\n"
+                f"{ran.stdout.strip()}\n{ran.stderr.strip()}"
+            )
+    return 0
+
+
 def check_cc_record_is_subprocess_only(repo_root: Path) -> int:
     """The caption recorder feeds ffmpeg nothing -- ffmpeg opens the exclusive
     VBI node itself -- so it has no ring, no thread, no preview tap and no
@@ -1924,6 +1979,172 @@ def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
                 f"{Path(rel).name} must nice the SPAWNED CHILD by pid; a 0 pid would "
                 "nice this process instead and slow the RF path it is protecting"
             )
+    return 0
+
+
+def check_gdh_host_installer(repo_root: Path) -> int:
+    """scripts/gdh-host/install.sh is what the GDH hosts run as root (from a
+    root-owned copy) to grant the scheduling limits the capture path needs. Run
+    it in --print mode -- no root, nothing written -- and check what it would
+    install: the user-manager drop-in lets the GUI's threads reach SCHED_FIFO 99
+    and nice -20; the runner drop-in gives CI exactly what the priority
+    harnesses lower to (RTPRIO 5, NICE 25) and no more, so a PR's code cannot
+    take FIFO 99 on a runner host; cs0's misrc-server unit runs --net-serve as
+    the invoking user with the GUI's limits, top CPU and I/O weight, and room
+    for a FLAC finalize on stop. It must refuse to install without root and
+    never restart a service: user@ and the runner would take the deploy down
+    with them."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: GDH host installer guard (Linux only)")
+        return 0
+    script = repo_root / "scripts/gdh-host/install.sh"
+    if not script.exists():
+        return fail(f"GDH host installer is missing: {script}")
+
+    def render(host: str):
+        ran = subprocess.run(["bash", str(script), "--print", host],
+                             capture_output=True, text=True)
+        if ran.returncode != 0:
+            return None, f"install.sh --print {host} exited {ran.returncode}: {ran.stderr.strip()}"
+        sections: Dict[str, List[str]] = {}
+        current = None
+        for line in ran.stdout.splitlines():
+            if line.startswith("== "):
+                current = line[3:].strip()
+                sections[current] = []
+            elif current is not None:
+                sections[current].append(line.strip())
+        return sections, None
+
+    def settings(lines: List[str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for line in lines:
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                out[key.strip()] = value.strip()
+        return out
+
+    cs0, err = render("cs0")
+    if err:
+        return fail(err)
+    wm, err = render("wm")
+    if err:
+        return fail(err)
+
+    user_dropin = "/etc/systemd/system/user@.service.d/misrc-limits.conf"
+    unit = "/etc/systemd/system/misrc-server.service"
+    for host, sections in (("cs0", cs0), ("wm", wm)):
+        got = settings(sections.get(user_dropin, []))
+        if got.get("LimitRTPRIO") != "99" or got.get("LimitNICE") != "-20":
+            return fail(f"install.sh {host}: {user_dropin} must set LimitRTPRIO=99 and "
+                        f"LimitNICE=-20, got {got}")
+        runner = [k for k in sections if "actions.runner." in k
+                  and k.endswith("/misrc-guard-limits.conf")]
+        if not runner:
+            return fail(f"install.sh {host} installs no runner drop-in (misrc-guard-limits.conf)")
+        for key in runner:
+            got = settings(sections[key])
+            # Exactly what priority_clamp_harness.c / flac_worker_priority_harness.c
+            # lower their soft limits to; anything higher hands PR code more.
+            if got.get("LimitRTPRIO") != "5" or got.get("LimitNICE") != "25":
+                return fail(f"install.sh {host}: {key} must set LimitRTPRIO=5 and "
+                            f"LimitNICE=25, got {got}")
+            # 2026-09-15: a global OOM killed one small process inside the wm runner's
+            # unit; systemd's default OOMPolicy=stop then took the whole runner down
+            # and Restart=no left it there, so every fork PR's CI queued. Measured:
+            # OOMPolicy=continue keeps the unit running through a child's kill, and
+            # Restart=on-failure brings it back when the listener itself dies.
+            if got.get("OOMPolicy") != "continue":
+                return fail(f"install.sh {host}: {key} must set OOMPolicy=continue so a "
+                            f"child's OOM kill does not stop the runner, got {got.get('OOMPolicy')}")
+            if got.get("Restart") != "on-failure" or not got.get("RestartSec", "").rstrip("s").isdigit():
+                return fail(f"install.sh {host}: {key} must set Restart=on-failure with a "
+                            f"RestartSec, got Restart={got.get('Restart')} "
+                            f"RestartSec={got.get('RestartSec')}")
+    if unit in wm:
+        return fail("install.sh wm installs misrc-server.service; the unit is cs0's only")
+    if unit not in cs0:
+        return fail("install.sh cs0 does not install misrc-server.service")
+    body = cs0[unit]
+    got = settings(body)
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+    exec_start = got.get("ExecStart", "")
+    problems = []
+    if "--net-serve" not in exec_start or "--config" not in exec_start:
+        problems.append(f"ExecStart must run --config ... --net-serve, got '{exec_start}'")
+    if any("%h" in line for line in body if not line.startswith("#")):
+        problems.append("uses %h, which is root's home in a system unit even with User=")
+    if got.get("User") != who:
+        problems.append(f"User={got.get('User')}, want the invoking user {who}")
+    for key, want in (("LimitRTPRIO", "99"), ("LimitNICE", "-20"), ("CPUWeight", "10000"),
+                      ("IOWeight", "10000"), ("Restart", "on-failure"),
+                      ("WantedBy", "multi-user.target")):
+        if got.get(key) != want:
+            problems.append(f"{key}={got.get(key)}, want {want}")
+    stop = got.get("TimeoutStopSec", "")
+    if not stop.isdigit() or int(stop) < 600:
+        problems.append(f"TimeoutStopSec={stop or 'unset'}; a legacy FLAC rewrite on stop "
+                        "takes minutes, give it at least 600")
+    if problems:
+        return fail("install.sh cs0: misrc-server.service " + "; ".join(problems))
+
+    bad = subprocess.run(["bash", str(script), "--print", "nosuchhost"],
+                         capture_output=True, text=True)
+    if bad.returncode == 0:
+        return fail("install.sh accepts an unknown host; it must take only wm or cs0")
+    if os.geteuid() != 0:
+        real = subprocess.run(["bash", str(script), "wm"], capture_output=True, text=True)
+        if real.returncode == 0:
+            return fail("install.sh installed without root; it must refuse")
+    source = strip_shell_comments(read_text(script))
+    if re.search(r"systemctl\s+(restart|try-restart|reload-or-restart|try-reload-or-restart)\b",
+                 source):
+        return fail("install.sh restarts a service; it may only enable, start and daemon-reload")
+    return 0
+
+
+def check_capture_children_io_class(repo_root: Path) -> int:
+    """Every child process the GUI spawns carries an I/O class chosen for it. It
+    is set on the spawning thread right before posix_spawn -- the child inherits
+    it at fork, so the child's own threads cannot race it -- and taken back
+    right after, because that thread is the render thread. The recorders'
+    children (the ffmpeg reference video, the caption recorder) sit one step
+    below the RF writers, best-effort level 1; the stream's ffmpeg and mediamtx
+    take only idle disk time. The caption recorder and mediamtx also have
+    runtime checks; the other two need a V4L2 device to start."""
+    for rel, define, want in (
+        ("misrc_tools/misrc_gui/output/gui_video_record.c", "VR_CHILD_IOPRIO", (2 << 13) | 1),
+        ("misrc_tools/misrc_gui/output/gui_cc_record.c", "CC_CHILD_IOPRIO", (2 << 13) | 1),
+        ("misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c", "RS_CHILD_IOPRIO", 3 << 13),
+        ("misrc_tools/misrc_gui/streaming/gui_mediamtx.c", "MTX_CHILD_IOPRIO", 3 << 13),
+    ):
+        code = strip_c_comments(read_text(repo_root / rel))
+        name = Path(rel).name
+        m = re.search(rf"#define\s+{define}\s+\(([\d\s<|()]+)\)", code)
+        if not m:
+            return fail(f"{name} does not define {define}")
+        # "(class << 13) | level" or "class << 13", the kernel's ioprio encoding.
+        parts = re.fullmatch(r"(\d+)<<13(?:\|(\d+))?", re.sub(r"[\s()]", "", m.group(1)))
+        if not parts:
+            return fail(f"{name} writes {define} as '{m.group(1)}', not (class << 13) | level")
+        value = (int(parts.group(1)) << 13) | int(parts.group(2) or 0)
+        if value != want:
+            return fail(f"{name} sets {define} to {value}, want {want}")
+        spawns = [mm.start() for mm in re.finditer(r"\bposix_spawnp?\(", code)]
+        if not spawns:
+            return fail(f"{name} spawns no child any more; update this guard")
+        for at in spawns:
+            before, after = code[max(0, at - 400):at], code[at:at + 400]
+            if not re.search(rf"SYS_ioprio_set[^;]*{define}", before):
+                return fail(
+                    f"{name} spawns a child without setting {define} on the spawning "
+                    "thread first; the child would inherit the render thread's class"
+                )
+            if "SYS_ioprio_set" not in after:
+                return fail(
+                    f"{name} never gives the spawning thread its own I/O class back "
+                    "after posix_spawn; the render thread would keep the child's"
+                )
     return 0
 
 
@@ -3781,6 +4002,8 @@ def main() -> int:
         ("LAN requires acknowledgement", lambda: check_lan_requires_acknowledgement(repo_root)),
         ("live readout cannot resize the panel", lambda: check_live_stream_readout_cannot_resize_the_panel(repo_root)),
         ("streaming children yield to RF", lambda: check_streaming_children_yield_to_rf(repo_root)),
+        ("capture children I/O class", lambda: check_capture_children_io_class(repo_root)),
+        ("GDH host installer", lambda: check_gdh_host_installer(repo_root)),
         ("streaming writes are private", lambda: check_streaming_writes_are_private(repo_root)),
         ("Clay text outlives the layout pass", lambda: check_clay_text_outlives_layout(repo_root)),
         ("URL opening is whitelisted", lambda: check_url_open_is_whitelisted(repo_root)),
@@ -3820,6 +4043,7 @@ def main() -> int:
         checks.insert(12, ("mediamtx config runtime", lambda: check_mediamtx_config_runtime(repo_root)))
         checks.insert(13, ("alsa device resolution", lambda: check_alsa_device_resolution(repo_root)))
         checks.insert(14, ("closed-caption argv contract", lambda: check_cc_record_argv_runtime(repo_root)))
+        checks.insert(15, ("closed-caption child I/O class", lambda: check_cc_record_ioprio_runtime(repo_root)))
         checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))

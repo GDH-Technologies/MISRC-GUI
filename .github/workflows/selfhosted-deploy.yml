@@ -588,6 +588,38 @@ jobs:
           done
 
       # ----------------------------------------------------------------------------
+      # Host provisioning -- wm and cs0 ONLY. scripts/gdh-host/install.sh grants the
+      # scheduling limits the capture threads need and, on cs0, installs the
+      # misrc-server unit. It runs as root from a root-owned copy installed once by
+      # hand; sudoers names that copy and nothing else, because a rule pointing at
+      # this user-writable checkout would make every process of the runner user root.
+      # So this step never installs the script: when the repo's copy differs it says
+      # so and carries on. Setup and sudoers lines: scripts/gdh-host/README.md.
+      # A provisioning failure must not stop the binaries above from being verified,
+      # hence continue-on-error.
+      # ----------------------------------------------------------------------------
+      - name: Provision host (gdh-host)
+        if: >-
+          (matrix.runner.name == 'wm' || matrix.runner.name == 'cs0') &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        continue-on-error: true
+        env:
+          RUNNER_HOST: ${{ matrix.runner.name }}
+        run: |
+          set -euo pipefail
+          installed=/usr/local/libexec/misrc/gdh-host-install
+          if [ ! -x "$installed" ]; then
+            echo "::warning::$installed is not set up on $RUNNER_HOST, so host limits and the cs0 unit are unmanaged. One-time setup: scripts/gdh-host/README.md"
+            exit 0
+          fi
+          if ! cmp -s "$installed" scripts/gdh-host/install.sh; then
+            echo "::warning::$installed on $RUNNER_HOST differs from scripts/gdh-host/install.sh; reinstall it: sudo install -D -o root -g root -m 0755 scripts/gdh-host/install.sh $installed"
+            exit 0
+          fi
+          sudo -n "$installed" "$RUNNER_HOST"
+
+      # ----------------------------------------------------------------------------
       # Windows install -- win0 ONLY. %LOCALAPPDATA%\Programs\MISRC, the per-user
       # application location, plus a Start Menu shortcut so the GUI is launchable from
       # the Start menu and search; the shortcut takes its icon from the .exe, which
@@ -969,3 +1001,35 @@ jobs:
             "$app_bin" --smoke-test
             echo "- app bundle: \`~/Applications/MISRC.app\`" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # ----------------------------------------------------------------------------
+      # cs0's misrc-server unit only picks up the binary installed above when it
+      # restarts, and a restart mid-capture would cut the recording. So restart only
+      # when the server reports idle -- GET /settings "state": 0 idle, 1 capturing,
+      # 2 recording -- and otherwise leave it running and say so. Set up by
+      # scripts/gdh-host (sudoers allows exactly this restart).
+      # ----------------------------------------------------------------------------
+      - name: Restart cs0 misrc-server if idle
+        if: >-
+          matrix.runner.name == 'cs0' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! systemctl is-active --quiet misrc-server.service; then
+            echo "misrc-server.service is not running; nothing to restart"
+            exit 0
+          fi
+          port="$(python3 -c 'import json, os; print(json.load(open(os.path.expanduser("~/.config/misrc/server.json"))).get("net_server_port", 8080))')"
+          state="$(curl -s --max-time 5 "http://127.0.0.1:$port/settings" \
+                   | python3 -c 'import json, sys; print(json.load(sys.stdin)["state"])' || echo unknown)"
+          if [ "$state" != "0" ]; then
+            echo "::warning::misrc-server on cs0 is busy (state $state); it keeps the previous binary until its next restart"
+            echo "- misrc-server: busy (state \`$state\`), still on the previous binary" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          sudo -n /usr/bin/systemctl restart misrc-server.service
+          sleep 3
+          systemctl is-active --quiet misrc-server.service
+          echo "- misrc-server: restarted onto the new binary" >> "$GITHUB_STEP_SUMMARY"

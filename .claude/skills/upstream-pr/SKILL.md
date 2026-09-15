@@ -44,7 +44,7 @@ self-contained, evidenced, and free of anything that only makes sense at GDH.
    git diff --name-only upstream/main...HEAD
    ```
    Every path must be an upstream path. None of `.claude/`, `docs/gdh-*`, `docs/superpowers/`,
-   `.github/workflows/selfhosted-deploy.yml`, `scripts/fetch-mediamtx.sh`,
+   `.github/workflows/selfhosted-deploy.yml`, `scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`,
    `misrc_gui/streaming/`, `gui_preview_v4l2.c`, `gui_video_record.c`, `gui_preview_panel.c`
    may appear. Grep the diff for `gdh`, `GDH`, `cs0`, `air0`, `workflow-master`, `wm` as a
    host name, and `192.168.` — none may appear.
