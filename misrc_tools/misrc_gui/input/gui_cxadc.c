@@ -575,6 +575,9 @@ static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool e
                     else app->settings.rf_bits_b = 8;
                     gui_settings_save(&app->settings);
                     gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
+                    // Ask the UI thread to show a help popup with the full
+                    // one-time setup instructions (consumed in gui_handle_interactions).
+                    atomic_store(&app->cxadc_perm_help_pending, true);
                 }
                 continue;
             }

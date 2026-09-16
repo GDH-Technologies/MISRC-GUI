@@ -458,9 +458,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // FLAC defaults
     settings->use_flac = true;
     settings->flac_12bit = false;
-    settings->flac_level = 4;             // Balanced compression
+    settings->flac_level = 8;             // Max compression (best ratio for archival RF)
     settings->flac_verification = false;  // Faster
-    settings->flac_threads = 0;           // Auto
+    settings->flac_threads = 8;           // 8 encoder threads (was 0/auto; auto can under-use cores)
     settings->flac_affinity_enabled = false;
     settings->flac_affinity_cpu_list[0] = '\0';
     

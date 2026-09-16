@@ -8003,6 +8003,23 @@ void gui_handle_interactions(gui_app_t *app) {
         }
     }
 
+    // CXADC 10-bit permission help: the capture thread sets this flag when a
+    // 10-bit sysfs write is denied; show a one-time help popup with the
+    // chgrp setup instructions. Defer to the UI thread (not the capture
+    // thread) since popup state is UI-thread-only.
+    if (atomic_exchange(&app->cxadc_perm_help_pending, false) && !gui_popup_is_open()) {
+        gui_dropdown_close_all();
+        gui_ui_clear_text_edit();
+        gui_popup_info("CXADC 10-bit mode needs one-time setup",
+            "10-bit mode requires write access to the cxadc sysfs parameters,\n"
+            "which are root-only by default. Capture fell back to 8-bit.\n\n"
+            "Run this one-time setup to enable 10-bit for non-root users:\n\n"
+            "  sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*\n"
+            "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
+            "  sudo usermod -aG video $USER   (then log out/in)\n\n"
+            "8-bit capture needs no setup and still works.");
+    }
+
     // Handle popup interactions first (modal behavior)
     if (gui_popup_handle_interactions()) {
         s_ui_consumed_click = true;
@@ -8967,6 +8984,19 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("FlacThreadsMinus"))) {
                 if (app->settings.flac_threads > 0) app->settings.flac_threads--;
+                if (app->settings.flac_threads == 0) {
+                    // 0 means "auto" to the encoder, which can under-use available
+                    // cores. Warn once per visit to 0 so the user knows to pick an
+                    // explicit thread count for best throughput.
+                    gui_dropdown_close_all();
+                    gui_ui_clear_text_edit();
+                    gui_popup_info("FLAC threads set to auto (0)",
+                        "FLAC encoder threads is now 0 (auto).\n\n"
+                        "Auto may not use all available CPU cores efficiently.\n"
+                        "For best encode throughput on multi-core systems, set an\n"
+                        "explicit thread count (e.g. 4, 6, or 8).\n\n"
+                        "You can raise it back with the + button.");
+                }
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("FlacThreadsPlus"))) {

@@ -510,6 +510,11 @@ typedef struct gui_app {
     float low_signal_time;     // Seconds signal has stayed below the level threshold
     bool low_signal_armed;     // True once a real signal level has been seen above the threshold
 
+    // CXADC 10-bit sysfs permission help: set by the capture thread when a
+    // 10-bit mode sysfs write is denied (EACCES/EPERM); consumed by the UI
+    // thread to show a help popup with the one-time chgrp setup instructions.
+    atomic_bool cxadc_perm_help_pending;
+
     // Device disconnect detection (timestamp of last successful callback)
     atomic_uint_fast64_t last_callback_time_ms;
 
