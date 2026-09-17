@@ -21,6 +21,7 @@
       "Bash(build-local/misrc_gui.exe --version)",
       "Bash(build-local/misrc_gui.exe --help)",
       "Bash(build-local/misrc_gui.exe --device-list)",
+      "Bash(git commit:*)",
       "Bash(gh label list *)",
       "Bash(gh run watch *)",
       "Bash(gh run view *)"
@@ -36,7 +37,6 @@
       "Bash(curl:*)",
       "Bash(gh pr create:*)",
       "Bash(gh repo edit:*)",
-      "Bash(git commit:*)",
       "Bash(rm:*)",
       "Bash(git worktree remove:*)",
       "Bash(claude plugin install:*)",
