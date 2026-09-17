@@ -277,6 +277,10 @@ typedef struct {
     thrd_t audio_thread;
     bool audio_thread_started;
     int card_count;
+    // Card 1 is opened and read only when RF B is recorded. card_count keeps
+    // meaning "cards present" (it selects the Clockgen 40/20 rate), so an
+    // RF-B-off capture on a two-card rig still reports the modded rate.
+    bool read_b;
     bool misrc_clockgen_mode;
     bool tenbit_mode[CXADC_MAX_CARDS];
     uint32_t card_sample_rate_hz[CXADC_MAX_CARDS];
@@ -1827,8 +1831,8 @@ static int cxadc_capture_thread(void *ctx_ptr)
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
 
     uint8_t *card_buf_a = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES);
-    uint8_t *card_buf_b = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES);
-    if (!card_buf_a || !card_buf_b) {
+    uint8_t *card_buf_b = ctx->read_b ? (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES) : NULL;
+    if (!card_buf_a || (ctx->read_b && !card_buf_b)) {
         free(card_buf_a);
         free(card_buf_b);
         gui_app_set_status(app, "CXADC: failed to allocate capture buffers");
@@ -1860,7 +1864,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
             thrd_sleep_ms(1);
             continue;
         }
-        if (ctx->card_count > 1) {
+        if (ctx->read_b) {
 #if defined(_WIN32)
             int read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
 #else
@@ -1901,7 +1905,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 sample_a = cxadc_decode_sample_8bit(card_buf_a[i]);
             }
             int16_t sample_b = 0;
-            if (ctx->card_count > 1) {
+            if (ctx->read_b) {
                 if (ctx->tenbit_mode[1]) {
                     int idx = i * 2;
                     sample_b = cxadc_decode_sample_tenbit(card_buf_b[idx], card_buf_b[idx + 1]);
@@ -2012,6 +2016,11 @@ bool gui_cxadc_audio_capture_active(void)
     return s_cxadc.audio_device_name[0] != '\0';
 }
 
+bool gui_cxadc_card_b_skipped(void)
+{
+    return atomic_load(&s_cxadc.running) && s_cxadc.card_count > 1 && !s_cxadc.read_b;
+}
+
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
@@ -2026,7 +2035,10 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     memset(&s_cxadc, 0, sizeof(s_cxadc));
     s_cxadc.app = app;
     s_cxadc.card_count = card_count;
+    s_cxadc.read_b = (card_count > 1) && app->settings.capture_b;
     s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
+    // Cards actually programmed and opened: card 1 only when RF B is read.
+    const int open_count = s_cxadc.read_b ? card_count : (card_count > 0 ? 1 : 0);
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
         bool mode = app->settings.cxadc_tenbit_mode_card[i];
         if (i >= card_count) {
@@ -2076,11 +2088,14 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // Skip CXADC card programming/open when there are no RF cards (audio-only
     // MISRC Clockgen). tenbit/center-offset sysfs writes would fail and abort.
     if (card_count > 0) {
-        if (cxadc_apply_tenbit_modes(app, card_count, s_cxadc.tenbit_mode) != 0) {
+        if (!s_cxadc.read_b && card_count > 1) {
+            fprintf(stderr, "[CXADC] RF B off: card 1 not opened\n");
+        }
+        if (cxadc_apply_tenbit_modes(app, open_count, s_cxadc.tenbit_mode) != 0) {
 #if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s): %s (errno %d)\n",
-                    card_count, strerror(saved_errno), saved_errno);
+                    open_count, strerror(saved_errno), saved_errno);
             if (saved_errno == EACCES || saved_errno == EPERM) {
                 fprintf(stderr, "[CXADC] sysfs write denied. For 10-bit mode you need one-time setup:\n"
                                 "          sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*\n"
@@ -2091,16 +2106,16 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
                 gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
             }
 #else
-            fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s)\n", card_count);
+            fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s)\n", open_count);
             gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
 #endif
             return -1;
         }
 
-        if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
+        if (cxadc_open_cards(&s_cxadc, open_count) != 0) {
 #if !defined(_WIN32)
             fprintf(stderr, "[CXADC] failed to open /dev/cxadc0..%d: %s (errno %d)\n",
-                    card_count - 1, strerror(errno), errno);
+                    open_count - 1, strerror(errno), errno);
             fprintf(stderr, "[CXADC] check the cxadc driver is loaded and /dev/cxadcN exists (ls -l /dev/cxadc*)\n");
 #else
             fprintf(stderr, "[CXADC] failed to open card device(s)\\n");
