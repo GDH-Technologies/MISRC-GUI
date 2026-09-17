@@ -1211,11 +1211,16 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
     app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
+    app->panel_config_a.left_source = 0;
+    app->panel_config_a.right_source = 0;
+
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
     app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
     app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    app->panel_config_b.left_source = 1;
+    app->panel_config_b.right_source = 1;
 
     // Note: All buffers (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO, etc.) are initialized
     // by buffer manager automatically on first use
@@ -2970,4 +2975,18 @@ bool gui_capture_device_timeout(gui_app_t *app, uint32_t timeout_ms) {
     }
 
     return (now - last_cb) > timeout_ms;
+}
+
+void gui_capture_service_channel_b(gui_app_t *app)
+{
+    if (!app || !app->is_capturing || !gui_cxadc_has_card_b()) return;
+    // capture_b is locked while recording; never move card 1 under a file.
+    if (app->is_recording) return;
+    if (gui_cxadc_sync_card_b(app, app->settings.capture_b) != 0) {
+        app->settings.capture_b = false;
+        app->settings.enable_resample_b = false;
+        gui_settings_save(&app->settings);
+        gui_app_set_status(app, "CXADC card 1 could not be opened; RF B turned off");
+    }
+    app->capture_has_channel_b = gui_cxadc_card_b_reading();
 }

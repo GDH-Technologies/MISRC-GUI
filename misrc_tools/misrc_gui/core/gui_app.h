@@ -50,6 +50,8 @@ typedef struct channel_panel_config {
     panel_view_type_t right_view;  // View for right panel (only used if split)
     void *left_state;              // View-specific state (created via panel_create_view_state)
     void *right_state;             // View-specific state for right panel
+    int left_source;               // Data feeding the left panel: 0 = CH A, 1 = CH B
+    int right_source;              // Data feeding the right panel
     Rectangle left_bounds;         // Cached bounds from last render (for click handling)
     Rectangle right_bounds;        // Cached bounds for right panel
 } channel_panel_config_t;

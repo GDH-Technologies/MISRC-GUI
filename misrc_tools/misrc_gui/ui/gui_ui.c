@@ -2416,14 +2416,6 @@ static void gui_ui_clear_text_edit(void)
     s_active_text_backspace_repeat_at = 0.0;
 }
 
-/* RF B off at capture start leaves CXADC card 1 closed, so turning it back
- * on cannot take effect until the capture restarts. Turning it off is fine. */
-static bool gui_ui_capture_b_enable_locked(const gui_app_t *app)
-{
-    return app && app->is_capturing && !app->settings.capture_b &&
-           gui_cxadc_card_b_skipped();
-}
-
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
     if (!app) return false;
@@ -2714,11 +2706,6 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
     if (strncmp(key, "rtsp_", 5) == 0 && strcmp(key, "rtsp_stream_enabled") != 0 &&
         gui_rtsp_stream_is_running()) {
         snprintf(msg, msg_cap, "stop the stream before changing its settings");
-        return 409;
-    }
-    if (strcmp(key, "capture_b") == 0 && strcmp(value, "true") == 0 &&
-        gui_ui_capture_b_enable_locked(app)) {
-        snprintf(msg, msg_cap, "stop the capture to turn RF B on");
         return 409;
     }
     if (strcmp(key, "rtsp_stream_lan") == 0 && strcmp(value, "true") == 0 &&
@@ -3777,7 +3764,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     CLAY(CLAY_ID("ToggleRowCaptureB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        bool cap_b_toggle_disabled = settings_b_disabled || gui_ui_capture_b_enable_locked(app);
+                        bool cap_b_toggle_disabled = settings_b_disabled;
                         Color cap_b_toggle_bg = cap_b_toggle_disabled ? ui_disabled_color(app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON) : (app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
                         Color cap_b_toggle_fg = cap_b_toggle_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("ToggleCaptureB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cap_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
@@ -7156,14 +7143,11 @@ static Clay_BoundingBox gui_ui_channel_menu_bounds(Clay_BoundingBox button,
     return (Clay_BoundingBox){x, y, width, height};
 }
 
-static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id,
-                                                    int width, int option_count)
+static Clay_ElementDeclaration gui_ui_menu_at(Clay_BoundingBox anchor, int width,
+                                              int option_count, int16_t z_index)
 {
-    // A menu opens after the button's layout and click have completed, so its
-    // last laid-out bounds are available. Root positioning also clamps the
-    // menu during a viewport resize instead of inheriting a stale offset.
     Clay_BoundingBox bounds = gui_ui_channel_menu_bounds(
-        Clay_GetElementData(button_id).boundingBox, width, option_count * 20,
+        anchor, width, option_count * 20,
         gui_ui_get_layout_width(), gui_ui_get_layout_height());
     return (Clay_ElementDeclaration){
         .layout = {
@@ -7174,12 +7158,23 @@ static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id,
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
             .offset = {bounds.x, bounds.y},
+            .zIndex = z_index,
             .clipTo = CLAY_CLIP_TO_NONE
         },
         .clip = { .vertical = true, .childOffset = Clay_GetScrollOffset() },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(3)
     };
+}
+
+static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id,
+                                                    int width, int option_count)
+{
+    // A menu opens after the button's layout and click have completed, so its
+    // last laid-out bounds are available. Root positioning also clamps the
+    // menu during a viewport resize instead of inheriting a stale offset.
+    return gui_ui_menu_at(Clay_GetElementData(button_id).boundingBox,
+                          width, option_count, 0);
 }
 
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
@@ -7857,8 +7852,6 @@ static void render_channel_gear(gui_app_t *app, int channel) {
         bool resample_on = (channel == 0) ? app->settings.enable_resample_a
                                           : app->settings.enable_resample_b;
         bool row_disabled = locked || channel_b_missing;
-        bool record_disabled = row_disabled ||
-                               (channel == 1 && gui_ui_capture_b_enable_locked(app));
         bool tag_disabled = row_disabled || !app->settings.auto_names_enabled ||
                             (channel == 1 && !app->settings.capture_b);
         bool resample_disabled = row_disabled ||
@@ -7888,13 +7881,13 @@ static void render_channel_gear(gui_app_t *app, int channel) {
                     .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(26) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                 },
-                .backgroundColor = to_clay_color(record_disabled ? ui_disabled_color(rec_bg) : rec_bg),
+                .backgroundColor = to_clay_color(row_disabled ? ui_disabled_color(rec_bg) : rec_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
                 CLAY_TEXT(capture_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
                     CLAY_TEXT_CONFIG({
                         .fontSize = FONT_SIZE_STATS,
-                        .textColor = to_clay_color(record_disabled ? ui_disabled_color(COLOR_TEXT)
+                        .textColor = to_clay_color(row_disabled ? ui_disabled_color(COLOR_TEXT)
                                                                 : COLOR_TEXT)
                     }));
             }
@@ -7982,6 +7975,109 @@ static void render_channel_gear(gui_app_t *app, int channel) {
             }
         }
 
+    }
+}
+
+// Right-click menu on a channel pane: pick the pane's view, the channel that
+// feeds it, and the row's Single/Split layout. It opens at the pointer and
+// shares the one-open-at-a-time dropdown slot (index row * 2 + side).
+static Vector2 s_pane_menu_anchor;
+static bool s_pane_row_b_visible = true;
+
+#define PANE_MENU_WIDTH 180
+
+static bool gui_ui_pane_menu_open_index(uint32_t *index)
+{
+    for (uint32_t i = 0; i < 4; i++) {
+        if (gui_dropdown_is_open(DROPDOWN_PANE_MENU, i)) {
+            if (index) *index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// B cannot feed a pane while the running capture has no channel B.
+static bool gui_ui_pane_menu_b_missing(const gui_app_t *app)
+{
+    return app->is_capturing && !app->capture_has_channel_b;
+}
+
+static void gui_ui_pane_menu_header(uint32_t id, const char *menu_text)
+{
+    CLAY(CLAY_IDI("PaneMenuHeader", id), {
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
+            .padding = { 8, 8, 0, 0 },
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        }
+    }) {
+        CLAY_TEXT(make_string(menu_text),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+    }
+}
+
+// menu_text must be a literal or other static string (Clay keeps the pointer).
+static void gui_ui_pane_menu_option(Clay_ElementId id, const char *menu_text,
+                                    bool selected, bool disabled)
+{
+    bool hover = !disabled && Clay_PointerOver(id);
+    Color bg = gui_dropdown_option_color(selected, hover);
+    CLAY(id, {
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
+            .padding = { 16, 8, 0, 0 },
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = to_clay_color(bg)
+    }) {
+        CLAY_TEXT(make_string(menu_text),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_DROPDOWN_OPT,
+                               .textColor = to_clay_color(disabled ? ui_disabled_color(COLOR_TEXT)
+                                                                   : COLOR_TEXT) }));
+    }
+}
+
+static void render_pane_menu(gui_app_t *app)
+{
+    uint32_t index = 0;
+    if (!gui_ui_pane_menu_open_index(&index)) return;
+    int row = (int)(index / 2);
+    bool right = (index % 2) != 0;
+
+    channel_panel_config_t *config = (row == 0) ? &app->panel_config_a : &app->panel_config_b;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+    bool split = config->split;
+    panel_view_type_t view = right ? config->right_view : config->left_view;
+    int source = panel_config_source(config, right);
+    atomic_flag_clear(&app->panel_config_lock);
+
+    bool b_missing = gui_ui_pane_menu_b_missing(app);
+    bool has_source = panel_view_type_has_source(view);
+
+    int rows = 3 + 2 + 2;  // three headers, two sources, two layouts
+    for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+        if (panel_view_type_available((panel_view_type_t)vt)) rows++;
+    }
+
+    Clay_BoundingBox anchor = { s_pane_menu_anchor.x, s_pane_menu_anchor.y, 0, 0 };
+    CLAY(CLAY_ID("PaneMenu"), gui_ui_menu_at(anchor, PANE_MENU_WIDTH, rows, 20)) {
+        gui_ui_pane_menu_header(0, "View");
+        for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+            if (!panel_view_type_available((panel_view_type_t)vt)) continue;
+            gui_ui_pane_menu_option(CLAY_IDI("PaneMenuView", vt),
+                                    panel_view_type_name((panel_view_type_t)vt),
+                                    vt == (int)view,
+                                    vt == PANEL_VIEW_DEMOD && b_missing);
+        }
+        gui_ui_pane_menu_header(1, "Source");
+        gui_ui_pane_menu_option(CLAY_IDI("PaneMenuSource", 0), "CH A",
+                                has_source && source == 0, !has_source);
+        gui_ui_pane_menu_option(CLAY_IDI("PaneMenuSource", 1), "CH B",
+                                has_source && source == 1, !has_source || b_missing);
+        gui_ui_pane_menu_header(2, row == 0 ? "Layout (top row)" : "Layout (bottom row)");
+        gui_ui_pane_menu_option(CLAY_IDI("PaneMenuLayout", 0), "Single", !split, false);
+        gui_ui_pane_menu_option(CLAY_IDI("PaneMenuLayout", 1), "Split", split, false);
     }
 }
 
@@ -8136,6 +8232,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
                 render_channel_stats(app, 1, &stats[1], &stats_layout);
             }
         }
+        s_pane_row_b_visible = !single_channel_preview;
+        render_pane_menu(app);
     }
 }
 
@@ -9531,10 +9629,6 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
                 : "Single-card CXADC has no RF channel B source");
             return;
         }
-        if (channel == 1 && gui_ui_capture_b_enable_locked(app)) {
-            gui_app_set_status(app, "Stop the capture to turn RF B on (card 1 opens at capture start)");
-            return;
-        }
         if (channel == 0) {
             app->settings.capture_a = !app->settings.capture_a;
         } else {
@@ -9705,6 +9799,96 @@ static bool gui_ui_handle_channel_gear_click(gui_app_t *app) {
     return false;
 }
 
+// Left clicks while the pane menu is open. Same ordering and dismissal rules
+// as the gear popover above: it floats over waveform panels, so it must run
+// before panel_handle_all_clicks or a click on an option would also grab the
+// trigger level; an outside click closes it without being consumed.
+static bool gui_ui_handle_pane_menu_click(gui_app_t *app) {
+    uint32_t index = 0;
+    if (!gui_ui_pane_menu_open_index(&index)) return false;
+    if (!Clay_PointerOver(CLAY_ID("PaneMenu"))) {
+        gui_dropdown_close_all();
+        return false;
+    }
+
+    int row = (int)(index / 2);
+    bool right = (index % 2) != 0;
+    channel_panel_config_t *config = (row == 0) ? &app->panel_config_a : &app->panel_config_b;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+    panel_view_type_t view = right ? config->right_view : config->left_view;
+    atomic_flag_clear(&app->panel_config_lock);
+    bool b_missing = gui_ui_pane_menu_b_missing(app);
+
+    for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+        if (!Clay_PointerOver(CLAY_IDI("PaneMenuView", vt))) continue;
+        if (!panel_view_type_available((panel_view_type_t)vt)) break;
+        if (vt == PANEL_VIEW_DEMOD && b_missing) {
+            gui_app_set_status(app, "Demod needs channel B, which this capture does not have");
+            return true;
+        }
+        gui_dropdown_set_pane_view(app, row, right, vt);
+        gui_dropdown_close_all();
+        return true;
+    }
+    for (int src = 0; src < 2; src++) {
+        if (!Clay_PointerOver(CLAY_IDI("PaneMenuSource", src))) continue;
+        if (!panel_view_type_has_source(view)) {
+            gui_app_set_status(app, "This view has no channel source");
+            return true;
+        }
+        if (src == 1 && b_missing) {
+            gui_app_set_status(app, "Channel B is not captured; restart the capture with RF B on");
+            return true;
+        }
+        gui_dropdown_set_pane_source(app, row, right, src);
+        gui_dropdown_close_all();
+        return true;
+    }
+    for (int split = 0; split < 2; split++) {
+        if (!Clay_PointerOver(CLAY_IDI("PaneMenuLayout", split))) continue;
+        gui_dropdown_set_pane_split(app, row, split != 0);
+        gui_dropdown_close_all();
+        return true;
+    }
+    // Consume dead space and headers so nothing leaks to the panel beneath.
+    return true;
+}
+
+// Right press: open the pane menu for the pane under the pointer. Returns true
+// when a menu was opened (or the press landed on an open menu).
+static bool gui_ui_handle_pane_right_click(gui_app_t *app) {
+    if (gui_ui_pane_menu_open_index(NULL) && Clay_PointerOver(CLAY_ID("PaneMenu"))) {
+        return true;
+    }
+    Vector2 mouse = gui_ui_get_mouse_position();
+    for (int row = 0; row < 2; row++) {
+        if (row == 1 && !s_pane_row_b_visible) continue;
+        channel_panel_config_t *config = (row == 0) ? &app->panel_config_a : &app->panel_config_b;
+        while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+        bool split = config->split;
+        Rectangle left = config->left_bounds;
+        Rectangle right = config->right_bounds;
+        atomic_flag_clear(&app->panel_config_lock);
+
+        int side = -1;
+        if (CheckCollisionPointRec(mouse, left)) side = 0;
+        else if (split && CheckCollisionPointRec(mouse, right)) side = 1;
+        if (side < 0) continue;
+
+        gui_dropdown_open(DROPDOWN_PANE_MENU, (uint32_t)(row * 2 + side));
+        s_pane_menu_anchor = mouse;
+        gui_ui_close_channel_panel_overlays(app, row);
+        if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
+            gui_ui_clear_text_edit();
+        }
+        return true;
+    }
+    if (gui_ui_pane_menu_open_index(NULL)) {
+        gui_dropdown_close_all();
+    }
+    return false;
+}
+
 void gui_handle_interactions(gui_app_t *app) {
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
@@ -9760,7 +9944,8 @@ void gui_handle_interactions(gui_app_t *app) {
     // edit and close the popover out from under it.
     if (IsKeyPressed(KEY_ESCAPE) && s_active_text_field == UI_TEXT_FIELD_NONE &&
         (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
-         gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1))) {
+         gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1) ||
+         gui_ui_pane_menu_open_index(NULL))) {
         gui_dropdown_close_all();
     }
 
@@ -9933,9 +10118,14 @@ void gui_handle_interactions(gui_app_t *app) {
         s_version_info_window_open || s_metadata_window_open ||
         s_rtsp_lan_confirm_open || s_rtsp_codec_window_open || gui_popup_is_open()) {
         if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
-            gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1)) {
+            gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1) ||
+            gui_ui_pane_menu_open_index(NULL)) {
             gui_dropdown_close_all();
         }
+    } else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) &&
+               gui_ui_handle_pane_right_click(app)) {
+        gui_ui_set_click_consumed();
+        return;
     }
 
     // Steppers use hold-repeat, so they need IsMouseButtonDown and cannot sit
@@ -9947,7 +10137,11 @@ void gui_handle_interactions(gui_app_t *app) {
 
     // Handle clicks
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-        // Runs before every panel hit test -- see the note on the handler.
+        // Both run before every panel hit test -- see the notes on the handlers.
+        if (gui_ui_handle_pane_menu_click(app)) {
+            gui_ui_set_click_consumed();
+            return;
+        }
         if (gui_ui_handle_channel_gear_click(app)) {
             gui_ui_set_click_consumed();
             return;
@@ -11040,8 +11234,6 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     }
-                } else if (gui_ui_capture_b_enable_locked(app)) {
-                    gui_app_set_status(app, "Stop the capture to turn RF B on (card 1 opens at capture start)");
                 } else {
                     app->settings.capture_b = !app->settings.capture_b;
                     if (!app->settings.capture_b) {

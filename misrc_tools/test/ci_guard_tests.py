@@ -2575,21 +2575,28 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
     thread. card_count still means "cards present" so a two-card Clockgen rig
     keeps its forced 40/20 rate; only read_b decides whether card 1 is used.
     The capability flag follows, so extraction, the display thread and net
-    clients all treat B as absent, and RF B cannot be turned back on until
-    the capture restarts."""
+    clients all treat B as absent.
+
+    RF B can be toggled while connected: the main thread opens or closes card
+    1 once per frame (window loop and --net-serve) and hands it to the RF
+    thread with a two-flag handshake. The RF thread raises b_active before it
+    reads b_enabled; the main thread drops b_enabled before it reads
+    b_active. Any other order lets a card close under a blocking read().
+    Extraction re-selects its unpack function when B joins or leaves."""
     base = repo_root / "misrc_tools/misrc_gui"
     try:
         cx = strip_c_comments(read_text(base / "input/gui_cxadc.c"))
         cap = strip_c_comments(read_text(base / "input/gui_capture.c"))
         disp = strip_c_comments(read_text(base / "processing/gui_display_thread.c"))
-        ui = strip_c_comments(read_text(base / "ui/gui_ui.c"))
         net = strip_c_comments(read_text(base / "net/gui_net.c"))
         ext = strip_c_comments(read_text(base / "processing/gui_extract.c"))
+        main_loop = strip_c_comments(read_text(base / "core/misrc_gui.c"))
     except OSError as exc:
         return fail(f"card-B skip guard: cannot read a source file: {exc}")
     try:
         start = extract_function_body(cx, "int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)")
         thread = extract_function_body(cx, "static int cxadc_capture_thread(void *ctx_ptr)")
+        sync = extract_function_body(cx, "int gui_cxadc_sync_card_b(gui_app_t *app, bool want)")
     except RuntimeError as exc:
         return fail(f"gui_cxadc.c: {exc}")
     if not re.search(r"read_b\s*=\s*\(card_count\s*>\s*1\)\s*&&\s*app->settings\.capture_b", start):
@@ -2597,16 +2604,29 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
     if "cxadc_apply_tenbit_modes(app, open_count" not in start or "cxadc_open_cards(&s_cxadc, open_count)" not in start:
         return fail("gui_cxadc.c: gui_cxadc_start() programs or opens cards by card_count instead of open_count; "
                     "RF B off would open card 1 again")
-    if "card_count > 1" in thread:
-        return fail("gui_cxadc.c: cxadc_capture_thread() gates card 1 on card_count; gate it on ctx->read_b")
-    if thread.count("ctx->read_b") < 3:
-        return fail("gui_cxadc.c: cxadc_capture_thread() must gate card_buf_b, the card 1 read and the B decode on ctx->read_b")
+    raise_active = thread.find("atomic_store(&ctx->b_active, true)")
+    load_enabled = thread.find("atomic_load(&ctx->b_enabled)")
+    card1_read = thread.find("card_fds[1]")
+    if raise_active < 0 or load_enabled < 0 or not (raise_active < load_enabled < card1_read):
+        return fail("gui_cxadc.c: cxadc_capture_thread() must raise b_active, then read b_enabled, "
+                    "before it reads card 1")
+    if thread.count("if (read_b)") < 2:
+        return fail("gui_cxadc.c: cxadc_capture_thread() must gate the card 1 read and the B decode on read_b")
+    drop_enabled = sync.find("atomic_store(&s_cxadc.b_enabled, false)")
+    load_active = sync.find("atomic_load(&s_cxadc.b_active)")
+    if drop_enabled < 0 or load_active < 0 or drop_enabled > load_active:
+        return fail("gui_cxadc.c: gui_cxadc_sync_card_b() must drop b_enabled before it checks b_active")
+    if not re.search(r"!enabled\s*&&\s*!atomic_load\(&s_cxadc\.b_active\)\s*&&\s*cxadc_card_b_is_open", sync):
+        return fail("gui_cxadc.c: gui_cxadc_sync_card_b() may close card 1 only when b_enabled and b_active are both down")
+    for where, text in (("core/misrc_gui.c", main_loop), ("net/gui_net.c", net)):
+        if "gui_capture_service_channel_b(" not in text:
+            return fail(f"{where}: the main loop no longer services RF B (gui_capture_service_channel_b)")
+    if not re.search(r"want_ab\s*!=\s*s_extract_fn_ab", ext):
+        return fail("gui_extract.c: extraction no longer re-selects its unpack function when channel B joins or leaves")
     if not re.search(r"capture_has_channel_b\s*=\s*\(cxadc_cards\s*>\s*1\)\s*&&\s*app->settings\.capture_b", cap):
         return fail("gui_capture.c: the CXADC start no longer clears capture_has_channel_b when RF B is off")
     if "app->capture_has_channel_b" not in disp:
         return fail("gui_display_thread.c: the display thread no longer skips channel B panels when the capture has no B")
-    if "gui_cxadc_card_b_skipped()" not in ui:
-        return fail("gui_ui.c: RF B can be turned on mid-capture while card 1 is closed (gui_cxadc_card_b_skipped unused)")
     if not re.search(r"s_b_present\s*=\s*s_extract_fn_ab\s*&&", ext):
         return fail("gui_extract.c: s_b_present can turn true while the extract function is A-only "
                     "(s_buf_b would carry uninitialized data)")
@@ -2615,6 +2635,70 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
         return fail("gui_net.c: client ingest must start extraction with channel B present (the A+B unpack)")
     if '\\"has_channel_b\\"' not in net or 'json_bool(stats, "has_channel_b", true)' not in net:
         return fail("gui_net.c: /stats no longer carries has_channel_b, or the client no longer reads it (default true)")
+    return 0
+
+
+def check_pane_menu_contract(repo_root: Path) -> int:
+    """Each of the four channel panes has its own data source and a right-click
+    menu (view, source, row layout). The menu floats over waveform panes, whose
+    click handler grabs the trigger level on any press inside them, so its
+    click handler must run before the gear's and before the panel hit tests.
+    Panel processing must pick samples by the pane's source, not by its row."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        ui = strip_c_comments(read_text(base / "ui/gui_ui.c"))
+        registry = strip_c_comments(read_text(base / "visualization/panel_registry.c"))
+    except OSError as exc:
+        return fail(f"pane menu guard: cannot read a source file: {exc}")
+    try:
+        interactions = extract_function_body(ui, "void gui_handle_interactions(gui_app_t *app)")
+        process = extract_function_body(registry, "static void process_config_panels(channel_panel_config_t *config,\n"
+                                                  "                                  const int16_t *samples_a,\n"
+                                                  "                                  const int16_t *samples_b,\n"
+                                                  "                                  size_t count, uint32_t sample_rate)")
+    except RuntimeError as exc:
+        return fail(f"pane menu guard: {exc}")
+    menu = interactions.find("gui_ui_handle_pane_menu_click(app)")
+    gear = interactions.find("gui_ui_handle_channel_gear_click(app)")
+    panels = interactions.find("gui_dropdown_handle_click(app)")
+    if menu < 0 or gear < 0 or panels < 0:
+        return fail("gui_ui.c: gui_handle_interactions() no longer calls the pane menu, gear and dropdown click handlers")
+    if not (menu < gear < panels):
+        return fail("gui_ui.c: the pane menu click handler must run before the gear and the panel hit tests "
+                    "(a click on a menu option would also grab the trigger level)")
+    if "MOUSE_BUTTON_RIGHT" not in interactions or "gui_ui_handle_pane_right_click(app)" not in interactions:
+        return fail("gui_ui.c: a right press no longer opens the pane menu")
+    if "left_source" not in process or "right_source" not in process:
+        return fail("panel_registry.c: process_config_panels() no longer feeds each pane from its own source")
+    return 0
+
+
+def check_panel_source_harness_post_build(gui_path: Path) -> int:
+    """Build and run the per-pane source harness in the GUI's meson build
+    directory. CI runs this suite, not meson test, and compiles only the
+    named product targets, so the harness target is compiled here."""
+    build_dir = gui_path.parent
+    if not (build_dir / "build.ninja").exists():
+        print("SKIP: panel source harness (not a meson build directory)")
+        return 0
+    meson = shutil.which("meson")
+    if meson is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("meson is required to build the panel source harness")
+        print("SKIP: panel source harness (meson not available)")
+        return 0
+    built = subprocess.run([meson, "compile", "-C", str(build_dir), "gui_panel_source_test"],
+                           capture_output=True, text=True)
+    if built.returncode != 0:
+        return fail("panel source harness failed to build:\n"
+                    f"{built.stdout.strip()[-2000:]}\n{built.stderr.strip()[-2000:]}")
+    exe = build_dir / ("gui_panel_source_test.exe" if gui_path.suffix == ".exe" else "gui_panel_source_test")
+    if not exe.exists():
+        return fail(f"panel source harness was not built: {exe}")
+    ran = subprocess.run([str(exe)], capture_output=True, text=True)
+    if ran.returncode != 0:
+        return fail(f"panel source harness failed:\n{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    print(ran.stdout.strip())
     return 0
 
 
@@ -4107,6 +4191,7 @@ def main() -> int:
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
+        ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
     ]
     if not args.static_only:
@@ -4141,6 +4226,7 @@ def main() -> int:
             return fail(f"--post-build --gui-path does not exist (build did not produce misrc_gui?): {args.gui_path}")
         checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
         checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
+        checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()

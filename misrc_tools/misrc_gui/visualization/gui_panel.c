@@ -140,6 +140,21 @@ void panel_clear_view_state(panel_view_type_t type, void *state) {
 // Channel Panel Rendering (Main Entry Point)
 //-----------------------------------------------------------------------------
 
+bool panel_view_type_has_source(panel_view_type_t type) {
+    return type != PANEL_VIEW_DEMOD && type != PANEL_VIEW_PREVIEW;
+}
+
+// The channel a panel's renderer and click handler are told about: its data
+// source, so the label, colour and default trigger follow the data. Preview
+// has no source and keeps the row, which its gear check keys on.
+static int panel_render_channel(panel_view_type_t type, int row, int source) {
+    return panel_view_type_has_source(type) ? source : row;
+}
+
+static Color panel_channel_color(int channel) {
+    return (channel == 0) ? COLOR_CHANNEL_A : COLOR_CHANNEL_B;
+}
+
 // Helper: Render a single panel using vtable dispatch
 static void render_single_panel(gui_app_t *app, int channel,
                                  panel_view_type_t type, void *state,
@@ -147,10 +162,11 @@ static void render_single_panel(gui_app_t *app, int channel,
     const panel_vtable_t *vtable = panel_get_vtable(type);
 
     // A capture without channel B (RF B off on a two-card CXADC rig, a
-    // single-ADC device) feeds B's panes nothing; say so instead of drawing a
-    // frozen trace. Preview reads V4L2, not B, so it keeps rendering.
-    if (channel == 1 && type != PANEL_VIEW_PREVIEW &&
-        app->is_capturing && !app->capture_has_channel_b) {
+    // single-ADC device) feeds B-sourced panes nothing, and Demod needs B as
+    // its Q; say so instead of drawing a frozen trace. Preview reads V4L2.
+    bool needs_b = (type == PANEL_VIEW_DEMOD) ||
+                   (channel == 1 && type != PANEL_VIEW_PREVIEW);
+    if (needs_b && app->is_capturing && !app->capture_has_channel_b) {
         DrawRectangleRec(bounds, (Color){20, 20, 20, 255});
         DrawRectangleLinesEx(bounds, 1, (Color){60, 60, 60, 255});
         const char *msg = "CH B not captured";
@@ -181,11 +197,14 @@ static void render_single_panel(gui_app_t *app, int channel,
 void render_channel_panels(gui_app_t *app, int channel,
                            float x, float y, float width, float height,
                            Color channel_color) {
+    (void)channel_color;  // each panel takes its own channel's colour
 
     // Get the config for this channel
     channel_panel_config_t *config = (channel == 0)
         ? &app->panel_config_a
         : &app->panel_config_b;
+    int left_ch = panel_render_channel(config->left_view, channel, config->left_source);
+    int right_ch = panel_render_channel(config->right_view, channel, config->right_source);
 
     if (!config->split) {
         // Single panel - render at full width
@@ -193,8 +212,8 @@ void render_channel_panels(gui_app_t *app, int channel,
         config->left_bounds = bounds;
         config->right_bounds = (Rectangle){0, 0, 0, 0};
 
-        render_single_panel(app, channel, config->left_view,
-                           config->left_state, bounds, channel_color);
+        render_single_panel(app, left_ch, config->left_view,
+                           config->left_state, bounds, panel_channel_color(left_ch));
     } else {
         // Split panels - divide width between left and right
         float half_width = width / 2.0f;
@@ -207,16 +226,16 @@ void render_channel_panels(gui_app_t *app, int channel,
         config->right_bounds = right_bounds;
 
         // Left panel
-        render_single_panel(app, channel, config->left_view,
-                           config->left_state, left_bounds, channel_color);
+        render_single_panel(app, left_ch, config->left_view,
+                           config->left_state, left_bounds, panel_channel_color(left_ch));
 
         // Divider line
         DrawLineEx((Vector2){divider_x, y}, (Vector2){divider_x, y + height},
                    2.0f, COLOR_GRID_MAJOR);
 
         // Right panel
-        render_single_panel(app, channel, config->right_view,
-                           config->right_state, right_bounds, channel_color);
+        render_single_panel(app, right_ch, config->right_view,
+                           config->right_state, right_bounds, panel_channel_color(right_ch));
     }
 }
 
@@ -292,6 +311,29 @@ void panel_config_set_split(channel_panel_config_t *config, bool split) {
     }
 }
 
+void panel_config_set_source(channel_panel_config_t *config, bool right, int source) {
+    source = (source == 1) ? 1 : 0;
+    int *slot = right ? &config->right_source : &config->left_source;
+    if (*slot == source) return;
+    *slot = source;
+
+    // Fresh state: FFT averaging, waveform persistence and video decoders
+    // must not carry the other channel's history into this one.
+    panel_view_type_t type = right ? config->right_view : config->left_view;
+    void **state = right ? &config->right_state : &config->left_state;
+    if (*state) {
+        panel_destroy_view_state(type, *state);
+        *state = NULL;
+    }
+    if (!right || config->split) {
+        *state = panel_create_view_state(type);
+    }
+}
+
+int panel_config_source(const channel_panel_config_t *config, bool right) {
+    return right ? config->right_source : config->left_source;
+}
+
 //-----------------------------------------------------------------------------
 // Unified Panel Click Handling
 //-----------------------------------------------------------------------------
@@ -325,14 +367,18 @@ bool panel_handle_all_clicks(gui_app_t *app, Vector2 mouse_pos) {
             : &app->panel_config_b;
 
         // Try left panel
-        if (try_panel_click(app, ch, config->left_view, config->left_state,
+        if (try_panel_click(app,
+                            panel_render_channel(config->left_view, ch, config->left_source),
+                            config->left_view, config->left_state,
                             config->left_bounds, mouse_pos)) {
             return true;
         }
 
         // Try right panel if in split mode
         if (config->split) {
-            if (try_panel_click(app, ch, config->right_view, config->right_state,
+            if (try_panel_click(app,
+                                panel_render_channel(config->right_view, ch, config->right_source),
+                                config->right_view, config->right_state,
                                 config->right_bounds, mouse_pos)) {
                 return true;
             }

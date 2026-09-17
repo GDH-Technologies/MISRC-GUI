@@ -104,8 +104,15 @@ bool gui_cxadc_audio_capture_active(void);
 // touch extraction/display/audio-monitor/cards (owned by the caller's RF path).
 void gui_cxadc_stop_clockgen_audio(void);
 
-// True while a two-card RF capture runs with card 1 left closed (RF B was off
-// at start). Turning RF B on then needs a capture restart to open the card.
-bool gui_cxadc_card_b_skipped(void);
+// True while a two-card RF capture runs (RF B can be toggled while connected).
+bool gui_cxadc_has_card_b(void);
+
+// Main thread, once per frame: open card 1 when want is true, close it when
+// false. Card 1 is handed to or taken from the RF thread without stopping
+// the capture. Returns -1 when card 1 could not be set up or opened.
+int gui_cxadc_sync_card_b(gui_app_t *app, bool want);
+
+// True while the RF thread is reading card 1 (channel B is in the stream).
+bool gui_cxadc_card_b_reading(void);
 
 #endif // GUI_CXADC_H

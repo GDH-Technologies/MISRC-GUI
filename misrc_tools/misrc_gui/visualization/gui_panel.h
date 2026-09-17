@@ -61,6 +61,17 @@ void panel_config_set_right_view(channel_panel_config_t *config, panel_view_type
 // Toggle split mode (allocates/deallocates right panel state as needed)
 void panel_config_set_split(channel_panel_config_t *config, bool split);
 
+// Choose which channel's samples feed a panel (0 = CH A, 1 = CH B). A change
+// recreates that panel's state so no history from the other channel remains.
+void panel_config_set_source(channel_panel_config_t *config, bool right, int source);
+
+// The channel feeding a panel (0 = CH A, 1 = CH B).
+int panel_config_source(const channel_panel_config_t *config, bool right);
+
+// True when a view draws from the per-panel source channel. Demod reads both
+// channels as I/Q and Preview reads V4L2, so neither has a source.
+bool panel_view_type_has_source(panel_view_type_t type);
+
 //-----------------------------------------------------------------------------
 // Shared Geometry
 //-----------------------------------------------------------------------------

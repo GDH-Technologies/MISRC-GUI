@@ -13,6 +13,7 @@
 #include "../../common/threading.h"
 #include "../core/gui_settings.h"
 #include "../output/gui_record.h"
+#include "../input/gui_capture.h"
 #include "../ui/gui_ui.h"
 #include "../ui/gui_popup.h"
 #include "gui_net_query.h"
@@ -2489,9 +2490,10 @@ void gui_net_poll_mirror(gui_app_t *app) {
          * axis stays 1:1 with the server when the server's feed rate changes. */
         int psr = atomic_load(&s_client->peer_sample_rate);
         if (psr > 0) atomic_store(&app->sample_rate, (uint32_t)psr);
-        /* Follow the server's channel B the same way, so a server restarted
-         * with RF B toggled is picked up without reconnecting. */
-        if (atomic_load(&s_client->ingest_active)) {
+        /* Follow the server's channel B the same way (RF B can be toggled
+         * on a connected server). Not while this machine records the feed:
+         * its B file keeps running, with zeros if the server drops B. */
+        if (atomic_load(&s_client->ingest_active) && !app->is_recording) {
             app->capture_has_channel_b = atomic_load(&s_client->peer_has_channel_b);
         }
 
@@ -2932,6 +2934,7 @@ int gui_net_serve_main(int seconds) {
         while (!s_headless_stop && (deadline_ms == 0 || get_time_ms() < deadline_ms)) {
             gui_net_poll_commands(app);
             gui_net_poll_mirror(app);
+            gui_capture_service_channel_b(app);
             gui_record_check_popup(app);   /* a client's /record?confirm= answer lands here */
             thrd_sleep_ms(20);
         }
