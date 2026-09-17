@@ -8003,12 +8003,10 @@ void gui_handle_interactions(gui_app_t *app) {
         }
     }
 
-    // Deferred help popups: set by the capture/UI thread, consumed here
+    // Deferred help popups: set by the capture thread, consumed here
     // at the top of gui_handle_interactions BEFORE
     // gui_popup_handle_interactions runs, so the popup is open by the
-    // time the modal consumer runs. This avoids the timing issue where
-    // a popup set inside a click handler (after gui_popup_handle_interactions
-    // already returned false) could be dismissed on the next frame.
+    // time the modal consumer runs.
     if (!gui_popup_is_open()) {
         if (atomic_exchange(&app->cxadc_perm_help_pending, false)) {
             gui_dropdown_close_all();
@@ -8021,15 +8019,6 @@ void gui_handle_interactions(gui_app_t *app) {
                 "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
                 "  sudo usermod -aG video $USER   (then log out/in)\n\n"
                 "8-bit capture needs no setup and still works.");
-        } else if (atomic_exchange(&app->flac_threads_zero_help_pending, false)) {
-            gui_dropdown_close_all();
-            gui_ui_clear_text_edit();
-            gui_popup_info("FLAC threads set to auto (0)",
-                "FLAC encoder threads is now 0 (auto).\n\n"
-                "Auto may not use all available CPU cores efficiently.\n"
-                "For best encode throughput on multi-core systems, set an\n"
-                "explicit thread count (e.g. 4, 6, or 8).\n\n"
-                "You can raise it back with the + button.");
         }
     }
 
@@ -8999,16 +8988,18 @@ void gui_handle_interactions(gui_app_t *app) {
                 if (app->settings.flac_threads > 0) app->settings.flac_threads--;
                 if (app->settings.flac_threads == 0) {
                     // 0 means "auto" to the encoder, which can under-use
-                    // available cores. Defer the warning popup to the next
-                    // frame via an atomic flag so it opens BEFORE
-                    // gui_popup_handle_interactions runs (avoids the popup
-                    // being set after the modal consumer already returned
-                    // false, which could let it be dismissed on the next frame).
-                    atomic_store(&app->flac_threads_zero_help_pending, true);
+                    // available cores. Warn immediately so the user knows
+                    // to pick an explicit thread count for best throughput.
+                    gui_dropdown_close_all();
+                    gui_ui_clear_text_edit();
+                    gui_popup_info("FLAC threads set to auto (0)",
+                        "FLAC encoder threads is now 0 (auto).\n\n"
+                        "Auto may not use all available CPU cores efficiently.\n"
+                        "For best encode throughput on multi-core systems, set an\n"
+                        "explicit thread count (e.g. 4, 6, or 8).\n\n"
+                        "You can raise it back with the + button.");
                 }
                 gui_settings_save(&app->settings);
-                gui_ui_set_click_consumed();
-                return;
             }
             if (Clay_PointerOver(CLAY_ID("FlacThreadsPlus"))) {
                 if (app->settings.flac_threads < 64) app->settings.flac_threads++;

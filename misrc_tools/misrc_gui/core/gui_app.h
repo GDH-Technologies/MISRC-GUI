@@ -515,11 +515,6 @@ typedef struct gui_app {
     // thread to show a help popup with the one-time chgrp setup instructions.
     atomic_bool cxadc_perm_help_pending;
 
-    // FLAC threads=0 (auto) warning: set by the UI thread when the user
-    // decrements flac_threads to 0; consumed next frame to show a help
-    // popup explaining auto may under-use cores.
-    atomic_bool flac_threads_zero_help_pending;
-
     // Device disconnect detection (timestamp of last successful callback)
     atomic_uint_fast64_t last_callback_time_ms;
 
