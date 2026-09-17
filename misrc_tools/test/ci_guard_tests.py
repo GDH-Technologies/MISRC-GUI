@@ -2618,6 +2618,70 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
     return 0
 
 
+def check_pane_menu_contract(repo_root: Path) -> int:
+    """Each of the four channel panes has its own data source and a right-click
+    menu (view, source, row layout). The menu floats over waveform panes, whose
+    click handler grabs the trigger level on any press inside them, so its
+    click handler must run before the gear's and before the panel hit tests.
+    Panel processing must pick samples by the pane's source, not by its row."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        ui = strip_c_comments(read_text(base / "ui/gui_ui.c"))
+        registry = strip_c_comments(read_text(base / "visualization/panel_registry.c"))
+    except OSError as exc:
+        return fail(f"pane menu guard: cannot read a source file: {exc}")
+    try:
+        interactions = extract_function_body(ui, "void gui_handle_interactions(gui_app_t *app)")
+        process = extract_function_body(registry, "static void process_config_panels(channel_panel_config_t *config,\n"
+                                                  "                                  const int16_t *samples_a,\n"
+                                                  "                                  const int16_t *samples_b,\n"
+                                                  "                                  size_t count, uint32_t sample_rate)")
+    except RuntimeError as exc:
+        return fail(f"pane menu guard: {exc}")
+    menu = interactions.find("gui_ui_handle_pane_menu_click(app)")
+    gear = interactions.find("gui_ui_handle_channel_gear_click(app)")
+    panels = interactions.find("gui_dropdown_handle_click(app)")
+    if menu < 0 or gear < 0 or panels < 0:
+        return fail("gui_ui.c: gui_handle_interactions() no longer calls the pane menu, gear and dropdown click handlers")
+    if not (menu < gear < panels):
+        return fail("gui_ui.c: the pane menu click handler must run before the gear and the panel hit tests "
+                    "(a click on a menu option would also grab the trigger level)")
+    if "MOUSE_BUTTON_RIGHT" not in interactions or "gui_ui_handle_pane_right_click(app)" not in interactions:
+        return fail("gui_ui.c: a right press no longer opens the pane menu")
+    if "left_source" not in process or "right_source" not in process:
+        return fail("panel_registry.c: process_config_panels() no longer feeds each pane from its own source")
+    return 0
+
+
+def check_panel_source_harness_post_build(gui_path: Path) -> int:
+    """Build and run the per-pane source harness in the GUI's meson build
+    directory. CI runs this suite, not meson test, and compiles only the
+    named product targets, so the harness target is compiled here."""
+    build_dir = gui_path.parent
+    if not (build_dir / "build.ninja").exists():
+        print("SKIP: panel source harness (not a meson build directory)")
+        return 0
+    meson = shutil.which("meson")
+    if meson is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("meson is required to build the panel source harness")
+        print("SKIP: panel source harness (meson not available)")
+        return 0
+    built = subprocess.run([meson, "compile", "-C", str(build_dir), "gui_panel_source_test"],
+                           capture_output=True, text=True)
+    if built.returncode != 0:
+        return fail("panel source harness failed to build:\n"
+                    f"{built.stdout.strip()[-2000:]}\n{built.stderr.strip()[-2000:]}")
+    exe = build_dir / ("gui_panel_source_test.exe" if gui_path.suffix == ".exe" else "gui_panel_source_test")
+    if not exe.exists():
+        return fail(f"panel source harness was not built: {exe}")
+    ran = subprocess.run([str(exe)], capture_output=True, text=True)
+    if ran.returncode != 0:
+        return fail(f"panel source harness failed:\n{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    print(ran.stdout.strip())
+    return 0
+
+
 def check_record_parity(repo_root: Path) -> int:
     """The Record button, its click and the R/Space keys read the effective
     recording and capture state (the server's on a net client that records on
@@ -4078,6 +4142,7 @@ def main() -> int:
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
+        ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
@@ -4111,6 +4176,7 @@ def main() -> int:
             return fail(f"--post-build --gui-path does not exist (build did not produce misrc_gui?): {args.gui_path}")
         checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
         checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
+        checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()

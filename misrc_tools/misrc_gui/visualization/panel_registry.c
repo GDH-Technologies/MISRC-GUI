@@ -157,23 +157,26 @@ panel_menu_t panel_instance_get_menu(panel_instance_t *instance, size_t index) {
 // Batch Processing
 //-----------------------------------------------------------------------------
 
-// Helper to process a single panel config's panels
+// Helper to process a single panel config's panels. Each panel is fed from
+// its own source channel; a B-sourced panel is skipped when there is no B.
 static void process_config_panels(channel_panel_config_t *config,
-                                  const int16_t *samples, size_t count,
-                                  uint32_t sample_rate) {
-    if (!config || !samples || count == 0) return;
+                                  const int16_t *samples_a,
+                                  const int16_t *samples_b,
+                                  size_t count, uint32_t sample_rate) {
+    if (!config || count == 0) return;
 
-    // Get vtable for left panel and process if it has a process function
+    const int16_t *left = (config->left_source == 1) ? samples_b : samples_a;
     const panel_vtable_t *left_vtable = panel_get_vtable(config->left_view);
-    if (left_vtable && left_vtable->process && config->left_state) {
-        left_vtable->process(config->left_state, samples, count, sample_rate);
+    if (left && left_vtable && left_vtable->process && config->left_state) {
+        left_vtable->process(config->left_state, left, count, sample_rate);
     }
 
     // Process right panel if in split mode
     if (config->split) {
+        const int16_t *right = (config->right_source == 1) ? samples_b : samples_a;
         const panel_vtable_t *right_vtable = panel_get_vtable(config->right_view);
-        if (right_vtable && right_vtable->process && config->right_state) {
-            right_vtable->process(config->right_state, samples, count, sample_rate);
+        if (right && right_vtable && right_vtable->process && config->right_state) {
+            right_vtable->process(config->right_state, right, count, sample_rate);
         }
     }
 }
@@ -197,15 +200,9 @@ void panel_process_all(gui_app_t *app,
 
     panel_cfg_lock(app);
 
-    // Process channel A panels
-    if (samples_a) {
-        process_config_panels(&app->panel_config_a, samples_a, count, sample_rate);
-    }
-
-    // Process channel B panels
-    if (samples_b) {
-        process_config_panels(&app->panel_config_b, samples_b, count, sample_rate);
-    }
+    // Both rows; each panel picks A or B by its own source.
+    process_config_panels(&app->panel_config_a, samples_a, samples_b, count, sample_rate);
+    process_config_panels(&app->panel_config_b, samples_a, samples_b, count, sample_rate);
 
     panel_cfg_unlock(app);
 }
