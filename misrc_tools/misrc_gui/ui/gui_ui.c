@@ -7725,23 +7725,29 @@ static bool gui_ui_repeat_button(Clay_ElementId id, int *out_step) {
 // keeps the button a real Clay element, which Clay_PointerOver can test and
 // which the text-edit machinery can anchor to.
 //
-// The offset clears the "CH A" label drawn at (x+8, y+4) at FONT_SIZE_OSC_LABEL
-// and sits above the "100us/div" line at y+26. The Mode and Trig buttons are
-// top-right, so there is no collision there.
+// It sits right after the top-left panel's title (panel_gear_offset_x); the
+// waveform leaves PANEL_GEAR_SLOT between "CH A" and its time/div label. The
+// Mode and Trig buttons are top-right, so there is no collision there.
 static void render_channel_gear(gui_app_t *app, int channel) {
     if (!app) return;
 
     bool open = gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, (uint32_t)channel);
     Clay_ElementId canvas_id = (channel == 0) ? CLAY_ID("OscilloscopeCanvasA")
                                               : CLAY_ID("OscilloscopeCanvasB");
+    channel_panel_config_t *config = (channel == 0) ? &app->panel_config_a
+                                                    : &app->panel_config_b;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+    panel_view_type_t top_left_view = config->left_view;
+    atomic_flag_clear(&app->panel_config_lock);
+    float gear_x = panel_gear_offset_x(top_left_view);
 
     CLAY(CLAY_IDI("ChannelGearBtn", channel), {
         .layout = {
-            .sizing = { CLAY_SIZING_FIXED(20), CLAY_SIZING_FIXED(20) },
+            .sizing = { CLAY_SIZING_FIXED(PANEL_GEAR_SIZE), CLAY_SIZING_FIXED(PANEL_GEAR_SIZE) },
             .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
         },
         .floating = {
-            .offset = { 58.0f, 5.0f },
+            .offset = { gear_x, PANEL_GEAR_Y },
             .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP,
                               .parent  = CLAY_ATTACH_POINT_LEFT_TOP },
             .parentId = canvas_id.id,
@@ -7752,7 +7758,7 @@ static void render_channel_gear(gui_app_t *app, int channel) {
         .cornerRadius = CLAY_CORNER_RADIUS(4)
     }) {
         CLAY(CLAY_IDI("ChannelGearIcon", channel), {
-            .layout = { .sizing = { CLAY_SIZING_FIXED(14), CLAY_SIZING_FIXED(14) } },
+            .layout = { .sizing = { CLAY_SIZING_FIXED(16), CLAY_SIZING_FIXED(16) } },
             .custom = { .customData = &s_channel_gear_icon_element }
         }) {}
     }

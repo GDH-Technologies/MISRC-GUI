@@ -14,6 +14,7 @@
 #include "../ui/gui_ui.h"
 #include "../ui/gui_ui_scale.h"
 #include "gui_panel.h"
+#include "gui_panel.h"
 #include "../ui/gui_dropdown.h"
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include <math.h>
@@ -425,7 +426,8 @@ void draw_channel_grid(float x, float y, float width, float height,
             format_time_label(time_buf, sizeof(time_buf), time_division);
             char div_label[48];
             snprintf(div_label, sizeof(div_label), "%s/div", time_buf);
-            int div_x = ch_label_x + ch_label_w + 8;
+            // The row's gear floats right after the channel label.
+            int div_x = ch_label_x + ch_label_w + PANEL_GEAR_SLOT + 8;
             int div_label_w = (int)(gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV) * to_logical_w);
             int div_y = ch_label_y;
             // Measure the right-side overlay group (Scale + Mode + Trig
@@ -1295,13 +1297,13 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     // Wrap Mode/Trig to rows when the Mode button itself doesn't fit
     // beside the CH label.
-    if (render_btn_x < bounds.x + 8 + channel_label_w + 8) {
+    if (render_btn_x < bounds.x + 8 + channel_label_w + PANEL_GEAR_SLOT + 8) {
         float row_gap = 2;
         float label_width = fmaxf(mode_prefix_w, trig_prefix_w);
         render_btn_x = bounds.x + bounds.width - render_btn_w - 8;
         mode_label_x = render_btn_x - label_width - 4;
         trig_label_x = mode_label_x;
-        if (mode_label_x < bounds.x + 8 + channel_label_w + 8) {
+        if (mode_label_x < bounds.x + 8 + channel_label_w + PANEL_GEAR_SLOT + 8) {
             render_btn_y = bounds.y + 4 + FONT_SIZE_OSC_LABEL + row_gap;
         }
         bool labels_above = mode_label_x < bounds.x + 8;
@@ -1330,6 +1332,20 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
             trig_label_y = trig_btn_y;
             trig_btn_y += FONT_SIZE_DROPDOWN_OPT + row_gap;
         }
+    }
+
+    // Scale shares Mode's row when it fits after the channel label and the
+    // row's gear. Otherwise it takes its own right-aligned row below the
+    // others, without its "Scale:" text, rather than covering the label.
+    float scale_btn_y = render_btn_y;
+    if (scale_btn_x < bounds.x + 8 + channel_label_w + PANEL_GEAR_SLOT + 8) {
+        scale_btn_x = bounds.x + bounds.width - 8 - scale_btn_w;
+        scale_btn_y = fmaxf(render_btn_y, trig_btn_y) + btn_h + 2;
+        Rectangle scale_row = {scale_btn_x, scale_btn_y, scale_btn_w, btn_h};
+        if (state->time_div_rect.width > 0 && CheckCollisionRecs(scale_row, state->time_div_rect)) {
+            scale_btn_y = state->time_div_rect.y + state->time_div_rect.height + 2;
+        }
+        scale_label_x = -1;
     }
 
     //-------------------------------------------------------------------------
@@ -1474,7 +1490,6 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     // Scale dropdown: button ALWAYS visible (never hidden).
     // Only its "Scale:" text label hides on narrow panels.
     bool scale_visible = true;
-    float scale_btn_y = render_btn_y;  // same row as Mode
     if (scale_visible) {
         if (!scale_label_hidden && scale_label_x >= 0) {
             gui_text_draw(scale_prefix, scale_label_x, scale_label_y,
