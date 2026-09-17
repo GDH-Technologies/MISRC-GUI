@@ -38,7 +38,6 @@ float panel_gear_offset_x(panel_view_type_t type) {
     // Title positions and strings as each view draws them (FONT_SIZE_OSC_LABEL).
     float title_x;
     float title_w;
-    float to_logical = 1.0f / gui_ui_get_scale_factor();
     switch (type) {
         case PANEL_VIEW_WAVEFORM:
             title_x = 8;
@@ -56,7 +55,7 @@ float panel_gear_offset_x(panel_view_type_t type) {
         default:
             return 58.0f;
     }
-    return title_x + ceilf(title_w * to_logical) + PANEL_GEAR_GAP;
+    return title_x + ceilf(title_w) + PANEL_GEAR_GAP;
 }
 
 Rectangle gui_panel_aspect_fit(Rectangle bounds, float aspect) {
