@@ -61,6 +61,11 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
   field describes this machine, and add it to the guard's `SETTINGS_CLIENT_LOCAL_KEYS`.
   Legacy keys become `GS_LOAD_ONLY` alias rows placed before the new row; migrations
   become hooks. The v1.1.8 key list never loses a key.
+  Watch for a changed **default**, not just a new field: upstream edits
+  `gui_settings_init_defaults` in `gui_settings.c`, the fork's copy of that function lives
+  in `gui_settings_table.c`, and taking the fork's side of the file drops the change with
+  no marker. Diff that one file across the incoming range and port every changed default
+  deliberately -- the v1.2.1 sync's FLAC level 8 / threads 8 arrived this way.
 - **Net record model.** A client records on the server unless `net_client_record_local` is
   on (`58bf460`, a follow-on commit to the v1.2.0 merge). Upstream changes to
   `gui_app_start/stop_recording` or `gui_app_effective_recording` do not replace this.
@@ -118,6 +123,7 @@ upstream's tree on every machine.
 
 | Sync | Conflicts |
 | --- | --- |
+| 2026-09-17, v1.2.1 + `e8bf5d7` (`5a24859`) | `gui_settings.c` (upstream's whole hand-written block against the fork's empty side -- took the fork's side); `misrc_gui.c` (`print_usage`). Silent clashes: upstream's FLAC default change (level 4->8, threads 0->8) vanished with the fork's side of `gui_settings.c` and was ported by hand; `cxadc_perm_help_pending` (a `gui_app` struct-layout change -- build `--clean`); the new startup `flac_threads == 0` popup, which no headless mode can reach |
 | 2026-09-14, v1.2.0 + `c051361` (`7853b35`) | `gui_app.h` and `gui_settings.c` (settings port); `gui_capture.c` (autostop helpers next to the fork's effective state; `a7d1511` merged silently); `misrc_gui.c` (Space lock); `gui_net.c` (idle probe); `gui_ui.c` (mode lock). Silent clash: `cxadc_hw_rate_khz` |
 | 2026-09-06, v1.1.9 (`60f5d1d`) | `gui_ui.c` (toolbar); the stats harness `"Preview"` stub |
 | 2026-09-02, v1.1.8 (`7b92f44`); `38814fe`; `e9ddaf6` | by hand, before this skill existed |
