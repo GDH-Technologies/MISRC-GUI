@@ -136,7 +136,7 @@ else
   ST2=$(curl -s "$(url /stats)")
   if jq -e --argjson b1 "$B1" '.state == 2 and .rec_raw_a > $b1 and .rec_drops == 0 and .disk_free > 0
                                and .rec_pending == false and (.status | length) > 0 and .rec_elapsed_ms >= 0
-                               and .generation >= 1' <<<"$ST2" >/dev/null; then
+                               and .generation >= 1 and .has_channel_b == true' <<<"$ST2" >/dev/null; then
     pass "/stats relays a growing recording (raw_a $B1 -> $(jq .rec_raw_a <<<"$ST2"), status '$(jq -r .status <<<"$ST2")')"
   else
     fail "/stats relay: $ST2"
@@ -147,8 +147,8 @@ else
   PROBE=$("$BIN" --net-client-probe 127.0.0.1 "$PORT" 4 2>"$S/probe.log"); PRC=$?
   [ "$PRC" = 0 ] && pass "--net-client-probe exits 0" || fail "--net-client-probe exited $PRC: $PROBE $(tail -3 "$S/probe.log")"
   if jq -e '.connected == true and .settings_support == 1 and .settings.flac_level == 6 and .peer_state == 2
-            and .local_settings_touched == false and .rec_bytes > 0' <<<"$PROBE" >/dev/null; then
-    pass "the probe mirrors flac_level 6, the recording state and its bytes, and never touched its own settings"
+            and .local_settings_touched == false and .rec_bytes > 0 and .has_channel_b == true' <<<"$PROBE" >/dev/null; then
+    pass "the probe mirrors flac_level 6, the recording state and its bytes, channel B present, and never touched its own settings"
   else
     fail "probe output: $PROBE"
   fi

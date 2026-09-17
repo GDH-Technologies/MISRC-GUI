@@ -36,6 +36,7 @@ static int16_t *s_buf_a = NULL;
 static int16_t *s_buf_b = NULL;
 static uint8_t *s_buf_aux = NULL;
 static conv_function_t s_extract_fn = NULL;
+static bool s_extract_fn_ab = false;  // s_extract_fn also unpacks channel B
 static bool s_initialized = false;
 
 static bool s_b_present = true; // Runtime capability set at capture start
@@ -124,10 +125,13 @@ static int extraction_thread(void *ctx) {
         // Re-read capture_has_channel_b each iteration so upstream dual-ADC
         // auto-detection (sets flag on first stream_id=1 callback) is picked
         // up without restarting the extraction thread.
-        s_b_present = (s_extract_app && s_extract_app->capture_has_channel_b);
+        // An A-only function never fills s_buf_b, so B cannot become present
+        // mid-run unless the function chosen at start unpacks it.
+        s_b_present = s_extract_fn_ab && s_extract_app && s_extract_app->capture_has_channel_b;
         s_extract_fn((uint32_t*)buf, BUFFER_READ_SIZE, clip, s_buf_aux, s_buf_a, s_buf_b, peak);
-        if (!s_b_present) {
-            // Prevent stale/uninitialized data from driving CH-B meters/display
+        if (!s_b_present && s_extract_fn_ab) {
+            // Prevent stale/uninitialized data from driving CH-B meters/display.
+            // An A-only function never writes s_buf_b, and mapped_b stays NULL.
             memset(s_buf_b, 0, BUFFER_READ_SIZE * sizeof(int16_t));
         }
         bool swap_channels = false;
@@ -484,6 +488,7 @@ int gui_extract_start(gui_app_t *app) {
     s_b_present = (app && app->capture_has_channel_b);
     bool use_ab_fn = s_b_present || upstream;
     s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, use_ab_fn ? (void*)1 : NULL);
+    s_extract_fn_ab = use_ab_fn;
     if (!s_b_present && misrc_debug_enabled()) {
         fprintf(stderr, "[EXTRACT] Runtime A-only extraction enabled (upstream=%d)\n", upstream);
     }

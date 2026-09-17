@@ -119,6 +119,20 @@ static void render_single_panel(gui_app_t *app, int channel,
                                  Rectangle bounds, Color color) {
     const panel_vtable_t *vtable = panel_get_vtable(type);
 
+    // A capture without channel B (RF B off on a two-card CXADC rig, a
+    // single-ADC device) feeds B's panes nothing; say so instead of drawing a
+    // frozen trace. Preview reads V4L2, not B, so it keeps rendering.
+    if (channel == 1 && type != PANEL_VIEW_PREVIEW &&
+        app->is_capturing && !app->capture_has_channel_b) {
+        DrawRectangleRec(bounds, (Color){20, 20, 20, 255});
+        DrawRectangleLinesEx(bounds, 1, (Color){60, 60, 60, 255});
+        const char *msg = "CH B not captured";
+        int w = MeasureText(msg, 14);
+        DrawText(msg, (int)(bounds.x + bounds.width/2 - w/2),
+                 (int)(bounds.y + bounds.height/2 - 7), 14, COLOR_TEXT_DIM);
+        return;
+    }
+
     if (vtable && vtable->render) {
         vtable->render(state, app, channel, bounds, color);
 

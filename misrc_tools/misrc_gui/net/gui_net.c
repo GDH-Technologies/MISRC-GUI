@@ -282,6 +282,7 @@ typedef struct {
     /* Mirror snapshot (written by worker, read by main poll). */
     atomic_int peer_state;          /* 0 idle, 1 capturing, 2 recording */
     atomic_int peer_sample_rate;    /* Hz */
+    atomic_bool peer_has_channel_b; /* false: the server's capture has no B */
     atomic_int peer_device_count;
     atomic_int peer_selected;
     atomic_int peer_audio_frame_bytes; /* for /baseband re-framing */
@@ -576,6 +577,11 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     /* Audio frame size: the capture callback pads 24-bit/4ch to 12 bytes.
      * Report 12 so clients can re-frame /baseband correctly. */
     int audio_frame = 12;
+    /* Read on the HTTP thread like is_capturing and selected_device above;
+     * a bool copied once, so a race only delays the change. False when the
+     * capture carries no channel B (RF B off on a two-card CXADC rig), so
+     * the /rf words' B field is filler. */
+    bool has_b = app->capture_has_channel_b;
 
     /* Recording relay. */
     uint64_t rec_elapsed_ms = 0;
@@ -608,7 +614,7 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
         "{\"state\":%d,\"sample_rate\":%u,\"total_samples\":%llu,"
         "\"frames\":%u,\"errors\":%u,\"selected_device\":%d,"
         "\"device_count\":%d,\"device_name\":\"%s\",\"device_type\":%d,"
-        "\"audio_frame_bytes\":%d,"
+        "\"audio_frame_bytes\":%d,\"has_channel_b\":%s,"
         "\"rec_elapsed_ms\":%llu,\"rec_bytes\":%llu,"
         "\"rec_raw_a\":%llu,\"rec_raw_b\":%llu,\"rec_comp_a\":%llu,\"rec_comp_b\":%llu,"
         "\"rec_drops\":%u,\"disk_free\":%llu,\"rec_pending\":%s,\"rec_pending_text\":\"%s\","
@@ -616,7 +622,7 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
         "\"status\":\"%s\",\"status_seq\":%u,\"generation\":%u}",
         state, (unsigned)sr, (unsigned long long)total,
         (unsigned)frames, (unsigned)errors, sel,
-        dcount, dname, dtype, audio_frame,
+        dcount, dname, dtype, audio_frame, has_b ? "true" : "false",
         (unsigned long long)rec_elapsed_ms, (unsigned long long)rec_bytes,
         (unsigned long long)raw_a, (unsigned long long)raw_b,
         (unsigned long long)comp_a, (unsigned long long)comp_b,
@@ -1621,7 +1627,10 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     app->display_samples_available_a = 0;
     app->display_samples_available_b = 0;
 
-    /* Treat the network feed as a MISRC-style dual-channel raw stream. */
+    /* Treat the network feed as a MISRC-style dual-channel raw stream.
+     * Ingest outlives the server's captures, so extraction must start with
+     * the A+B unpack; the server's has_channel_b is applied after it starts
+     * and on every mirror poll. */
     app->capture_backend_upstream = false;
     app->capture_has_channel_b = true;
     app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
@@ -1631,6 +1640,7 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     app->reconnect_attempts = 0;
 
     int r = gui_extract_start(app);
+    app->capture_has_channel_b = atomic_load(&cli->peer_has_channel_b);
     if (r < 0) {
         fprintf(stderr, "[NET] client: failed to start extraction\n");
         app->is_capturing = false;
@@ -1695,6 +1705,8 @@ static void client_apply_stats(net_client_t *cli, const char *stats) {
     atomic_store(&cli->peer_selected, sel);
     atomic_store(&cli->peer_device_count, dc);
     atomic_store(&cli->peer_audio_frame_bytes, af);
+    /* Absent from older servers, which always carried B. */
+    atomic_store(&cli->peer_has_channel_b, json_bool(stats, "has_channel_b", true));
 
     atomic_store(&cli->peer_rec_elapsed_ms, (uint_fast64_t)json_u64(stats, "rec_elapsed_ms", 0));
     atomic_store(&cli->peer_rec_bytes, (uint_fast64_t)json_u64(stats, "rec_bytes", 0));
@@ -2138,6 +2150,7 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port) {
     atomic_store(&cli->error, false);
     atomic_store(&cli->peer_state, 0);
     atomic_store(&cli->peer_sample_rate, 0);
+    atomic_store(&cli->peer_has_channel_b, true);
     atomic_store(&cli->peer_device_count, 0);
     atomic_store(&cli->peer_selected, -1);
     atomic_store(&cli->peer_audio_frame_bytes, 12);
@@ -2476,6 +2489,11 @@ void gui_net_poll_mirror(gui_app_t *app) {
          * axis stays 1:1 with the server when the server's feed rate changes. */
         int psr = atomic_load(&s_client->peer_sample_rate);
         if (psr > 0) atomic_store(&app->sample_rate, (uint32_t)psr);
+        /* Follow the server's channel B the same way, so a server restarted
+         * with RF B toggled is picked up without reconnecting. */
+        if (atomic_load(&s_client->ingest_active)) {
+            app->capture_has_channel_b = atomic_load(&s_client->peer_has_channel_b);
+        }
 
         client_apply_snapshot(app, s_client);
         client_apply_set_results(app, s_client);
@@ -2985,11 +3003,12 @@ int gui_net_client_probe_main(const char *host, int port, int seconds) {
             gui_settings_json_escape(app->net_peer_status, status_esc, sizeof(status_esc));
             int n = snprintf(json, cap,
                 "{\"connected\":%s,\"settings_support\":%d,\"generation\":%u,\"peer_state\":%d,"
-                "\"misrc_mode_effective\":%s,\"rec_bytes\":%llu,\"rec_drops\":%u,\"disk_free\":%llu,"
+                "\"misrc_mode_effective\":%s,\"has_channel_b\":%s,\"rec_bytes\":%llu,\"rec_drops\":%u,\"disk_free\":%llu,"
                 "\"status\":\"%s\",\"local_settings_touched\":%s,\"settings\":",
                 connected ? "true" : "false", support,
                 (unsigned)gui_net_client_peer_generation(app), atomic_load(&app->net_peer_state),
                 s_peer_effective_misrc ? "true" : "false",
+                (s_client && atomic_load(&s_client->peer_has_channel_b)) ? "true" : "false",
                 (unsigned long long)atomic_load(&app->recording_bytes),
                 (unsigned)gui_net_client_peer_record_drops(app),
                 (unsigned long long)gui_net_client_peer_disk_free(app),

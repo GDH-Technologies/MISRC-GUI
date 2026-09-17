@@ -38,6 +38,7 @@ static int display_thread_func(void *ctx) {
     thrd_set_priority(THRD_PRIORITY_ABOVE);
 
     fprintf(stderr, "[DISPLAY] Display thread started\n");
+    bool b_cleared = false;
 
     while (!atomic_load(&dt->stop_requested) && !atomic_load(&do_exit)) {
         /* Read from display buffer with timeout */
@@ -50,7 +51,12 @@ static int display_thread_func(void *ctx) {
 
         /* Split into channels */
         const int16_t *samples_a = (const int16_t *)buf;
-        const int16_t *samples_b = (const int16_t *)((uint8_t *)buf + DISPLAY_CHANNEL_SIZE);
+        /* The frame always carries a B half; when the capture has no channel
+         * B it is zero-fill, so skip B's panels and the render copy. */
+        const bool b_present = app->capture_has_channel_b;
+        const int16_t *samples_b = b_present
+            ? (const int16_t *)((uint8_t *)buf + DISPLAY_CHANNEL_SIZE)
+            : NULL;
 
         /* Process all panels via unified vtable dispatch
          * This handles histogram, FFT, CVBS, and any other panel types that process raw samples.
@@ -61,7 +67,13 @@ static int display_thread_func(void *ctx) {
 
         /* Copy samples to output buffer for render thread */
         memcpy(dt->samples.samples_a, samples_a, DISPLAY_CHANNEL_SIZE);
-        memcpy(dt->samples.samples_b, samples_b, DISPLAY_CHANNEL_SIZE);
+        if (samples_b) {
+            memcpy(dt->samples.samples_b, samples_b, DISPLAY_CHANNEL_SIZE);
+            b_cleared = false;
+        } else if (!b_cleared) {
+            memset(dt->samples.samples_b, 0, DISPLAY_CHANNEL_SIZE);
+            b_cleared = true;
+        }
         dt->samples.sample_count = DISPLAY_FRAME_SAMPLES;
         dt->samples.sample_rate = atomic_load(&app->sample_rate);
 

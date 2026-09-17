@@ -2416,6 +2416,14 @@ static void gui_ui_clear_text_edit(void)
     s_active_text_backspace_repeat_at = 0.0;
 }
 
+/* RF B off at capture start leaves CXADC card 1 closed, so turning it back
+ * on cannot take effect until the capture restarts. Turning it off is fine. */
+static bool gui_ui_capture_b_enable_locked(const gui_app_t *app)
+{
+    return app && app->is_capturing && !app->settings.capture_b &&
+           gui_cxadc_card_b_skipped();
+}
+
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
     if (!app) return false;
@@ -2706,6 +2714,11 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
     if (strncmp(key, "rtsp_", 5) == 0 && strcmp(key, "rtsp_stream_enabled") != 0 &&
         gui_rtsp_stream_is_running()) {
         snprintf(msg, msg_cap, "stop the stream before changing its settings");
+        return 409;
+    }
+    if (strcmp(key, "capture_b") == 0 && strcmp(value, "true") == 0 &&
+        gui_ui_capture_b_enable_locked(app)) {
+        snprintf(msg, msg_cap, "stop the capture to turn RF B on");
         return 409;
     }
     if (strcmp(key, "rtsp_stream_lan") == 0 && strcmp(value, "true") == 0 &&
@@ -3764,8 +3777,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     CLAY(CLAY_ID("ToggleRowCaptureB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color cap_b_toggle_bg = settings_b_disabled ? ui_disabled_color(app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON) : (app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-                        Color cap_b_toggle_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        bool cap_b_toggle_disabled = settings_b_disabled || gui_ui_capture_b_enable_locked(app);
+                        Color cap_b_toggle_bg = cap_b_toggle_disabled ? ui_disabled_color(app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON) : (app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                        Color cap_b_toggle_fg = cap_b_toggle_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("ToggleCaptureB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cap_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.capture_b ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cap_b_toggle_fg) }));
                         }
@@ -7837,6 +7851,8 @@ static void render_channel_gear(gui_app_t *app, int channel) {
         bool resample_on = (channel == 0) ? app->settings.enable_resample_a
                                           : app->settings.enable_resample_b;
         bool row_disabled = locked || channel_b_missing;
+        bool record_disabled = row_disabled ||
+                               (channel == 1 && gui_ui_capture_b_enable_locked(app));
         bool tag_disabled = row_disabled || !app->settings.auto_names_enabled ||
                             (channel == 1 && !app->settings.capture_b);
         bool resample_disabled = row_disabled ||
@@ -7866,13 +7882,13 @@ static void render_channel_gear(gui_app_t *app, int channel) {
                     .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(26) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                 },
-                .backgroundColor = to_clay_color(row_disabled ? ui_disabled_color(rec_bg) : rec_bg),
+                .backgroundColor = to_clay_color(record_disabled ? ui_disabled_color(rec_bg) : rec_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
                 CLAY_TEXT(capture_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
                     CLAY_TEXT_CONFIG({
                         .fontSize = FONT_SIZE_STATS,
-                        .textColor = to_clay_color(row_disabled ? ui_disabled_color(COLOR_TEXT)
+                        .textColor = to_clay_color(record_disabled ? ui_disabled_color(COLOR_TEXT)
                                                                 : COLOR_TEXT)
                     }));
             }
@@ -9509,6 +9525,10 @@ static void gui_ui_handle_channel_gear_controls(gui_app_t *app, int channel) {
                 : "Single-card CXADC has no RF channel B source");
             return;
         }
+        if (channel == 1 && gui_ui_capture_b_enable_locked(app)) {
+            gui_app_set_status(app, "Stop the capture to turn RF B on (card 1 opens at capture start)");
+            return;
+        }
         if (channel == 0) {
             app->settings.capture_a = !app->settings.capture_a;
         } else {
@@ -11014,6 +11034,8 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else if (settings_cxadc_mode) {
                         gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                     }
+                } else if (gui_ui_capture_b_enable_locked(app)) {
+                    gui_app_set_status(app, "Stop the capture to turn RF B on (card 1 opens at capture start)");
                 } else {
                     app->settings.capture_b = !app->settings.capture_b;
                     if (!app->settings.capture_b) {

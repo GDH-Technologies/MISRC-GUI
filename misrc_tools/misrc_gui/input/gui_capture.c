@@ -1935,8 +1935,11 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
         // gui_cxadc_start() launches extraction internally; set runtime
         // capability flags first so extraction selects the correct A/B path.
         app->capture_backend_upstream = false;
-        app->capture_has_channel_b = (cxadc_cards > 1);
+        // The profile runs first: it forces capture_b off for a single card.
+        // With RF B off on a two-card rig, card 1 is never opened, so B is
+        // absent for extraction, display and net clients alike.
         gui_capture_apply_cxadc_profile(app, cxadc_cards);
+        app->capture_has_channel_b = (cxadc_cards > 1) && app->settings.capture_b;
         int cxadc_rc = gui_cxadc_start(app, cxadc_cards, false);
         if (cxadc_rc == 0) {
             bool prev_runtime_mode = app->capture_mode_runtime_misrc;
