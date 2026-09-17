@@ -31,6 +31,9 @@ typedef struct gui_app gui_app_t;
 // Per-channel gear popover; index is the channel (0 = A, 1 = B). Registered
 // here so it shares the one-open-at-a-time slot with the view dropdowns.
 #define DROPDOWN_CHANNEL_GEAR   "ChannelGear"
+// Right-click menu on a channel pane; index is row * 2 + side (0 = left,
+// 1 = right), so it too shares the one-open-at-a-time slot.
+#define DROPDOWN_PANE_MENU      "PaneMenu"
 
 //-----------------------------------------------------------------------------
 // State Management
@@ -76,5 +79,16 @@ static inline Clay_String gui_dropdown_string(const char *str) {
 // Call once per frame after rendering, when mouse button is pressed
 // Returns true if a dropdown consumed the click
 bool gui_dropdown_handle_click(gui_app_t *app);
+
+//-----------------------------------------------------------------------------
+// Panel Changes
+//-----------------------------------------------------------------------------
+
+// Change a channel row's panels under panel_config_lock, logging a CVBS
+// preview on/off transition. ch is the row (0 = A, 1 = B); right picks the
+// right-hand panel. Used by the sidebar dropdowns and the pane context menu.
+void gui_dropdown_set_pane_split(gui_app_t *app, int ch, bool split);
+void gui_dropdown_set_pane_view(gui_app_t *app, int ch, bool right, int view_type);
+void gui_dropdown_set_pane_source(gui_app_t *app, int ch, bool right, int source);
 
 #endif // GUI_DROPDOWN_H

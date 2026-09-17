@@ -642,6 +642,16 @@ if raylib_dep.found()
     )
     test('gui_stats_layout', stats_layout_test)
 
+    # Per-panel source routing through the production registry and helpers.
+    panel_source_test = executable('gui_panel_source_test',
+      ['test/panel_source_harness.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_panel_source', panel_source_test)
+
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
       ['test/gui_toolbar_layout_harness.c', version_target],

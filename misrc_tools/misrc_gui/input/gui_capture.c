@@ -1211,11 +1211,16 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
     app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
+    app->panel_config_a.left_source = 0;
+    app->panel_config_a.right_source = 0;
+
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
     app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
     app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    app->panel_config_b.left_source = 1;
+    app->panel_config_b.right_source = 1;
 
     // Note: All buffers (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO, etc.) are initialized
     // by buffer manager automatically on first use
