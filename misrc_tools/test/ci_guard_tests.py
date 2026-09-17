@@ -2728,6 +2728,17 @@ def check_channel_gear_clearance(repo_root: Path) -> int:
         return fail("gui_oscilloscope.c: the Mode/Trig wrap and the Scale row no longer clear the channel gear")
     if "test_gear_clearance(&state);" not in harness:
         return fail("gui_waveform_overlay_harness.c: the gear clearance test is no longer run")
+
+    # Clay_Raylib_Render wraps the pass in one rlScalef(ui_scale): panel bounds,
+    # gui_ui_get_mouse_position() and gui_text_measure() share those units. The
+    # overlay used to divide measured widths by the scale, which at 150% put
+    # "Scale:"/"Mode:"/"Trig:" under their own buttons and the gear over "CH A".
+    if "to_logical_w" in osc or re.search(r"1\.0f\s*/\s*gui_ui_get_scale_factor\(\)", osc):
+        return fail("gui_oscilloscope.c: overlay geometry divides measured text by the UI scale again; "
+                    "bounds, the mouse and text measurements are already in the same units")
+    for test in ("test_scale_independence(&state);", "test_prefix_labels_clear_buttons(&state);"):
+        if test not in harness:
+            return fail(f"gui_waveform_overlay_harness.c: {test.split('(')[0]} is no longer run")
     return 0
 
 

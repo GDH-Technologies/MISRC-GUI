@@ -218,6 +218,9 @@ static void waveform_capture_render_snapshot(waveform_panel_state_t *state,
 //-----------------------------------------------------------------------------
 
 #define GRID_DIVISIONS_Y 4  // Per channel (amplitude)
+// Logical width of the Scale/Mode/Trig dropdown buttons, wide enough for the
+// longest label ("Phosphor", "Rising/CH2").
+#define WAVEFORM_OVERLAY_BUTTON_W 98
 #define GRID_MIN_SPACING_PX 120  // Minimum pixels between time grid lines
 #define GRID_MAX_DIVISIONS 20   // Maximum number of time divisions
 
@@ -328,13 +331,14 @@ void draw_channel_grid(float x, float y, float width, float height,
 
     float center_y = y + height / 2;
 
-    // Text measurements return physical pixels; bounds are logical (physical / scale).
-    // Scale text widths to logical so layout math is consistent at all UI zoom levels.
-    float text_scale = gui_ui_get_scale_factor();
-    float to_logical_w = 1.0f / text_scale;
+    // Clay_Raylib_Render wraps the whole pass in rlScalef(ui_scale), and the
+    // panel bounds, the mouse (gui_ui_get_mouse_position) and gui_text_measure
+    // all speak those same pre-scale units. So text widths are used as
+    // measured: scaling them here shrank every gap to 1/scale and put the
+    // labels under the controls at any zoom above 100%.
 
     // Channel label width (used to place the time/div label beside it).
-    int ch_label_w = (int)(gui_text_measure(label, FONT_SIZE_OSC_LABEL) * to_logical_w);
+    int ch_label_w = gui_text_measure(label, FONT_SIZE_OSC_LABEL);
     int ch_label_x = (int)x + 8;
     int ch_label_y = (int)y + 4;
     (void)channel;
@@ -407,11 +411,11 @@ void draw_channel_grid(float x, float y, float width, float height,
                 if (gx > x + 40 && gx < x + width - 40) {
                     if (is_zero) {
                         // Draw "0" for the trigger point
-                        int label_w = (int)(gui_text_measure_mono("0", FONT_SIZE_OSC_SCALE) * to_logical_w);
+                        int label_w = gui_text_measure_mono("0", FONT_SIZE_OSC_SCALE);
                         gui_text_draw_mono("0", gx - label_w / 2, y + height - 16, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
                     } else {
                         format_time_label(time_buf, sizeof(time_buf), fabs(t));
-                        int label_w = (int)(gui_text_measure_mono(time_buf, FONT_SIZE_OSC_SCALE) * to_logical_w);
+                        int label_w = gui_text_measure_mono(time_buf, FONT_SIZE_OSC_SCALE);
                         gui_text_draw_mono(time_buf, gx - label_w / 2, y + height - 16, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
                     }
                 }
@@ -428,15 +432,15 @@ void draw_channel_grid(float x, float y, float width, float height,
             snprintf(div_label, sizeof(div_label), "%s/div", time_buf);
             // The row's gear floats right after the channel label.
             int div_x = ch_label_x + ch_label_w + PANEL_GEAR_SLOT + 8;
-            int div_label_w = (int)(gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV) * to_logical_w);
+            int div_label_w = gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV);
             int div_y = ch_label_y;
             // Measure the right-side overlay group (Scale + Mode + Trig
             // labels + buttons + gaps + 8px margin) so the time/div collapse
             // threshold is based on the actual space the right side needs.
-            int mode_prefix_w_meas = (int)(gui_text_measure("Mode:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
-            int trig_prefix_w_meas = (int)(gui_text_measure("Trig:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
-            int scale_prefix_w_meas = (int)(gui_text_measure("Scale:", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
-            int btn_w_logical = (int)(98 * to_logical_w);
+            int mode_prefix_w_meas = gui_text_measure("Mode:", FONT_SIZE_DROPDOWN_OPT);
+            int trig_prefix_w_meas = gui_text_measure("Trig:", FONT_SIZE_DROPDOWN_OPT);
+            int scale_prefix_w_meas = gui_text_measure("Scale:", FONT_SIZE_DROPDOWN_OPT);
+            int btn_w_logical = WAVEFORM_OVERLAY_BUTTON_W;
             int right_group_w = trig_prefix_w_meas + 4 + btn_w_logical + 4 + 8 +
                                mode_prefix_w_meas + 4 + btn_w_logical + 4 + 8 +
                                scale_prefix_w_meas + 4 + btn_w_logical + 4 + 8;
@@ -1216,15 +1220,13 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     // Text measurements return physical pixels; bounds are logical.
     // Scale to logical for consistent layout at all UI zoom levels.
-    float text_scale = gui_ui_get_scale_factor();
-    float to_logical_w = 1.0f / text_scale;
-    #define TEXT_W(t, fs) ((int)(gui_text_measure(t, fs) * to_logical_w))
+    #define TEXT_W(t, fs) (gui_text_measure(t, fs))
 
     // Reserve the widest label plus arrow/padding, not just the current value.
     // Both dropdowns keep the same width when the selection changes.
     // 98px is the physical-pixel floor; scale to logical so it stays
     // the same visual size at all UI zoom levels.
-    float button_width = 98.0f * to_logical_w;
+    float button_width = (float)WAVEFORM_OVERLAY_BUTTON_W;
     for (int i = 0; i < WAVEFORM_MODE_COUNT; i++) {
         button_width = fmaxf(button_width,
             (float)TEXT_W(s_render_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 24);

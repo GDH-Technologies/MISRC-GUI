@@ -185,10 +185,12 @@ Color gui_dropdown_option_color(bool selected, bool hovered)
  * no-op so the link resolves. Signature must match gui_app.h. */
 void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
 
-/* Stub: the production overlay scales text measurements to logical units via
- * gui_ui_get_scale_factor(); the harness doesn't link gui_ui_scale.c,
- * so return 1.0 (no scaling in the test). */
-float gui_ui_get_scale_factor(void) { return 1.0f; }
+/* Stub: the harness doesn't link gui_ui_scale.c. The whole Clay pass is drawn
+ * inside one rlScalef(ui_scale), so panel bounds and text measurements share
+ * one space and the overlay geometry must not depend on this at all --
+ * test_scale_independence sweeps it to prove that. */
+static float test_ui_scale = 1.0f;
+float gui_ui_get_scale_factor(void) { return test_ui_scale; }
 
 static void init_state(waveform_panel_state_t *state)
 {
@@ -709,6 +711,82 @@ static void test_gear_clearance(waveform_panel_state_t *state)
     test_text_width_scale = 1;
 }
 
+// A UI zoom must not move anything in panel space: at 150% the production
+// code used to shrink every measured width to 1/scale, which put "Scale:",
+// "Mode:" and "Trig:" under their own buttons and the gear over "CH A".
+static void test_scale_independence(waveform_panel_state_t *state)
+{
+    test_case = "overlay geometry is the same at every UI zoom";
+    static const float scales[] = {1.0f, 1.25f, 1.5f, 2.0f};
+    static const float widths[] = {1400, 900, 520, 320};
+    for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+        Rectangle bounds = {73, 41, widths[w], 400};
+        Rectangle scale_at_100 = {0}, mode_at_100 = {0}, trig_at_100 = {0};
+        Rectangle div_at_100 = {0};
+        for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
+            test_ui_scale = scales[i];
+            init_state(state);
+            draw_count = 0;
+            draw_channel_grid(bounds.x, bounds.y, bounds.width, bounds.height,
+                              "CH A", COLOR_TEXT, true, 1, 20000000, false, -1,
+                              &state->time_div_rect, 0, 0);
+            render(state, bounds);
+            if (i == 0) {
+                scale_at_100 = state->scale_btn_rect;
+                mode_at_100 = state->render_mode_btn_rect;
+                trig_at_100 = state->trigger_btn_rect;
+                div_at_100 = state->time_div_rect;
+                continue;
+            }
+            expect_true(near(state->scale_btn_rect.x, scale_at_100.x) &&
+                        near(state->scale_btn_rect.y, scale_at_100.y) &&
+                        near(state->scale_btn_rect.width, scale_at_100.width),
+                        "the Scale button keeps its place and width under zoom");
+            expect_true(near(state->render_mode_btn_rect.x, mode_at_100.x) &&
+                        near(state->render_mode_btn_rect.y, mode_at_100.y) &&
+                        near(state->render_mode_btn_rect.width, mode_at_100.width),
+                        "the Mode button keeps its place and width under zoom");
+            expect_true(near(state->trigger_btn_rect.x, trig_at_100.x) &&
+                        near(state->trigger_btn_rect.y, trig_at_100.y),
+                        "the Trig button keeps its place under zoom");
+            expect_true(near(state->time_div_rect.x, div_at_100.x) &&
+                        near(state->time_div_rect.y, div_at_100.y),
+                        "time/div keeps its place under zoom");
+        }
+    }
+    test_ui_scale = 1.0f;
+}
+
+// The prefix labels sit left of their own buttons, never under them.
+static void test_prefix_labels_clear_buttons(waveform_panel_state_t *state)
+{
+    test_case = "Scale:/Mode:/Trig: never overlap their buttons";
+    static const float scales[] = {1.0f, 1.5f, 2.0f};
+    static const float widths[] = {1400, 900, 700, 520};
+    for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
+        test_ui_scale = scales[i];
+        for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+            Rectangle bounds = {73, 41, widths[w], 400};
+            init_state(state);
+            render(state, bounds);
+            const struct { const char *text; Rectangle btn; } pairs[] = {
+                {"Scale:", state->scale_btn_rect},
+                {"Mode:", state->render_mode_btn_rect},
+                {"Trig:", state->trigger_btn_rect},
+            };
+            for (size_t k = 0; k < sizeof(pairs) / sizeof(pairs[0]); k++) {
+                const overlay_draw_t *label = find_text(pairs[k].text);
+                if (!label) continue;  /* hidden on narrow panels */
+                expect_true(!overlaps(label->rect, pairs[k].btn),
+                            "a prefix label does not sit under its button");
+                expect_true(label->rect.x + label->rect.width <= pairs[k].btn.x + 0.01f,
+                            "a prefix label sits left of its button");
+            }
+        }
+    }
+    test_ui_scale = 1.0f;
+}
+
 int main(void)
 {
     waveform_panel_state_t state;
@@ -728,6 +806,8 @@ int main(void)
     test_short_panels(&state);
     test_panel_independence(&state);
     test_gear_clearance(&state);
+    test_scale_independence(&state);
+    test_prefix_labels_clear_buttons(&state);
     printf("Waveform overlay: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
