@@ -3771,6 +3771,82 @@ def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_preview_sdtv_geometry_runtime(repo_root: Path) -> int:
+    """The SDTV preview geometry arithmetic, proved on every build.
+
+    This is the only proof the 625-line answers ever get: there is one NTSC
+    dongle on this site and no PAL or SECAM source at all, so PAL's 720x576
+    raster and its 16:15 sample aspect cannot be checked against hardware here.
+    """
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the SDTV preview geometry guard")
+        print("SKIP: SDTV preview geometry guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/preview_sdtv_harness.c"
+    policy_path = repo_root / "misrc_tools/misrc_gui/input/gui_preview_sdtv.c"
+    include_dir = repo_root / "misrc_tools/misrc_gui/input"
+
+    for path, label in [(harness_path, "SDTV preview harness"),
+                        (policy_path, "SDTV preview geometry")]:
+        if not path.exists():
+            return fail(f"{label} source is missing: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_preview_sdtv_guard_") as temp_root:
+        exe_name = "preview_sdtv_guard.exe" if os.name == "nt" else "preview_sdtv_guard"
+        exe_path = Path(temp_root) / exe_name
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(policy_path),
+            "-lm",
+            "-o",
+            str(exe_path),
+        ]
+        try:
+            run_checked(compile_cmd)
+            run_checked([str(exe_path)])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "SDTV preview geometry guard failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+    return 0
+
+
+def check_preview_crop_never_reaches_a_recording(repo_root: Path) -> int:
+    """The preview crop is a viewing aid and must stay one.
+
+    The reference MKV exists to be compared frame-for-frame against a
+    tbc-video-export of the same tape, so it has to keep the full active
+    raster. A crop filter in either encoder argv builder would silently break
+    that comparison, and it would look like a feature while doing it.
+    """
+    for rel in ("misrc_tools/misrc_gui/output/gui_video_record.c",
+                "misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c"):
+        path = repo_root / rel
+        if not path.exists():
+            return fail(f"encoder source is missing: {path}")
+        text = strip_c_comments(path.read_text(encoding="utf-8", errors="replace"))
+        for needle in ("crop=", "\"crop\"", "drawbox"):
+            if needle in text:
+                return fail(
+                    f"{rel} builds an ffmpeg crop/mask filter ({needle}).\n"
+                    "The preview crop is preview-only by design: the reference "
+                    "recording keeps the full active raster so it stays "
+                    "frame-comparable with a tbc-video-export. Crop at the "
+                    "render path in gui_preview_v4l2.c instead."
+                )
+    return 0
+
+
 def check_ui_scale_policy_runtime(repo_root: Path) -> int:
     cc = shutil.which("cc")
     if cc is None:
@@ -4204,6 +4280,7 @@ def main() -> int:
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
         ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
+        ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
@@ -4222,6 +4299,7 @@ def main() -> int:
         checks.insert(15, ("closed-caption child I/O class", lambda: check_cc_record_ioprio_runtime(repo_root)))
         checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
+        checks.insert(17, ("SDTV preview geometry runtime", lambda: check_preview_sdtv_geometry_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode

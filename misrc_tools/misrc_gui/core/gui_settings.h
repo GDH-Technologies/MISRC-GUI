@@ -148,6 +148,24 @@ typedef struct {
     // again at launch. Stored by path rather than index: /dev/videoN survives a
     // reboot, an enumeration order does not.
     char preview_device_path[40];
+    /* Analog capture settings for an SDTV dongle (em28xx and friends). Stored
+     * by NAME rather than by index for the same reason the device is stored by
+     * path: an index into a device-specific list means nothing once the device
+     * changes, and the standard list differs between bridges.
+     * Empty preview_standard = auto-detect on connect. */
+    char preview_input[32];                  // "Composite", "S-Video"; empty = leave as-is
+    char preview_standard[24];               // "NTSC", "PAL"; empty = auto-detect
+    /* The picture mode, as "YUYV:WxH@num/den". Previously the selected mode was
+     * never persisted and every launch silently reverted to the largest one. */
+    char preview_mode_spec[40];
+    int  preview_aspect_mode;                // 0 auto, 1 4:3, 2 16:9, 3 square pixels
+    /* Preview-only crop, in source pixels off each edge. Deliberately NOT
+     * applied to the recording: the reference MKV keeps the full active raster
+     * so it stays frame-comparable with a tbc-video-export of the same tape. */
+    int  preview_crop_top;
+    int  preview_crop_bottom;
+    int  preview_crop_left;
+    int  preview_crop_right;
     /* Raw VBI node captions are read from. Empty means "derive it from
      * preview_device_path by sysfs correlation" -- the VBI node on the same
      * dongle whose picture is being previewed. Not GS_CLIENT_LOCAL, for the

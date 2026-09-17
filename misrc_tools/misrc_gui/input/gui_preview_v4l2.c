@@ -52,7 +52,16 @@ static struct {
     size_t           n_devices;
     int              sel_device;
     int              sel_mode;
+    int              sel_input;    /* -1 = leave the device on whatever it has */
+    /* True once the user (or a persisted setting) named a standard. Until then
+     * connect is free to auto-detect; after it, the choice is theirs. */
+    bool             std_pinned;
     bool             enumerated;
+
+    /* --- display geometry (render thread only) --- */
+    int  aspect_mode;              /* preview_aspect_mode_t, as the user set it */
+    bool conn_sdtv;                /* the connected device has a video standard */
+    int  crop_top, crop_bottom, crop_left, crop_right;
 
     /* --- device (render thread owns open/close) --- */
     int           fd;
@@ -137,6 +146,9 @@ void gui_preview_tap_remove(void)
 static void preview_poll_child(void);
 static void preview_restore_popout_selection(void);
 static void preview_kill_child(void);
+/* Defined with the popout machinery that first needed it; the persisted-mode
+ * restore below uses the same parser rather than a second one. */
+static int  preview_parse_mode_spec(const preview_device_t *dev, const char *spec);
 
 /* ------------------------------------------------------------------ status */
 
@@ -191,6 +203,172 @@ static int mode_cmp(const void *a, const void *b)
     return 0;
 }
 
+static void mode_label(preview_mode_t *m)
+{
+    double fps = (m->fps_den ? (double)m->fps_num / (double)m->fps_den : 0.0);
+    if (m->fps_den == 1) {
+        snprintf(m->label, sizeof(m->label), "%ux%u @ %u", m->w, m->h, m->fps_num);
+    } else {
+        snprintf(m->label, sizeof(m->label), "%ux%u @ %.2f", m->w, m->h, fps);
+    }
+}
+
+/* Does the device offer YUYV at all? The converter has no other input, so a
+ * device without it can only ever produce a Connect button that fails. */
+static bool device_has_yuyv(int fd)
+{
+    struct v4l2_fmtdesc fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (fmt.index = 0; ioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; fmt.index++) {
+        if (fmt.pixelformat == V4L2_PIX_FMT_YUYV) return true;
+    }
+    return false;
+}
+
+static void enumerate_inputs(int fd, preview_device_t *dev)
+{
+    struct v4l2_input in;
+    dev->n_inputs = 0;
+    for (uint32_t i = 0; dev->n_inputs < PREVIEW_MAX_INPUTS; i++) {
+        memset(&in, 0, sizeof(in));
+        in.index = i;
+        if (ioctl(fd, VIDIOC_ENUMINPUT, &in) < 0) break;
+        preview_input_t *p = &dev->inputs[dev->n_inputs++];
+        p->index = in.index;
+        snprintf(p->name, sizeof(p->name), "%s", (const char *)in.name);
+        p->is_sdtv = (in.capabilities & V4L2_IN_CAP_STD) != 0;
+    }
+}
+
+static void enumerate_standards(int fd, preview_device_t *dev)
+{
+    struct v4l2_standard st;
+    dev->n_stds = 0;
+    dev->std_index = -1;
+    for (uint32_t i = 0; dev->n_stds < PREVIEW_MAX_STDS; i++) {
+        memset(&st, 0, sizeof(st));
+        st.index = i;
+        if (ioctl(fd, VIDIOC_ENUMSTD, &st) < 0) break;
+        preview_standard_t *p = &dev->stds[dev->n_stds++];
+        p->id = (uint64_t)st.id;
+        snprintf(p->name, sizeof(p->name), "%s", (const char *)st.name);
+        /* frameperiod is seconds-per-frame; the picker wants frames-per-second. */
+        p->fps_num = st.frameperiod.denominator ? st.frameperiod.denominator : 25u;
+        p->fps_den = st.frameperiod.numerator ? st.frameperiod.numerator : 1u;
+        p->framelines = st.framelines;
+    }
+}
+
+/* Ask the driver what it would actually give us for a geometry, without
+ * changing any device state. Returns false if it cannot serve YUYV there. */
+static bool try_fmt_size(int fd, uint32_t want_w, uint32_t want_h,
+                         uint32_t *got_w, uint32_t *got_h)
+{
+    struct v4l2_format f;
+    memset(&f, 0, sizeof(f));
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    f.fmt.pix.width = want_w;
+    f.fmt.pix.height = want_h;
+    f.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    f.fmt.pix.field = V4L2_FIELD_ANY;
+    if (ioctl(fd, VIDIOC_TRY_FMT, &f) < 0) return false;
+    if (f.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) return false;
+    if (f.fmt.pix.width == 0 || f.fmt.pix.height == 0) return false;
+    *got_w = f.fmt.pix.width;
+    *got_h = f.fmt.pix.height;
+    return true;
+}
+
+/* Match a v4l2_std_id back to exactly one enumerated entry.
+ *
+ * A v4l2_std_id is a *mask*: "NTSC" is itself three bits, and V4L2_STD_ALL is
+ * all of them. So only an exact equality match identifies a standard. That
+ * strictness is load-bearing rather than pedantic -- see std_index_from_query.
+ * Returns -1 when the id names no single entry. */
+static int std_index_from_id(const preview_device_t *dev, uint64_t id)
+{
+    if (id == 0) return -1;
+    for (int i = 0; i < dev->n_stds; i++) {
+        if (dev->stds[i].id == id) return i;
+    }
+    return -1;
+}
+
+/* Auto-detect the standard the source is actually sending.
+ *
+ * VIDIOC_QUERYSTD cannot be trusted on its face. The V4L2 core pre-fills the
+ * argument with the device's whole tvnorms mask and then calls the driver,
+ * and a driver whose decoder subdev does not implement querystd -- em28xx with
+ * its built-in decoder is exactly this case -- leaves it untouched and still
+ * returns success. Believing that would silently pick a standard at random.
+ *
+ * So the result is only accepted when it names one enumerated standard.
+ * Anything broader is the "I did not actually detect anything" answer.
+ * Returns -1 when nothing was detected. */
+static int std_index_from_query(int fd, const preview_device_t *dev)
+{
+    v4l2_std_id det = 0;
+    if (ioctl(fd, VIDIOC_QUERYSTD, &det) < 0) return -1;
+    return std_index_from_id(dev, (uint64_t)det);
+}
+
+/* The standard to build the initial mode list for: what the device is already
+ * set to if that names one entry, otherwise the first it enumerated. No
+ * detection here -- enumeration must not depend on a signal being present. */
+static int resolve_std_index(int fd, const preview_device_t *dev)
+{
+    if (dev->n_stds <= 0) return -1;
+    v4l2_std_id cur = 0;
+    if (ioctl(fd, VIDIOC_G_STD, &cur) == 0) {
+        int idx = std_index_from_id(dev, (uint64_t)cur);
+        if (idx >= 0) return idx;
+    }
+    return 0;
+}
+
+/* Build the mode list for one video standard.
+ *
+ * An SDTV bridge has no mode list to enumerate: VIDIOC_ENUM_FRAMESIZES answers
+ * with a stepwise scaler range and VIDIOC_ENUM_FRAMEINTERVALS is frequently not
+ * implemented at all. Deriving the ladder from the standard and then asking
+ * TRY_FMT what the driver would really give us is the only way to get an
+ * honest list -- and TRY_FMT changes nothing, so this is safe to run while
+ * merely enumerating.
+ */
+static void build_sdtv_modes(int fd, preview_device_t *dev, int std_index)
+{
+    dev->n_modes = 0;
+    if (std_index < 0 || std_index >= dev->n_stds) return;
+    const preview_standard_t *std = &dev->stds[std_index];
+    dev->std_index = std_index;
+
+    preview_sdtv_mode_t ladder[PREVIEW_SDTV_MAX_LADDER];
+    int n = preview_sdtv_modes_for_std(std->framelines, std->fps_num, std->fps_den,
+                                       ladder, PREVIEW_SDTV_MAX_LADDER);
+
+    for (int i = 0; i < n && dev->n_modes < PREVIEW_MAX_MODES; i++) {
+        uint32_t w = ladder[i].w, h = ladder[i].h;
+        uint32_t gw = w, gh = h;
+        if (!try_fmt_size(fd, w, h, &gw, &gh)) continue;
+
+        /* The driver's answer wins, and it may well collapse two rungs onto
+         * one raster -- keep the first and drop the duplicate. */
+        bool dup = false;
+        for (int k = 0; k < dev->n_modes; k++) {
+            if (dev->modes[k].w == gw && dev->modes[k].h == gh) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        preview_mode_t *m = &dev->modes[dev->n_modes++];
+        m->w = gw;
+        m->h = gh;
+        m->fps_num = ladder[i].fps_num;
+        m->fps_den = ladder[i].fps_den;
+        mode_label(m);
+    }
+}
+
 static void enumerate_modes(int fd, preview_device_t *dev)
 {
     struct v4l2_fmtdesc fmt;
@@ -218,6 +396,7 @@ static void enumerate_modes(int fd, preview_device_t *dev)
             fie.width = fse.discrete.width;
             fie.height = fse.discrete.height;
 
+            int rates_found = 0;
             for (fie.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fie) == 0; fie.index++) {
                 if (dev->n_modes >= PREVIEW_MAX_MODES) return;
                 uint32_t num, den;
@@ -236,13 +415,36 @@ static void enumerate_modes(int fd, preview_device_t *dev)
                 m->h = fse.discrete.height;
                 m->fps_num = num;
                 m->fps_den = den;
-                if (den == 1) {
-                    snprintf(m->label, sizeof(m->label), "%ux%u @ %u", m->w, m->h, num);
-                } else {
-                    snprintf(m->label, sizeof(m->label), "%ux%u @ %.1f",
-                             m->w, m->h, (double)num / (double)den);
-                }
+                mode_label(m);
+                rates_found++;
                 if (fie.type != V4L2_FRMIVAL_TYPE_DISCRETE) break;  /* one synthetic entry */
+            }
+
+            /* ENUM_FRAMEINTERVALS is optional, and a device that skips it used
+             * to lose the frame size with it -- the size was only ever recorded
+             * inside the rate loop. Fall back to the rate the device is already
+             * set to, so a missing optional ioctl costs a label, not a mode. */
+            if (rates_found == 0 && dev->n_modes < PREVIEW_MAX_MODES) {
+                uint32_t num = 0, den = 1;
+                struct v4l2_streamparm parm;
+                memset(&parm, 0, sizeof(parm));
+                parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0 &&
+                    parm.parm.capture.timeperframe.numerator != 0) {
+                    num = parm.parm.capture.timeperframe.denominator;
+                    den = parm.parm.capture.timeperframe.numerator;
+                }
+                preview_mode_t *m = &dev->modes[dev->n_modes++];
+                m->w = fse.discrete.width;
+                m->h = fse.discrete.height;
+                m->fps_num = num;
+                m->fps_den = den ? den : 1;
+                if (num == 0) {
+                    /* Rate genuinely unknown: say so rather than print "@ 0". */
+                    snprintf(m->label, sizeof(m->label), "%ux%u", m->w, m->h);
+                } else {
+                    mode_label(m);
+                }
             }
         }
     }
@@ -281,7 +483,18 @@ void gui_preview_refresh_devices(void)
         memset(dev, 0, sizeof(*dev));
         snprintf(dev->path, sizeof(dev->path), "%s", node);
         snprintf(dev->card, sizeof(dev->card), "%s", (const char *)cap.card);
-        enumerate_modes(fd, dev);
+
+        enumerate_inputs(fd, dev);
+        enumerate_standards(fd, dev);
+        /* An analog SD capture device is the one that has video standards. A
+         * webcam has none, and its discrete mode list is authoritative. */
+        dev->is_sdtv = (dev->n_stds > 0) && device_has_yuyv(fd);
+
+        if (dev->is_sdtv) {
+            build_sdtv_modes(fd, dev, resolve_std_index(fd, dev));
+        } else {
+            enumerate_modes(fd, dev);
+        }
         close(fd);
 
         /* A capture node with no YUYV mode can only ever produce a Connect
@@ -314,9 +527,176 @@ int  gui_preview_selected_mode(void)   { return g.sel_mode; }
 
 void gui_preview_select(int device_index, int mode_index)
 {
+    int prev_device = g.sel_device;
     if (device_index >= 0 && device_index < (int)g.n_devices) g.sel_device = device_index;
     if (g.n_devices == 0) return;
+    /* The input list is device-specific, so a device change invalidates it. */
+    if (g.sel_device != prev_device) g.sel_input = -1;
     if (mode_index >= 0 && mode_index < g.devices[g.sel_device].n_modes) g.sel_mode = mode_index;
+}
+
+/* ----------------------------------------------- analog input and standard */
+
+int gui_preview_selected_input(void) { return g.sel_input; }
+
+int gui_preview_selected_standard(void)
+{
+    if (g.n_devices == 0) return -1;
+    return g.devices[g.sel_device].std_index;
+}
+
+/* Record a message without declaring the stream dead: a rejected jack change
+ * leaves the previous picture perfectly valid. */
+static void preview_note_error(const char *what, int err)
+{
+    status_lock();
+    g.status.err_errno = err;
+    if (err) {
+        snprintf(g.status.err_text, sizeof(g.status.err_text), "%s: %s", what, strerror(err));
+    } else {
+        snprintf(g.status.err_text, sizeof(g.status.err_text), "%s", what);
+    }
+    status_unlock();
+}
+
+int gui_preview_select_input(int input_index)
+{
+    if (g.n_devices == 0) return -1;
+    preview_device_t *dev = &g.devices[g.sel_device];
+    if (input_index < 0 || input_index >= dev->n_inputs) return -1;
+
+    /* V4L2 permits S_INPUT while streaming and the analog bridges we care about
+     * implement it that way, which is the whole point: switching Composite to
+     * S-Video is something you do while watching a tape, not something worth
+     * tearing the stream down for. If a driver does refuse, keep the old
+     * selection rather than leave the UI claiming an input we never got. */
+    if (g.fd >= 0) {
+        uint32_t idx = dev->inputs[input_index].index;
+        if (ioctl(g.fd, VIDIOC_S_INPUT, &idx) < 0) {
+            preview_note_error("device refused the input change", errno);
+            return -1;
+        }
+        status_lock();
+        g.status.input = input_index;
+        snprintf(g.status.input_name, sizeof(g.status.input_name), "%s",
+                 dev->inputs[input_index].name);
+        status_unlock();
+    }
+    g.sel_input = input_index;
+    return 0;
+}
+
+bool gui_preview_select_standard(int std_index)
+{
+    if (g.n_devices == 0) return false;
+    preview_device_t *dev = &g.devices[g.sel_device];
+    if (std_index < 0 || std_index >= dev->n_stds) return false;
+    if (std_index == dev->std_index) return false;
+
+    /* Rebuild the mode ladder for the new standard. TRY_FMT needs a descriptor
+     * but changes nothing, so the streaming one is fine; otherwise open briefly
+     * read-only. If we cannot open it at all, fall back to the underived
+     * ladder -- a list without TRY_FMT validation still beats an empty picker. */
+    int fd = g.fd;
+    bool borrowed = (fd >= 0);
+    if (!borrowed) fd = open(dev->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        build_sdtv_modes(fd, dev, std_index);
+        if (!borrowed) close(fd);
+    } else {
+        dev->std_index = std_index;
+    }
+    g.sel_mode = 0;   /* the full raster; mode 0 is the default everywhere */
+    g.std_pinned = true;
+    return true;
+}
+
+void gui_preview_select_input_by_name(const char *name)
+{
+    if (!name || !*name || g.n_devices == 0) return;
+    const preview_device_t *dev = &g.devices[g.sel_device];
+    for (int i = 0; i < dev->n_inputs; i++) {
+        if (strcmp(dev->inputs[i].name, name) == 0) { gui_preview_select_input(i); return; }
+    }
+}
+
+void gui_preview_select_standard_by_name(const char *name)
+{
+    if (!name || !*name || g.n_devices == 0) return;
+    const preview_device_t *dev = &g.devices[g.sel_device];
+    for (int i = 0; i < dev->n_stds; i++) {
+        if (strcmp(dev->stds[i].name, name) == 0) { gui_preview_select_standard(i); return; }
+    }
+}
+
+void gui_preview_select_mode_by_spec(const char *spec)
+{
+    if (!spec || !*spec || g.n_devices == 0) return;
+    int idx = preview_parse_mode_spec(&g.devices[g.sel_device], spec);
+    if (idx >= 0) g.sel_mode = idx;
+}
+
+void gui_preview_mode_spec(char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (g.n_devices == 0) return;
+    const preview_device_t *dev = &g.devices[g.sel_device];
+    if (g.sel_mode < 0 || g.sel_mode >= dev->n_modes) return;
+    const preview_mode_t *m = &dev->modes[g.sel_mode];
+    snprintf(out, cap, "YUYV:%ux%u@%u/%u", m->w, m->h, m->fps_num, m->fps_den);
+}
+
+/* ------------------------------------------------------- display geometry */
+
+/* "Auto" is a question only the device can answer. A video standard means the
+ * picture is 4:3 regardless of how many samples per line it was digitised at --
+ * that is what makes 720x480 and 720x576 the same shape. A webcam has no such
+ * contract: its pixels are square and its raster is its shape, so forcing 4:3
+ * onto a 480x320 mode would invent a distortion that is not in the signal. */
+static int effective_aspect_mode(bool sdtv)
+{
+    if (g.aspect_mode != PREVIEW_ASPECT_AUTO) return g.aspect_mode;
+    return sdtv ? PREVIEW_ASPECT_4_3 : PREVIEW_ASPECT_SQUARE;
+}
+
+void gui_preview_set_aspect_mode(int mode)
+{
+    if (mode < PREVIEW_ASPECT_AUTO || mode > PREVIEW_ASPECT_SQUARE) mode = PREVIEW_ASPECT_AUTO;
+    g.aspect_mode = mode;
+
+    /* Keep the published aspect in step, so a recording started after the
+     * change gets the new value without waiting for a reconnect. */
+    status_lock();
+    preview_aspect_ratios(g.status.width, g.status.height, effective_aspect_mode(g.conn_sdtv),
+                          &g.status.dar_num, &g.status.dar_den,
+                          &g.status.sar_num, &g.status.sar_den);
+    status_unlock();
+}
+
+int gui_preview_aspect_mode(void) { return g.aspect_mode; }
+
+void gui_preview_set_crop(int top, int bottom, int left, int right)
+{
+    g.crop_top    = top    > 0 ? top    : 0;
+    g.crop_bottom = bottom > 0 ? bottom : 0;
+    g.crop_left   = left   > 0 ? left   : 0;
+    g.crop_right  = right  > 0 ? right  : 0;
+}
+
+void gui_preview_get_crop(int *top, int *bottom, int *left, int *right)
+{
+    if (top)    *top    = g.crop_top;
+    if (bottom) *bottom = g.crop_bottom;
+    if (left)   *left   = g.crop_left;
+    if (right)  *right  = g.crop_right;
+}
+
+void gui_preview_aspect_arg(char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    preview_status_t st = gui_preview_get_status();
+    preview_aspect_string(st.width, st.height, effective_aspect_mode(g.conn_sdtv), out, cap);
 }
 
 /* ------------------------------------------------------------- conversion */
@@ -569,8 +949,7 @@ int gui_preview_connect(void)
     }
     if (g.fd >= 0) return 0;   /* already streaming */
 
-    const preview_device_t *dev = &g.devices[g.sel_device];
-    const preview_mode_t *mode = &dev->modes[g.sel_mode];
+    preview_device_t *dev = &g.devices[g.sel_device];
 
     status_lock();
     memset(&g.status, 0, sizeof(g.status));
@@ -587,6 +966,44 @@ int gui_preview_connect(void)
         }
         return preview_open_fail("cannot open device", e);
     }
+
+    /* Analog bridges must be told which jack and which standard BEFORE the
+     * format is set: the standard decides the active raster (480 vs 576 lines),
+     * so an S_FMT issued first is negotiated against the wrong geometry. It
+     * also matters to the hardware beyond geometry -- a decoder that is only
+     * reprogrammed from S_INPUT/S_STD stays on its power-on defaults for an
+     * application that just opens the node and streams. */
+    if (dev->is_sdtv) {
+        if (g.sel_input >= 0 && g.sel_input < dev->n_inputs) {
+            uint32_t idx = dev->inputs[g.sel_input].index;
+            if (ioctl(g.fd, VIDIOC_S_INPUT, &idx) < 0) {
+                return preview_open_fail("cannot select input", errno);
+            }
+        }
+
+        int want_std = dev->std_index;
+        if (!g.std_pinned) {
+            /* Auto: believe QUERYSTD only when it names one standard. */
+            int det = std_index_from_query(g.fd, dev);
+            if (det >= 0 && det != want_std) {
+                build_sdtv_modes(g.fd, dev, det);
+                if (g.sel_mode >= dev->n_modes) g.sel_mode = 0;
+                want_std = det;
+            }
+        }
+        if (want_std >= 0 && want_std < dev->n_stds) {
+            v4l2_std_id id = (v4l2_std_id)dev->stds[want_std].id;
+            /* Not fatal: the S_FMT readback below is authoritative either way,
+             * and a device that refuses still gives a usable picture. */
+            if (ioctl(g.fd, VIDIOC_S_STD, &id) < 0) {
+                preview_note_error("device refused the video standard", errno);
+            }
+        }
+    }
+
+    if (g.sel_mode < 0 || g.sel_mode >= dev->n_modes) g.sel_mode = 0;
+    const preview_mode_t *mode = &dev->modes[g.sel_mode];
+    g.conn_sdtv = dev->is_sdtv;
 
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
@@ -681,11 +1098,44 @@ int gui_preview_connect(void)
         return preview_open_fail("cannot start streaming", errno);
     }
 
+    /* What the device ended up on, not what we asked for. The jack and the
+     * standard are read back for the same reason the pixel format is: S_INPUT
+     * and S_STD both clamp silently, and a panel that displays the request
+     * rather than the result is lying to the operator. */
+    int      got_input = -1;
+    char     got_input_name[32] = {0};
+    char     got_std_name[24] = {0};
+    if (dev->is_sdtv) {
+        uint32_t cur = 0;
+        if (ioctl(g.fd, VIDIOC_G_INPUT, &cur) == 0) {
+            for (int i = 0; i < dev->n_inputs; i++) {
+                if (dev->inputs[i].index == cur) {
+                    got_input = i;
+                    snprintf(got_input_name, sizeof(got_input_name), "%s", dev->inputs[i].name);
+                    break;
+                }
+            }
+            if (got_input >= 0) g.sel_input = got_input;
+        }
+        v4l2_std_id cur_std = 0;
+        if (ioctl(g.fd, VIDIOC_G_STD, &cur_std) == 0) {
+            int idx = std_index_from_id(dev, (uint64_t)cur_std);
+            if (idx >= 0) snprintf(got_std_name, sizeof(got_std_name), "%s", dev->stds[idx].name);
+        }
+    }
+
     status_lock();
     g.status.width = g.width;
     g.status.height = g.height;
     g.status.fps_num = got_num;
     g.status.fps_den = got_den;
+    g.status.input = got_input;
+    snprintf(g.status.input_name, sizeof(g.status.input_name), "%s", got_input_name);
+    snprintf(g.status.std_name, sizeof(g.status.std_name), "%s", got_std_name);
+    g.status.field = fmt.fmt.pix.field;
+    preview_aspect_ratios(g.width, g.height, effective_aspect_mode(dev->is_sdtv),
+                          &g.status.dar_num, &g.status.dar_den,
+                          &g.status.sar_num, &g.status.sar_den);
     status_unlock();
     g.fps_window_start = preview_now();
     g.fps_window_frames = 0;
@@ -837,8 +1287,35 @@ void gui_preview_draw(Rectangle bounds, bool with_status)
     else if (st.state == PREVIEW_STATE_ERROR) alpha = 90;
 
     if (have_picture) {
-        Rectangle dst = preview_aspect_fit(bounds, 4.0f / 3.0f);
-        Rectangle src = { 0, 0, (float)g.tex.width, (float)g.tex.height };
+        /* Crop first, then fit what survives.
+         *
+         * The crop is a source-rectangle inset and nothing more: no pixel is
+         * copied, the texture is untouched, and above all the frame tap never
+         * sees it. That is deliberate -- the reference recording has to keep
+         * the full active raster so it stays frame-comparable with a
+         * tbc-video-export of the same tape, while the operator still gets to
+         * hide the head-switching noise at the bottom of the picture on screen.
+         *
+         * The aspect is computed from the *cropped* window for the same reason
+         * a player must: cropping 4 lines off a 4:3 frame no longer makes a 4:3
+         * frame, and stretching it back to 4:3 would put a geometry error on
+         * screen that the recording does not have. */
+        float tw = (float)g.tex.width, th = (float)g.tex.height;
+        float cl = (float)g.crop_left,   cr = (float)g.crop_right;
+        float ct = (float)g.crop_top,    cb = (float)g.crop_bottom;
+        if (cl + cr > tw - 2.0f) { cl = 0; cr = 0; }
+        if (ct + cb > th - 2.0f) { ct = 0; cb = 0; }
+
+        Rectangle src = { cl, ct, tw - cl - cr, th - ct - cb };
+
+        uint32_t sar_n = 1, sar_d = 1;
+        preview_aspect_ratios(g.width, g.height, effective_aspect_mode(g.conn_sdtv),
+                              NULL, NULL, &sar_n, &sar_d);
+        float aspect = (src.height > 0.0f && sar_d > 0)
+                         ? (src.width * (float)sar_n) / (src.height * (float)sar_d)
+                         : 4.0f / 3.0f;
+
+        Rectangle dst = preview_aspect_fit(bounds, aspect);
         DrawTexturePro(g.tex, src, dst, (Vector2){ 0, 0 }, 0.0f,
                        (Color){ 255, 255, 255, alpha });
     }
@@ -1123,9 +1600,31 @@ int gui_preview_probe_main(void)
     const preview_device_t *devs = gui_preview_devices(&n);
     printf("preview devices: %zu\n", n);
     for (size_t i = 0; i < n; i++) {
-        printf("  %s  \"%s\"  (%d YUYV modes)\n", devs[i].path, devs[i].card, devs[i].n_modes);
-        for (int m = 0; m < devs[i].n_modes; m++) {
-            printf("      %-16s %s\n", devs[i].modes[m].label, m == 0 ? "<- default" : "");
+        const preview_device_t *d = &devs[i];
+        printf("  %s  \"%s\"  (%d YUYV modes%s)\n", d->path, d->card, d->n_modes,
+               d->is_sdtv ? ", SDTV" : "");
+
+        if (d->n_inputs > 0) {
+            printf("    inputs:");
+            for (int k = 0; k < d->n_inputs; k++) {
+                printf(" %u=%s%s", d->inputs[k].index, d->inputs[k].name,
+                       d->inputs[k].is_sdtv ? "" : " (no standard)");
+            }
+            printf("\n");
+        }
+        if (d->n_stds > 0) {
+            printf("    standards:");
+            for (int k = 0; k < d->n_stds; k++) {
+                printf(" %s%s", d->stds[k].name, k == d->std_index ? "*" : "");
+            }
+            printf("   (* = modes derived from this one)\n");
+        }
+        for (int m = 0; m < d->n_modes; m++) {
+            uint32_t dn = 0, dd = 0, sn = 0, sd = 0;
+            preview_aspect_ratios(d->modes[m].w, d->modes[m].h,
+                                  effective_aspect_mode(d->is_sdtv), &dn, &dd, &sn, &sd);
+            printf("      %-18s SAR %u:%u  DAR %u:%u %s\n", d->modes[m].label,
+                   sn, sd, dn, dd, m == 0 ? "<- default" : "");
         }
     }
     gui_preview_shutdown();
@@ -1597,6 +2096,32 @@ const preview_device_t *gui_preview_devices(size_t *count) { if (count) *count =
 int  gui_preview_selected_device(void) { return 0; }
 int  gui_preview_selected_mode(void) { return 0; }
 void gui_preview_select(int d, int m) { (void)d; (void)m; }
+
+int  gui_preview_selected_input(void) { return -1; }
+int  gui_preview_selected_standard(void) { return -1; }
+int  gui_preview_select_input(int i) { (void)i; return -1; }
+bool gui_preview_select_standard(int i) { (void)i; return false; }
+void gui_preview_select_input_by_name(const char *n) { (void)n; }
+void gui_preview_select_standard_by_name(const char *n) { (void)n; }
+void gui_preview_select_mode_by_spec(const char *s) { (void)s; }
+void gui_preview_mode_spec(char *out, size_t cap) { if (out && cap) out[0] = '\0'; }
+
+/* The aspect and crop settings are persisted on every platform, so their
+ * setters must exist even where there is no picture to apply them to. */
+void gui_preview_set_aspect_mode(int m) { (void)m; }
+int  gui_preview_aspect_mode(void) { return PREVIEW_ASPECT_AUTO; }
+void gui_preview_set_crop(int t, int b, int l, int r) { (void)t; (void)b; (void)l; (void)r; }
+void gui_preview_get_crop(int *t, int *b, int *l, int *r)
+{
+    if (t) *t = 0;
+    if (b) *b = 0;
+    if (l) *l = 0;
+    if (r) *r = 0;
+}
+void gui_preview_aspect_arg(char *out, size_t cap)
+{
+    if (out && cap) snprintf(out, cap, "4:3");
+}
 
 int  gui_preview_connect(void) { return -1; }
 void gui_preview_disconnect(void) { }

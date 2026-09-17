@@ -14,7 +14,7 @@ Say which in the PR body. A change that mixes both is split before it is opened.
 
 `.claude/` · `.clangd` · `.github/workflows/selfhosted-deploy.yml` · `docs/gdh-*` · `docs/superpowers/` ·
 `scripts/fetch-mediamtx.sh` · `scripts/gdh-host/` · `misrc_tools/misrc_gui/streaming/` ·
-`misrc_tools/misrc_gui/input/gui_preview_v4l2.c` (+ `gui_preview_tap.h`) ·
+`misrc_tools/misrc_gui/input/gui_preview_v4l2.c` (+ `gui_preview_tap.h`, `gui_preview_sdtv.{c,h}`) ·
 `misrc_tools/misrc_gui/output/gui_video_record.{c,h}` ·
 `misrc_tools/misrc_gui/visualization/gui_preview_panel.{c,h}` · the fork's guards in
 `misrc_tools/test/ci_guard_tests.py` and `misrc_tools/test/*_harness.c` that name them.

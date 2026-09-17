@@ -4107,6 +4107,46 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
+                    /* Picture shape. These are set once for a deck and then
+                     * left alone, which is why they live here rather than on
+                     * the panel, where Input and Standard are changed per tape.
+                     *
+                     * Aspect reaches the preview, the reference MKV and the
+                     * RTSP stream alike, so the three cannot disagree. Crop
+                     * reaches ONLY the preview: the recording keeps the full
+                     * active raster so it stays frame-comparable with a
+                     * tbc-video-export of the same tape. */
+                    CLAY(CLAY_ID("PreviewGeometryRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+                        CLAY_TEXT(CLAY_STRING("Aspect"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY(CLAY_ID("PreviewAspectBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(72), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            int am = app->settings.preview_aspect_mode;
+                            const char *aspect_label = (am == 1) ? "4:3"
+                                                     : (am == 2) ? "16:9"
+                                                     : (am == 3) ? "Square" : "Auto";
+                            CLAY_TEXT(make_string(aspect_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                        /* Preview-only, and labelled so nobody expects it in
+                         * the file. Each box steps by 2 and wraps at 32. */
+                        CLAY_TEXT(CLAY_STRING("Crop (preview only)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        static char crop_t_buf[8], crop_b_buf[8], crop_l_buf[8], crop_r_buf[8];
+                        snprintf(crop_t_buf, sizeof(crop_t_buf), "T%d", app->settings.preview_crop_top);
+                        snprintf(crop_b_buf, sizeof(crop_b_buf), "B%d", app->settings.preview_crop_bottom);
+                        snprintf(crop_l_buf, sizeof(crop_l_buf), "L%d", app->settings.preview_crop_left);
+                        snprintf(crop_r_buf, sizeof(crop_r_buf), "R%d", app->settings.preview_crop_right);
+                        CLAY(CLAY_ID("PreviewCropTop"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(crop_t_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                        CLAY(CLAY_ID("PreviewCropBottom"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(crop_b_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                        CLAY(CLAY_ID("PreviewCropLeft"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(crop_l_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                        CLAY(CLAY_ID("PreviewCropRight"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(crop_r_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                    }
+
                     // Stream: the same picture as the reference recording,
                     // published live so a tape can be watched from another
                     // machine. Greyed out when no mediamtx was found, for the
@@ -11607,6 +11647,36 @@ void gui_handle_interactions(gui_app_t *app) {
                     int next = (gui_preview_selected_device() + 1) % (int)n_pv;
                     gui_preview_select(next, 0);
                     gui_ui_remember_preview_device(app);
+                }
+            }
+            /* Aspect cycles Auto -> 4:3 -> 16:9 -> Square. It is safe at any
+             * time: it changes how frames are presented, never the capture, so
+             * a live recording keeps its geometry and simply gets the new
+             * display aspect from the next spawn onwards. */
+            if (Clay_PointerOver(CLAY_ID("PreviewAspectBox"))) {
+                app->settings.preview_aspect_mode = (app->settings.preview_aspect_mode + 1) % 4;
+                gui_preview_set_aspect_mode(app->settings.preview_aspect_mode);
+                gui_settings_save(&app->settings);
+            }
+            /* Crop steps by 2 and wraps at 32: an edge mask is a handful of
+             * lines, and a wrap is how you get back to 0 without a second
+             * control. Preview-only, so nothing here can touch a recording. */
+            {
+                struct { const char *id; int *field; } crop_boxes[] = {
+                    { "PreviewCropTop",    &app->settings.preview_crop_top },
+                    { "PreviewCropBottom", &app->settings.preview_crop_bottom },
+                    { "PreviewCropLeft",   &app->settings.preview_crop_left },
+                    { "PreviewCropRight",  &app->settings.preview_crop_right },
+                };
+                for (size_t ci = 0; ci < sizeof(crop_boxes) / sizeof(crop_boxes[0]); ci++) {
+                    if (!Clay_PointerOver(Clay_GetElementId(make_string(crop_boxes[ci].id)))) continue;
+                    *crop_boxes[ci].field = (*crop_boxes[ci].field + 2) % 34;
+                    gui_preview_set_crop(app->settings.preview_crop_top,
+                                         app->settings.preview_crop_bottom,
+                                         app->settings.preview_crop_left,
+                                         app->settings.preview_crop_right);
+                    gui_settings_save(&app->settings);
+                    break;
                 }
             }
             if (Clay_PointerOver(CLAY_ID("PreviewConnectBtn"))) {

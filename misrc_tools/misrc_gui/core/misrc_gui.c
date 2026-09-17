@@ -833,6 +833,13 @@ int main(int argc, char **argv) {
      * Quiet on failure by design: a dongle that is unplugged, or in use
      * elsewhere, must not produce a dialog on every launch. The picker keeps
      * showing the remembered name and the status line says what happened. */
+    /* Display geometry does not depend on a device being present, so it is
+     * applied unconditionally: the panel must render a remembered crop and
+     * aspect correctly even when the dongle shows up later. */
+    gui_preview_set_aspect_mode(app.settings.preview_aspect_mode);
+    gui_preview_set_crop(app.settings.preview_crop_top, app.settings.preview_crop_bottom,
+                         app.settings.preview_crop_left, app.settings.preview_crop_right);
+
     if (app.settings.preview_device_path[0]) {
         gui_preview_refresh_devices();
         size_t n_pv = 0;
@@ -843,6 +850,12 @@ int main(int argc, char **argv) {
         }
         if (want >= 0) {
             gui_preview_select(want, 0);
+            /* Order matters: the standard rebuilds the mode list, so it has to
+             * be chosen before a persisted mode can be matched against it. An
+             * empty standard means auto-detect, which connect() does. */
+            gui_preview_select_standard_by_name(app.settings.preview_standard);
+            gui_preview_select_input_by_name(app.settings.preview_input);
+            gui_preview_select_mode_by_spec(app.settings.preview_mode_spec);
             if (gui_preview_connect() != 0) {
                 preview_status_t pst = gui_preview_get_status();
                 gui_app_set_status(&app, pst.err_text[0] ? pst.err_text

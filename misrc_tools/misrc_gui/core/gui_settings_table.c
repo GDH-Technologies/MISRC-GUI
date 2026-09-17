@@ -144,6 +144,14 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->cc_vbi_device[0] = '\0';       /* auto: the dongle the preview is on */
     settings->ffmpeg_path[0] = '\0';
     settings->preview_device_path[0] = '\0';
+    settings->preview_input[0] = '\0';       /* leave the device on whatever jack it has */
+    settings->preview_standard[0] = '\0';    /* auto-detect on connect */
+    settings->preview_mode_spec[0] = '\0';   /* the device's default mode */
+    settings->preview_aspect_mode = 0;       /* auto: 4:3 for SDTV, square otherwise */
+    settings->preview_crop_top = 0;
+    settings->preview_crop_bottom = 0;
+    settings->preview_crop_left = 0;
+    settings->preview_crop_right = 0;
     settings->rtsp_stream_enabled = false;
     settings->rtsp_stream_lan = false;       /* loopback: going off-box is explicit */
     settings->rtsp_stream_port = 0;          /* 0 = the module's default */
@@ -656,6 +664,32 @@ static bool hook_rtsp_port(const gui_setting_desc_t *d, gui_settings_t *s, const
     return true;
 }
 
+static bool hook_preview_aspect_mode(const gui_setting_desc_t *d, gui_settings_t *s,
+                                     const char *value, bool strict, char *err, size_t errcap) {
+    long long ll;
+    if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
+    int e = (int)ll;
+    /* Anything outside the enum falls back to auto rather than being rejected:
+     * a settings file written by a newer build must not make this one unusable. */
+    s->preview_aspect_mode = (e >= 0 && e <= 3) ? e : 0;
+    (void)d;
+    return true;
+}
+
+/* A crop is in source pixels off one edge. Negative is meaningless, and a crop
+ * wider than any SD raster would leave nothing to show, so clamp rather than
+ * reject -- the render path clamps again against the real frame size. */
+static bool hook_preview_crop(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                              bool strict, char *err, size_t errcap) {
+    long long ll;
+    if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
+    int v = (int)ll;
+    if (v < 0) v = 0;
+    if (v > 512) v = 512;
+    *(int *)((char *)s + d->offset) = v;
+    return true;
+}
+
 static bool hook_rtsp_encoder(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
                               bool strict, char *err, size_t errcap) {
     long long ll;
@@ -967,6 +1001,20 @@ static const gui_setting_desc_t s_table[] = {
     /* Where a net client records (server or this machine): it describes this
      * machine, so a client keeps its own and never sends it. */
     GS_B  ("net_client_record_local",          net_client_record_local,     GS_LOCAL),
+    /* SDTV preview: which jack, which video standard, which picture mode, and
+     * how the result is shaped. Appended for the reason stated above. Stored by
+     * name, not index -- see gui_settings.h. None of these are GS_LOCAL: in net
+     * mode the server owns the dongle, so a client that could not name the
+     * server's input could not switch Composite to S-Video at all, which is the
+     * whole point of the control. */
+    GS_S  ("preview_input",                    preview_input,               0),
+    GS_S  ("preview_standard",                 preview_standard,            0),
+    GS_S  ("preview_mode_spec",                preview_mode_spec,           0),
+    GS_IH ("preview_aspect_mode",              preview_aspect_mode,         0, hook_preview_aspect_mode),
+    GS_IH ("preview_crop_top",                 preview_crop_top,            0, hook_preview_crop),
+    GS_IH ("preview_crop_bottom",              preview_crop_bottom,         0, hook_preview_crop),
+    GS_IH ("preview_crop_left",                preview_crop_left,           0, hook_preview_crop),
+    GS_IH ("preview_crop_right",               preview_crop_right,          0, hook_preview_crop),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))
