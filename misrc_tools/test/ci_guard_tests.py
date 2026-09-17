@@ -2618,6 +2618,35 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
     return 0
 
 
+def check_channel_gear_clearance(repo_root: Path) -> int:
+    """Each row's gear button floats in its top-left panel right after that
+    panel's title (panel_gear_offset_x), and the waveform leaves
+    PANEL_GEAR_SLOT after "CH A"/"CH B" before its time/div label and before
+    any overlay button. A fixed offset put the gear on top of time/div on
+    wide panels. test/gui_waveform_overlay_harness.c checks the geometry
+    (meson test gui_waveform_overlay); this pins the wiring."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        ui = strip_c_comments(read_text(base / "ui/gui_ui.c"))
+        osc = strip_c_comments(read_text(base / "visualization/gui_oscilloscope.c"))
+        harness = read_text(repo_root / "misrc_tools/test/gui_waveform_overlay_harness.c")
+    except OSError as exc:
+        return fail(f"channel gear guard: cannot read a source file: {exc}")
+    try:
+        gear = extract_function_body(ui, "static void render_channel_gear(gui_app_t *app, int channel)")
+    except RuntimeError as exc:
+        return fail(f"gui_ui.c: {exc}")
+    if "panel_gear_offset_x(" not in gear or ".offset = { gear_x, PANEL_GEAR_Y }" not in gear:
+        return fail("gui_ui.c: render_channel_gear() no longer places the gear after the top-left panel's title")
+    if not re.search(r"int div_x = ch_label_x \+ ch_label_w \+ PANEL_GEAR_SLOT \+ 8;", osc):
+        return fail("gui_oscilloscope.c: time/div no longer leaves room for the channel gear after the label")
+    if osc.count("channel_label_w + PANEL_GEAR_SLOT + 8") < 3:
+        return fail("gui_oscilloscope.c: the Mode/Trig wrap and the Scale row no longer clear the channel gear")
+    if "test_gear_clearance(&state);" not in harness:
+        return fail("gui_waveform_overlay_harness.c: the gear clearance test is no longer run")
+    return 0
+
+
 def check_record_parity(repo_root: Path) -> int:
     """The Record button, its click and the R/Space keys read the effective
     recording and capture state (the server's on a net client that records on
@@ -4078,6 +4107,7 @@ def main() -> int:
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
+        ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))

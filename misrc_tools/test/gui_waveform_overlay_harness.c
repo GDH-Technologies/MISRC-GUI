@@ -666,6 +666,49 @@ static void test_panel_independence(waveform_panel_state_t *first)
                 "clicking panel A leaves panel B Mode state unchanged");
 }
 
+// The row's gear floats at panel_gear_offset_x(PANEL_VIEW_WAVEFORM): after the
+// wider of "CH A"/"CH B". Nothing the waveform draws may sit under it.
+static Rectangle gear_rect(float x, float y)
+{
+    float label_w = fmaxf((float)gui_text_measure("CH A", FONT_SIZE_OSC_LABEL),
+                          (float)gui_text_measure("CH B", FONT_SIZE_OSC_LABEL));
+    return (Rectangle){x + 8 + ceilf(label_w) + PANEL_GEAR_GAP, y + PANEL_GEAR_Y,
+                       PANEL_GEAR_SIZE, PANEL_GEAR_SIZE};
+}
+
+static void test_gear_clearance(waveform_panel_state_t *state)
+{
+    test_case = "the channel gear never covers time/div or the overlay buttons";
+    static const float widths[] = {1400, 900, 700, 520, 420, 320, 240};
+    static const float text_scales[] = {1, 1.5f};
+    for (size_t t = 0; t < sizeof(text_scales) / sizeof(text_scales[0]); t++) {
+        test_text_width_scale = text_scales[t];
+        for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+            Rectangle bounds = {73, 41, widths[w], 400};
+            Rectangle gear = gear_rect(bounds.x, bounds.y);
+            init_state(state);
+            for (int ch = 0; ch < 2; ch++) {
+                draw_count = 0;
+                draw_channel_grid(bounds.x, bounds.y, bounds.width, bounds.height,
+                                  ch ? "CH B" : "CH A", COLOR_TEXT, true,
+                                  1, 20000000, false, -1, &state->time_div_rect, 0, ch);
+                for (int i = 0; i < draw_count; i++) {
+                    if (strstr(draw_calls[i].text, "/div") || strncmp(draw_calls[i].text, "CH ", 3) == 0) {
+                        expect_true(!overlaps(draw_calls[i].rect, gear),
+                                    "the channel label and time/div stay clear of the gear");
+                    }
+                }
+            }
+            render(state, bounds);
+            expect_true(!overlaps(state->scale_btn_rect, gear) &&
+                        !overlaps(state->render_mode_btn_rect, gear) &&
+                        !overlaps(state->trigger_btn_rect, gear),
+                        "Scale, Mode and Trig stay clear of the gear");
+        }
+    }
+    test_text_width_scale = 1;
+}
+
 int main(void)
 {
     waveform_panel_state_t state;
@@ -684,6 +727,7 @@ int main(void)
     test_clicks(&state);
     test_short_panels(&state);
     test_panel_independence(&state);
+    test_gear_clearance(&state);
     printf("Waveform overlay: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

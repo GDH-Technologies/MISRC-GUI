@@ -65,6 +65,19 @@ void panel_config_set_split(channel_panel_config_t *config, bool split);
 // Shared Geometry
 //-----------------------------------------------------------------------------
 
+// Each channel row's gear button floats in its top-left panel, just after
+// that panel's title. A view that draws beside its title (the waveform's
+// time/div) leaves PANEL_GEAR_SLOT of room after it.
+#define PANEL_GEAR_SIZE 20
+#define PANEL_GEAR_GAP  6
+#define PANEL_GEAR_SLOT (PANEL_GEAR_SIZE + PANEL_GEAR_GAP)
+#define PANEL_GEAR_Y    4
+
+// Logical x offset of the gear from the left edge of a panel showing this
+// view: after the title for the views that draw one, else clear of the
+// left-edge axis labels (FFT dB, spectrograph frequency).
+float panel_gear_offset_x(panel_view_type_t type);
+
 // Largest rectangle of the given aspect ratio that fits inside bounds, centred.
 // Shared by every panel that draws a picture (CVBS, VHS FM, Preview) so the
 // letterboxing math exists once rather than three times.

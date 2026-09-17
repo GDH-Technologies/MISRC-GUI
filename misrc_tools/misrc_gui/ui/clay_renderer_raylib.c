@@ -70,6 +70,26 @@ void Clay_Raylib_Initialize(int width, int height, const char *title, unsigned i
 
 // A MALLOC'd buffer, that we keep modifying inorder to save from so many Malloc and Free Calls.
 // Call Clay_Raylib_Close() to free
+// Gear of outer radius r centred on (cx, cy): a ring with a centre hole and
+// six broad teeth, drawn filled so it still reads as a gear at 16 px.
+static void gui_draw_gear_icon(float cx, float cy, float r, Color col)
+{
+    const int teeth = 6;
+    float r_tip = r * 0.98f;
+    float r_body = r * 0.66f;
+    float r_hole = r * 0.32f;
+    float tooth_w = r * 0.55f;
+    // Each tooth is a rectangle pivoted on the centre, starting inside the
+    // ring so the joint has no seam.
+    float r_root = r_body * 0.80f;
+    for (int i = 0; i < teeth; i++) {
+        float angle = (360.0f / (float)teeth) * (float)i;
+        DrawRectanglePro((Rectangle){ cx, cy, tooth_w, r_tip - r_root },
+                         (Vector2){ tooth_w * 0.5f, -r_root }, angle, col);
+    }
+    DrawRing((Vector2){ cx, cy }, r_hole, r_body, 0.0f, 360.0f, 36, col);
+}
+
 static char *temp_render_buffer = NULL;
 static int temp_render_buffer_len = 0;
 
@@ -209,25 +229,13 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                         break;
                     }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON: {
-                        // Simple gear icon drawn with primitives (no font dependency)
-                        float cx = boundingBox.x + boundingBox.width * 0.5f;
-                        float cy = boundingBox.y + boundingBox.height * 0.5f;
-                        float r_outer = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height) * 0.45f;
-                        float r_inner = r_outer * 0.55f;
+                        // Gear icon drawn with primitives (no font dependency):
+                        // a solid ring with a centre hole and square teeth.
                         Color col = COLOR_TEXT;
-
-                        DrawCircleLines((int)roundf(cx), (int)roundf(cy), r_outer, col);
-                        DrawCircleLines((int)roundf(cx), (int)roundf(cy), r_inner, col);
-
-                        // 8 teeth/spokes
-                        for (int i = 0; i < 8; i++) {
-                            float a = (float)i * (PI / 4.0f);
-                            float x0 = cx + cosf(a) * r_inner;
-                            float y0 = cy + sinf(a) * r_inner;
-                            float x1 = cx + cosf(a) * r_outer;
-                            float y1 = cy + sinf(a) * r_outer;
-                            DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, 2.0f, col);
-                        }
+                        gui_draw_gear_icon(boundingBox.x + boundingBox.width * 0.5f,
+                                           boundingBox.y + boundingBox.height * 0.5f,
+                                           (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height) * 0.5f,
+                                           col);
                         break;
                     }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON: {
