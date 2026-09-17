@@ -50,6 +50,49 @@ static void log_cvbs_preview_state_change(gui_app_t *app, int ch, bool enabled, 
 }
 
 //-----------------------------------------------------------------------------
+// Panel Changes (shared by the sidebar dropdowns and the pane context menu)
+//-----------------------------------------------------------------------------
+
+typedef enum { PANE_OP_SPLIT, PANE_OP_VIEW, PANE_OP_SOURCE } pane_op_t;
+
+static void apply_pane_change(gui_app_t *app, int ch, pane_op_t op, bool right,
+                              int value, const char *reason) {
+    if (!app) return;
+    channel_panel_config_t *config = (ch == 0) ? &app->panel_config_a : &app->panel_config_b;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+    bool cvbs_before = cvbs_preview_enabled_for_channel_locked(config);
+    switch (op) {
+        case PANE_OP_SPLIT:
+            panel_config_set_split(config, value != 0);
+            break;
+        case PANE_OP_VIEW:
+            if (right) panel_config_set_right_view(config, (panel_view_type_t)value);
+            else       panel_config_set_left_view(config, (panel_view_type_t)value);
+            break;
+        case PANE_OP_SOURCE:
+            panel_config_set_source(config, right, value);
+            break;
+    }
+    bool cvbs_after = cvbs_preview_enabled_for_channel_locked(config);
+    atomic_flag_clear(&app->panel_config_lock);
+    if (cvbs_before != cvbs_after) {
+        log_cvbs_preview_state_change(app, ch, cvbs_after, reason);
+    }
+}
+
+void gui_dropdown_set_pane_split(gui_app_t *app, int ch, bool split) {
+    apply_pane_change(app, ch, PANE_OP_SPLIT, false, split ? 1 : 0, "layout change");
+}
+
+void gui_dropdown_set_pane_view(gui_app_t *app, int ch, bool right, int view_type) {
+    apply_pane_change(app, ch, PANE_OP_VIEW, right, view_type, right ? "right view" : "left view");
+}
+
+void gui_dropdown_set_pane_source(gui_app_t *app, int ch, bool right, int source) {
+    apply_pane_change(app, ch, PANE_OP_SOURCE, right, source, "source change");
+}
+
+//-----------------------------------------------------------------------------
 // State Management
 //-----------------------------------------------------------------------------
 
@@ -141,37 +184,18 @@ static bool handle_device_dropdown(gui_app_t *app) {
 // Handle layout selection for a channel
 static bool handle_layout_dropdown(gui_app_t *app, int ch) {
     bool clicked = false;
-    channel_panel_config_t *config = (ch == 0) ? &app->panel_config_a : &app->panel_config_b;
 
     if (Clay_PointerOver(CLAY_IDI("LayoutBtn", ch))) {
         gui_dropdown_toggle(DROPDOWN_LAYOUT, ch);
         clicked = true;
     } else if (gui_dropdown_is_open(DROPDOWN_LAYOUT, ch)) {
         if (Clay_PointerOver(CLAY_IDI("LayoutOptSingle", ch))) {
-            bool cvbs_before = false;
-            bool cvbs_after = false;
-            while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
-            cvbs_before = cvbs_preview_enabled_for_channel_locked(config);
-            panel_config_set_split(config, false);
-            cvbs_after = cvbs_preview_enabled_for_channel_locked(config);
-            atomic_flag_clear(&app->panel_config_lock);
-            if (cvbs_before != cvbs_after) {
-                log_cvbs_preview_state_change(app, ch, cvbs_after, "layout change");
-            }
+            gui_dropdown_set_pane_split(app, ch, false);
             gui_dropdown_close_all();
             clicked = true;
         }
         if (Clay_PointerOver(CLAY_IDI("LayoutOptSplit", ch))) {
-            bool cvbs_before = false;
-            bool cvbs_after = false;
-            while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
-            cvbs_before = cvbs_preview_enabled_for_channel_locked(config);
-            panel_config_set_split(config, true);
-            cvbs_after = cvbs_preview_enabled_for_channel_locked(config);
-            atomic_flag_clear(&app->panel_config_lock);
-            if (cvbs_before != cvbs_after) {
-                log_cvbs_preview_state_change(app, ch, cvbs_after, "layout change");
-            }
+            gui_dropdown_set_pane_split(app, ch, true);
             gui_dropdown_close_all();
             clicked = true;
         }
@@ -183,7 +207,6 @@ static bool handle_layout_dropdown(gui_app_t *app, int ch) {
 // Handle left view selection for a channel
 static bool handle_left_view_dropdown(gui_app_t *app, int ch) {
     bool clicked = false;
-    channel_panel_config_t *config = (ch == 0) ? &app->panel_config_a : &app->panel_config_b;
 
     if (Clay_PointerOver(CLAY_IDI("LeftViewBtn", ch))) {
         gui_dropdown_toggle(DROPDOWN_LEFT_VIEW, ch);
@@ -193,16 +216,7 @@ static bool handle_left_view_dropdown(gui_app_t *app, int ch) {
             if (!panel_view_type_available((panel_view_type_t)vt)) continue;
             // Use ch * 10 + vt to match the ID used in rendering
             if (Clay_PointerOver(CLAY_IDI("LeftViewOpt", ch * 10 + vt))) {
-                bool cvbs_before = false;
-                bool cvbs_after = false;
-                while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
-                cvbs_before = cvbs_preview_enabled_for_channel_locked(config);
-                panel_config_set_left_view(config, (panel_view_type_t)vt);
-                cvbs_after = cvbs_preview_enabled_for_channel_locked(config);
-                atomic_flag_clear(&app->panel_config_lock);
-                if (cvbs_before != cvbs_after) {
-                    log_cvbs_preview_state_change(app, ch, cvbs_after, "left view");
-                }
+                gui_dropdown_set_pane_view(app, ch, false, vt);
                 gui_dropdown_close_all();
                 clicked = true;
                 break;
@@ -228,16 +242,7 @@ static bool handle_right_view_dropdown(gui_app_t *app, int ch) {
             if (!panel_view_type_available((panel_view_type_t)vt)) continue;
             // Use ch * 10 + vt to match the ID used in rendering
             if (Clay_PointerOver(CLAY_IDI("RightViewOpt", ch * 10 + vt))) {
-                bool cvbs_before = false;
-                bool cvbs_after = false;
-                while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
-                cvbs_before = cvbs_preview_enabled_for_channel_locked(config);
-                panel_config_set_right_view(config, (panel_view_type_t)vt);
-                cvbs_after = cvbs_preview_enabled_for_channel_locked(config);
-                atomic_flag_clear(&app->panel_config_lock);
-                if (cvbs_before != cvbs_after) {
-                    log_cvbs_preview_state_change(app, ch, cvbs_after, "right view");
-                }
+                gui_dropdown_set_pane_view(app, ch, true, vt);
                 gui_dropdown_close_all();
                 clicked = true;
                 break;
