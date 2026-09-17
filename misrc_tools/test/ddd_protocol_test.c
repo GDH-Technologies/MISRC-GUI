@@ -460,6 +460,144 @@ static bool test_fifo_telemetry_totals(void)
     return true;
 }
 
+/* Exercise the wire lengths shipped in fw-v3.1.0 and fw-v3.2.0 with
+ * arbitrary USB splits and an initial partial marker spanning 62 -> 0. */
+static bool test_sequence_wire_lengths(void)
+{
+    const uint32_t block_lengths[] = {65536u, 65535u};
+    const size_t chunk_lengths[] = {1u, 509u, 65536u};
+    uint16_t *words = malloc(65536u * sizeof(*words));
+    CHECK(words != NULL);
+
+    for (size_t b = 0; b < sizeof(block_lengths) / sizeof(block_lengths[0]); ++b) {
+        const uint32_t block_length = block_lengths[b];
+        const size_t total = 3u * block_length + 113u;
+        const size_t start = 63u * block_length - 113u;
+        for (size_t c = 0; c < sizeof(chunk_lengths) / sizeof(chunk_lengths[0]); ++c) {
+            ddd_sequence_validator_t sequence;
+            ddd_sequence_validator_init(&sequence);
+            for (size_t offset = 0; offset < total;) {
+                size_t count = total - offset;
+                if (count > chunk_lengths[c]) count = chunk_lengths[c];
+                for (size_t i = 0; i < count; ++i) {
+                    size_t position = start + offset + i;
+                    uint16_t marker = (uint16_t)((position / block_length) % 63u);
+                    words[i] = (uint16_t)((marker << 10) | (position & 0x3ffu));
+                }
+                CHECK(ddd_sequence_validator_feed(&sequence, words, count) ==
+                      DDD_VALIDATION_OK);
+                offset += count;
+            }
+            CHECK(sequence.phase == DDD_SEQUENCE_RUNNING);
+            CHECK(sequence.samples_seen == total);
+            CHECK(sequence.samples_per_marker == block_length);
+        }
+    }
+    free(words);
+    return true;
+}
+
+static ddd_validation_result_t feed_sequence_run(
+    ddd_sequence_validator_t *sequence, uint8_t marker, uint32_t count)
+{
+    uint16_t words[1024];
+    for (size_t i = 0; i < 1024u; ++i) {
+        words[i] = (uint16_t)(((uint16_t)marker << 10) | i);
+    }
+    while (count != 0) {
+        size_t chunk = count < 1024u ? count : 1024u;
+        ddd_validation_result_t result = ddd_sequence_validator_feed(
+            sequence, words, chunk);
+        if (result != DDD_VALIDATION_OK) return result;
+        count -= (uint32_t)chunk;
+    }
+    return DDD_VALIDATION_OK;
+}
+
+static bool prime_sequence(ddd_sequence_validator_t *sequence, uint32_t length)
+{
+    ddd_sequence_validator_init(sequence);
+    CHECK(feed_sequence_run(sequence, 62, 37) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(sequence, 0, length) == DDD_VALIDATION_OK);
+    CHECK(sequence->samples_per_marker == 0);
+    CHECK(feed_sequence_run(sequence, 1, 1) == DDD_VALIDATION_OK);
+    CHECK(sequence->samples_per_marker == length);
+    return true;
+}
+
+static bool test_sequence_fault_detection(uint32_t length)
+{
+    ddd_sequence_validator_t sequence;
+    const uint32_t lost_samples[] = {1u, 512u};
+
+    /* Losing one sample must not renegotiate 65536 down to 65535. A lost
+     * SuperSpeed packet (512 samples) must also remain a capture failure. */
+    for (size_t i = 0; i < sizeof(lost_samples) / sizeof(lost_samples[0]); ++i) {
+        CHECK(prime_sequence(&sequence, length));
+        CHECK(feed_sequence_run(&sequence, 1, length - lost_samples[i] - 1u) ==
+              DDD_VALIDATION_OK);
+        CHECK(feed_sequence_run(&sequence, 2, 1) == DDD_VALIDATION_MISMATCH);
+        CHECK(sequence.error_sample_index == 37u + 2u * length - lost_samples[i]);
+        CHECK(sequence.samples_per_marker == length);
+        CHECK(sequence.phase == DDD_SEQUENCE_FAILED);
+        CHECK(feed_sequence_run(&sequence, 1, 1) == DDD_VALIDATION_MISMATCH);
+    }
+
+    /* One duplicated sample must not renegotiate 65535 up to 65536. */
+    CHECK(prime_sequence(&sequence, length));
+    CHECK(feed_sequence_run(&sequence, 1, length) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.error_sample_index == 37u + 2u * length);
+    CHECK(sequence.expected_marker == 2);
+    CHECK(sequence.actual_marker == 1);
+
+    /* A complete marker followed by a skipped or reserved value fails. */
+    CHECK(prime_sequence(&sequence, length));
+    CHECK(feed_sequence_run(&sequence, 1, length - 1u) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 3, 1) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.expected_marker == 2);
+    CHECK(sequence.actual_marker == 3);
+    CHECK(prime_sequence(&sequence, length));
+    CHECK(feed_sequence_run(&sequence, 63, 1) == DDD_VALIDATION_MISMATCH);
+
+    /* A new connection can learn the other firmware after a failed stream. */
+    CHECK(prime_sequence(&sequence, length == 65535u ? 65536u : 65535u));
+    return true;
+}
+
+static bool test_sequence_learning_guards(void)
+{
+    ddd_sequence_validator_t sequence;
+
+    /* An initial fragment as long as a legacy block is legal, but no more. */
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 62, 65536u) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 0, 65535u) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 1, 1) == DDD_VALIDATION_OK);
+    CHECK(sequence.samples_per_marker == 65535u);
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 0, 65537u) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.error_sample_index == 65536u);
+
+    /* Do not learn an arbitrary short run, an overlong run, or a run that
+     * ends at the wrong marker, even before a wire length is established. */
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 10, 1) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 11, 65534u) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 12, 1) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.samples_per_marker == 0);
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 10, 1) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 11, 65537u) == DDD_VALIDATION_MISMATCH);
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 10, 1) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 11, 65535u) == DDD_VALIDATION_OK);
+    CHECK(feed_sequence_run(&sequence, 13, 1) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.samples_per_marker == 0);
+    ddd_sequence_validator_init(&sequence);
+    CHECK(feed_sequence_run(&sequence, 63, 1) == DDD_VALIDATION_MISMATCH);
+    return true;
+}
+
 static bool test_validators(void)
 {
     ddd_sequence_validator_t sequence;
@@ -518,7 +656,11 @@ int main(void)
         !test_lifecycle() ||
         !test_fifo_telemetry() ||
         !test_fifo_telemetry_totals() ||
-        !test_validators()) {
+        !test_validators() ||
+        !test_sequence_wire_lengths() ||
+        !test_sequence_fault_detection(65536u) ||
+        !test_sequence_fault_detection(65535u) ||
+        !test_sequence_learning_guards()) {
         return 1;
     }
     puts("DDD protocol tests passed");
