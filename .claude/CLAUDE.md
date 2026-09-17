@@ -92,8 +92,8 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 70
-  checks in a Linux `--post-build` run (v1.2.0 sync), several of which compile and run C
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 75
+  checks in a Linux `--post-build` run (v1.2.1 sync), several of which compile and run C
   harnesses in `misrc_tools/test/*_harness.c`. Meson has ten `test()` targets
   (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
   must keep the fork's `"Preview"` entry.
@@ -108,6 +108,11 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
   `--net-client-probe <host> <port> [s]` (mirror a server, print its settings as JSON).
   `misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui 18080` runs the whole
   server-side protocol against the Simulated device on any host, no Xvfb needed.
+- `--auto-connect` (upstream v1.2.1+) is automation but NOT headless: it requires `--config`,
+  refuses to run without one, and drives the server's capture start or the client's connect
+  with no click — with a window. Upstream's `misrc_tools/test/cxadc_remote_capture_ci.sh`
+  drives a server/client pair through it; that script is not wired into meson or CI and is
+  unproven here.
 - No formatter — there is no `.clang-format` upstream or here. Match the surrounding code.
 - Two hooks enforce this automatically (`.claude/settings.json`): `guards-on-edit.py` runs
   `--static-only` after any edit to a guard-matched file (the deploy workflow, `meson.build`,
@@ -132,6 +137,13 @@ callback-gating edits have silently broken GUI feeds before):
   `atomic_store(&s_capture_handler.capture_audio, true);` or the audio-monitor path is empty.
 - Validate RF and monitor audio as separate checks after capture-path edits.
 - Minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, `gui_audio`.
+- Windows cxadc is not at parity (`dev/cxadc_win_lockstep_notes.md`, upstream v1.2.1+):
+  `gui_cxadc_get_sample_rate_hz` returns false on Windows, so that path always assumes the
+  40/20 clockgen baseline and never detects a stock 28.6 card. The 10-bit
+  EACCES/EPERM fallback to 8-bit plus its help popup is Linux-only
+  (`#if !defined(_WIN32)`); on Windows a failed `Set-CxadcWinConfig` returns -1 and aborts
+  the capture instead. Do not "fix" either by widening the Linux branch — upstream's own
+  plan is to make the Windows baseline explicit and give it its own fallback.
 
 Fork-side:
 
@@ -187,6 +199,13 @@ Fork-side:
   file of whoever runs them: `--auto-record` saves defaults before the override applies, and
   `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
   file is the running server's; never run those bare on a host with a live GUI.
+- FLAC defaults are level 8 / threads 8 since the v1.2.1 sync (upstream's `c4bb577`, ported
+  into `gui_settings_table.c` because the fork's defaults live in the table, not in
+  `gui_settings.c`). Only new settings files get them, so an install that already saved
+  `flac_threads` 0 keeps 0 — and upstream's startup popup then fires once per launch on an
+  attended GUI until someone raises it. That popup lives in the render loop, so no headless
+  mode can reach it: `--net-serve`, `--auto-record` and the preview/video/rtsp modes all
+  return before `InitWindow`, which is why cs0's `--config ... --net-serve` unit is unaffected.
 
 ## Worktrees and git hygiene
 
