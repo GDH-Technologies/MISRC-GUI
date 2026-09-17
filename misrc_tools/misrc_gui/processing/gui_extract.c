@@ -125,8 +125,16 @@ static int extraction_thread(void *ctx) {
         // Re-read capture_has_channel_b each iteration so upstream dual-ADC
         // auto-detection (sets flag on first stream_id=1 callback) is picked
         // up without restarting the extraction thread.
-        // An A-only function never fills s_buf_b, so B cannot become present
-        // mid-run unless the function chosen at start unpacks it.
+        // Channel B can join or leave mid-run (RF B toggled on a connected
+        // two-card CXADC rig), so follow the flag with the unpack function.
+        // The upstream backend always unpacks A+B. An A-only function never
+        // fills s_buf_b, so B is present only when the function unpacks it.
+        bool want_ab = s_extract_app &&
+                       (s_extract_app->capture_has_channel_b || s_extract_app->capture_backend_upstream);
+        if (want_ab != s_extract_fn_ab) {
+            s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, want_ab ? (void*)1 : NULL);
+            s_extract_fn_ab = want_ab;
+        }
         s_b_present = s_extract_fn_ab && s_extract_app && s_extract_app->capture_has_channel_b;
         s_extract_fn((uint32_t*)buf, BUFFER_READ_SIZE, clip, s_buf_aux, s_buf_a, s_buf_b, peak);
         if (!s_b_present && s_extract_fn_ab) {

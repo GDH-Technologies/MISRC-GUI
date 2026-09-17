@@ -2971,3 +2971,17 @@ bool gui_capture_device_timeout(gui_app_t *app, uint32_t timeout_ms) {
 
     return (now - last_cb) > timeout_ms;
 }
+
+void gui_capture_service_channel_b(gui_app_t *app)
+{
+    if (!app || !app->is_capturing || !gui_cxadc_has_card_b()) return;
+    // capture_b is locked while recording; never move card 1 under a file.
+    if (app->is_recording) return;
+    if (gui_cxadc_sync_card_b(app, app->settings.capture_b) != 0) {
+        app->settings.capture_b = false;
+        app->settings.enable_resample_b = false;
+        gui_settings_save(&app->settings);
+        gui_app_set_status(app, "CXADC card 1 could not be opened; RF B turned off");
+    }
+    app->capture_has_channel_b = gui_cxadc_card_b_reading();
+}

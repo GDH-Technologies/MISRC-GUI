@@ -57,4 +57,9 @@ float gui_app_level_autostop_default_vpp(const gui_app_t *app);
 // clamped to a sane positive minimum). Re-defaulted on device change by UI.
 float gui_app_level_autostop_vpp(const gui_app_t *app);
 
+// Main thread, once per frame (window loop and --net-serve): follow RF B on a
+// two-card CXADC connection by opening or closing card 1, and keep
+// capture_has_channel_b in step with what the stream carries.
+void gui_capture_service_channel_b(gui_app_t *app);
+
 #endif // GUI_CAPTURE_H

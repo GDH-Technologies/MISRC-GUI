@@ -277,10 +277,20 @@ typedef struct {
     thrd_t audio_thread;
     bool audio_thread_started;
     int card_count;
-    // Card 1 is opened and read only when RF B is recorded. card_count keeps
+    // Card 1 is opened and read only while RF B is on. card_count keeps
     // meaning "cards present" (it selects the Clockgen 40/20 rate), so an
     // RF-B-off capture on a two-card rig still reports the modded rate.
+    // RF B can be toggled while connected: the main thread opens or closes
+    // card 1 (gui_cxadc_sync_card_b) and hands it over with a two-flag
+    // handshake, so a card is never closed under the RF thread's read():
+    //   b_enabled  main -> RF: card 1 is open and may be read
+    //   b_active   RF -> main: the RF thread may be reading card 1
+    // The RF thread raises b_active before it reads b_enabled; the main
+    // thread clears b_enabled before it reads b_active, and closes the card
+    // only when both are down.
     bool read_b;
+    atomic_bool b_enabled;
+    atomic_bool b_active;
     bool misrc_clockgen_mode;
     bool tenbit_mode[CXADC_MAX_CARDS];
     uint32_t card_sample_rate_hz[CXADC_MAX_CARDS];
@@ -605,6 +615,8 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
 #endif
 }
 
+static int cxadc_apply_tenbit_mode_card(gui_app_t *app, int i, bool mode);
+
 static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool enabled[CXADC_MAX_CARDS])
 {
     if (!app) return -1;
@@ -612,70 +624,80 @@ static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool e
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     for (int i = 0; i < card_count; i++) {
         bool mode = (enabled != NULL) ? enabled[i] : false;
-
-        // Read the card's current tenbit setting first. The cxadc driver
-        // defaults to 8-bit (tenbit=0), so when the user wants 8-bit (the
-        // common case) and the card is already in 8-bit, skip the sysfs write
-        // entirely. This restores the pre-v1.1.6 behaviour where a plain
-        // 8-bit capture start needed no sysfs write permission at all: the
-        // /sys/class/cxadc/cxadcN/device/parameters/* files are root:root
-        // 0644 by default and need a one-time `chgrp video` (+ group memship)
-        // to be writable by non-root users. Writing tenbit=0 on every start
-        // regressed that by requiring write access for an 8-bit capture.
-        int current = -1;
-        bool have_current = (gui_cxadc_get_tenbit(i, &current) == 0);
-        if (have_current && (((current != 0) ? true : false) == mode)) {
-            continue;  // already in the requested mode; no sysfs write needed
-        }
-
-        if (gui_cxadc_set_tenbit(i, mode) != 0) {
-#if !defined(_WIN32)
-            int saved_errno = errno;
-            fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
-                    i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
-            // If the write was denied for permissions, fall back to 8-bit
-            // (the driver default) instead of aborting the whole capture.
-            // 8-bit needs no sysfs write; 10-bit does, but degrading to
-            // 8-bit is better than refusing to start. Revert this card's
-            // tenbit flag so the live sample-rate readout matches reality.
-            if (saved_errno == EACCES || saved_errno == EPERM) {
-                fprintf(stderr, "[CXADC] sysfs write denied; falling back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/* for 10-bit)\n");
-                if (mode) {
-                    s_cxadc.tenbit_mode[i] = false;
-                    app->settings.cxadc_tenbit_mode_card[i] = false;
-                    if (i == 0) app->settings.rf_bits_a = 8;
-                    else app->settings.rf_bits_b = 8;
-                    gui_settings_save(&app->settings);
-                    gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
-                    // Ask the UI thread to show a help popup with the full
-                    // one-time setup instructions (consumed in gui_handle_interactions).
-                    atomic_store(&app->cxadc_perm_help_pending, true);
-                }
-                continue;
-            }
-#else
-            fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed\n",
-                    i, mode ? "10-bit" : "8-bit");
-#endif
-            return -1;
-        }
-        int readback = -1;
-        if (gui_cxadc_get_tenbit(i, &readback) != 0) {
-#if !defined(_WIN32)
-            fprintf(stderr, "[CXADC] tenbit readback failed on card %d: %s (errno %d)\n",
-                    i, strerror(errno), errno);
-#endif
-            return -1;
-        }
-        if (((readback != 0) ? true : false) != mode) {
-            fprintf(stderr, "[CXADC] tenbit readback mismatch on card %d: expected %s got %s\n",
-                    i, mode ? "10-bit" : "8-bit", readback ? "10-bit" : "8-bit");
-            errno = EIO;
+        if (cxadc_apply_tenbit_mode_card(app, i, mode) != 0) {
             return -1;
         }
     }
     return 0;
 }
+
+// Main thread only: it may rewrite and save settings on the 8-bit fallback.
+static int cxadc_apply_tenbit_mode_card(gui_app_t *app, int i, bool mode)
+{
+    (void)app;  // only the non-Windows 8-bit fallback uses it
+    // Read the card's current tenbit setting first. The cxadc driver
+    // defaults to 8-bit (tenbit=0), so when the user wants 8-bit (the
+    // common case) and the card is already in 8-bit, skip the sysfs write
+    // entirely. This restores the pre-v1.1.6 behaviour where a plain
+    // 8-bit capture start needed no sysfs write permission at all: the
+    // /sys/class/cxadc/cxadcN/device/parameters/* files are root:root
+    // 0644 by default and need a one-time `chgrp video` (+ group memship)
+    // to be writable by non-root users. Writing tenbit=0 on every start
+    // regressed that by requiring write access for an 8-bit capture.
+    int current = -1;
+    bool have_current = (gui_cxadc_get_tenbit(i, &current) == 0);
+    if (have_current && (((current != 0) ? true : false) == mode)) {
+        return 0;  // already in the requested mode; no sysfs write needed
+    }
+
+    if (gui_cxadc_set_tenbit(i, mode) != 0) {
+#if !defined(_WIN32)
+        int saved_errno = errno;
+        fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
+                i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
+        // If the write was denied for permissions, fall back to 8-bit
+        // (the driver default) instead of aborting the whole capture.
+        // 8-bit needs no sysfs write; 10-bit does, but degrading to
+        // 8-bit is better than refusing to start. Revert this card's
+        // tenbit flag so the live sample-rate readout matches reality.
+        if (saved_errno == EACCES || saved_errno == EPERM) {
+            fprintf(stderr, "[CXADC] sysfs write denied; falling back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/* for 10-bit)\n");
+            if (mode) {
+                s_cxadc.tenbit_mode[i] = false;
+                app->settings.cxadc_tenbit_mode_card[i] = false;
+                if (i == 0) app->settings.rf_bits_a = 8;
+                else app->settings.rf_bits_b = 8;
+                gui_settings_save(&app->settings);
+                gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
+                // Ask the UI thread to show a help popup with the full
+                // one-time setup instructions (consumed in gui_handle_interactions).
+                atomic_store(&app->cxadc_perm_help_pending, true);
+            }
+            return 0;
+        }
+#else
+        fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed\n",
+                i, mode ? "10-bit" : "8-bit");
+#endif
+        return -1;
+    }
+    int readback = -1;
+    if (gui_cxadc_get_tenbit(i, &readback) != 0) {
+#if !defined(_WIN32)
+        fprintf(stderr, "[CXADC] tenbit readback failed on card %d: %s (errno %d)\n",
+                i, strerror(errno), errno);
+#endif
+        return -1;
+    }
+    if (((readback != 0) ? true : false) != mode) {
+        fprintf(stderr, "[CXADC] tenbit readback mismatch on card %d: expected %s got %s\n",
+                i, mode ? "10-bit" : "8-bit", readback ? "10-bit" : "8-bit");
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_b)
 {
     if (sample_a > 2047) sample_a = 2047;
@@ -1831,15 +1853,16 @@ static int cxadc_capture_thread(void *ctx_ptr)
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
 
     uint8_t *card_buf_a = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES);
-    uint8_t *card_buf_b = ctx->read_b ? (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES) : NULL;
-    if (!card_buf_a || (ctx->read_b && !card_buf_b)) {
+    // Card B's buffer exists whenever a second card does, so RF B can be
+    // turned on while connected.
+    uint8_t *card_buf_b = (ctx->card_count > 1) ? (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES) : NULL;
+    if (!card_buf_a || (ctx->card_count > 1 && !card_buf_b)) {
         free(card_buf_a);
         free(card_buf_b);
         gui_app_set_status(app, "CXADC: failed to allocate capture buffers");
         return -1;
     }
     const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
-    const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
 
     atomic_store(&app->stream_synced, true);
     atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
@@ -1864,21 +1887,30 @@ static int cxadc_capture_thread(void *ctx_ptr)
             thrd_sleep_ms(1);
             continue;
         }
-        if (ctx->read_b) {
+        // Handshake with gui_cxadc_sync_card_b: raise b_active first, then
+        // look at b_enabled, and drop b_active again if card 1 is not ours.
+        bool read_b = false;
+        if (card_buf_b) {
+            atomic_store(&ctx->b_active, true);
+            read_b = atomic_load(&ctx->b_enabled);
+            if (!read_b) atomic_store(&ctx->b_active, false);
+        }
+        const bool tenbit_b = read_b && ctx->tenbit_mode[1];
+        if (read_b) {
 #if defined(_WIN32)
-            int read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+            int read_b_bytes = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
 #else
-            int read_b = cxadc_read_card(ctx->card_fds[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+            int read_b_bytes = cxadc_read_card(ctx->card_fds[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
 #endif
-            if (read_b < 0) {
+            if (read_b_bytes < 0) {
                 gui_app_set_status(app, "CXADC read error on card 1");
                 break;
             }
-            if (read_b == 0) {
+            if (read_b_bytes == 0) {
                 thrd_sleep_ms(1);
                 continue;
             }
-            int output_samples_b = read_b / input_bytes_per_sample_b;
+            int output_samples_b = read_b_bytes / (tenbit_b ? 2 : 1);
             if (output_samples_b < output_samples) {
                 output_samples = output_samples_b;
             }
@@ -1905,8 +1937,8 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 sample_a = cxadc_decode_sample_8bit(card_buf_a[i]);
             }
             int16_t sample_b = 0;
-            if (ctx->read_b) {
-                if (ctx->tenbit_mode[1]) {
+            if (read_b) {
+                if (tenbit_b) {
                     int idx = i * 2;
                     sample_b = cxadc_decode_sample_tenbit(card_buf_b[idx], card_buf_b[idx + 1]);
                 } else {
@@ -2016,9 +2048,72 @@ bool gui_cxadc_audio_capture_active(void)
     return s_cxadc.audio_device_name[0] != '\0';
 }
 
-bool gui_cxadc_card_b_skipped(void)
+static bool cxadc_card_b_is_open(const cxadc_ctx_t *ctx)
 {
-    return atomic_load(&s_cxadc.running) && s_cxadc.card_count > 1 && !s_cxadc.read_b;
+#if defined(_WIN32)
+    return ctx->card_handles[1] != INVALID_HANDLE_VALUE;
+#else
+    return ctx->card_fds[1] >= 0;
+#endif
+}
+
+int gui_cxadc_sync_card_b(gui_app_t *app, bool want)
+{
+    if (!app || !atomic_load(&s_cxadc.running) || !s_cxadc.rf_thread_started ||
+        s_cxadc.card_count < 2) {
+        return 0;
+    }
+    bool enabled = atomic_load(&s_cxadc.b_enabled);
+
+    if (!want && enabled) {
+        atomic_store(&s_cxadc.b_enabled, false);
+        enabled = false;
+    }
+    if (!enabled && !atomic_load(&s_cxadc.b_active) && cxadc_card_b_is_open(&s_cxadc)) {
+#if defined(_WIN32)
+        cxadc_close_handle(&s_cxadc.card_handles[1]);
+#else
+        cxadc_close_fd(&s_cxadc.card_fds[1]);
+#endif
+        s_cxadc.read_b = false;
+        fprintf(stderr, "[CXADC] RF B off: card 1 closed\n");
+    }
+
+    if (want && !enabled && !cxadc_card_b_is_open(&s_cxadc)) {
+        // The depth chosen at connect, not the live setting: a bit-mode change
+        // applies on the next connect, and cards at different depths would
+        // cut every A chunk to B's sample count.
+        if (cxadc_apply_tenbit_mode_card(app, 1, s_cxadc.tenbit_mode[1]) != 0) {
+            fprintf(stderr, "[CXADC] RF B on: tenbit setup failed on card 1\n");
+            return -1;
+        }
+#if defined(_WIN32)
+        s_cxadc.card_handles[1] = cxadc_open_card(1);
+        bool opened = s_cxadc.card_handles[1] != INVALID_HANDLE_VALUE;
+#else
+        s_cxadc.card_fds[1] = cxadc_open_card(1);
+        bool opened = s_cxadc.card_fds[1] >= 0;
+#endif
+        if (!opened) {
+            fprintf(stderr, "[CXADC] RF B on: failed to open card 1\n");
+            return -1;
+        }
+        s_cxadc.read_b = true;
+        atomic_store(&s_cxadc.b_enabled, true);
+        fprintf(stderr, "[CXADC] RF B on: card 1 opened\n");
+    }
+    return 0;
+}
+
+bool gui_cxadc_card_b_reading(void)
+{
+    return atomic_load(&s_cxadc.running) && atomic_load(&s_cxadc.b_enabled) &&
+           atomic_load(&s_cxadc.b_active);
+}
+
+bool gui_cxadc_has_card_b(void)
+{
+    return atomic_load(&s_cxadc.running) && s_cxadc.rf_thread_started && s_cxadc.card_count > 1;
 }
 
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
@@ -2036,6 +2131,10 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     s_cxadc.app = app;
     s_cxadc.card_count = card_count;
     s_cxadc.read_b = (card_count > 1) && app->settings.capture_b;
+    // The RF thread is not running yet, so b_active can start where it will
+    // be after its first read.
+    atomic_store(&s_cxadc.b_enabled, s_cxadc.read_b);
+    atomic_store(&s_cxadc.b_active, s_cxadc.read_b);
     s_cxadc.misrc_clockgen_mode = misrc_clockgen_mode;
     // Cards actually programmed and opened: card 1 only when RF B is read.
     const int open_count = s_cxadc.read_b ? card_count : (card_count > 0 ? 1 : 0);
