@@ -664,6 +664,11 @@ int main(int argc, char **argv) {
     int last_layout_width = -1;
     int last_layout_height = -1;
     bool recording_fps_throttle = false;
+    // One-time startup warning: if FLAC threads is 0 (auto, e.g. loaded from
+    // saved settings), warn once on launch so the user knows auto may under-use
+    // cores. The FlacThreadsMinus handler only fires on the 1->0 click
+    // transition, so a session that starts at 0 would never warn without this.
+    bool flac_threads_zero_warned = false;
     gui_ui_zoom_state_t ui_zoom_state = {0};
     bool ui_scale_save_pending = false;
     double ui_scale_save_deadline = 0.0;
@@ -762,6 +767,21 @@ int main(int argc, char **argv) {
 
         // Check for pending popup result (for async confirmations like file overwrite)
         gui_record_check_popup(&app);
+
+        // One-time startup warning: if FLAC threads is 0 (auto), warn once.
+        // Uses a local bool so it fires only once per session, on the first
+        // frame where no other popup is open.
+        if (!flac_threads_zero_warned && !gui_popup_is_open()) {
+            flac_threads_zero_warned = true;
+            if (app.settings.flac_threads == 0) {
+                gui_popup_info("FLAC threads set to auto (0)",
+                    "FLAC encoder threads is 0 (auto).\n\n"
+                    "Auto may not use all available CPU cores efficiently.\n"
+                    "For best encode throughput on multi-core systems, set an\n"
+                    "explicit thread count (e.g. 4, 6, or 8) in Settings.\n\n"
+                    "You can raise it with the + button.");
+            }
+        }
 
         // Handle keyboard shortcuts
         // Popup gets priority for keyboard input
