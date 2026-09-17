@@ -2805,6 +2805,14 @@ int gui_record_start(gui_app_t *app) {
         return RECORD_ERROR;
     }
 
+    /* RF B was just turned on while connected: card 1 opens on the main
+     * thread and joins the stream on the RF thread's next read. A recording
+     * started in that gap would begin B late, so wait for it. */
+    if (app->settings.capture_b && gui_cxadc_has_card_b() && !app->capture_has_channel_b) {
+        gui_app_set_status(app, "Channel B is still opening; try again");
+        return RECORD_ERROR;
+    }
+
     if (app->is_recording) {
         return RECORD_OK;
     }

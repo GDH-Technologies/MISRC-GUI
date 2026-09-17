@@ -1203,6 +1203,7 @@ int main(int argc, char **argv) {
         // are no-ops when net_mode == Local.
         gui_net_poll_commands(&app);
         gui_net_poll_mirror(&app);
+        gui_capture_service_channel_b(&app);
 
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
         if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
