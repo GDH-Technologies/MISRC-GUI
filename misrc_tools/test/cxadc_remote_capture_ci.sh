@@ -61,7 +61,7 @@ CLIENT_LOG="$WORK/client.stderr.log"
 # --- Launch server ---
 pkill -f "misrc_gui --config $WORK" 2>/dev/null || true
 sleep 1
-nohup "$GUI_BIN" --config "$SERVER_CFG" >"$WORK/server.stdout.log" 2>"$SERVER_LOG" &
+nohup "$GUI_BIN" --config "$SERVER_CFG" --auto-connect >"$WORK/server.stdout.log" 2>"$SERVER_LOG" &
 SERVER_PID=$!
 sleep 3
 kill -0 "$SERVER_PID" 2>/dev/null || fail "server process died within 3s"
@@ -79,12 +79,13 @@ STATS="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/stats" 2>/dev/null)"
 printf '%s\n' "$STATS" | grep -q '"sample_rate"' || fail "server /stats missing sample_rate field"
 
 # --- Launch client ---
-nohup "$GUI_BIN" --config "$CLIENT_CFG" >"$WORK/client.stdout.log" 2>"$CLIENT_LOG" &
+nohup "$GUI_BIN" --config "$CLIENT_CFG" --auto-connect >"$WORK/client.stdout.log" 2>"$CLIENT_LOG" &
 CLIENT_PID=$!
 sleep 4
 kill -0 "$CLIENT_PID" 2>/dev/null || fail "client process died within 4s"
 
 # Verify client connected and pumps started
+grep -qF -- "--auto-connect: client mode" "$CLIENT_LOG" || fail "client auto-connect did not trigger"
 grep -q "client worker started -> 127.0.0.1:$PORT" "$CLIENT_LOG" || fail "client worker did not start"
 grep -q "pump /rf streaming" "$CLIENT_LOG" || fail "client /rf pump did not start"
 grep -q "pump /baseband streaming" "$CLIENT_LOG" || fail "client /baseband pump did not start"

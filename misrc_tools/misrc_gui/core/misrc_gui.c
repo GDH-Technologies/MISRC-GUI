@@ -81,7 +81,7 @@ static void print_usage(const char *program_name) {
     fprintf(stdout,
             "MISRC GUI %s\n"
             "Usage:\n"
-            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>]\n"
+            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect]\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
@@ -394,6 +394,7 @@ int main(int argc, char **argv) {
     bool show_help = false;
     bool show_version = false;
     bool smoke_test = false;
+    bool auto_connect = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
@@ -412,6 +413,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--smoke-test") == 0) {
             smoke_test = true;
+            continue;
+        }
+        if (strcmp(a, "--auto-connect") == 0) {
+            auto_connect = true;
             continue;
         }
         if (strcmp(argv[i], "--debug-view") == 0) {
@@ -448,6 +453,13 @@ int main(int argc, char **argv) {
     }
     if (smoke_test) {
         return 0;
+    }
+    if (auto_connect && !config_path) {
+        // --auto-connect requires --config so the net_mode/host are known.
+        // Without a config the stock loadup is Local and there is nothing to
+        // auto-connect to.
+        fprintf(stderr, "--auto-connect requires --config <path> (need a server/client config)\n");
+        return 1;
     }
 #if defined(__APPLE__)
     int elevate_rc = gui_macos_relaunch_as_admin_if_needed(argc, argv);
@@ -590,9 +602,33 @@ int main(int argc, char **argv) {
     // Enable auto-reconnect by default
     app.auto_reconnect_enabled = true;
 
-    // Do not auto-start capture on launch.
-    // Keep mode controls toggleable until the user explicitly clicks Connect.
-    if (app.device_count > 0) {
+    // --auto-connect: when launched with a server/client config, trigger the
+    // full connection chain without human intervention. Server mode
+    // auto-starts capture so RF data flows to clients; Client mode
+    // auto-connects to the configured server (the worker already starts
+    // from gui_app_init when a host is set, but set the status so the
+    // user knows the connection is automatic, not waiting for a click).
+    if (auto_connect) {
+        if (app.settings.net_mode == GUI_NET_MODE_SERVER) {
+            // Server: auto-start capture after a short delay so devices
+            // have time to enumerate. The reconnect logic in the main
+            // loop will pick this up and start capture.
+            app.reconnect_pending = true;
+            app.reconnect_attempt_time = GetTime() + 1.0;  // 1s grace
+            app.reconnect_attempts = 0;
+            gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+            gui_app_set_status(&app, "Auto-connect: starting server capture...");
+            fprintf(stderr, "[GUI] --auto-connect: server mode, auto-starting capture\n");
+        } else if (app.settings.net_mode == GUI_NET_MODE_CLIENT) {
+            // Client: the worker already started from gui_app_init.
+            // Just confirm the connection is automatic.
+            gui_app_set_status(&app, "Auto-connect: client connecting to server...");
+            fprintf(stderr, "[GUI] --auto-connect: client mode, auto-connecting to %s:%u\n",
+                    app.settings.net_client_host, (unsigned)app.settings.net_client_port);
+        } else {
+            fprintf(stderr, "[GUI] --auto-connect: net_mode is Local, nothing to auto-connect to\n");
+        }
+    } else if (app.device_count > 0) {
         int hs_idx = gui_find_first_device_of_type(&app, DEVICE_TYPE_HSDAOH);
         if (hs_idx >= 0) {
             app.selected_device = hs_idx;
