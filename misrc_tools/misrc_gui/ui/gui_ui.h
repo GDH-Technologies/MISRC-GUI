@@ -83,7 +83,72 @@ bool gui_ui_click_consumed(void);
 // Text measurement function (from clay_renderer_raylib.c)
 Clay_Dimensions Raylib_MeasureText(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData);
 
+/* Draws a gear of outer radius r centred on (cx, cy), with raylib primitives
+ * rather than a glyph or a texture. Exported because the preview panel's
+ * overlay is drawn straight to the canvas and cannot use the Clay custom
+ * element the toolbar and channel gears go through. */
+void gui_draw_gear_icon(float cx, float cy, float r, Color col);
+
 // Raylib render function (from clay_renderer_raylib.c)
 void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts);
+
+/* ---- editable text fields ------------------------------------------------
+ *
+ * The edit state (which field, caret, selection) stays private to gui_ui.c;
+ * only the identity of a field and the three calls a renderer needs are
+ * exported. A settings surface that lives outside gui_ui.c -- the USB
+ * Reference Video dialog -- has editable tags like any other, and could not
+ * draw them otherwise.
+ *
+ * ui_text_field_t is an identity, not an index: gui_ui_text_field_can_edit()
+ * decides per field whether editing is allowed right now, which is where a
+ * field belonging to a window other than the settings panel is handled. */
+typedef enum {
+    UI_TEXT_FIELD_NONE = 0,
+    UI_TEXT_FIELD_OUTPUT_BASE_NAME,
+    UI_TEXT_FIELD_OUTPUT_PATH,
+    UI_TEXT_FIELD_FLAC_AFFINITY,
+    UI_TEXT_FIELD_RF_TAG_A,
+    UI_TEXT_FIELD_RF_TAG_B,
+    UI_TEXT_FIELD_AUDIO_TAG_4CH,
+    UI_TEXT_FIELD_VIDEO_TAG,
+    UI_TEXT_FIELD_CC_TAG,
+    UI_TEXT_FIELD_AUDIO_TAG_12,
+    UI_TEXT_FIELD_AUDIO_TAG_34,
+    UI_TEXT_FIELD_AUDIO_LABEL_1,
+    UI_TEXT_FIELD_AUDIO_LABEL_2,
+    UI_TEXT_FIELD_AUDIO_LABEL_3,
+    UI_TEXT_FIELD_AUDIO_LABEL_4,
+    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold (normalized 0.1-0.8)
+    UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION,  // Level autostop sustain seconds
+    UI_TEXT_FIELD_INGEST_PROJECT,
+    UI_TEXT_FIELD_INGEST_TAPE_ID,
+    UI_TEXT_FIELD_INGEST_TAPE_FORMAT,
+    UI_TEXT_FIELD_INGEST_TAPE_SIZE,
+    UI_TEXT_FIELD_INGEST_TAPE_SPEED,
+    UI_TEXT_FIELD_INGEST_TAPE_CONDITION,
+    UI_TEXT_FIELD_INGEST_OPERATOR,
+    UI_TEXT_FIELD_INGEST_LOCATION,
+    UI_TEXT_FIELD_INGEST_NOTES,
+    UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
+    UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
+    UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
+    UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
+} ui_text_field_t;
+
+bool gui_ui_is_text_field_active(ui_text_field_t field);
+void gui_ui_render_active_text(ui_text_field_t field, const char *text,
+                               int font_size, int font_id, Color text_color);
+void gui_ui_begin_text_edit(gui_app_t *app, ui_text_field_t field,
+                            Clay_ElementId element_id, float pad_left, float pad_right);
+
+/* True while a settings surface must refuse edits: no capture may be running,
+ * and on a net client the server must be reachable and idle. */
+bool gui_ui_settings_locked(const gui_app_t *app);
+
+int gui_ui_clamp_int(int value, int min_value, int max_value);
+
+/* Control on Linux and Windows, Command on macOS. */
+bool gui_ui_primary_mod_down(void);
 
 #endif // GUI_UI_H

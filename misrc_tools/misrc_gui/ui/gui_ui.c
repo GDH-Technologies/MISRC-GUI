@@ -6,6 +6,7 @@
 #include "gui_ui.h"
 #include "gui_dropdown.h"
 #include "gui_popup.h"
+#include "gui_usbref_settings.h"
 #include "gui_device_label.h"
 #include "../visualization/gui_fft.h"
 #include "../visualization/gui_oscilloscope.h"
@@ -405,161 +406,6 @@ static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
     return app->settings.cxadc_tenbit_mode_card[card_idx] ? 16 : 8;
 }
-/* Remember which USB preview device is selected, so the next launch can reopen
- * it. Stored by path: /dev/videoN survives a reboot, an enumeration index does
- * not. */
-static void gui_ui_remember_preview_device(gui_app_t *app)
-{
-    size_t n = 0;
-    const preview_device_t *devs = gui_preview_devices(&n);
-    int sel = gui_preview_selected_device();
-    if (sel < 0 || (size_t)sel >= n) return;
-    snprintf(app->settings.preview_device_path, sizeof(app->settings.preview_device_path),
-             "%s", devs[sel].path);
-    gui_settings_save(&app->settings);
-}
-
-/* The three ways to watch the stream, in the order the panel lists them. One
- * place to ask which row is which, so the layout, the click handler and the
- * clipboard cannot drift apart. */
-#define RTSP_URL_COUNT 3
-
-static const char *rtsp_url_kind_label(int kind)
-{
-    switch (kind) {
-        case 0:  return "RTSP";
-        case 1:  return "WebRTC";
-        default: return "HLS";
-    }
-}
-
-static const char *rtsp_url_for_kind(const gui_rtsp_stream_status_t *st, int kind)
-{
-    if (!st) return "";
-    switch (kind) {
-        case 0:  return st->url_rtsp;
-        case 1:  return st->url_webrtc;
-        default: return st->url_hls;
-    }
-}
-
-/* raylib's OpenURL() pastes the string into a shell command and runs it through
- * system(), guarding only against a single quote. These URLs are ours -- a
- * fixed scheme, a fixed path, a port number -- but the host is gethostname() in
- * LAN mode, and gui_rtsp_stream_opts_t::reader_host is a public field a future
- * caller could wire to a settings string a user edits by hand. Stating what a
- * URL may contain is a sounder contract than trusting one blacklisted
- * character, so nothing reaches the shell that is not plainly a URL we built. */
-static bool rtsp_url_is_safe_to_open(const char *url)
-{
-    if (!url || !url[0] || strlen(url) >= 256) return false;
-
-    size_t off;
-    if      (strncmp(url, "rtsp://", 7) == 0) off = 7;
-    else if (strncmp(url, "http://", 7) == 0) off = 7;
-    else return false;
-    if (!url[off]) return false;   /* a scheme with no host is not openable */
-
-    for (const char *p = url + off; *p; p++) {
-        const bool ok = (*p >= 'a' && *p <= 'z') ||
-                        (*p >= 'A' && *p <= 'Z') ||
-                        (*p >= '0' && *p <= '9') ||
-                        *p == '.' || *p == '-' || *p == '_' ||
-                        *p == ':' || *p == '/';
-        if (!ok) return false;
-    }
-    return true;
-}
-
-/* Control on Linux and Windows, Command on macOS -- the same modifier the text
- * fields already treat as primary. */
-static bool gui_ui_primary_mod_down(void)
-{
-    bool down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-#if defined(__APPLE__)
-    down = down || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
-#endif
-    return down;
-}
-
-/* Copy one reader URL and say which one, so the status line is not a bare
- * "copied" that leaves you guessing which of the three you got. */
-static void rtsp_url_copy(gui_app_t *app, int kind, const char *url)
-{
-    char msg[64];
-    SetClipboardText(url);
-    snprintf(msg, sizeof(msg), "%s URL copied", rtsp_url_kind_label(kind));
-    gui_app_set_status(app, msg);
-}
-
-/* Start or stop the stream from the panel toggle.
- *
- * Acts immediately rather than arming a flag the way the reference-recording
- * toggle does: the panel shows live counters and URLs, and a toggle that only
- * took effect at the next capture would leave both lying. */
-static bool gui_ui_set_rtsp_stream(gui_app_t *app, bool want)
-{
-    if (!want) {
-        if (!gui_rtsp_stream_is_running()) return true;
-        gui_rtsp_stream_request_stop();
-        gui_rtsp_stream_finish();
-        app->settings.rtsp_stream_enabled = false;
-        gui_settings_save(&app->settings);
-        gui_app_set_status(app, "Stream stopped");
-        return true;
-    }
-    if (gui_rtsp_stream_is_running()) return true;
-
-    if (!gui_mediamtx_probe()) {
-        gui_app_set_status(app, "mediamtx was not found; the stream cannot be started");
-        return false;
-    }
-
-    preview_status_t ps = gui_preview_get_status();
-    if (ps.width == 0 || ps.height == 0) {
-        /* The stream is a tee off the preview; without a connected device there
-         * is no geometry to negotiate and nothing to publish. */
-        gui_app_set_status(app, "Connect the USB preview before starting the stream");
-        return false;
-    }
-
-    gui_rtsp_stream_opts_t opts = {0};
-    opts.width = ps.width;
-    opts.height = ps.height;
-    opts.pitch = gui_preview_negotiated_pitch();
-    if (opts.pitch == 0) opts.pitch = ps.width * 2;
-    opts.fps_num = ps.fps_num ? ps.fps_num : 25;
-    opts.fps_den = ps.fps_den ? ps.fps_den : 1;
-    opts.video_device = ps.device_path;
-    opts.audio_device = app->settings.rtsp_audio_device;
-    opts.encoder = (rtsp_encoder_t)app->settings.rtsp_stream_encoder;
-    opts.bitrate_kbps = (uint32_t)app->settings.rtsp_stream_bitrate_kbps;
-    opts.deinterlace = app->settings.rtsp_stream_deinterlace;
-    opts.ports = gui_mediamtx_default_config();
-    opts.ports.lan = app->settings.rtsp_stream_lan;
-    if (app->settings.rtsp_stream_port > 0) {
-        opts.ports.rtsp = (uint16_t)app->settings.rtsp_stream_port;
-    }
-    opts.reader_host = "";
-    opts.want_password = app->settings.rtsp_stream_password;
-
-    char err[192] = {0};
-    if (gui_rtsp_stream_start(&opts, err, sizeof(err)) != 0) {
-        gui_app_set_status(app, err[0] ? err : "the stream could not be started");
-        return false;
-    }
-    app->settings.rtsp_stream_enabled = true;
-    gui_settings_save(&app->settings);
-    /* start() only launches. Whether ffmpeg survived shows up in the panel a
-     * moment later, via gui_rtsp_stream_poll(). */
-    gui_app_set_status(app, "Starting the stream...");
-    return true;
-}
-
-static void gui_ui_toggle_rtsp_stream(gui_app_t *app)
-{
-    (void)gui_ui_set_rtsp_stream(app, !gui_rtsp_stream_is_running());
-}
 
 /* The bit-depth and resample-rate clamp that follows a card's tenbit flag. */
 static void gui_ui_apply_cxadc_bit_mode_clamp(gui_app_t *app, int card_idx)
@@ -825,38 +671,8 @@ static void gui_ui_trace_capture_mode_render(gui_app_t *app, bool rendered_mode,
     s_capture_mode_render_last_source_runtime = source_runtime;
 }
 
-typedef enum {
-    UI_TEXT_FIELD_NONE = 0,
-    UI_TEXT_FIELD_OUTPUT_BASE_NAME,
-    UI_TEXT_FIELD_OUTPUT_PATH,
-    UI_TEXT_FIELD_FLAC_AFFINITY,
-    UI_TEXT_FIELD_RF_TAG_A,
-    UI_TEXT_FIELD_RF_TAG_B,
-    UI_TEXT_FIELD_AUDIO_TAG_4CH,
-    UI_TEXT_FIELD_VIDEO_TAG,
-    UI_TEXT_FIELD_CC_TAG,
-    UI_TEXT_FIELD_AUDIO_TAG_12,
-    UI_TEXT_FIELD_AUDIO_TAG_34,
-    UI_TEXT_FIELD_AUDIO_LABEL_1,
-    UI_TEXT_FIELD_AUDIO_LABEL_2,
-    UI_TEXT_FIELD_AUDIO_LABEL_3,
-    UI_TEXT_FIELD_AUDIO_LABEL_4,
-    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold (normalized 0.1-0.8)
-    UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION,  // Level autostop sustain seconds
-    UI_TEXT_FIELD_INGEST_PROJECT,
-    UI_TEXT_FIELD_INGEST_TAPE_ID,
-    UI_TEXT_FIELD_INGEST_TAPE_FORMAT,
-    UI_TEXT_FIELD_INGEST_TAPE_SIZE,
-    UI_TEXT_FIELD_INGEST_TAPE_SPEED,
-    UI_TEXT_FIELD_INGEST_TAPE_CONDITION,
-    UI_TEXT_FIELD_INGEST_OPERATOR,
-    UI_TEXT_FIELD_INGEST_LOCATION,
-    UI_TEXT_FIELD_INGEST_NOTES,
-    UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
-    UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
-    UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
-    UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
-} ui_text_field_t;
+/* ui_text_field_t moved to gui_ui.h: the USB Reference Video dialog draws
+ * editable tags too, and could not name a field otherwise. */
 
 // Above this the CX front end's own noise starts interfering with the signal,
 // so the value is tinted as a warning rather than blocked.
@@ -902,20 +718,8 @@ static char s_rtlsdr_freq_str[32] = {0};
 static bool s_record_limit_window_open = false;
 // Version info popup state (toolbar "i" badge button)
 static bool s_version_info_window_open = false;
-/* Asks once, the first time the stream is pointed at the network. After the
- * answer is remembered in settings this stays false forever. */
-static bool s_rtsp_lan_confirm_open = false;
-/* The stream's video encoder settings, which are too many for the row they
- * belong to and are all baked in when ffmpeg is spawned. */
-static bool s_rtsp_codec_window_open = false;
-
-/* Bitrate stepper bounds. Kept inside the range gui_settings.c will accept on
- * reload (0, or 100..100000) so a value set here survives a restart, and well
- * inside what is sensible for a 720x576 preview. */
-#define RTSP_BITRATE_DEFAULT_KBPS 2000
-#define RTSP_BITRATE_MIN_KBPS      500
-#define RTSP_BITRATE_MAX_KBPS    20000
-#define RTSP_BITRATE_STEP_KBPS     250
+/* The stream's LAN confirmation, encoder sheet and bitrate bounds moved to
+ * ui/gui_usbref_settings.c with the rest of the streaming UI. */
 // Metadata popup state (toolbar scroll badge button)
 static bool s_metadata_window_open = false;
 static bool s_record_limit_armed = false;
@@ -2125,7 +1929,7 @@ static Color ui_disabled_color(Color c) {
     // Dim and slightly transparent.
     return (Color){ (unsigned char)(c.r * 0.55f), (unsigned char)(c.g * 0.55f), (unsigned char)(c.b * 0.55f), (unsigned char)(c.a * 0.80f) };
 }
-static int gui_ui_clamp_int(int value, int min_value, int max_value)
+int gui_ui_clamp_int(int value, int min_value, int max_value)
 {
     if (value < min_value) return min_value;
     if (value > max_value) return max_value;
@@ -2397,7 +2201,19 @@ static bool gui_ui_flac_affinity_char_allowed(int ch) {
     return ((ch >= '0' && ch <= '9') || ch == ',' || ch == '-' || ch == ' ' || ch == '\t');
 }
 
-static bool gui_ui_is_text_field_active(ui_text_field_t field)
+/* Control on Linux and Windows, Command on macOS -- the same modifier the text
+ * fields already treat as primary. Shared with the USB Reference Video dialog,
+ * whose stream URLs open on a primary-modified click. */
+bool gui_ui_primary_mod_down(void)
+{
+    bool down = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    down = down || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#endif
+    return down;
+}
+
+bool gui_ui_is_text_field_active(ui_text_field_t field)
 {
     return s_active_text_field == field;
 }
@@ -2416,7 +2232,7 @@ static void gui_ui_clear_text_edit(void)
     s_active_text_backspace_repeat_at = 0.0;
 }
 
-static bool gui_ui_settings_locked(const gui_app_t *app)
+bool gui_ui_settings_locked(const gui_app_t *app)
 {
     if (!app) return false;
     /* A client edits the server's settings: locked while the server records
@@ -2634,6 +2450,15 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
         return s_version_info_window_open;
     }
+    /* The caption tag lives in the USB Reference Video dialog, which opens
+     * independently of the settings panel -- from the preview overlay's gear
+     * with the panel shut. Gating it on settings_panel_open would leave a field
+     * that looks editable and silently is not. Same shape as the net fields
+     * above, which answer to the About window. */
+    if (field == UI_TEXT_FIELD_CC_TAG) {
+        return gui_usbref_settings_is_open() && !gui_ui_settings_locked(app) &&
+               app->settings.auto_names_enabled;
+    }
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
@@ -2728,7 +2553,7 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
         else { snprintf(msg, msg_cap, "expected true or false"); return 422; }
         /* Starts or stops the stream itself, like the panel toggle; the
          * failure reason is the status the toggle would have shown. */
-        if (!gui_ui_set_rtsp_stream(app, want)) {
+        if (!gui_usbref_set_rtsp_stream(app, want)) {
             snprintf(msg, msg_cap, "%s", app->status_message);
             return 409;
         }
@@ -3067,7 +2892,7 @@ static void gui_ui_sort_unique_ints(int *values, int *count)
     *count = out;
 }
 
-static void gui_ui_render_active_text(ui_text_field_t field,
+void gui_ui_render_active_text(ui_text_field_t field,
                                       const char *text,
                                       int font_size,
                                       int font_id,
@@ -3151,7 +2976,7 @@ static void gui_ui_render_active_text(ui_text_field_t field,
     }
 }
 
-static void gui_ui_begin_text_edit(gui_app_t *app, ui_text_field_t field, Clay_ElementId element_id, float left_padding, float right_padding)
+void gui_ui_begin_text_edit(gui_app_t *app, ui_text_field_t field, Clay_ElementId element_id, float left_padding, float right_padding)
 {
     char *dst = NULL;
     size_t cap = 0;
@@ -3805,9 +3630,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT((app->settings.video_record_enabled && ff_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
                         }
                         CLAY_TEXT(CLAY_STRING("Reference video"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        CLAY(CLAY_ID("VideoCodecBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(ff_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.video_record_codec == 1 ? CLAY_STRING("FFV1") : CLAY_STRING("H.264"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ff_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
+                        /* The codec choice moved to the USB Reference Video
+                         * dialog with the rest of the picture settings; the
+                         * hint line below still names which one is in force. */
                         Color vtag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
                         Color vtag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
                         CLAY(CLAY_ID("VideoTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(vtag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
@@ -3832,45 +3657,6 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
                     }
 
-                    // Closed captions: EIA-608 line-21 data read off the capture
-                    // dongle's RAW VBI node by ffmpeg. Not from the RF, and not
-                    // from the preview picture -- the chip clamps capture to 480
-                    // active lines, so line 21 is never in a frame we could see.
-                    // Greyed out unless the whole chain probes clean, so the
-                    // toggle cannot be armed into a state that would refuse a
-                    // recording. The probe is cached; this costs a compare.
-                    gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
-                    gui_cc_record_set_preview_device(app->settings.preview_device_path);
-                    gui_cc_record_set_device(app->settings.cc_vbi_device);
-                    bool cc_ok = (gui_cc_record_probe() == CC_PROBE_OK);
-                    CLAY(CLAY_ID("ToggleRowCaptions"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color cc_bg = app->settings.cc_record_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        if (!cc_ok) cc_bg = ui_disabled_color(cc_bg);
-                        CLAY(CLAY_ID("ToggleCcRecord"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cc_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT((app->settings.cc_record_enabled && cc_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cc_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("Closed captions"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cc_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        Color ctag_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-                        Color ctag_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("CcTagField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(100), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(ctag_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *ctag = app->settings.cc_output_tag[0] ? app->settings.cc_output_tag : "(tag)";
-                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_CC_TAG) && app->settings.auto_names_enabled) {
-                                gui_ui_render_active_text(UI_TEXT_FIELD_CC_TAG, ctag, FONT_SIZE_STATS, 1, ctag_fg);
-                            } else {
-                                CLAY_TEXT(make_string(ctag), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(ctag_fg) }));
-                            }
-                        }
-                    }
-                    // Names the node, or says exactly which link in the chain is
-                    // missing -- ffmpeg, the v4l2vbi input device, the scc muxer,
-                    // the node itself, or another program already holding it.
-                    CLAY(CLAY_ID("CaptionsHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-                        /* static: Clay draws text from this pointer after layout
-                         * returns, so an automatic buffer would be a dangling read. */
-                        static char cc_hint[240];
-                        snprintf(cc_hint, sizeof(cc_hint), "%s", gui_cc_record_probe_hint());
-                        CLAY_TEXT(make_string(cc_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(cc_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
-                    }
 
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
@@ -4047,304 +3833,23 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         .childGap = 8
                     }
                 }) {
-                    // Audio outputs
-                    CLAY_TEXT(CLAY_STRING("USB Preview Video:"),
-                              CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-                    // The device the picture comes from. Both the reference
-                    // recording and the RTSP stream tee off this one preview, so
-                    // the picker belongs here rather than only inside the
-                    // Preview pane -- an RTSP toggle that cannot be armed until
-                    // you visit another pane and click Connect is a strange
-                    // prerequisite for a setting in the settings dialog.
-                    {
-                        size_t n_pv = 0;
-                        const preview_device_t *pv = gui_preview_devices(&n_pv);
-                        int pv_sel = gui_preview_selected_device();
-                        preview_status_t pv_st = gui_preview_get_status();
-                        bool pv_live = (pv_st.state == PREVIEW_STATE_STREAMING ||
-                                        pv_st.state == PREVIEW_STATE_STALLED ||
-                                        pv_st.state == PREVIEW_STATE_CONNECTING ||
-                                        pv_st.state == PREVIEW_STATE_POPPED_OUT);
-                        /* On a net client the preview devices are the SERVER's
-                         * hardware: no connect/rescan here, and the box shows
-                         * the path the server has remembered, read-only. */
-                        bool pv_is_client = gui_net_is_client(app);
-                        CLAY(CLAY_ID("PreviewDeviceRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            if (!pv_is_client) {
-                                CLAY(CLAY_ID("PreviewConnectBtn"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(pv_live ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                    CLAY_TEXT(pv_live ? CLAY_STRING("CONNECTED") : CLAY_STRING("CONNECT"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                            }
-                            CLAY_TEXT(pv_is_client ? CLAY_STRING("Server device") : CLAY_STRING("Device"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                            // Click to cycle. A dropdown would be nicer with
-                            // many devices; there is realistically one dongle.
-                            CLAY(CLAY_ID("PreviewDeviceBox"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                static char pv_label[96];
-                                if (pv_is_client) {
-                                    snprintf(pv_label, sizeof(pv_label), "%s",
-                                             app->settings.preview_device_path[0]
-                                               ? app->settings.preview_device_path
-                                               : "(none remembered on the server)");
-                                } else if (n_pv == 0) {
-                                    snprintf(pv_label, sizeof(pv_label), "%s",
-                                             app->settings.preview_device_path[0]
-                                               ? app->settings.preview_device_path
-                                               : "(no USB video device)");
-                                } else if (pv_sel >= 0 && (size_t)pv_sel < n_pv) {
-                                    snprintf(pv_label, sizeof(pv_label), "%s  %s",
-                                             pv[pv_sel].card, pv[pv_sel].path);
-                                } else {
-                                    snprintf(pv_label, sizeof(pv_label), "(select a device)");
-                                }
-                                CLAY_TEXT(make_string(pv_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color((n_pv || pv_is_client) ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                            }
-                            if (!pv_is_client) {
-                                CLAY(CLAY_ID("PreviewRescanBtn"), { .layout = { .sizing = { CLAY_SIZING_FIXED(66), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                    CLAY_TEXT(CLAY_STRING("Rescan"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                            }
-                        }
-                    }
-
-                    /* Picture shape. These are set once for a deck and then
-                     * left alone, which is why they live here rather than on
-                     * the panel, where Input and Standard are changed per tape.
+                    /* The whole USB reference video surface -- device, picture,
+                     * stream and captions -- lives in its own window now. What
+                     * is left here is the way in.
                      *
-                     * Aspect reaches the preview, the reference MKV and the
-                     * RTSP stream alike, so the three cannot disagree. Crop
-                     * reaches ONLY the preview: the recording keeps the full
-                     * active raster so it stays frame-comparable with a
-                     * tbc-video-export of the same tape. */
-                    CLAY(CLAY_ID("PreviewGeometryRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
-                        CLAY_TEXT(CLAY_STRING("Aspect"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        CLAY(CLAY_ID("PreviewAspectBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(72), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            int am = app->settings.preview_aspect_mode;
-                            const char *aspect_label = (am == 1) ? "4:3"
-                                                     : (am == 2) ? "16:9"
-                                                     : (am == 3) ? "Square" : "Auto";
-                            CLAY_TEXT(make_string(aspect_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        /* Preview-only, and labelled so nobody expects it in
-                         * the file. Each box steps by 2 and wraps at 32. */
-                        CLAY_TEXT(CLAY_STRING("Crop (preview only)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        static char crop_t_buf[8], crop_b_buf[8], crop_l_buf[8], crop_r_buf[8];
-                        snprintf(crop_t_buf, sizeof(crop_t_buf), "T%d", app->settings.preview_crop_top);
-                        snprintf(crop_b_buf, sizeof(crop_b_buf), "B%d", app->settings.preview_crop_bottom);
-                        snprintf(crop_l_buf, sizeof(crop_l_buf), "L%d", app->settings.preview_crop_left);
-                        snprintf(crop_r_buf, sizeof(crop_r_buf), "R%d", app->settings.preview_crop_right);
-                        CLAY(CLAY_ID("PreviewCropTop"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(crop_t_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        CLAY(CLAY_ID("PreviewCropBottom"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(crop_b_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        CLAY(CLAY_ID("PreviewCropLeft"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(crop_l_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        CLAY(CLAY_ID("PreviewCropRight"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(crop_r_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                     * It is not merely tidier: this file is upstream's, and the
+                     * roughly 800 lines that moved were 800 lines of merge
+                     * conflict on every sync. Upstream's settings know none of
+                     * these keys. */
+                    CLAY(CLAY_ID("UsbRefSectionRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+                        CLAY_TEXT(CLAY_STRING("USB Reference Video:"),
+                                  CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY(CLAY_ID("UsbRefOpenBtn"), { .layout = { .sizing = { CLAY_SIZING_FIXED(24), CLAY_SIZING_FIXED(24) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(gui_usbref_settings_is_open() ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY(CLAY_ID("UsbRefOpenIcon"), { .layout = { .sizing = { CLAY_SIZING_FIXED(16), CLAY_SIZING_FIXED(16) } }, .custom = { .customData = &s_settings_icon_element } }) {}
                         }
                     }
 
-                    // Stream: the same picture as the reference recording,
-                    // published live so a tape can be watched from another
-                    // machine. Greyed out when no mediamtx was found, for the
-                    // same reason as the ffmpeg toggle above -- it must not arm
-                    // into a state that would later refuse to start.
-                    /* On a net client the stream runs on the server; the
-                     * toggle shows the server's saved switch and the settings
-                     * row below it edits the server's. mediamtx here is not
-                     * the point. */
-                    bool rs_is_client = gui_net_is_client(app);
-                    bool mtx_ok = rs_is_client ? true : gui_mediamtx_probe();
-                    /* Warm the encoder cache while the panel is merely being
-                     * looked at, so the click does not pay for an ffmpeg
-                     * -encoders popen. Both probes are cached. */
-                    if (!rs_is_client) (void)gui_rtsp_stream_probe();
-                    gui_rtsp_stream_status_t rs_st = gui_rtsp_stream_get_status();
-                    if (rs_is_client) {
-                        rs_st.running = app->settings.rtsp_stream_enabled;
-                        rs_st.starting = false;
-                    }
-                    CLAY(CLAY_ID("ToggleRowRtsp"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color rs_bg = (rs_st.running || rs_st.starting) ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        if (!mtx_ok) rs_bg = ui_disabled_color(rs_bg);
-                        Color rs_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("ToggleRtspStream"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rs_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            /* Three states: ffmpeg is spawned but not yet known
-                             * to have survived its first frames, and saying ON
-                             * during that would be a claim we cannot support. */
-                            CLAY_TEXT(rs_st.starting ? CLAY_STRING("...")
-                                                     : (rs_st.running ? CLAY_STRING("ON")
-                                                                      : CLAY_STRING("OFF")),
-                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("RTSP Stream"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rs_fg) }));
-                        /* Opens the codec submenu rather than cycling. It still
-                         * shows which encoder is in force, so the row loses no
-                         * information by gaining a place to put the rest. */
-                        CLAY(CLAY_ID("RtspEncoderBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(76), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *enc_label = app->settings.rtsp_stream_encoder == 1 ? "NVENC..."
-                                                  : app->settings.rtsp_stream_encoder == 2 ? "x264..." : "Auto...";
-                            CLAY_TEXT(make_string(enc_label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
-                        }
-                        // Loopback vs LAN. There is no auth either way, so the
-                        // hint line below says so rather than hiding it.
-                        CLAY(CLAY_ID("RtspBindBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(84), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(mtx_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.rtsp_stream_lan ? CLAY_STRING("LAN") : CLAY_STRING("Loopback"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rs_fg) }));
-                        }
-                    /* A FIXED box, always present, whatever it says.
-                     *
-                     * The settings panel is CLAY_SIZING_FIT, so it measures itself
-                     * from its contents: an unconstrained label that changes every
-                     * frame re-measures the whole panel, and because the panel is
-                     * centre-attached it grows and shrinks around the middle. That
-                     * is what made the window breathe. A fixed box cannot influence
-                     * the layout however long its text gets, and keeping it present
-                     * while stopped means starting the stream does not resize the
-                     * row either.
-                     *
-                     * Monospaced for the same reason at a smaller scale: in a
-                     * proportional face "1111" and "8888" are not the same width. */
-                    {
-                        static char rs_live[32];
-                        if (!rs_st.running || rs_st.starting) {
-                            rs_live[0] = '\0';
-                        } else {
-                            /* Sampled from mediamtx's loopback metrics endpoint
-                             * every two seconds -- the only place the real
-                             * published rate exists. 0 until the first pair of
-                             * samples exists to difference. */
-                            uint32_t kbps = gui_mediamtx_stream_kbps();
-                            if (kbps == 0) {
-                                snprintf(rs_live, sizeof(rs_live), "-- kbit/s");
-                            } else if (kbps < 1000) {
-                                snprintf(rs_live, sizeof(rs_live), "%u kbit/s",
-                                         (unsigned)kbps);
-                            } else {
-                                snprintf(rs_live, sizeof(rs_live), "%.1f Mbit/s",
-                                         (double)kbps / 1000.0);
-                            }
-                        }
-                        CLAY(CLAY_ID("RtspLiveBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(104), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                            CLAY_TEXT(make_string(rs_live), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        }
-                    }
-                    }
-                    /* Require a password to watch. Off by default, and only
-                     * meaningful in LAN mode -- on loopback the only things that
-                     * can reach the stream are already on this machine. The
-                     * password itself is generated fresh each time the stream
-                     * starts and is never written to settings. */
-                    CLAY(CLAY_ID("ToggleRowRtspPassword"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color pw_bg = app->settings.rtsp_stream_password ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                        if (!mtx_ok) pw_bg = ui_disabled_color(pw_bg);
-                        Color pw_fg = mtx_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("ToggleRtspPassword"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(pw_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.rtsp_stream_password ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
-                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(pw_fg) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("Password"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(pw_fg) }));
 
-                        /* Read back from the RUNNING server, not from settings, so
-                         * the panel can never show a password that is not the one
-                         * actually being enforced. Fixed width for the same reason
-                         * as the bitrate box. */
-                        static char rs_pw[48];
-                        const char *live_pw = gui_mediamtx_read_password();
-                        snprintf(rs_pw, sizeof(rs_pw), "%s", live_pw[0] ? live_pw : "");
-                        CLAY(CLAY_ID("RtspPasswordBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(190), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(rs_pw[0] ? (Color){25,25,30,255} : COLOR_PANEL_BG), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(rs_pw), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        if (rs_pw[0]) {
-                            CLAY(CLAY_ID("RtspPasswordCopy"), { .layout = { .sizing = { CLAY_SIZING_FIXED(62), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(Clay_PointerOver(CLAY_ID("RtspPasswordCopy")) ? COLOR_BUTTON_HOVER : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(CLAY_STRING("Copy"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                        }
-                    }
-
-                    // The URLs a viewer actually types, one per row: at a size
-                    // worth reading, three of them will not sit side by side.
-                    // Clicking copies, Ctrl+click hands the URL to whatever the
-                    // desktop registered for the scheme -- VLC for rtsp://, the
-                    // browser for http:// -- so a tape can be watched without
-                    // anyone retyping a port and landing on capture-node's
-                    // stream by accident.
-                    if (rs_st.running && !rs_st.starting) {
-                        // rs_st is a copy on this frame's stack, and Clay does not
-                        // copy the text it is handed -- it keeps the pointer and
-                        // reads it back in Clay_EndLayout(), by which time this
-                        // frame is gone. Reading straight out of rs_st drew boxes
-                        // of exactly the right width, because layout measured a
-                        // live string, holding '?' -- raylib's stand-in for
-                        // whatever bytes had since landed on that stack slot.
-                        static char rs_urls[RTSP_URL_COUNT][256];
-                        for (int u = 0; u < RTSP_URL_COUNT; u++) {
-                            snprintf(rs_urls[u], sizeof(rs_urls[u]), "%s",
-                                     rtsp_url_for_kind(&rs_st, u));
-                            // Reads last frame's boxes, so the tint trails the
-                            // pointer by a frame. For "this responds to a click"
-                            // that is imperceptible.
-                            bool u_hot = Clay_PointerOver(CLAY_IDI("RtspUrlBox", u));
-                            CLAY(CLAY_IDI("RtspUrlRow", u), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
-                                CLAY(CLAY_IDI("RtspUrlLabel", u), { .layout = { .sizing = { CLAY_SIZING_FIXED(58), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                                    CLAY_TEXT(make_string(rtsp_url_kind_label(u)), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                                }
-                                CLAY(CLAY_IDI("RtspUrlBox", u), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(u_hot ? COLOR_BUTTON : (Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                    CLAY_TEXT(make_string(rs_urls[u]), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                                CLAY(CLAY_IDI("RtspUrlCopy", u), { .layout = { .sizing = { CLAY_SIZING_FIXED(62), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(Clay_PointerOver(CLAY_IDI("RtspUrlCopy", u)) ? COLOR_BUTTON_HOVER : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                    CLAY_TEXT(CLAY_STRING("Copy"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                            }
-                        }
-                        // Neither gesture is discoverable on its own, so say both.
-                        CLAY(CLAY_ID("RtspUrlHelpRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-#if defined(__APPLE__)
-                            CLAY_TEXT(CLAY_STRING("click a URL to copy it, Cmd+click to open it"),
-#else
-                            CLAY_TEXT(CLAY_STRING("click a URL to copy it, Ctrl+click to open it"),
-#endif
-                                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        }
-                    }
-                    // One line that says what is wrong, or what is about to be
-                    // shared with the whole network.
-                    CLAY(CLAY_ID("RtspHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-                        static char rs_hint[260];
-                        Color hint_fg = COLOR_TEXT_DIM;
-                        if (!mtx_ok) {
-                            snprintf(rs_hint, sizeof(rs_hint),
-                                     "mediamtx not found - install it or set mediamtx_path in the settings file");
-                            hint_fg = COLOR_SYNC_RED;
-                        } else if (rs_st.error) {
-                            snprintf(rs_hint, sizeof(rs_hint), "stream error: %s", rs_st.err_text);
-                            hint_fg = COLOR_SYNC_RED;
-                        } else if (rs_st.starting) {
-                            snprintf(rs_hint, sizeof(rs_hint), "starting the stream...");
-                        } else if (rs_st.running && rs_st.frames_dropped > 0) {
-                            /* The dropped counter used to sit in the row above and
-                             * was half of why it jittered. It still matters -- it is
-                             * the only sign the encoder cannot keep up -- so it
-                             * moves here, deliberately WITHOUT the number: a live
-                             * count in this line would just move the jitter. */
-                            snprintf(rs_hint, sizeof(rs_hint),
-                                     "frames are being dropped - the encoder is not keeping up");
-                            hint_fg = COLOR_SYNC_RED;
-                        } else if (rs_st.running && !rs_st.audio_active) {
-                            snprintf(rs_hint, sizeof(rs_hint), "video only - %s",
-                                     rs_st.audio_note[0] ? rs_st.audio_note : "no audio device");
-                        } else if (app->settings.rtsp_stream_lan) {
-                            snprintf(rs_hint, sizeof(rs_hint),
-                                     "LAN: anyone on the network can watch this stream - there is no password");
-                            hint_fg = COLOR_SYNC_RED;
-                        } else {
-                            snprintf(rs_hint, sizeof(rs_hint), "mediamtx: %s   loopback only",
-                                     gui_mediamtx_binary_path());
-                        }
-                        CLAY_TEXT(make_string(rs_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(hint_fg) }));
-                    }
 
 
                     CLAY_TEXT(CLAY_STRING("Audio output (WAV):"),
@@ -4835,219 +4340,7 @@ static const char *gui_ui_device_type_name(device_type_t type) {
 }
 
 // Version info popup (opened by clicking the toolbar "i" badge)
-/* Putting a tape on the network is a different kind of act from the toggles
- * around it, so it is worth one deliberate answer. Only ever shown once: after
- * that rtsp_lan_acknowledged is set and the bind box behaves like any other
- * toggle. Floats above the settings panel it is launched from -- that panel
- * sits at the implicit zIndex 0, and the gear popover already uses 20, so this
- * takes 30 to clear both. */
-/* Everything about how the picture is encoded, in one place.
- *
- * These are all read when ffmpeg is spawned, so they are editable only while the
- * stream is stopped -- offering a control that silently would not apply until
- * the next start is worse than greying it out. */
-static void render_rtsp_codec_window(gui_app_t *app)
-{
-    if (!s_rtsp_codec_window_open) return;
 
-    gui_rtsp_stream_status_t cs = gui_rtsp_stream_get_status();
-    bool locked = cs.running || cs.starting;
-    bool nvenc_ok = gui_rtsp_stream_has_nvenc();
-
-    CLAY(CLAY_ID("RtspCodecBackdrop"), {
-        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
-            .zIndex = 30
-        },
-        .backgroundColor = (Clay_Color){0, 0, 0, 150}
-    }) {}
-
-    CLAY(CLAY_ID("RtspCodecWindow"), {
-        .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 460, .max = 560), CLAY_SIZING_FIT(0) },
-            .layoutDirection = CLAY_TOP_TO_BOTTOM,
-            .padding = { 18, 18, 16, 16 },
-            .childGap = 10
-        },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
-            .zIndex = 31
-        },
-        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
-        .cornerRadius = CLAY_CORNER_RADIUS(8)
-    }) {
-        CLAY(CLAY_ID("RtspCodecHeader"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Stream video codec"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
-            CLAY(CLAY_ID("RtspCodecHeaderSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } } }) {}
-            CLAY(CLAY_ID("RtspCodecClose"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-
-        /* Encoder: three explicit choices rather than a cycling box, so the one
-         * in force is visible without clicking through the others. */
-        CLAY(CLAY_ID("RtspCodecEncRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
-        }) {
-            CLAY(CLAY_ID("RtspCodecEncLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                CLAY_TEXT(CLAY_STRING("Encoder"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            for (int e = 0; e < 3; e++) {
-                bool avail = (e != 1) || nvenc_ok;
-                bool on = (app->settings.rtsp_stream_encoder == e);
-                Color bg = on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                if (locked || !avail) bg = ui_disabled_color(bg);
-                CLAY(CLAY_IDI("RtspCodecEnc", e), {
-                    .layout = { .sizing = { CLAY_SIZING_FIXED(86), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                    .backgroundColor = to_clay_color(bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
-                }) {
-                    CLAY_TEXT(make_string(e == 0 ? "Auto" : (e == 1 ? "NVENC" : "x264")),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color((locked || !avail) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
-                }
-            }
-        }
-        if (!nvenc_ok) {
-            CLAY_TEXT(CLAY_STRING("NVENC is unavailable in this ffmpeg build"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-        }
-
-        /* Bitrate: software encoder only, which the hint below says plainly
-         * rather than leaving it to be discovered. */
-        CLAY(CLAY_ID("RtspCodecRateRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
-        }) {
-            CLAY(CLAY_ID("RtspCodecRateLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                CLAY_TEXT(CLAY_STRING("Bitrate"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            Color step_bg = locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-            CLAY(CLAY_ID("RtspCodecRateMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            /* Fixed width, like every other number in this panel. */
-            static char rate_buf[32];
-            int eff = app->settings.rtsp_stream_bitrate_kbps > 0
-                    ? app->settings.rtsp_stream_bitrate_kbps : RTSP_BITRATE_DEFAULT_KBPS;
-            snprintf(rate_buf, sizeof(rate_buf), "%d kbit/s%s", eff,
-                     app->settings.rtsp_stream_bitrate_kbps > 0 ? "" : " (default)");
-            CLAY(CLAY_ID("RtspCodecRateValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(160), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                CLAY_TEXT(make_string(rate_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            CLAY(CLAY_ID("RtspCodecRatePlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-        CLAY_TEXT(CLAY_STRING("Bitrate applies to x264 only; NVENC is driven by quality, not a target."),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-        /* Deinterlace */
-        CLAY(CLAY_ID("RtspCodecDeintRow"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
-        }) {
-            CLAY(CLAY_ID("RtspCodecDeintLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                CLAY_TEXT(CLAY_STRING("Deinterlace"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            Color d_bg = app->settings.rtsp_stream_deinterlace ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-            if (locked) d_bg = ui_disabled_color(d_bg);
-            CLAY(CLAY_ID("RtspCodecDeint"), { .layout = { .sizing = { CLAY_SIZING_FIXED(86), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(d_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                CLAY_TEXT(app->settings.rtsp_stream_deinterlace ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            CLAY_TEXT(CLAY_STRING("bwdif - smoother motion, more latency"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-        }
-
-        CLAY_TEXT(locked
-                    ? CLAY_STRING("These are fixed while the stream runs. Stop it to change them.")
-                    : CLAY_STRING("These take effect the next time the stream starts."),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(locked ? COLOR_SYNC_RED : COLOR_TEXT_DIM) }));
-    }
-}
-
-static void render_rtsp_lan_confirm(gui_app_t *app)
-{
-    (void)app;
-    if (!s_rtsp_lan_confirm_open) return;
-
-    CLAY(CLAY_ID("RtspLanConfirmBackdrop"), {
-        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
-            .zIndex = 30
-        },
-        .backgroundColor = (Clay_Color){0, 0, 0, 170}
-    }) {}
-
-    CLAY(CLAY_ID("RtspLanConfirmWindow"), {
-        .layout = {
-            .sizing = { CLAY_SIZING_FIT(.min = 420, .max = 520), CLAY_SIZING_FIT(0) },
-            .layoutDirection = CLAY_TOP_TO_BOTTOM,
-            .padding = { 18, 18, 16, 16 },
-            .childGap = 10
-        },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
-            .zIndex = 31
-        },
-        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
-        .cornerRadius = CLAY_CORNER_RADIUS(8)
-    }) {
-        CLAY_TEXT(CLAY_STRING("Share this stream on the network?"),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
-
-        CLAY(CLAY_ID("RtspLanConfirmBody"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                        .layoutDirection = CLAY_TOP_TO_BOTTOM, .childGap = 6 }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Anyone on this network will be able to watch the tape you are capturing."),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-            CLAY_TEXT(CLAY_STRING("The video is not encrypted, and by default there is no password."),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-            CLAY_TEXT(CLAY_STRING("Customers' tapes are private. Only do this on a network you trust."),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_SYNC_RED) }));
-            CLAY_TEXT(CLAY_STRING("You will only be asked once."),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-        }
-
-        CLAY(CLAY_ID("RtspLanConfirmButtons"), {
-            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
-        }) {
-            CLAY(CLAY_ID("RtspLanConfirmSpacer"), {
-                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
-            }) {}
-            CLAY(CLAY_ID("RtspLanConfirmCancel"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(32) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(COLOR_BUTTON),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("Keep private"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-            CLAY(CLAY_ID("RtspLanConfirmAccept"), {
-                .layout = { .sizing = { CLAY_SIZING_FIXED(130), CLAY_SIZING_FIXED(32) },
-                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
-                .backgroundColor = to_clay_color(COLOR_BUTTON_ACTIVE),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("Share on LAN"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-    }
-}
 
 static void render_version_info_window(gui_app_t *app)
 {
@@ -9413,9 +8706,9 @@ void gui_render_layout(gui_app_t *app) {
     render_metadata_window(app);
     // LAN confirmation, above everything including the settings panel it is
     // launched from.
-    render_rtsp_lan_confirm(app);
+    gui_usbref_settings_render(app);
     // Stream codec settings, same layer as the LAN confirmation.
-    render_rtsp_codec_window(app);
+
 
     // Device dropdown overlay (if open)
     if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0) && app->device_count > 0) {
@@ -9964,13 +9257,9 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_record_limit_window_open && !s_record_limit_timecode_edit && IsKeyPressed(KEY_ESCAPE)) {
         s_record_limit_window_open = false;
     }
-    if (s_rtsp_codec_window_open && IsKeyPressed(KEY_ESCAPE)) {
-        s_rtsp_codec_window_open = false;
-        return;
-    }
-    if (s_rtsp_lan_confirm_open && IsKeyPressed(KEY_ESCAPE)) {
-        /* Same as declining: escape is not consent. */
-        s_rtsp_lan_confirm_open = false;
+    /* The dialog dismisses its own sub-windows first; it says whether it
+     * took the key so nothing else also acts on it. */
+    if (IsKeyPressed(KEY_ESCAPE) && gui_usbref_settings_handle_escape(app)) {
         return;
     }
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
@@ -10156,7 +9445,7 @@ void gui_handle_interactions(gui_app_t *app) {
     // Close it whenever one of them opens rather than trying to interleave.
     if (app->settings_panel_open || s_record_limit_window_open ||
         s_version_info_window_open || s_metadata_window_open ||
-        s_rtsp_lan_confirm_open || s_rtsp_codec_window_open || gui_popup_is_open()) {
+        gui_usbref_settings_is_open() || gui_popup_is_open()) {
         if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
             gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1) ||
             gui_ui_pane_menu_open_index(NULL)) {
@@ -10186,64 +9475,14 @@ void gui_handle_interactions(gui_app_t *app) {
             gui_ui_set_click_consumed();
             return;
         }
-        if (s_rtsp_codec_window_open) {
-            gui_rtsp_stream_status_t cw = gui_rtsp_stream_get_status();
-            bool cw_locked = cw.running || cw.starting;
-            if (Clay_PointerOver(CLAY_ID("RtspCodecClose"))) {
-                s_rtsp_codec_window_open = false;
-            } else if (!cw_locked) {
-                /* Everything here is read when ffmpeg is spawned, so none of it
-                 * may move while a stream is up. */
-                for (int e = 0; e < 3; e++) {
-                    if (!Clay_PointerOver(CLAY_IDI("RtspCodecEnc", e))) continue;
-                    if (e == 1 && !gui_rtsp_stream_has_nvenc()) {
-                        gui_app_set_status(app, "This ffmpeg cannot encode with NVENC");
-                        break;
-                    }
-                    app->settings.rtsp_stream_encoder = e;
-                    gui_settings_save(&app->settings);
-                    break;
-                }
-                if (Clay_PointerOver(CLAY_ID("RtspCodecRateMinus")) ||
-                    Clay_PointerOver(CLAY_ID("RtspCodecRatePlus"))) {
-                    int cur = app->settings.rtsp_stream_bitrate_kbps > 0
-                            ? app->settings.rtsp_stream_bitrate_kbps
-                            : RTSP_BITRATE_DEFAULT_KBPS;
-                    cur += Clay_PointerOver(CLAY_ID("RtspCodecRatePlus"))
-                         ? RTSP_BITRATE_STEP_KBPS : -RTSP_BITRATE_STEP_KBPS;
-                    if (cur < RTSP_BITRATE_MIN_KBPS) cur = RTSP_BITRATE_MIN_KBPS;
-                    if (cur > RTSP_BITRATE_MAX_KBPS) cur = RTSP_BITRATE_MAX_KBPS;
-                    app->settings.rtsp_stream_bitrate_kbps = cur;
-                    gui_settings_save(&app->settings);
-                }
-                if (Clay_PointerOver(CLAY_ID("RtspCodecDeint"))) {
-                    app->settings.rtsp_stream_deinterlace = !app->settings.rtsp_stream_deinterlace;
-                    gui_settings_save(&app->settings);
-                }
-            }
-            gui_ui_set_click_consumed();
-            return;
-        }
-
-        /* Answered before anything else: while this is up it is the only thing
-         * on screen that may be clicked. */
-        if (s_rtsp_lan_confirm_open) {
-            if (Clay_PointerOver(CLAY_ID("RtspLanConfirmAccept"))) {
-                app->settings.rtsp_lan_acknowledged = true;
-                app->settings.rtsp_stream_lan = true;
-                gui_settings_save(&app->settings);
-                s_rtsp_lan_confirm_open = false;
-                gui_app_set_status(app, "The stream will be shared on the network");
-            } else if (Clay_PointerOver(CLAY_ID("RtspLanConfirmCancel"))) {
-                /* Deliberately does NOT set rtsp_lan_acknowledged: declining is
-                 * not an answer worth remembering, and the warning should come
-                 * back if they change their mind later. */
-                s_rtsp_lan_confirm_open = false;
-                gui_app_set_status(app, "The stream stays on this machine");
-            }
-            gui_ui_set_click_consumed();
-            return;
-        }
+    /* The USB Reference Video dialog owns the device, picture, stream and
+     * caption controls, and its two sub-windows. It reports whether the click
+     * was its own; an outside click closes it without consuming, so the press
+     * still reaches whatever was clicked. */
+    if (gui_usbref_settings_handle_interactions(app)) {
+        gui_ui_set_click_consumed();
+        return;
+    }
 
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
@@ -11600,205 +10839,19 @@ void gui_handle_interactions(gui_app_t *app) {
                 app->settings.enable_audio_2ch_12 = !app->settings.enable_audio_2ch_12;
                 gui_settings_save(&app->settings);
             }
+            /* The way into the USB Reference Video dialog. It opens over this
+             * panel rather than replacing it, so the click is consumed and the
+             * settings panel stays where it was. */
+            if (Clay_PointerOver(CLAY_ID("UsbRefOpenBtn"))) {
+                gui_usbref_settings_open();
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("ToggleVideoRecord"))) {
                 if (!gui_video_record_probe()) {
                     gui_app_set_status(app, "ffmpeg was not found; reference video cannot be enabled");
                 } else {
                     app->settings.video_record_enabled = !app->settings.video_record_enabled;
-                    gui_settings_save(&app->settings);
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("ToggleCcRecord"))) {
-                /* Refuse rather than arm: the same probe gates the record
-                 * preflight, so arming here would only move the refusal to
-                 * the moment the operator presses RECORD. The hint says
-                 * which link in the chain is missing. */
-                if (gui_cc_record_probe() != CC_PROBE_OK) {
-                    gui_app_set_status(app, gui_cc_record_probe_hint());
-                } else {
-                    app->settings.cc_record_enabled = !app->settings.cc_record_enabled;
-                    gui_settings_save(&app->settings);
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("CcTagField")) && app->settings.auto_names_enabled) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_CC_TAG, CLAY_ID("CcTagField"), 6.0f, 6.0f);
-            }
-            if (Clay_PointerOver(CLAY_ID("PreviewRescanBtn"))) {
-                gui_preview_refresh_devices();
-                size_t n_pv = 0;
-                (void)gui_preview_devices(&n_pv);
-                gui_app_set_status(app, n_pv ? "USB video devices rescanned"
-                                             : "no USB video device found");
-            }
-            if (Clay_PointerOver(CLAY_ID("PreviewDeviceBox")) && !gui_net_is_client(app)) {
-                size_t n_pv = 0;
-                (void)gui_preview_devices(&n_pv);
-                if (n_pv == 0) {
-                    gui_preview_refresh_devices();
-                    (void)gui_preview_devices(&n_pv);
-                }
-                if (n_pv == 0) {
-                    gui_app_set_status(app, "no USB video device found");
-                } else if (gui_rtsp_stream_is_running() || gui_video_record_is_running()) {
-                    /* Both outputs are tees off this device; swapping it under
-                     * them would change geometry mid-encode. */
-                    gui_app_set_status(app, "stop the stream and reference video before changing device");
-                } else {
-                    int next = (gui_preview_selected_device() + 1) % (int)n_pv;
-                    gui_preview_select(next, 0);
-                    gui_ui_remember_preview_device(app);
-                }
-            }
-            /* Aspect cycles Auto -> 4:3 -> 16:9 -> Square. It is safe at any
-             * time: it changes how frames are presented, never the capture, so
-             * a live recording keeps its geometry and simply gets the new
-             * display aspect from the next spawn onwards. */
-            if (Clay_PointerOver(CLAY_ID("PreviewAspectBox"))) {
-                app->settings.preview_aspect_mode = (app->settings.preview_aspect_mode + 1) % 4;
-                gui_preview_set_aspect_mode(app->settings.preview_aspect_mode);
-                gui_settings_save(&app->settings);
-            }
-            /* Crop steps by 2 and wraps at 32: an edge mask is a handful of
-             * lines, and a wrap is how you get back to 0 without a second
-             * control. Preview-only, so nothing here can touch a recording. */
-            {
-                struct { const char *id; int *field; } crop_boxes[] = {
-                    { "PreviewCropTop",    &app->settings.preview_crop_top },
-                    { "PreviewCropBottom", &app->settings.preview_crop_bottom },
-                    { "PreviewCropLeft",   &app->settings.preview_crop_left },
-                    { "PreviewCropRight",  &app->settings.preview_crop_right },
-                };
-                for (size_t ci = 0; ci < sizeof(crop_boxes) / sizeof(crop_boxes[0]); ci++) {
-                    if (!Clay_PointerOver(Clay_GetElementId(make_string(crop_boxes[ci].id)))) continue;
-                    *crop_boxes[ci].field = (*crop_boxes[ci].field + 2) % 34;
-                    gui_preview_set_crop(app->settings.preview_crop_top,
-                                         app->settings.preview_crop_bottom,
-                                         app->settings.preview_crop_left,
-                                         app->settings.preview_crop_right);
-                    gui_settings_save(&app->settings);
-                    break;
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("PreviewConnectBtn"))) {
-                preview_status_t pv_st = gui_preview_get_status();
-                bool pv_live = (pv_st.state == PREVIEW_STATE_STREAMING ||
-                                pv_st.state == PREVIEW_STATE_STALLED ||
-                                pv_st.state == PREVIEW_STATE_CONNECTING ||
-                                pv_st.state == PREVIEW_STATE_POPPED_OUT);
-                if (pv_live) {
-                    if (gui_rtsp_stream_is_running()) {
-                        gui_app_set_status(app, "stop the RTSP stream before disconnecting the preview");
-                    } else {
-                        gui_preview_disconnect();
-                    }
-                } else {
-                    size_t n_pv = 0;
-                    (void)gui_preview_devices(&n_pv);
-                    if (n_pv == 0) {
-                        gui_preview_refresh_devices();
-                        (void)gui_preview_devices(&n_pv);
-                    }
-                    if (n_pv == 0) {
-                        gui_app_set_status(app, "no USB video device found");
-                    } else if (gui_preview_connect() != 0) {
-                        preview_status_t ps = gui_preview_get_status();
-                        gui_app_set_status(app, ps.err_text[0] ? ps.err_text
-                                                               : "the USB preview could not be opened");
-                    } else {
-                        gui_ui_remember_preview_device(app);
-                    }
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("ToggleRtspStream"))) {
-                if (gui_net_is_client(app)) {
-                    /* Flipping the server's saved switch through /set starts
-                     * or stops its stream (gui_ui_apply_remote_setting). */
-                    if (gui_ui_settings_locked(app)) {
-                        gui_app_set_status(app, "Not connected, or the server is recording");
-                    } else {
-                        app->settings.rtsp_stream_enabled = !app->settings.rtsp_stream_enabled;
-                        gui_settings_save(&app->settings);
-                        gui_app_set_status(app, app->settings.rtsp_stream_enabled
-                            ? "Requested the stream start on the server"
-                            : "Requested the stream stop on the server");
-                    }
-                } else if (gui_rtsp_stream_get_status().starting) {
-                    /* Tearing down an attempt that has not resolved yet would
-                     * race the poll that is about to judge it. */
-                    gui_app_set_status(app, "the stream is still starting");
-                } else {
-                    gui_ui_toggle_rtsp_stream(app);
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("RtspEncoderBox"))) {
-                /* Opens even while streaming: the window shows the settings in
-                 * force and greys them out, which is more use than a button that
-                 * does nothing. */
-                s_rtsp_codec_window_open = true;
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("ToggleRtspPassword")) && !gui_rtsp_stream_is_running() &&
-                !gui_rtsp_stream_get_status().starting) {
-                /* Only while stopped: the credential is baked into mediamtx's
-                 * config at startup, so changing it mid-stream would show a
-                 * password the server is not enforcing. */
-                app->settings.rtsp_stream_password = !app->settings.rtsp_stream_password;
-                gui_settings_save(&app->settings);
-                gui_app_set_status(app, app->settings.rtsp_stream_password
-                    ? "Viewers will need a password; it appears when the stream starts"
-                    : "The stream will be open to anyone who can reach it");
-            }
-            if (Clay_PointerOver(CLAY_ID("RtspPasswordCopy"))) {
-                const char *pw = gui_net_is_client(app) ? "" : gui_mediamtx_read_password();
-                if (gui_net_is_client(app)) {
-                    gui_app_set_status(app, "The stream password is shown on the server");
-                } else if (pw[0]) {
-                    SetClipboardText(pw);
-                    gui_app_set_status(app, "Stream password copied");
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("RtspBindBox")) && !gui_rtsp_stream_is_running() &&
-                !gui_rtsp_stream_get_status().starting) {
-                if (!app->settings.rtsp_stream_lan && !app->settings.rtsp_lan_acknowledged) {
-                    /* Going off-box for the first time. Ask rather than flip:
-                     * the toggle is one click away from putting a customer's
-                     * tape on the network. */
-                    s_rtsp_lan_confirm_open = true;
-                } else {
-                    app->settings.rtsp_stream_lan = !app->settings.rtsp_stream_lan;
-                    gui_settings_save(&app->settings);
-                }
-            }
-            {
-                /* Read the status once: three rows asking separately could see
-                 * three different frames if the stream stopped mid-loop. */
-                gui_rtsp_stream_status_t url_st = gui_rtsp_stream_get_status();
-                for (int u = 0; u < RTSP_URL_COUNT; u++) {
-                    const char *url = rtsp_url_for_kind(&url_st, u);
-                    if (Clay_PointerOver(CLAY_IDI("RtspUrlCopy", u))) {
-                        rtsp_url_copy(app, u, url);
-                    } else if (Clay_PointerOver(CLAY_IDI("RtspUrlBox", u))) {
-                        if (!gui_ui_primary_mod_down()) {
-                            rtsp_url_copy(app, u, url);
-                        } else if (rtsp_url_is_safe_to_open(url)) {
-                            char msg[80];
-                            OpenURL(url);
-                            snprintf(msg, sizeof(msg), "Opening the %s URL...",
-                                     rtsp_url_kind_label(u));
-                            gui_app_set_status(app, msg);
-                        } else {
-                            /* Copying still works: the clipboard is not a shell. */
-                            gui_app_set_status(app,
-                                "That URL will not be opened - it is not a plain "
-                                "rtsp:// or http:// address");
-                        }
-                    }
-                }
-            }
-            if (Clay_PointerOver(CLAY_ID("VideoCodecBox"))) {
-                if (gui_video_record_probe()) {
-                    app->settings.video_record_codec = (app->settings.video_record_codec == 1) ? 0 : 1;
                     gui_settings_save(&app->settings);
                 }
             }

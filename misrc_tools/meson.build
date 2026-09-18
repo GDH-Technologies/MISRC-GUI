@@ -448,6 +448,7 @@ if raylib_dep.found()
     'misrc_gui/ui/gui_device_label.c',
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
+    'misrc_gui/ui/gui_usbref_settings.c',
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',

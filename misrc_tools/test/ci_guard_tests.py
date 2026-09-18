@@ -1324,9 +1324,11 @@ def check_cc_record_probes_never_assumes(repo_root: Path) -> int:
             "gui_cc_record.c references install.sh, a path that exists on no other "
             "machine; this module is upstream-bound and must probe ffmpeg directly"
         )
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # The captions toggle lives in the USB Reference Video dialog now.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
     if "gui_cc_record_probe()" not in ui:
-        return fail("gui_ui.c never calls gui_cc_record_probe(); the toggle cannot grey out")
+        return fail("gui_usbref_settings.c never calls gui_cc_record_probe(); "
+                    "the toggle cannot grey out")
     rec = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
     if "gui_cc_record_probe()" not in rec:
         return fail("gui_record.c never probes before starting captions")
@@ -2157,7 +2159,19 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     the layout pass measures the real string, so the box is the right size and only
     the text inside it is wrong. gui_ui.c states the rule in a comment; this makes
     it enforceable."""
-    path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
+    # Both Clay-drawing UI files: the USB Reference Video dialog hands Clay the
+    # same kind of formatted labels, and a dangling one there fails identically.
+    paths = [repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c",
+             repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"]
+    failures_before = 0
+    for path in paths:
+        rc = _check_clay_text_in_file(path)
+        if rc != 0:
+            failures_before += rc
+    return 1 if failures_before else 0
+
+
+def _check_clay_text_in_file(path: Path) -> int:
     code = strip_c_comments(read_text(path))
 
     # Declarations inside a function body, i.e. automatic storage. File-scope
@@ -2217,7 +2231,8 @@ def check_lan_requires_acknowledgement(repo_root: Path) -> int:
 
     Also asserts the shape of the answer: accepting records consent, declining
     does not. Remembering a "no" would mean the warning never returns."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # Moved to the USB Reference Video dialog with the rest of the stream UI.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
 
     m = re.search(r'Clay_PointerOver\(CLAY_ID\("RtspBindBox"\)\)', ui)
     if not m:
@@ -2768,7 +2783,8 @@ def check_record_parity(repo_root: Path) -> int:
         return fail("gui_ui.c: the RecordButton click does not branch on the effective state")
     if "app->is_recording" in click_window:
         return fail("gui_ui.c: the RecordButton click still reads app->is_recording")
-    lock = ui[ui.find("static bool gui_ui_settings_locked("):]
+    # No longer static: the USB Reference Video dialog asks the same question.
+    lock = ui[ui.find("bool gui_ui_settings_locked("):]
     lock = lock[:lock.find("\n}\n")]
     if "gui_net_client_peer_recording(app)" not in lock:
         return fail("gui_ui.c: gui_ui_settings_locked() does not consider the server's recording state")
@@ -2956,7 +2972,8 @@ def check_live_stream_readout_cannot_resize_the_panel(repo_root: Path) -> int:
     The fix is that the live readout sits in a FIXED box. This pins that, because
     the regression is invisible in a diff: dropping the wrapper leaves working,
     correct-looking code that just happens to make the window pulse."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # Moved to the USB Reference Video dialog with the rest of the stream UI.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
 
     m = re.search(r'CLAY\(CLAY_ID\("RtspLiveBox"\),\s*\{(.*?)\}\)\s*\{', ui, re.S)
     if not m:
@@ -3062,7 +3079,9 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
     app is restarted, and then is silently something else. That is the same
     failure check_rtsp_settings_roundtrip exists for, one level down: not a
     missing site, but two sites that disagree."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # The stepper moved to the USB Reference Video dialog with the rest of the
+    # streaming UI; the clamp it must agree with is still in the settings table.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
     settings = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"))
 
     bounds = {}
@@ -3070,7 +3089,7 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
                  "RTSP_BITRATE_STEP_KBPS", "RTSP_BITRATE_DEFAULT_KBPS"):
         m = re.search(rf"#define\s+{name}\s+(\d+)", ui)
         if not m:
-            return fail(f"gui_ui.c no longer defines {name}")
+            return fail(f"gui_usbref_settings.c no longer defines {name}")
         bounds[name] = int(m.group(1))
 
     m = re.search(
