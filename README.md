@@ -150,7 +150,7 @@ The main GUI window from beginning from the top row
 - Timer and level stop control 
 - Record button
 
-The record timer system is self fail proof, you cannot set a time lower than your current duration and instantly stop capture by accident, it will count the total timer with a discount of the current duration passed, and has to be armed with a manual button click.
+The record timer has to be armed with a manual button click. Armed before a recording, it counts from the recording's start; armed while recording, it counts from the moment you click Arm, so it can never stop a capture by accident. Once it is running, only longer limits apply live.
 
 
 ## Information Page 

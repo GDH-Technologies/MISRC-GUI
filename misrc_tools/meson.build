@@ -672,6 +672,15 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_viewport_layout', viewport_layout_test)
+
+    record_limit_test = executable('gui_record_limit_test',
+      ['test/gui_record_limit_harness.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_record_limit', record_limit_test)
   endif
 
   message('raylib found, building GUI application')
