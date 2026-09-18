@@ -1324,9 +1324,11 @@ def check_cc_record_probes_never_assumes(repo_root: Path) -> int:
             "gui_cc_record.c references install.sh, a path that exists on no other "
             "machine; this module is upstream-bound and must probe ffmpeg directly"
         )
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # The captions toggle lives in the USB Reference Video dialog now.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
     if "gui_cc_record_probe()" not in ui:
-        return fail("gui_ui.c never calls gui_cc_record_probe(); the toggle cannot grey out")
+        return fail("gui_usbref_settings.c never calls gui_cc_record_probe(); "
+                    "the toggle cannot grey out")
     rec = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
     if "gui_cc_record_probe()" not in rec:
         return fail("gui_record.c never probes before starting captions")
@@ -1348,7 +1350,7 @@ def check_cc_preflight_refuses_before_files(repo_root: Path) -> int:
     if alloc < 0:
         return fail("the session allocation was not found in gui_record_start_confirmed")
     for field, what in (
-        ("settings.cc_record_enabled", "closed captions"),
+        ("settings.usbref_cc_enabled", "closed captions"),
         ("settings.video_record_enabled", "reference video"),
     ):
         at = body.find(field)
@@ -1373,7 +1375,7 @@ def check_cc_sidecar_in_overwrite_set(repo_root: Path) -> int:
     if start < 0:
         return fail("gui_record_start not found")
     body = code[start:start + 12000]
-    if "settings.cc_filename" not in body:
+    if "settings.usbref_cc_filename" not in body:
         return fail("gui_record_start never builds the caption path for the overwrite check")
     if "file_cc_exists" not in body:
         return fail("gui_record_start never stat()s the caption sidecar")
@@ -1399,10 +1401,10 @@ def check_cc_settings_have_defaults_and_rows(repo_root: Path) -> int:
     header = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.h")
     table = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
     for field, key in (
-        ("cc_record_enabled", "cc_record_enabled"),
-        ("cc_filename", "cc_filename"),
-        ("cc_output_tag", "cc_output_tag"),
-        ("cc_vbi_device", "cc_vbi_device"),
+        ("usbref_cc_enabled", "usbref_cc_enabled"),
+        ("usbref_cc_filename", "usbref_cc_filename"),
+        ("usbref_cc_tag", "usbref_cc_tag"),
+        ("usbref_cc_vbi_device", "usbref_cc_vbi_device"),
     ):
         if field not in header:
             return fail(f"gui_settings.h has no {field}")
@@ -1738,6 +1740,15 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
 # descriptor table replaced it. The table may add keys (an old build ignores
 # what it does not know) but must never rename or drop one: a file written by
 # the new build has to load in the previous one, or a rollback loses settings.
+#
+# ONE deliberate exception, taken knowingly: the USB reference video, RTSP and
+# caption keys were renamed to a `usbref_` namespace when that UI moved into its
+# own dialog. They are fork-only -- upstream has no settings table at all and
+# knows none of these keys -- so the compatibility this list protects is the
+# fork's own, between fork builds. The cost is real and was accepted: a machine
+# on an older build loses these settings, and in net mode a renamed build and an
+# un-renamed one silently do not exchange them. Deploy wm and cs0 together.
+# The entries below carry the new names, so the contract holds from here on.
 SETTINGS_KEYS_V1_1_8 = (
     "device_index", "output_path", "auto_names_enabled", "output_base_name",
     "append_timestamp_on_capture_start", "rf_bits_a", "rf_bits_b", "cxadc_tenbit_mode_a",
@@ -1748,10 +1759,10 @@ SETTINGS_KEYS_V1_1_8 = (
     "audio_1ch_2_filename", "audio_1ch_3_filename", "audio_1ch_4_filename", "audio_1ch_1_label",
     "audio_1ch_2_label", "audio_1ch_3_label", "audio_1ch_4_label", "audio_tag_4ch",
     "audio_tag_2ch_12", "audio_tag_2ch_34", "enable_audio_4ch", "video_record_enabled",
-    "video_record_codec", "preview_device_path", "rtsp_stream_enabled", "rtsp_stream_lan",
-    "rtsp_stream_port", "rtsp_stream_encoder", "rtsp_stream_bitrate_kbps",
-    "rtsp_stream_deinterlace", "rtsp_lan_acknowledged", "rtsp_stream_password", "mediamtx_path",
-    "rtsp_audio_device", "enable_audio_2ch_12", "enable_audio_2ch_34", "audio_monitor_playback",
+    "usbref_codec", "usbref_device_path", "usbref_rtsp_enabled", "usbref_rtsp_lan",
+    "usbref_rtsp_port", "usbref_rtsp_encoder", "usbref_rtsp_bitrate_kbps",
+    "usbref_rtsp_deinterlace", "usbref_rtsp_lan_acknowledged", "usbref_rtsp_password", "usbref_mediamtx_path",
+    "usbref_rtsp_audio_device", "enable_audio_2ch_12", "enable_audio_2ch_34", "audio_monitor_playback",
     "audio_monitor_ch34", "misrc_mode", "misrc_v15_v25_ab_swap", "stop_on_dropout",
     "level_autostop_enabled", "level_autostop_level_str", "level_autostop_duration_str",
     "ingest_project", "ingest_tape_id", "ingest_tape_format", "ingest_tape_size",
@@ -1931,7 +1942,7 @@ def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
     table_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
 
     fields = sorted(set(
-        re.findall(r"\b(rtsp_[a-z0-9_]+|mediamtx_path|preview_device_path)\b(?:\[\d+\])?\s*;",
+        re.findall(r"\b(usbref_rtsp_[a-z0-9_]+|usbref_mediamtx_path|usbref_device_path)\b(?:\[\d+\])?\s*;",
                    struct_src)
     ))
     if not fields:
@@ -2157,7 +2168,19 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     the layout pass measures the real string, so the box is the right size and only
     the text inside it is wrong. gui_ui.c states the rule in a comment; this makes
     it enforceable."""
-    path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
+    # Both Clay-drawing UI files: the USB Reference Video dialog hands Clay the
+    # same kind of formatted labels, and a dangling one there fails identically.
+    paths = [repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c",
+             repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"]
+    failures_before = 0
+    for path in paths:
+        rc = _check_clay_text_in_file(path)
+        if rc != 0:
+            failures_before += rc
+    return 1 if failures_before else 0
+
+
+def _check_clay_text_in_file(path: Path) -> int:
     code = strip_c_comments(read_text(path))
 
     # Declarations inside a function body, i.e. automatic storage. File-scope
@@ -2217,16 +2240,17 @@ def check_lan_requires_acknowledgement(repo_root: Path) -> int:
 
     Also asserts the shape of the answer: accepting records consent, declining
     does not. Remembering a "no" would mean the warning never returns."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # Moved to the USB Reference Video dialog with the rest of the stream UI.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
 
     m = re.search(r'Clay_PointerOver\(CLAY_ID\("RtspBindBox"\)\)', ui)
     if not m:
         return fail("the RtspBindBox handler is gone; this guard must move with it")
     handler = ui[m.start():m.start() + 700]
 
-    if "rtsp_lan_acknowledged" not in handler:
+    if "usbref_rtsp_lan_acknowledged" not in handler:
         return fail(
-            "the LAN toggle flips without consulting rtsp_lan_acknowledged, so the "
+            "the LAN toggle flips without consulting usbref_rtsp_lan_acknowledged, so the "
             "first switch to LAN no longer asks before putting a tape on the network"
         )
     if "s_rtsp_lan_confirm_open" not in handler:
@@ -2239,7 +2263,7 @@ def check_lan_requires_acknowledgement(repo_root: Path) -> int:
     if not accept:
         return fail("the confirmation has no Accept branch")
     body = accept.group(1)
-    for needed in ("rtsp_lan_acknowledged = true", "rtsp_stream_lan = true",
+    for needed in ("usbref_rtsp_lan_acknowledged = true", "usbref_rtsp_lan = true",
                    "gui_settings_save"):
         if needed not in body:
             return fail(f"the Accept branch does not do `{needed}`")
@@ -2250,12 +2274,12 @@ def check_lan_requires_acknowledgement(repo_root: Path) -> int:
         ui, re.S)
     if not cancel:
         return fail("the confirmation has no Cancel branch")
-    if "rtsp_lan_acknowledged" in cancel.group(1):
+    if "usbref_rtsp_lan_acknowledged" in cancel.group(1):
         return fail(
-            "declining the LAN warning writes rtsp_lan_acknowledged. A refusal is not "
+            "declining the LAN warning writes usbref_rtsp_lan_acknowledged. A refusal is not "
             "consent, and recording it means the warning never comes back."
         )
-    if "rtsp_stream_lan = true" in cancel.group(1):
+    if "usbref_rtsp_lan = true" in cancel.group(1):
         return fail("declining the LAN warning still switches to LAN")
 
     return 0
@@ -2768,7 +2792,8 @@ def check_record_parity(repo_root: Path) -> int:
         return fail("gui_ui.c: the RecordButton click does not branch on the effective state")
     if "app->is_recording" in click_window:
         return fail("gui_ui.c: the RecordButton click still reads app->is_recording")
-    lock = ui[ui.find("static bool gui_ui_settings_locked("):]
+    # No longer static: the USB Reference Video dialog asks the same question.
+    lock = ui[ui.find("bool gui_ui_settings_locked("):]
     lock = lock[:lock.find("\n}\n")]
     if "gui_net_client_peer_recording(app)" not in lock:
         return fail("gui_ui.c: gui_ui_settings_locked() does not consider the server's recording state")
@@ -2956,7 +2981,8 @@ def check_live_stream_readout_cannot_resize_the_panel(repo_root: Path) -> int:
     The fix is that the live readout sits in a FIXED box. This pins that, because
     the regression is invisible in a diff: dropping the wrapper leaves working,
     correct-looking code that just happens to make the window pulse."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # Moved to the USB Reference Video dialog with the rest of the stream UI.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
 
     m = re.search(r'CLAY\(CLAY_ID\("RtspLiveBox"\),\s*\{(.*?)\}\)\s*\{', ui, re.S)
     if not m:
@@ -3062,7 +3088,9 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
     app is restarted, and then is silently something else. That is the same
     failure check_rtsp_settings_roundtrip exists for, one level down: not a
     missing site, but two sites that disagree."""
-    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    # The stepper moved to the USB Reference Video dialog with the rest of the
+    # streaming UI; the clamp it must agree with is still in the settings table.
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"))
     settings = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"))
 
     bounds = {}
@@ -3070,11 +3098,11 @@ def check_bitrate_stepper_survives_a_reload(repo_root: Path) -> int:
                  "RTSP_BITRATE_STEP_KBPS", "RTSP_BITRATE_DEFAULT_KBPS"):
         m = re.search(rf"#define\s+{name}\s+(\d+)", ui)
         if not m:
-            return fail(f"gui_ui.c no longer defines {name}")
+            return fail(f"gui_usbref_settings.c no longer defines {name}")
         bounds[name] = int(m.group(1))
 
     m = re.search(
-        r"rtsp_stream_bitrate_kbps\s*=\s*\(b == 0 \|\| \(b >= (\d+) && b <= (\d+)\)\)",
+        r"usbref_rtsp_bitrate_kbps\s*=\s*\(b == 0 \|\| \(b >= (\d+) && b <= (\d+)\)\)",
         settings)
     if not m:
         return fail("could not read the bitrate clamp in gui_settings_table.c; if its shape "
@@ -3771,6 +3799,125 @@ def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_preview_sdtv_geometry_runtime(repo_root: Path) -> int:
+    """The SDTV preview geometry arithmetic, proved on every build.
+
+    This is the only proof the 625-line answers ever get: there is one NTSC
+    dongle on this site and no PAL or SECAM source at all, so PAL's 720x576
+    raster and its 16:15 sample aspect cannot be checked against hardware here.
+    """
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the SDTV preview geometry guard")
+        print("SKIP: SDTV preview geometry guard (cc not available)")
+        return 0
+
+    harness_path = repo_root / "misrc_tools/test/preview_sdtv_harness.c"
+    policy_path = repo_root / "misrc_tools/misrc_gui/input/gui_preview_sdtv.c"
+    include_dir = repo_root / "misrc_tools/misrc_gui/input"
+
+    for path, label in [(harness_path, "SDTV preview harness"),
+                        (policy_path, "SDTV preview geometry")]:
+        if not path.exists():
+            return fail(f"{label} source is missing: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_preview_sdtv_guard_") as temp_root:
+        exe_name = "preview_sdtv_guard.exe" if os.name == "nt" else "preview_sdtv_guard"
+        exe_path = Path(temp_root) / exe_name
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            f"-I{include_dir}",
+            str(harness_path),
+            str(policy_path),
+            "-lm",
+            "-o",
+            str(exe_path),
+        ]
+        try:
+            run_checked(compile_cmd)
+            run_checked([str(exe_path)])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "SDTV preview geometry guard failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+    return 0
+
+
+def check_usbref_ui_stays_out_of_gui_ui(repo_root: Path) -> int:
+    """The USB reference video UI must stay in its own file.
+
+    ui/gui_ui.c is upstream's. Roughly 930 lines of this fork's reference-video
+    and streaming UI used to live in it, and every one was a conflict on every
+    upstream sync. Moving them out only helps for as long as they stay out, and
+    a new row is always easier to add where the other rows already are -- which
+    is exactly how it accumulated the first time.
+
+    gui_ui.c keeps the handful of wiring lines that raise the dialog. Anything
+    that draws or handles one of its controls belongs in
+    ui/gui_usbref_settings.c."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+
+    # Clay ids this fork's dialog owns. The wiring lines name the window itself,
+    # never a control inside it.
+    banned = ("RtspCodec", "RtspLanConfirm", "RtspBindBox", "RtspEncoderBox",
+              "RtspUrl", "RtspPassword", "RtspLiveBox", "ToggleRtsp",
+              "PreviewDeviceBox", "PreviewRescanBtn", "PreviewConnectBtn",
+              "PreviewAspectBox", "PreviewCrop", "ToggleCcRecord", "CcTagField",
+              "VideoCodecBox")
+    found = [b for b in banned if b in ui]
+    if found:
+        return fail(
+            "gui_ui.c draws or handles USB reference video controls again: "
+            + ", ".join(found) + ".\n"
+            "That file is upstream's. These belong in ui/gui_usbref_settings.c; "
+            "gui_ui.c keeps only the gear that opens the dialog and its five "
+            "wiring lines."
+        )
+
+    # Reading a usbref_* setting here is NOT banned, deliberately. Three
+    # legitimate readers remain and would be worse anywhere else:
+    #   - the text-field buffer map, because the edit machinery is gui_ui.c's;
+    #   - gui_ui_apply_remote_setting(), the server side of the net setter,
+    #     which gates by key string and must keep refusing stream changes
+    #     mid-stream;
+    #   - the Capture hint line, which names the codec in force for the
+    #     Reference video row that stays there.
+    # What must not come back is a CONTROL, which the ids above catch.
+    return 0
+
+
+def check_preview_crop_never_reaches_a_recording(repo_root: Path) -> int:
+    """The preview crop is a viewing aid and must stay one.
+
+    The reference MKV exists to be compared frame-for-frame against a
+    tbc-video-export of the same tape, so it has to keep the full active
+    raster. A crop filter in either encoder argv builder would silently break
+    that comparison, and it would look like a feature while doing it.
+    """
+    for rel in ("misrc_tools/misrc_gui/output/gui_video_record.c",
+                "misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c"):
+        path = repo_root / rel
+        if not path.exists():
+            return fail(f"encoder source is missing: {path}")
+        text = strip_c_comments(path.read_text(encoding="utf-8", errors="replace"))
+        for needle in ("crop=", "\"crop\"", "drawbox"):
+            if needle in text:
+                return fail(
+                    f"{rel} builds an ffmpeg crop/mask filter ({needle}).\n"
+                    "The preview crop is preview-only by design: the reference "
+                    "recording keeps the full active raster so it stays "
+                    "frame-comparable with a tbc-video-export. Crop at the "
+                    "render path in gui_preview_v4l2.c instead."
+                )
+    return 0
+
+
 def check_ui_scale_policy_runtime(repo_root: Path) -> int:
     cc = shutil.which("cc")
     if cc is None:
@@ -4204,6 +4351,8 @@ def main() -> int:
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
         ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
+        ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
+        ("USB reference video UI stays out of gui_ui.c", lambda: check_usbref_ui_stays_out_of_gui_ui(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
@@ -4222,6 +4371,7 @@ def main() -> int:
         checks.insert(15, ("closed-caption child I/O class", lambda: check_cc_record_ioprio_runtime(repo_root)))
         checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
+        checks.insert(17, ("SDTV preview geometry runtime", lambda: check_preview_sdtv_geometry_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode

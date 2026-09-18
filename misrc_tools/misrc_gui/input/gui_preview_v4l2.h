@@ -40,6 +40,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "gui_preview_sdtv.h"
 #include "gui_preview_tap.h"
 #include "raylib.h"
 
@@ -60,14 +61,48 @@ typedef struct {
     char     label[24];            /* "720x576 @ 25" - prebuilt for the picker */
 } preview_mode_t;
 
+/* An analog input jack: Composite, S-Video, Tuner... A webcam reports exactly
+ * one and it is not interesting; an SDTV dongle reports several and which one
+ * is selected decides what you are actually looking at. */
+typedef struct {
+    uint32_t index;                /* v4l2_input.index; what S_INPUT takes */
+    char     name[32];             /* v4l2_input.name, e.g. "Composite" */
+    bool     is_sdtv;              /* V4L2_IN_CAP_STD */
+} preview_input_t;
+
+/* A video standard as ENUMSTD reports it. `id` is a v4l2_std_id, which is a
+ * mask: several entries can share bits, so an id is only ever matched back to
+ * an entry by exact equality. */
+typedef struct {
+    uint64_t id;
+    char     name[24];             /* "NTSC", "PAL"... */
+    uint32_t fps_num, fps_den;     /* from frameperiod, inverted to a rate */
+    uint32_t framelines;
+} preview_standard_t;
+
 #define PREVIEW_MAX_MODES   32
 #define PREVIEW_MAX_DEVICES 16
+#define PREVIEW_MAX_INPUTS  8
+#define PREVIEW_MAX_STDS    12
 
 typedef struct {
     char           path[32];       /* "/dev/video0" */
     char           card[40];       /* v4l2_capability.card */
     preview_mode_t modes[PREVIEW_MAX_MODES];
-    int            n_modes;        /* YUYV, discrete, best first */
+    int            n_modes;        /* best first; for SDTV, derived per standard */
+
+    /* Analog-capture facing. n_inputs is 0 on a device that reports none. */
+    preview_input_t    inputs[PREVIEW_MAX_INPUTS];
+    int                n_inputs;
+    preview_standard_t stds[PREVIEW_MAX_STDS];
+    int                n_stds;
+    /* Which standard modes[] was derived for; -1 when the device has none.
+     * The mode list is standard-specific, so the two travel together. */
+    int                std_index;
+    /* True when this is a standard-definition analog capture device rather than
+     * a webcam: it has a video standard, its frame sizes are a scaler range
+     * rather than a list, and Input/Standard are meaningful controls. */
+    bool               is_sdtv;
 } preview_device_t;
 
 typedef struct {
@@ -83,6 +118,14 @@ typedef struct {
     char     err_text[128];
     int      child_pid;            /* non-zero only while popped out */
     int      viewers;              /* panels currently showing preview */
+
+    /* Analog state, as read back after connect -- never as requested. */
+    int      input;                /* -1 when the device reports no inputs */
+    char     input_name[32];
+    char     std_name[24];         /* "" when the device has no standard */
+    uint32_t sar_num, sar_den;     /* sample aspect of the negotiated raster */
+    uint32_t dar_num, dar_den;     /* display aspect it should be shown at */
+    uint32_t field;                /* negotiated v4l2_field; ANY means unknown */
 } preview_status_t;
 
 /* ---- lifecycle ---------------------------------------------------------- */
@@ -100,6 +143,55 @@ const preview_device_t *gui_preview_devices(size_t *count);
 int  gui_preview_selected_device(void);
 int  gui_preview_selected_mode(void);
 void gui_preview_select(int device_index, int mode_index);
+
+/* ---- analog input and standard ------------------------------------------ */
+
+int  gui_preview_selected_input(void);     /* index into the device's inputs[] */
+int  gui_preview_selected_standard(void);  /* index into the device's stds[] */
+
+/* Applied immediately when streaming: V4L2 lets a bridge switch jack without
+ * stopping, and refusing to would make Composite/S-Video unusable mid-tape.
+ * Returns 0 on success, -1 if the device rejected it (status carries why). */
+int  gui_preview_select_input(int input_index);
+
+/* A standard change resizes the raster (480 vs 576 lines) and every SDTV
+ * driver refuses S_STD while streaming, so this only records the choice and
+ * rebuilds the mode list; the caller must reconnect for it to take effect.
+ * Returns true if the selection changed. */
+bool gui_preview_select_standard(int std_index);
+
+/* Restore a persisted selection by name rather than by index: an index is
+ * meaningless across devices, and the standard list is device-specific. Both
+ * are no-ops when the name is empty or unknown. */
+void gui_preview_select_input_by_name(const char *name);
+void gui_preview_select_standard_by_name(const char *name);
+
+/* Select a mode from a persisted "YUYV:WxH@num/den" spec. Falls back to the
+ * same geometry at any rate, and leaves the selection alone if neither
+ * matches. Call it after the standard is chosen: the mode list is rebuilt
+ * whenever the standard changes. */
+void gui_preview_select_mode_by_spec(const char *spec);
+
+/* The current mode in that same form, for persisting. Always NUL-terminates. */
+void gui_preview_mode_spec(char *out, size_t cap);
+
+/* ---- display geometry ---------------------------------------------------- */
+
+/* Aspect override; one of preview_aspect_mode_t. Affects the preview, the
+ * reference recording and the RTSP stream alike, so they cannot disagree. */
+void gui_preview_set_aspect_mode(int mode);
+int  gui_preview_aspect_mode(void);
+
+/* Preview-only crop, in source pixels off each edge. This never reaches the
+ * frame tap: a reference recording must keep the full active raster so it
+ * stays comparable with a tbc-video-export of the same tape. Values are
+ * clamped so at least a 2x2 window survives. */
+void gui_preview_set_crop(int top, int bottom, int left, int right);
+void gui_preview_get_crop(int *top, int *bottom, int *left, int *right);
+
+/* The display aspect of the negotiated raster, as an "N:M" string for
+ * ffmpeg's -aspect. Falls back to "4:3" before anything is negotiated. */
+void gui_preview_aspect_arg(char *out, size_t cap);
 
 /* ---- stream ------------------------------------------------------------- */
 

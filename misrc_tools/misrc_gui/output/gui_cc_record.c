@@ -73,8 +73,8 @@ static struct {
     bool   dev_uncorrelated;   /* usable, but not on the previewed dongle */
 
     /* --- injected --- */
-    char   override_dev[64];   /* settings cc_vbi_device; "" = auto */
-    char   preview_dev[64];    /* settings preview_device_path; "" = no correlation */
+    char   override_dev[64];   /* settings usbref_cc_vbi_device; "" = auto */
+    char   preview_dev[64];    /* settings usbref_device_path; "" = no correlation */
 
     /* --- derived --- */
     cc_probe_state_t state;

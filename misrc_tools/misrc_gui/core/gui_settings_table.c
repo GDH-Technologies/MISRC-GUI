@@ -62,7 +62,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     strcpy(settings->raw_filename, "raw_data.bin");
     strcpy(settings->audio_4ch_filename, "quad_4ch.wav");
     strcpy(settings->video_filename, "video.mkv");
-    strcpy(settings->cc_filename, "captions.scc");
+    strcpy(settings->usbref_cc_filename, "captions.scc");
     strcpy(settings->audio_2ch_12_filename, "stereo_ch1_ch2.wav");
     strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
 
@@ -137,23 +137,31 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // Audio output defaults
     settings->enable_audio_4ch = false;
     settings->video_record_enabled = false;
-    settings->video_record_codec = 0;        /* H.264 */
+    settings->usbref_codec = 0;        /* H.264 */
     settings->video_output_tag[0] = '\0';
-    settings->cc_record_enabled = false;
-    settings->cc_output_tag[0] = '\0';
-    settings->cc_vbi_device[0] = '\0';       /* auto: the dongle the preview is on */
+    settings->usbref_cc_enabled = false;
+    settings->usbref_cc_tag[0] = '\0';
+    settings->usbref_cc_vbi_device[0] = '\0';       /* auto: the dongle the preview is on */
     settings->ffmpeg_path[0] = '\0';
-    settings->preview_device_path[0] = '\0';
-    settings->rtsp_stream_enabled = false;
-    settings->rtsp_stream_lan = false;       /* loopback: going off-box is explicit */
-    settings->rtsp_stream_port = 0;          /* 0 = the module's default */
-    settings->rtsp_stream_encoder = 0;       /* auto */
-    settings->rtsp_stream_bitrate_kbps = 0;  /* 0 = the module's default */
-    settings->rtsp_stream_deinterlace = false;
-    settings->rtsp_lan_acknowledged = false; /* the warning has not been seen yet */
-    settings->rtsp_stream_password = false;  /* passwordless unless asked */
-    settings->mediamtx_path[0] = '\0';
-    settings->rtsp_audio_device[0] = '\0';
+    settings->usbref_device_path[0] = '\0';
+    settings->usbref_input[0] = '\0';       /* leave the device on whatever jack it has */
+    settings->usbref_standard[0] = '\0';    /* auto-detect on connect */
+    settings->usbref_mode_spec[0] = '\0';   /* the device's default mode */
+    settings->usbref_aspect = 0;       /* auto: 4:3 for SDTV, square otherwise */
+    settings->usbref_crop_top = 0;
+    settings->usbref_crop_bottom = 0;
+    settings->usbref_crop_left = 0;
+    settings->usbref_crop_right = 0;
+    settings->usbref_rtsp_enabled = false;
+    settings->usbref_rtsp_lan = false;       /* loopback: going off-box is explicit */
+    settings->usbref_rtsp_port = 0;          /* 0 = the module's default */
+    settings->usbref_rtsp_encoder = 0;       /* auto */
+    settings->usbref_rtsp_bitrate_kbps = 0;  /* 0 = the module's default */
+    settings->usbref_rtsp_deinterlace = false;
+    settings->usbref_rtsp_lan_acknowledged = false; /* the warning has not been seen yet */
+    settings->usbref_rtsp_password = false;  /* passwordless unless asked */
+    settings->usbref_mediamtx_path[0] = '\0';
+    settings->usbref_rtsp_audio_device[0] = '\0';
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -368,11 +376,11 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
      * that base already carries the record-start timestamp. Keep the two
      * blocks textually identical so a diff of them is empty. */
     char cc_tag[40] = {0};
-    sanitize_tag(cc_tag, sizeof(cc_tag), settings->cc_output_tag);
+    sanitize_tag(cc_tag, sizeof(cc_tag), settings->usbref_cc_tag);
     if (cc_tag[0]) {
-        snprintf(settings->cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+        snprintf(settings->usbref_cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
     } else {
-        snprintf(settings->cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+        snprintf(settings->usbref_cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
     }
 
     if (audio_tag_12[0]) {
@@ -639,7 +647,7 @@ static bool hook_video_codec(const gui_setting_desc_t *d, gui_settings_t *s, con
     long long c;
     if (!parse_int_text(value, strict, &c, err, errcap)) return false;
     /* Clamp: a hand-edited file must not select a codec that does not exist. */
-    s->video_record_codec = (c == 1) ? 1 : 0;
+    s->usbref_codec = (c == 1) ? 1 : 0;
     (void)d;
     return true;
 }
@@ -651,8 +659,34 @@ static bool hook_rtsp_port(const gui_setting_desc_t *d, gui_settings_t *s, const
     int p = (int)ll;
     /* Clamp to a usable, unprivileged port. A hand-edited 0 means "default",
      * and anything below 1024 would need root we do not have. */
-    s->rtsp_stream_port = (p == 0 || (p >= 1024 && p <= 65535)) ? p : 0;
+    s->usbref_rtsp_port = (p == 0 || (p >= 1024 && p <= 65535)) ? p : 0;
     (void)d;
+    return true;
+}
+
+static bool hook_preview_aspect_mode(const gui_setting_desc_t *d, gui_settings_t *s,
+                                     const char *value, bool strict, char *err, size_t errcap) {
+    long long ll;
+    if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
+    int e = (int)ll;
+    /* Anything outside the enum falls back to auto rather than being rejected:
+     * a settings file written by a newer build must not make this one unusable. */
+    s->usbref_aspect = (e >= 0 && e <= 3) ? e : 0;
+    (void)d;
+    return true;
+}
+
+/* A crop is in source pixels off one edge. Negative is meaningless, and a crop
+ * wider than any SD raster would leave nothing to show, so clamp rather than
+ * reject -- the render path clamps again against the real frame size. */
+static bool hook_preview_crop(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                              bool strict, char *err, size_t errcap) {
+    long long ll;
+    if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
+    int v = (int)ll;
+    if (v < 0) v = 0;
+    if (v > 512) v = 512;
+    *(int *)((char *)s + d->offset) = v;
     return true;
 }
 
@@ -661,7 +695,7 @@ static bool hook_rtsp_encoder(const gui_setting_desc_t *d, gui_settings_t *s, co
     long long ll;
     if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
     int e = (int)ll;
-    s->rtsp_stream_encoder = (e >= 0 && e <= 2) ? e : 0;
+    s->usbref_rtsp_encoder = (e >= 0 && e <= 2) ? e : 0;
     (void)d;
     return true;
 }
@@ -673,7 +707,7 @@ static bool hook_rtsp_bitrate(const gui_setting_desc_t *d, gui_settings_t *s, co
     int b = (int)ll;
     /* 0 means "the module's default"; a silly value would otherwise produce
      * a stream nobody can watch. */
-    s->rtsp_stream_bitrate_kbps = (b == 0 || (b >= 100 && b <= 100000)) ? b : 0;
+    s->usbref_rtsp_bitrate_kbps = (b == 0 || (b >= 100 && b <= 100000)) ? b : 0;
     (void)d;
     return true;
 }
@@ -852,18 +886,18 @@ static const gui_setting_desc_t s_table[] = {
 
     GS_B  ("enable_audio_4ch",                 enable_audio_4ch,            0),
     GS_B  ("video_record_enabled",             video_record_enabled,        0),
-    GS_IH ("video_record_codec",               video_record_codec,          0, hook_video_codec),
-    GS_S  ("preview_device_path",              preview_device_path,         0),
-    GS_B  ("rtsp_stream_enabled",              rtsp_stream_enabled,         0),
-    GS_B  ("rtsp_stream_lan",                  rtsp_stream_lan,             0),
-    GS_IH ("rtsp_stream_port",                 rtsp_stream_port,            0, hook_rtsp_port),
-    GS_IH ("rtsp_stream_encoder",              rtsp_stream_encoder,         0, hook_rtsp_encoder),
-    GS_IH ("rtsp_stream_bitrate_kbps",         rtsp_stream_bitrate_kbps,    0, hook_rtsp_bitrate),
-    GS_B  ("rtsp_stream_deinterlace",          rtsp_stream_deinterlace,     0),
-    GS_B  ("rtsp_lan_acknowledged",            rtsp_lan_acknowledged,       0),
-    GS_B  ("rtsp_stream_password",             rtsp_stream_password,        0),
-    GS_S  ("mediamtx_path",                    mediamtx_path,               0),
-    GS_S  ("rtsp_audio_device",                rtsp_audio_device,           0),
+    GS_IH ("usbref_codec",               usbref_codec,          0, hook_video_codec),
+    GS_S  ("usbref_device_path",              usbref_device_path,         0),
+    GS_B  ("usbref_rtsp_enabled",              usbref_rtsp_enabled,         0),
+    GS_B  ("usbref_rtsp_lan",                  usbref_rtsp_lan,             0),
+    GS_IH ("usbref_rtsp_port",                 usbref_rtsp_port,            0, hook_rtsp_port),
+    GS_IH ("usbref_rtsp_encoder",              usbref_rtsp_encoder,         0, hook_rtsp_encoder),
+    GS_IH ("usbref_rtsp_bitrate_kbps",         usbref_rtsp_bitrate_kbps,    0, hook_rtsp_bitrate),
+    GS_B  ("usbref_rtsp_deinterlace",          usbref_rtsp_deinterlace,     0),
+    GS_B  ("usbref_rtsp_lan_acknowledged",            usbref_rtsp_lan_acknowledged,       0),
+    GS_B  ("usbref_rtsp_password",             usbref_rtsp_password,        0),
+    GS_S  ("usbref_mediamtx_path",                    usbref_mediamtx_path,               0),
+    GS_S  ("usbref_rtsp_audio_device",                usbref_rtsp_audio_device,           0),
     GS_B  ("enable_audio_2ch_12",              enable_audio_2ch_12,         0),
     GS_B  ("enable_audio_2ch_34",              enable_audio_2ch_34,         0),
     GS_B  ("audio_monitor_playback",           audio_monitor_playback,      GS_LOCAL),
@@ -950,11 +984,11 @@ static const gui_setting_desc_t s_table[] = {
      * and fails the comparison for reasons that look nothing like the cause.
      * New rows go on the end.
      *
-     * cc_vbi_device is deliberately NOT GS_LOCAL -- see gui_settings.h. */
-    GS_B  ("cc_record_enabled",                cc_record_enabled,           0),
-    GS_S  ("cc_filename",                      cc_filename,                 0),
-    GS_S  ("cc_output_tag",                    cc_output_tag,               GS_NAME),
-    GS_S  ("cc_vbi_device",                    cc_vbi_device,               0),
+     * usbref_cc_vbi_device is deliberately NOT GS_LOCAL -- see gui_settings.h. */
+    GS_B  ("usbref_cc_enabled",                usbref_cc_enabled,           0),
+    GS_S  ("usbref_cc_filename",                      usbref_cc_filename,                 0),
+    GS_S  ("usbref_cc_tag",                    usbref_cc_tag,               GS_NAME),
+    GS_S  ("usbref_cc_vbi_device",                    usbref_cc_vbi_device,               0),
     /* Upstream v1.2.0's level-autostop mV readout and waveform scale dropdown.
      * Appended for the same reason as the caption rows. The legacy
      * waveform_scale_mv alias precedes waveform_scale_mode so the newer key
@@ -967,6 +1001,20 @@ static const gui_setting_desc_t s_table[] = {
     /* Where a net client records (server or this machine): it describes this
      * machine, so a client keeps its own and never sends it. */
     GS_B  ("net_client_record_local",          net_client_record_local,     GS_LOCAL),
+    /* SDTV preview: which jack, which video standard, which picture mode, and
+     * how the result is shaped. Appended for the reason stated above. Stored by
+     * name, not index -- see gui_settings.h. None of these are GS_LOCAL: in net
+     * mode the server owns the dongle, so a client that could not name the
+     * server's input could not switch Composite to S-Video at all, which is the
+     * whole point of the control. */
+    GS_S  ("usbref_input",                    usbref_input,               0),
+    GS_S  ("usbref_standard",                 usbref_standard,            0),
+    GS_S  ("usbref_mode_spec",                usbref_mode_spec,           0),
+    GS_IH ("usbref_aspect",              usbref_aspect,         0, hook_preview_aspect_mode),
+    GS_IH ("usbref_crop_top",                 usbref_crop_top,            0, hook_preview_crop),
+    GS_IH ("usbref_crop_bottom",              usbref_crop_bottom,         0, hook_preview_crop),
+    GS_IH ("usbref_crop_left",                usbref_crop_left,           0, hook_preview_crop),
+    GS_IH ("usbref_crop_right",               usbref_crop_right,          0, hook_preview_crop),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

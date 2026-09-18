@@ -61,7 +61,7 @@ typedef struct {
     char raw_filename[MAX_FILENAME_LEN];
     char audio_4ch_filename[MAX_FILENAME_LEN];
     char video_filename[MAX_FILENAME_LEN];   // reference video (MKV)
-    char cc_filename[MAX_FILENAME_LEN];      // closed-caption sidecar (Scenarist SCC)
+    char usbref_cc_filename[MAX_FILENAME_LEN];      // closed-caption sidecar (Scenarist SCC)
     char audio_2ch_12_filename[MAX_FILENAME_LEN];
     char audio_2ch_34_filename[MAX_FILENAME_LEN];
     char audio_1ch_filenames[4][MAX_FILENAME_LEN]; // Individual channel files
@@ -103,8 +103,8 @@ typedef struct {
     // Reference video: the USB preview dongle's picture, encoded by ffmpeg
     // alongside the RF. The RF stays the archival master; this is for QC.
     bool video_record_enabled;
-    int  video_record_codec;                 // 0 = H.264 (default), 1 = FFV1
-    bool cc_record_enabled;                  // EIA-608 line-21 sidecar, off by default
+    int  usbref_codec;                 // 0 = H.264 (default), 1 = FFV1
+    bool usbref_cc_enabled;                  // EIA-608 line-21 sidecar, off by default
     bool enable_audio_2ch_12;
     bool enable_audio_2ch_34;
     bool enable_audio_1ch[4];                  // Individual channel enables
@@ -139,7 +139,7 @@ typedef struct {
     // Optional tags for non-mono audio outputs: [0]=4ch, [1]=stereo ch1/2, [2]=stereo ch3/4
     char audio_output_tags[3][32];
     char video_output_tag[32];
-    char cc_output_tag[32];
+    char usbref_cc_tag[32];
     char ffmpeg_path[512];                   // empty = resolve automatically
     // RTSP stream: publishes the preview picture and the dongle's own audio so
     // a tape can be watched from another machine. Monitoring only -- the RF
@@ -147,29 +147,47 @@ typedef struct {
     // The USB preview device last connected, remembered so the app can open it
     // again at launch. Stored by path rather than index: /dev/videoN survives a
     // reboot, an enumeration order does not.
-    char preview_device_path[40];
+    char usbref_device_path[40];
+    /* Analog capture settings for an SDTV dongle (em28xx and friends). Stored
+     * by NAME rather than by index for the same reason the device is stored by
+     * path: an index into a device-specific list means nothing once the device
+     * changes, and the standard list differs between bridges.
+     * Empty usbref_standard = auto-detect on connect. */
+    char usbref_input[32];                  // "Composite", "S-Video"; empty = leave as-is
+    char usbref_standard[24];               // "NTSC", "PAL"; empty = auto-detect
+    /* The picture mode, as "YUYV:WxH@num/den". Previously the selected mode was
+     * never persisted and every launch silently reverted to the largest one. */
+    char usbref_mode_spec[40];
+    int  usbref_aspect;                // 0 auto, 1 4:3, 2 16:9, 3 square pixels
+    /* Preview-only crop, in source pixels off each edge. Deliberately NOT
+     * applied to the recording: the reference MKV keeps the full active raster
+     * so it stays frame-comparable with a tbc-video-export of the same tape. */
+    int  usbref_crop_top;
+    int  usbref_crop_bottom;
+    int  usbref_crop_left;
+    int  usbref_crop_right;
     /* Raw VBI node captions are read from. Empty means "derive it from
-     * preview_device_path by sysfs correlation" -- the VBI node on the same
+     * usbref_device_path by sysfs correlation" -- the VBI node on the same
      * dongle whose picture is being previewed. Not GS_CLIENT_LOCAL, for the
-     * same reason preview_device_path and rtsp_audio_device are not: in net
+     * same reason usbref_device_path and usbref_rtsp_audio_device are not: in net
      * mode the server owns the capture hardware, and a client that could not
      * name the server's node could not configure captions at all. */
-    char cc_vbi_device[64];
-    bool rtsp_stream_enabled;
-    bool rtsp_stream_lan;                    // false = loopback only (default)
-    int  rtsp_stream_port;                   // 0 = the built-in default (8654)
-    int  rtsp_stream_encoder;                // 0 auto, 1 NVENC, 2 software
-    int  rtsp_stream_bitrate_kbps;           // software encoder only; 0 = 2000
-    bool rtsp_stream_deinterlace;            // bwdif; costs latency, off by default
+    char usbref_cc_vbi_device[64];
+    bool usbref_rtsp_enabled;
+    bool usbref_rtsp_lan;                    // false = loopback only (default)
+    int  usbref_rtsp_port;                   // 0 = the built-in default (8654)
+    int  usbref_rtsp_encoder;                // 0 auto, 1 NVENC, 2 software
+    int  usbref_rtsp_bitrate_kbps;           // software encoder only; 0 = 2000
+    bool usbref_rtsp_deinterlace;            // bwdif; costs latency, off by default
     // Set once the LAN warning has been read and accepted. Putting a tape on
     // the network is a deliberate act; after the first time, it is a toggle.
-    bool rtsp_lan_acknowledged;              // false = ask before the first LAN switch
+    bool usbref_rtsp_lan_acknowledged;              // false = ask before the first LAN switch
     // Require a password to WATCH. Off by default -- the stream is open unless
     // asked otherwise. The password itself is never stored: a fresh one is
     // drawn each time the stream starts and shown in the panel.
-    bool rtsp_stream_password;               // false = anyone who can reach it can watch
-    char mediamtx_path[512];                 // empty = bundled copy, then PATH
-    char rtsp_audio_device[96];              // empty = resolve from the video device
+    bool usbref_rtsp_password;               // false = anyone who can reach it can watch
+    char usbref_mediamtx_path[512];                 // empty = bundled copy, then PATH
+    char usbref_rtsp_audio_device[96];              // empty = resolve from the video device
     // Ingest metadata (saved to settings and written to capture log at record start)
     char ingest_project[128];
     char ingest_tape_id[128];

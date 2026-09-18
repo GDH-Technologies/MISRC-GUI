@@ -409,11 +409,13 @@ out:
 static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
                           char *size_buf, size_t size_cap,
                           char *rate_buf, size_t rate_cap,
+                          char *aspect_buf, size_t aspect_cap,
                           const char *out_path)
 {
     snprintf(size_buf, size_cap, "%ux%u", vr.width, vr.height);
     if (vr.fps_den <= 1) snprintf(rate_buf, rate_cap, "%u", vr.fps_num);
     else                 snprintf(rate_buf, rate_cap, "%u/%u", vr.fps_num, vr.fps_den);
+    gui_preview_aspect_arg(aspect_buf, aspect_cap);
 
     int n = 0;
     argv[n++] = ff.path;
@@ -429,9 +431,16 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
     argv[n++] = (char *)"-i";             argv[n++] = (char *)"-";
     argv[n++] = (char *)"-an";
     argv[n++] = (char *)"-sn";
-    /* 720x576 is non-square PAL; without this every player shows a 5:4
-     * stretch. Yields SAR 16:15 DAR 4:3. */
-    argv[n++] = (char *)"-aspect";        argv[n++] = (char *)"4:3";
+    /* SD rasters are not square-pixel: 720x576 without this shows a 5:4
+     * stretch and 720x480 a 3:2 one. The value is computed from the negotiated
+     * geometry and the user's aspect setting rather than hard-coded, so the
+     * MKV, the RTSP stream and the on-screen preview cannot disagree -- and so
+     * a non-SDTV source is not forced into 4:3 it never was.
+     *
+     * Note there is deliberately no crop filter here. The preview crop is a
+     * viewing aid; this file must keep the full active raster so it stays
+     * frame-comparable with a tbc-video-export of the same tape. */
+    argv[n++] = (char *)"-aspect";        argv[n++] = aspect_buf;
 
     if (codec == VIDEO_CODEC_FFV1) {
         argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"ffv1";
@@ -538,11 +547,11 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
         return -1;
     }
 
-    char size_buf[32], rate_buf[32];
+    char size_buf[32], rate_buf[32], aspect_buf[16];
     char *argv[64];
     int argc = 0;
     vr_build_argv(argv, &argc, codec, size_buf, sizeof(size_buf),
-                  rate_buf, sizeof(rate_buf), out_path);
+                  rate_buf, sizeof(rate_buf), aspect_buf, sizeof(aspect_buf), out_path);
 
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);

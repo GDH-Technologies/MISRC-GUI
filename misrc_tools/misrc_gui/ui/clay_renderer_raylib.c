@@ -72,7 +72,7 @@ void Clay_Raylib_Initialize(int width, int height, const char *title, unsigned i
 // Call Clay_Raylib_Close() to free
 // Gear of outer radius r centred on (cx, cy): a ring with a centre hole and
 // six broad teeth, drawn filled so it still reads as a gear at 16 px.
-static void gui_draw_gear_icon(float cx, float cy, float r, Color col)
+void gui_draw_gear_icon(float cx, float cy, float r, Color col)
 {
     const int teeth = 6;
     float r_tip = r * 0.98f;

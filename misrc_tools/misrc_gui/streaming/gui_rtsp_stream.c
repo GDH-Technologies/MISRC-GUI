@@ -276,6 +276,7 @@ static void rs_build_argv(char *argv[], int *argc_out,
                           char *br_buf, size_t br_cap,
                           char *maxr_buf, size_t maxr_cap,
                           char *bufs_buf, size_t bufs_cap,
+                          char *aspect_buf, size_t aspect_cap,
                           char *url_buf, size_t url_cap)
 {
     int n = 0;
@@ -290,6 +291,7 @@ static void rs_build_argv(char *argv[], int *argc_out,
     snprintf(maxr_buf, maxr_cap, "%uk", kbps);
     snprintf(bufs_buf, bufs_cap, "%uk", kbps * 2);
     snprintf(url_buf, url_cap, "rtsp://127.0.0.1:%u/misrc-preview", (unsigned)opts->ports.rtsp);
+    gui_preview_aspect_arg(aspect_buf, aspect_cap);
 
     argv[n++] = (char *)gui_video_record_ffmpeg_path();
     argv[n++] = (char *)"-hide_banner";
@@ -316,6 +318,15 @@ static void rs_build_argv(char *argv[], int *argc_out,
     if (!audio_device || !audio_device[0]) {
         argv[n++] = (char *)"-an";
     }
+
+    /* The same display aspect the MKV and the on-screen preview use. Without it
+     * the stream was the odd one out: a viewer saw a 3:2 stretch of an NTSC tape
+     * that the recording of the very same frames did not have.
+     *
+     * It must sit AFTER -i: -aspect is an encoding option, and in the input
+     * section ffmpeg rejects the whole command with "Error opening input files:
+     * Invalid argument" -- which reads like a broken device, not a bad flag. */
+    argv[n++] = (char *)"-aspect";      argv[n++] = aspect_buf;
 
     if (opts->deinterlace) {
         /* Helps a remote viewer on 480i/576i, costs latency and CPU. Off by
@@ -513,6 +524,7 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
     }
 
     char size_buf[32], rate_buf[32], gop_buf[16], br_buf[16], maxr_buf[16], bufs_buf[16];
+    char aspect_buf[16];
     char url_buf[256];
     char *argv[80];
     int argc = 0;
@@ -520,7 +532,7 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
                   size_buf, sizeof(size_buf), rate_buf, sizeof(rate_buf),
                   gop_buf, sizeof(gop_buf), br_buf, sizeof(br_buf),
                   maxr_buf, sizeof(maxr_buf), bufs_buf, sizeof(bufs_buf),
-                  url_buf, sizeof(url_buf));
+                  aspect_buf, sizeof(aspect_buf), url_buf, sizeof(url_buf));
 
     snprintf(rs.ffmpeg_log, sizeof(rs.ffmpeg_log), "%s/misrc-rtsp-ffmpeg.log",
              getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");

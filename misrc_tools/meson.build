@@ -414,6 +414,7 @@ if raylib_dep.found()
     'misrc_gui/input/gui_cxadc.c',
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
+    'misrc_gui/input/gui_preview_sdtv.c',
     'misrc_gui/input/gui_preview_v4l2.c',
     'misrc_gui/streaming/gui_preview_tap_mux.c',
     'misrc_gui/streaming/gui_mediamtx.c',
@@ -447,6 +448,7 @@ if raylib_dep.found()
     'misrc_gui/ui/gui_device_label.c',
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
+    'misrc_gui/ui/gui_usbref_settings.c',
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
