@@ -2,7 +2,8 @@
  * MISRC GUI - the USB Reference Video settings dialog.
  *
  * Everything about the USB capture dongle in one window: which device and jack,
- * the video standard and picture shape, the RTSP stream, and closed captions.
+ * the video standard and picture shape, and the RTSP stream. (The closed-caption
+ * row is drawn here too, but the settings panel places it; see below.)
  *
  * Why it is its own module rather than more rows in the settings panel:
  *
@@ -54,6 +55,15 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app);
  * confirmation before the dialog itself -- and returns true if it closed
  * something, so the caller stops looking for another window to dismiss. */
 bool gui_usbref_settings_handle_escape(gui_app_t *app);
+
+/* The closed-caption row: the ON/OFF switch, its file tag and the probe's hint
+ * line. It records alongside the reference video, so the settings panel draws
+ * it directly under the Reference video row; it lives here so upstream's
+ * gui_ui.c never names one of its controls. Render inside the panel's layout;
+ * call the handler from the panel's click block, and it returns true when the
+ * press was on one of the row's controls. */
+void gui_usbref_settings_render_captions_row(gui_app_t *app);
+bool gui_usbref_settings_handle_captions_click(gui_app_t *app);
 
 /* Start or stop the RTSP stream. Lives here with the rest of the streaming UI,
  * but stays exported because gui_ui_apply_remote_setting() drives the same
