@@ -29,9 +29,6 @@
 #define PV_CONFIRM_SECS  2.0
 
 typedef struct {
-    bool      dev_menu_open;
-    bool      fmt_menu_open;
-
     /* Sampled during render so handle_click, which runs a frame later, can
      * tell whether this click was the one that dismissed the gear popover. */
     bool      gear_open_at_render;
@@ -39,46 +36,9 @@ typedef struct {
     double    confirm_until;
     int       confirm_which;    /* 0 none, 1 disconnect, 2 popout */
 
-    /* Analog controls, present only for an SDTV device. They sit on their own
-     * row rather than competing for width with the device and mode pickers: a
-     * jack selector that vanishes in a split pane is a jack selector you cannot
-     * use, and switching Composite to S-Video mid-tape is the main thing this
-     * panel is for on such a device. */
-    bool      in_menu_open;
-
-    Rectangle r_dev, r_fmt, r_action, r_pop, r_in, r_gear;
-    Rectangle r_dev_opt[PV_MAX_OPTS];
-    Rectangle r_fmt_opt[PV_MAX_OPTS];
-    Rectangle r_in_opt[PV_MAX_OPTS];
-    int       n_dev_opt, n_fmt_opt, n_in_opt;
+    Rectangle r_action, r_pop, r_gear;
     bool      compact;
 } preview_panel_t;
-
-/* Snapshot the analog selections so the next launch restores them. Stored by
- * name for the same reason the device is stored by path: an index into a
- * device-specific list means nothing once the device changes. */
-static void pv_remember_analog(gui_app_t *app)
-{
-    if (!app) return;
-    size_t n = 0;
-    const preview_device_t *devs = gui_preview_devices(&n);
-    int sel = gui_preview_selected_device();
-    if (sel < 0 || (size_t)sel >= n) return;
-    const preview_device_t *d = &devs[sel];
-
-    int in = gui_preview_selected_input();
-    if (in >= 0 && in < d->n_inputs) {
-        snprintf(app->settings.usbref_input, sizeof(app->settings.usbref_input),
-                 "%s", d->inputs[in].name);
-    }
-    if (d->std_index >= 0 && d->std_index < d->n_stds) {
-        snprintf(app->settings.usbref_standard, sizeof(app->settings.usbref_standard),
-                 "%s", d->stds[d->std_index].name);
-    }
-    gui_preview_mode_spec(app->settings.usbref_mode_spec,
-                          sizeof(app->settings.usbref_mode_spec));
-    gui_settings_save(&app->settings);
-}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -119,9 +79,6 @@ static void preview_vtable_clear(void *state)
 {
     preview_panel_t *pp = state;
     if (!pp) return;
-    pp->dev_menu_open = false;
-    pp->fmt_menu_open = false;
-    pp->in_menu_open = false;
     pp->confirm_which = 0;
 }
 
@@ -155,14 +112,18 @@ static const char *pv_action_label(preview_status_t *st, preview_panel_t *pp, ch
 }
 
 /* Controls sit top-RIGHT: the channel gear button floats over the top-left of
- * the same canvas, and its popover opens downward from there. */
+ * the same canvas, and its popover opens downward from there.
+ *
+ * Only ACTIONS live here. Every setting for this device -- which one, the jack,
+ * the standard, the picture mode and shape, the stream, the captions -- is in
+ * the USB Reference Video dialog behind the gear. An overlay that also carried
+ * pickers meant half the controls were always on the surface you were not
+ * looking at, and the pickers had to shrink or vanish in a split pane. */
 static void preview_render_overlay(preview_panel_t *pp, Rectangle bounds)
 {
     preview_status_t st = gui_preview_get_status();
     size_t n_devs = 0;
-    const preview_device_t *devs = gui_preview_devices(&n_devs);
-    int sel_dev = gui_preview_selected_device();
-    int sel_mode = gui_preview_selected_mode();
+    (void)gui_preview_devices(&n_devs);
 
     if (pp->confirm_which && GetTime() > pp->confirm_until) pp->confirm_which = 0;
 
@@ -179,132 +140,22 @@ static void preview_render_overlay(preview_panel_t *pp, Rectangle bounds)
 
     pp->r_pop = (Rectangle){ x_right - pop_w, y, pop_w, PV_BTN_H };
     pp->r_action = (Rectangle){ pp->r_pop.x - PV_GAP - act_w, y, act_w, PV_BTN_H };
-
-    if (pp->compact) {
-        /* A split half-panel at the minimum window width has no room for the
-         * pickers; collapse them so the actions stay reachable. */
-        pp->r_fmt = (Rectangle){ pp->r_action.x - PV_GAP - 24.0f, y, 24.0f, PV_BTN_H };
-        pp->r_dev = (Rectangle){ 0, 0, 0, 0 };
-    } else {
-        pp->r_fmt = (Rectangle){ pp->r_action.x - PV_GAP - 104.0f, y, 104.0f, PV_BTN_H };
-        pp->r_dev = (Rectangle){ pp->r_fmt.x - PV_GAP - 110.0f, y, 110.0f, PV_BTN_H };
-    }
+    pp->r_gear = (Rectangle){ pp->r_action.x - PV_GAP - PV_BTN_H, y, PV_BTN_H, PV_BTN_H };
 
     bool busy = (st.state == PREVIEW_STATE_STREAMING || st.state == PREVIEW_STATE_STALLED ||
                  st.state == PREVIEW_STATE_CONNECTING || st.state == PREVIEW_STATE_POPPED_OUT);
-    bool can_pick = !busy && n_devs > 0;
 
-    if (pp->compact) {
-        pv_draw_button(pp->r_fmt, "...", pp->dev_menu_open || pp->fmt_menu_open, can_pick);
-    } else {
-        const char *dev_label = (n_devs > 0 && sel_dev < (int)n_devs) ? devs[sel_dev].path
-                                                                      : "(no device)";
-        const char *fmt_label = "(no mode)";
-        if (n_devs > 0 && sel_dev < (int)n_devs && sel_mode < devs[sel_dev].n_modes) {
-            fmt_label = devs[sel_dev].modes[sel_mode].label;
-        }
-        pv_draw_button(pp->r_dev, dev_label, pp->dev_menu_open, can_pick);
-        pv_draw_button(pp->r_fmt, fmt_label, pp->fmt_menu_open, can_pick);
-    }
-
-    pv_draw_button(pp->r_action, action, pp->confirm_which != 0, n_devs > 0);
-    pv_draw_button(pp->r_pop, st.state == PREVIEW_STATE_POPPED_OUT ? "Popped" : "Pop-out",
-                   st.state == PREVIEW_STATE_POPPED_OUT, busy || st.state == PREVIEW_STATE_POPPED_OUT);
-
-    /* ---- analog row: which jack ------------------------------------------- */
-    pp->r_in = (Rectangle){ 0, 0, 0, 0 };
-
-    const preview_device_t *adev = (n_devs > 0 && sel_dev < (int)n_devs) ? &devs[sel_dev] : NULL;
-    bool sdtv = adev && adev->is_sdtv;
-    /* A recording and the RTSP stream are both tees off this device. Changing
-     * the standard resizes the raster, so it is refused while either holds the
-     * stream -- the same reason the settings dialog refuses a device swap. */
-    bool tee_live = gui_video_record_is_running();
-    /* The jack, by contrast, is switchable live: V4L2 allows S_INPUT while
-     * streaming and it does not change geometry, so the encoders keep running. */
-    /* The jack is switchable live: V4L2 allows S_INPUT while streaming and it
-     * does not change geometry, so the encoders keep running. It earns its place
-     * on the overlay because it is the one control you reach for mid-tape.
-     *
-     * It is also only meaningful for the device actually streaming: the picker
-     * below reads the SELECTED device, and selection is inert until Connect. An
-     * input list for a device that is not on screen would be a control that
-     * silently does nothing. */
-    bool showing_selected = (st.device_path[0] == '\0') ||
-                            (strcmp(st.device_path, adev ? adev->path : "") == 0);
-    bool can_pick_input = sdtv && adev->n_inputs > 1 &&
-                          st.state != PREVIEW_STATE_POPPED_OUT && showing_selected;
-
-    if (sdtv) {
-        float y2 = y + PV_BTN_H + PV_GAP;
-        float in_w = 104.0f;
-        pp->r_in = (Rectangle){ x_right - in_w, y2, in_w, PV_BTN_H };
-
-        /* Prefer what the device reported back over what was merely selected:
-         * until it is streaming there is nothing to read back, and after that
-         * the readback is the truth. */
-        int sel_in = gui_preview_selected_input();
-        const char *in_label = "Input";
-        if (st.input_name[0]) in_label = st.input_name;
-        else if (sel_in >= 0 && sel_in < adev->n_inputs) in_label = adev->inputs[sel_in].name;
-
-        pv_draw_button(pp->r_in, in_label, pp->in_menu_open, can_pick_input);
-    }
-
-    /* Everything else about this device -- which one, the standard, the picture
-     * shape, the stream, the captions -- is one gear away. */
-    pp->r_gear = (Rectangle){ x_right - PV_BTN_H, y + PV_BTN_H + PV_GAP, PV_BTN_H, PV_BTN_H };
-    if (sdtv) pp->r_gear.x = pp->r_in.x - PV_GAP - PV_BTN_H;
+    /* Always enabled: the dialog is where you go when there is no device yet,
+     * to rescan or pick one. */
     pv_draw_button(pp->r_gear, "", gui_usbref_settings_is_open(), true);
     gui_draw_gear_icon(pp->r_gear.x + pp->r_gear.width * 0.5f,
                        pp->r_gear.y + pp->r_gear.height * 0.5f,
                        pp->r_gear.height * 0.38f,
                        (Color){ 220, 220, 225, 255 });
 
-    /* Option lists, right-aligned under their button. */
-    pp->n_dev_opt = 0;
-    pp->n_fmt_opt = 0;
-    pp->n_in_opt = 0;
-
-    if (pp->dev_menu_open && can_pick) {
-        Rectangle anchor = pp->compact ? pp->r_fmt : pp->r_dev;
-        float ow = 180.0f;
-        float ox = anchor.x + anchor.width - ow;
-        float oy = anchor.y + anchor.height + 2.0f;
-        for (size_t i = 0; i < n_devs && i < PV_MAX_OPTS; i++) {
-            Rectangle r = { ox, oy + (float)i * PV_OPT_H, ow, PV_OPT_H };
-            pp->r_dev_opt[pp->n_dev_opt++] = r;
-            char line[96];
-            snprintf(line, sizeof(line), "%s  %s", devs[i].path, devs[i].card);
-            pv_draw_button(r, line, (int)i == sel_dev, true);
-        }
-    }
-    if (pp->fmt_menu_open && can_pick && sel_dev < (int)n_devs) {
-        Rectangle anchor = pp->r_fmt;
-        float ow = 140.0f;
-        float ox = anchor.x + anchor.width - ow;
-        float oy = anchor.y + anchor.height + 2.0f;
-        int count = devs[sel_dev].n_modes;
-        if (count > PV_MAX_OPTS) count = PV_MAX_OPTS;
-        for (int i = 0; i < count; i++) {
-            Rectangle r = { ox, oy + (float)i * PV_OPT_H, ow, PV_OPT_H };
-            pp->r_fmt_opt[pp->n_fmt_opt++] = r;
-            pv_draw_button(r, devs[sel_dev].modes[i].label, i == sel_mode, true);
-        }
-    }
-    if (pp->in_menu_open && can_pick_input && adev) {
-        float ow = 140.0f;
-        float ox = pp->r_in.x + pp->r_in.width - ow;
-        float oy = pp->r_in.y + pp->r_in.height + 2.0f;
-        int count = adev->n_inputs;
-        if (count > PV_MAX_OPTS) count = PV_MAX_OPTS;
-        int sel_in = gui_preview_selected_input();
-        for (int i = 0; i < count; i++) {
-            Rectangle r = { ox, oy + (float)i * PV_OPT_H, ow, PV_OPT_H };
-            pp->r_in_opt[pp->n_in_opt++] = r;
-            pv_draw_button(r, adev->inputs[i].name, i == sel_in, true);
-        }
-    }
+    pv_draw_button(pp->r_action, action, pp->confirm_which != 0, n_devs > 0);
+    pv_draw_button(pp->r_pop, st.state == PREVIEW_STATE_POPPED_OUT ? "Popped" : "Pop-out",
+                   st.state == PREVIEW_STATE_POPPED_OUT, busy || st.state == PREVIEW_STATE_POPPED_OUT);
 }
 
 static void preview_vtable_render(void *state, gui_app_t *app, int channel,
@@ -328,7 +179,7 @@ static void preview_vtable_render(void *state, gui_app_t *app, int channel,
 static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel,
                                         Vector2 click, Rectangle bounds)
 {
-    (void)channel; (void)bounds;   /* app is used to persist the analog selections */
+    (void)app; (void)channel; (void)bounds;
     preview_panel_t *pp = state;
     if (!pp) return false;
 
@@ -338,60 +189,16 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
     bool dismissal = pp->gear_open_at_render;
     pp->gear_open_at_render = false;
 
-    /* Option lists first: they are drawn on top. */
-    for (int i = 0; i < pp->n_dev_opt; i++) {
-        if (CheckCollisionPointRec(click, pp->r_dev_opt[i])) {
-            gui_preview_select(i, 0);
-            pp->dev_menu_open = false;
-            return true;
-        }
-    }
-    for (int i = 0; i < pp->n_fmt_opt; i++) {
-        if (CheckCollisionPointRec(click, pp->r_fmt_opt[i])) {
-            gui_preview_select(gui_preview_selected_device(), i);
-            pp->fmt_menu_open = false;
-            pv_remember_analog(app);
-            return true;
-        }
-    }
-    for (int i = 0; i < pp->n_in_opt; i++) {
-        if (CheckCollisionPointRec(click, pp->r_in_opt[i])) {
-            /* Applied to the hardware immediately when streaming, so the
-             * picture changes under the operator's hand rather than at the next
-             * reconnect. A device that refuses leaves the old selection. */
-            gui_preview_select_input(i);
-            pp->in_menu_open = false;
-            pv_remember_analog(app);
-            return true;
-        }
-    }
-
     preview_status_t st = gui_preview_get_status();
     bool busy = (st.state == PREVIEW_STATE_STREAMING || st.state == PREVIEW_STATE_STALLED ||
                  st.state == PREVIEW_STATE_CONNECTING || st.state == PREVIEW_STATE_POPPED_OUT);
+    (void)busy;
 
-    if (CheckCollisionPointRec(click, pp->r_dev) ||
-        (pp->compact && CheckCollisionPointRec(click, pp->r_fmt) && !pp->fmt_menu_open)) {
-        if (!busy) { pp->dev_menu_open = !pp->dev_menu_open; pp->fmt_menu_open = false; }
-        return true;
-    }
-    if (CheckCollisionPointRec(click, pp->r_fmt)) {
-        if (!busy) { pp->fmt_menu_open = !pp->fmt_menu_open; pp->dev_menu_open = false; }
-        return true;
-    }
-    /* The zero rectangles a non-SDTV device leaves behind must not swallow a
-     * click at the panel's origin, so test for a real button first. */
-    if (pp->r_in.width > 0.0f && CheckCollisionPointRec(click, pp->r_in)) {
-        pp->in_menu_open = !pp->in_menu_open;
-        pp->dev_menu_open = pp->fmt_menu_open = false;
-        return true;
-    }
-    if (pp->r_gear.width > 0.0f && CheckCollisionPointRec(click, pp->r_gear)) {
+    if (CheckCollisionPointRec(click, pp->r_gear)) {
         /* Acts even on a gear-dismissal frame: opening a settings window is not
          * a destructive action, and making it need a second click would be a
          * worse surprise than the one the dismissal guard protects against. */
         gui_usbref_settings_open();
-        pp->dev_menu_open = pp->fmt_menu_open = pp->in_menu_open = false;
         return true;
     }
 
@@ -400,7 +207,6 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
     bool video_recording = gui_video_record_is_running();
 
     if (CheckCollisionPointRec(click, pp->r_action)) {
-        pp->dev_menu_open = pp->fmt_menu_open = false;
         if (video_recording && (st.state == PREVIEW_STATE_STREAMING ||
                                 st.state == PREVIEW_STATE_STALLED)) {
             return true;   /* swallowed: recording in progress */
@@ -438,7 +244,6 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
     }
 
     if (CheckCollisionPointRec(click, pp->r_pop)) {
-        pp->dev_menu_open = pp->fmt_menu_open = false;
         if (video_recording) return true;   /* swallowed: recording in progress */
         if (dismissal) return true;
         if (st.state == PREVIEW_STATE_POPPED_OUT) {
@@ -455,11 +260,8 @@ static bool preview_vtable_handle_click(void *state, gui_app_t *app, int channel
         return true;
     }
 
-    /* A click anywhere else in the panel closes the menus but is not consumed,
-     * so it still does whatever it would normally have done. */
-    if (pp->dev_menu_open || pp->fmt_menu_open) {
-        pp->dev_menu_open = pp->fmt_menu_open = false;
-    }
+    /* Nothing of ours: the overlay holds only three buttons now, and the
+     * settings that used to need dismissing live in the dialog. */
     return false;
 }
 

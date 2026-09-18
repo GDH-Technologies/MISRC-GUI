@@ -50,6 +50,24 @@ static Color ui_disabled_color(Color c)
 
 static bool s_open = false;
 
+/* Which list picker is up, if any.
+ *
+ * Device, mode, input and standard are all "choose one of N", and N runs from
+ * two (the jacks) to twenty (a webcam's modes). Click-to-cycle is fine at two
+ * and unusable at twenty -- the settings panel's own device box carried a
+ * comment admitting as much -- so they share ONE sheet instead of four bespoke
+ * controls. Adding a fifth list is a case in five small functions, not another
+ * popover. */
+typedef enum {
+    PICK_NONE = 0,
+    PICK_DEVICE,
+    PICK_MODE,
+    PICK_INPUT,
+    PICK_STANDARD
+} pick_kind_t;
+
+static pick_kind_t s_pick = PICK_NONE;
+
 /* Asks once, the first time the stream is pointed at the network. After the
  * answer is remembered in settings this stays false forever. */
 static bool s_rtsp_lan_confirm_open = false;
@@ -250,7 +268,7 @@ static void render_rtsp_codec_window(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
-            .zIndex = 30
+            .zIndex = 34
         },
         .backgroundColor = (Clay_Color){0, 0, 0, 150}
     }) {}
@@ -265,7 +283,7 @@ static void render_rtsp_codec_window(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
-            .zIndex = 31
+            .zIndex = 35
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(8)
@@ -379,7 +397,7 @@ static void render_rtsp_lan_confirm(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
-            .zIndex = 30
+            .zIndex = 36
         },
         .backgroundColor = (Clay_Color){0, 0, 0, 170}
     }) {}
@@ -394,7 +412,7 @@ static void render_rtsp_lan_confirm(gui_app_t *app)
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
-            .zIndex = 31
+            .zIndex = 37
         },
         .backgroundColor = to_clay_color(COLOR_PANEL_BG),
         .cornerRadius = CLAY_CORNER_RADIUS(8)
@@ -447,6 +465,236 @@ static void render_rtsp_lan_confirm(gui_app_t *app)
 }
 
 
+/* ------------------------------------------------------------ list picker */
+
+/* The selected device, or NULL when nothing is enumerated. Every picker but
+ * PICK_DEVICE describes a property OF that device. */
+static const preview_device_t *pick_device(void)
+{
+    size_t n = 0;
+    const preview_device_t *devs = gui_preview_devices(&n);
+    int sel = gui_preview_selected_device();
+    if (sel < 0 || (size_t)sel >= n) return NULL;
+    return &devs[sel];
+}
+
+static int pick_count(pick_kind_t k)
+{
+    const preview_device_t *d = pick_device();
+    switch (k) {
+        case PICK_DEVICE: { size_t n = 0; (void)gui_preview_devices(&n); return (int)n; }
+        case PICK_MODE:     return d ? d->n_modes : 0;
+        case PICK_INPUT:    return d ? d->n_inputs : 0;
+        case PICK_STANDARD: return d ? d->n_stds : 0;
+        default:            return 0;
+    }
+}
+
+static const char *pick_label(pick_kind_t k, int i)
+{
+    const preview_device_t *d = pick_device();
+    static char buf[96];
+    switch (k) {
+        case PICK_DEVICE: {
+            size_t n = 0;
+            const preview_device_t *devs = gui_preview_devices(&n);
+            if (i < 0 || (size_t)i >= n) return "";
+            snprintf(buf, sizeof(buf), "%s  %s", devs[i].card, devs[i].path);
+            return buf;
+        }
+        case PICK_MODE:     return (d && i < d->n_modes)  ? d->modes[i].label : "";
+        case PICK_INPUT:    return (d && i < d->n_inputs) ? d->inputs[i].name : "";
+        case PICK_STANDARD: return (d && i < d->n_stds)   ? d->stds[i].name : "";
+        default:            return "";
+    }
+}
+
+static int pick_selected(pick_kind_t k)
+{
+    const preview_device_t *d = pick_device();
+    switch (k) {
+        case PICK_DEVICE:   return gui_preview_selected_device();
+        case PICK_MODE:     return gui_preview_selected_mode();
+        case PICK_INPUT:    return gui_preview_selected_input();
+        case PICK_STANDARD: return d ? d->std_index : -1;
+        default:            return -1;
+    }
+}
+
+static const char *pick_title(pick_kind_t k)
+{
+    switch (k) {
+        case PICK_DEVICE:   return "Capture device";
+        case PICK_MODE:     return "Picture mode";
+        case PICK_INPUT:    return "Input";
+        case PICK_STANDARD: return "Video standard";
+        default:            return "";
+    }
+}
+
+/* What the row shows when the sheet is shut: the value in force, with an
+ * ellipsis because clicking opens a list rather than cycling. Prefers the
+ * device's readback over the selection -- see the panel overlay's note. */
+static const char *pick_current_label(pick_kind_t k, char *out, size_t cap)
+{
+    const preview_device_t *d = pick_device();
+    preview_status_t st = gui_preview_get_status();
+    const char *cur = NULL;
+
+    if (k == PICK_INPUT && st.input_name[0]) cur = st.input_name;
+    else if (k == PICK_STANDARD && st.std_name[0]) cur = st.std_name;
+    else {
+        int sel = pick_selected(k);
+        if (sel >= 0 && sel < pick_count(k)) cur = pick_label(k, sel);
+    }
+    if (!cur || !cur[0]) cur = (d || k == PICK_DEVICE) ? "(none)" : "(no device)";
+    snprintf(out, cap, "%s...", cur);
+    return out;
+}
+
+/* Is this list changeable right now? The answers differ and each has a reason:
+ *   - the device resizes everything downstream, so not while a tee holds it;
+ *   - the mode likewise;
+ *   - the standard changes the raster AND every SDTV driver refuses S_STD
+ *     while streaming, so it needs a disconnect;
+ *   - the input is switchable live, which is the whole point of it. */
+static bool pick_enabled(const gui_app_t *app, pick_kind_t k)
+{
+    if (gui_net_is_client(app)) return false;
+    const preview_device_t *d = pick_device();
+    bool tee_live = gui_rtsp_stream_is_running() || gui_video_record_is_running();
+    preview_status_t st = gui_preview_get_status();
+    bool streaming = (st.state == PREVIEW_STATE_STREAMING ||
+                      st.state == PREVIEW_STATE_STALLED ||
+                      st.state == PREVIEW_STATE_CONNECTING ||
+                      st.state == PREVIEW_STATE_POPPED_OUT);
+    switch (k) {
+        case PICK_DEVICE:   return pick_count(k) > 0 && !tee_live && !streaming;
+        case PICK_MODE:     return pick_count(k) > 0 && !tee_live && !streaming;
+        case PICK_STANDARD: return d && d->is_sdtv && d->n_stds > 1 && !tee_live && !streaming;
+        case PICK_INPUT:    return d && d->is_sdtv && d->n_inputs > 1 &&
+                                   st.state != PREVIEW_STATE_POPPED_OUT;
+        default:            return false;
+    }
+}
+
+static void pick_remember(gui_app_t *app)
+{
+    const preview_device_t *d = pick_device();
+    if (!d) return;
+    snprintf(app->settings.usbref_device_path, sizeof(app->settings.usbref_device_path),
+             "%s", d->path);
+    int in = gui_preview_selected_input();
+    if (in >= 0 && in < d->n_inputs) {
+        snprintf(app->settings.usbref_input, sizeof(app->settings.usbref_input),
+                 "%s", d->inputs[in].name);
+    }
+    if (d->std_index >= 0 && d->std_index < d->n_stds) {
+        snprintf(app->settings.usbref_standard, sizeof(app->settings.usbref_standard),
+                 "%s", d->stds[d->std_index].name);
+    }
+    gui_preview_mode_spec(app->settings.usbref_mode_spec,
+                          sizeof(app->settings.usbref_mode_spec));
+    gui_settings_save(&app->settings);
+}
+
+static void pick_choose(gui_app_t *app, pick_kind_t k, int i)
+{
+    switch (k) {
+        case PICK_DEVICE:   gui_preview_select(i, 0); break;
+        case PICK_MODE:     gui_preview_select(gui_preview_selected_device(), i); break;
+        case PICK_INPUT:    gui_preview_select_input(i); break;
+        case PICK_STANDARD: gui_preview_select_standard(i); break;
+        default: return;
+    }
+    pick_remember(app);
+}
+
+/* One row: a dim label and a box carrying the current value. */
+static void pick_row(const gui_app_t *app, pick_kind_t k, Clay_ElementId row_id,
+                     Clay_ElementId box_id, const char *label, char *buf, size_t cap)
+{
+    bool on = pick_enabled(app, k);
+    Color bg = on ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+    Color fg = on ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+    pick_current_label(k, buf, cap);
+
+    CLAY(row_id, { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                               .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                               .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+        CLAY(CLAY_IDI("UsbRefPickLabel", (int)k), {
+            .layout = { .sizing = { CLAY_SIZING_FIXED(74), CLAY_SIZING_FIXED(28) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } }
+        }) {
+            CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS,
+                                                             .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+        CLAY(box_id, { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                   .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                                   .padding = { 8, 8, 0, 0 } },
+                       .backgroundColor = to_clay_color(bg),
+                       .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+            CLAY_TEXT(make_string(buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1,
+                                                           .textColor = to_clay_color(fg) }));
+        }
+    }
+}
+
+/* The sheet itself. Modal over the dialog: while a list is up it is the only
+ * thing that may be clicked, which is why it carries a backdrop the dialog
+ * deliberately does not. */
+static void render_pick_sheet(gui_app_t *app)
+{
+    (void)app;
+    if (s_pick == PICK_NONE) return;
+    int n = pick_count(s_pick);
+    if (n <= 0) { s_pick = PICK_NONE; return; }
+
+    CLAY(CLAY_ID("UsbRefPickBackdrop"), {
+        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+        .floating = { .attachTo = CLAY_ATTACH_TO_ROOT,
+                      .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP,
+                                        .parent = CLAY_ATTACH_POINT_LEFT_TOP },
+                      .zIndex = 32 },
+        .backgroundColor = (Clay_Color){0, 0, 0, 120}
+    }) {}
+
+    CLAY(CLAY_ID("UsbRefPickWindow"), {
+        .layout = { .sizing = { CLAY_SIZING_FIT(.min = 380, .max = 620),
+                                CLAY_SIZING_FIT(0) },
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .padding = { 16, 16, 14, 14 }, .childGap = 6 },
+        .floating = { .attachTo = CLAY_ATTACH_TO_ROOT,
+                      .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER,
+                                        .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
+                      .zIndex = 33 },
+        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+        .cornerRadius = CLAY_CORNER_RADIUS(8),
+        .border = { .width = { 1, 1, 1, 1 }, .color = to_clay_color(COLOR_BUTTON_ACTIVE) }
+    }) {
+        CLAY_TEXT(make_string(pick_title(s_pick)),
+                  CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING,
+                                     .textColor = to_clay_color(COLOR_TEXT) }));
+        int sel = pick_selected(s_pick);
+        if (n > 24) n = 24;   /* the sheet is a list, not a scroll view */
+        for (int i = 0; i < n; i++) {
+            bool chosen = (i == sel);
+            CLAY(CLAY_IDI("UsbRefPickOpt", i), {
+                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(26) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                            .padding = { 8, 8, 0, 0 } },
+                .backgroundColor = to_clay_color(chosen ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+                .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(make_string(pick_label(s_pick, i)),
+                          CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1,
+                                             .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+    }
+}
+
+
 /* ----------------------------------------------------------------- render */
 
 void gui_usbref_settings_render(gui_app_t *app)
@@ -456,7 +704,7 @@ void gui_usbref_settings_render(gui_app_t *app)
     render_rtsp_codec_window(app);
     render_rtsp_lan_confirm(app);
 
-    if (!s_open) return;
+    if (!s_open) { s_pick = PICK_NONE; return; }
 
     /* No backdrop, deliberately -- see the header. The window alone floats, at
      * the same layer the codec sheet uses to clear the settings panel (0) and
@@ -560,6 +808,30 @@ void gui_usbref_settings_render(gui_app_t *app)
                         }
                     }
                 }
+            }
+
+            /* Which jack. Live-switchable, so it stays usable with a tape
+             * running; it lives here now rather than on the panel overlay so
+             * every control for this device is in one place. */
+            {
+                static char in_buf[96];
+                pick_row(app, PICK_INPUT, CLAY_ID("UsbRefInputRow"),
+                         CLAY_ID("UsbRefInputBox"), "Input", in_buf, sizeof(in_buf));
+            }
+
+            CLAY_TEXT(CLAY_STRING("Picture"),
+                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL,
+                                         .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            {
+                /* The standard fixes the active raster, so the mode list is
+                 * rebuilt whenever it changes -- they belong next to each
+                 * other and in that order. */
+                static char std_buf[96];
+                static char mode_buf[96];
+                pick_row(app, PICK_STANDARD, CLAY_ID("UsbRefStdRow"),
+                         CLAY_ID("UsbRefStdBox"), "Standard", std_buf, sizeof(std_buf));
+                pick_row(app, PICK_MODE, CLAY_ID("UsbRefModeRow"),
+                         CLAY_ID("UsbRefModeBox"), "Mode", mode_buf, sizeof(mode_buf));
             }
 
             /* Picture shape. These are set once for a deck and then
@@ -848,6 +1120,9 @@ void gui_usbref_settings_render(gui_app_t *app)
             }
         }
     }
+
+    /* After the window, so it floats over it. */
+    render_pick_sheet(app);
 }
 
 /* ----------------------------------------------------------- interactions */
@@ -915,6 +1190,55 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app)
 
     if (!s_open) return false;
 
+    /* A list is up: it is modal over the dialog, so nothing else is asked. */
+    if (s_pick != PICK_NONE) {
+        int n = pick_count(s_pick);
+        if (n > 24) n = 24;
+        for (int i = 0; i < n; i++) {
+            if (Clay_PointerOver(CLAY_IDI("UsbRefPickOpt", i))) {
+                pick_choose(app, s_pick, i);
+                s_pick = PICK_NONE;
+                return true;
+            }
+        }
+        /* Anywhere else, including the backdrop, dismisses without choosing. */
+        s_pick = PICK_NONE;
+        return true;
+    }
+
+    {
+        const struct { const char *id; pick_kind_t kind; } pick_boxes[] = {
+            { "PreviewDeviceBox", PICK_DEVICE },
+            { "UsbRefInputBox",   PICK_INPUT },
+            { "UsbRefStdBox",     PICK_STANDARD },
+            { "UsbRefModeBox",    PICK_MODE },
+        };
+        for (size_t bi = 0; bi < sizeof(pick_boxes) / sizeof(pick_boxes[0]); bi++) {
+            if (!Clay_PointerOver(Clay_GetElementId(make_string(pick_boxes[bi].id)))) continue;
+            /* The same predicate the row was drawn with, so a greyed box
+             * cannot be clickable. */
+            pick_kind_t k = pick_boxes[bi].kind;
+            /* An empty device list is usually a dongle plugged in after launch;
+             * rescan rather than making them find the Rescan button first. */
+            if (k == PICK_DEVICE && pick_count(k) == 0) gui_preview_refresh_devices();
+
+            if (pick_enabled(app, k)) {
+                s_pick = k;
+            } else if (pick_count(k) == 0) {
+                gui_app_set_status(app, "no USB video device found");
+            } else if (gui_net_is_client(app)) {
+                gui_app_set_status(app, "the server owns the capture device");
+            } else if (gui_rtsp_stream_is_running() || gui_video_record_is_running()) {
+                /* Both outputs are tees off this device; swapping it under them
+                 * would change geometry mid-encode. */
+                gui_app_set_status(app, "stop the stream and reference video first");
+            } else if (k != PICK_INPUT) {
+                gui_app_set_status(app, "disconnect the preview before changing that");
+            }
+            return true;
+        }
+    }
+
     if (Clay_PointerOver(CLAY_ID("UsbRefClose"))) {
         s_open = false;
         return true;
@@ -941,25 +1265,6 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app)
         (void)gui_preview_devices(&n_pv);
         gui_app_set_status(app, n_pv ? "USB video devices rescanned"
                                      : "no USB video device found");
-    }
-    if (Clay_PointerOver(CLAY_ID("PreviewDeviceBox")) && !gui_net_is_client(app)) {
-        size_t n_pv = 0;
-        (void)gui_preview_devices(&n_pv);
-        if (n_pv == 0) {
-            gui_preview_refresh_devices();
-            (void)gui_preview_devices(&n_pv);
-        }
-        if (n_pv == 0) {
-            gui_app_set_status(app, "no USB video device found");
-        } else if (gui_rtsp_stream_is_running() || gui_video_record_is_running()) {
-            /* Both outputs are tees off this device; swapping it under
-             * them would change geometry mid-encode. */
-            gui_app_set_status(app, "stop the stream and reference video before changing device");
-        } else {
-            int next = (gui_preview_selected_device() + 1) % (int)n_pv;
-            gui_preview_select(next, 0);
-            gui_ui_remember_preview_device(app);
-        }
     }
     /* Aspect cycles Auto -> 4:3 -> 16:9 -> Square. It is safe at any
      * time: it changes how frames are presented, never the capture, so
