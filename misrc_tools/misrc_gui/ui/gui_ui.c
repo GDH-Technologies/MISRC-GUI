@@ -731,6 +731,9 @@ static int s_record_limit_cursor_char = 0; // editable char index in HH:MM:SS =>
 static uint32_t s_record_limit_seconds = 0;
 static bool s_record_limit_session_seen = false;
 static bool s_record_limit_deadline_active = false;
+// When the limit starts counting: the moment it was armed if that was during a
+// recording, otherwise the recording's start. 0 = not anchored yet.
+static double s_record_limit_anchor_s = 0.0;
 static double s_record_limit_deadline_s = 0.0;
 #define RECORD_LIMIT_TIMECODE_SCALE 1.30f
 #define RECORD_LIMIT_TIMECODE_BORDER_X 5
@@ -1866,6 +1869,45 @@ static void update_status_free_space(gui_app_t *app)
     s_status_output_last_sample_s = now;
 }
 
+// The Arm click. A time still being typed is taken as the limit. Armed while
+// recording, the limit counts from this moment; armed while idle, the runtime
+// tick anchors it to the next recording's start.
+static void gui_record_limit_arm(gui_app_t *app)
+{
+    if (s_record_limit_timecode_edit) {
+        uint32_t staged_seconds = 0;
+        if (parse_record_limit_timecode(s_record_limit_timecode_edit_buffer, &staged_seconds) && staged_seconds > 0) {
+            s_record_limit_seconds = staged_seconds;
+            format_record_limit_timecode(s_record_limit_timecode, sizeof(s_record_limit_timecode), staged_seconds);
+        }
+        s_record_limit_timecode_edit = false;
+    }
+    uint32_t parsed_seconds = 0;
+    bool timecode_valid = parse_record_limit_timecode(s_record_limit_timecode, &parsed_seconds) && parsed_seconds > 0;
+    if (!timecode_valid) {
+        gui_record_limit_sync_settings(app);
+        gui_app_set_status(app, "Invalid record limit timecode");
+    } else {
+        s_record_limit_seconds = parsed_seconds;
+        s_record_limit_armed = true;
+        gui_record_limit_sync_settings(app);
+        gui_record_limit_log_state(app, "Record timer armed");
+        if (app->is_recording) {
+            // Armed mid-recording: the limit counts from now,
+            // not from the start, so it can never land behind
+            // the time already recorded and stop at once. Marking the session
+            // seen keeps the tick's first-frame reset from discarding it.
+            s_record_limit_session_seen = true;
+            s_record_limit_anchor_s = GetTime();
+            s_record_limit_deadline_active = true;
+            s_record_limit_deadline_s = s_record_limit_anchor_s + (double)s_record_limit_seconds;
+            gui_app_set_status(app, "Record time limit armed; counting from now");
+        } else {
+            gui_app_set_status(app, "Record time limit armed");
+        }
+    }
+}
+
 static void gui_record_limit_runtime_tick(gui_app_t *app)
 {
     if (!app) return;
@@ -1874,6 +1916,7 @@ static void gui_record_limit_runtime_tick(gui_app_t *app)
         s_record_limit_session_seen = false;
         s_record_limit_deadline_active = false;
         s_record_limit_deadline_s = 0.0;
+        s_record_limit_anchor_s = 0.0;
         gui_record_limit_sync_settings(app);
         return;
     }
@@ -1882,6 +1925,7 @@ static void gui_record_limit_runtime_tick(gui_app_t *app)
         s_record_limit_session_seen = true;
         s_record_limit_deadline_active = false;
         s_record_limit_deadline_s = 0.0;
+        s_record_limit_anchor_s = 0.0;
     }
 
     uint32_t parsed_seconds = 0;
@@ -1894,15 +1938,20 @@ static void gui_record_limit_runtime_tick(gui_app_t *app)
     if (!s_record_limit_armed || !timecode_valid) {
         s_record_limit_deadline_active = false;
         s_record_limit_deadline_s = 0.0;
+        s_record_limit_anchor_s = 0.0;
         return;
     }
 
+    // Armed before this recording began: count from its start. Armed during
+    // it: the Arm click already anchored the limit to that moment.
+    if (s_record_limit_anchor_s <= 0.0) {
+        s_record_limit_anchor_s = app->recording_start_time;
+    }
+
     double now = GetTime();
-    double requested_deadline_s = app->recording_start_time + (double)s_record_limit_seconds;
+    double requested_deadline_s = s_record_limit_anchor_s + (double)s_record_limit_seconds;
 
     if (!s_record_limit_deadline_active) {
-        // If the requested limit is already behind elapsed recording time,
-        // ignore it while recording (only longer extensions are applied live).
         if (requested_deadline_s > now) {
             s_record_limit_deadline_active = true;
             s_record_limit_deadline_s = requested_deadline_s;
@@ -1922,6 +1971,7 @@ static void gui_record_limit_runtime_tick(gui_app_t *app)
         gui_app_stop_recording(app);
         s_record_limit_deadline_active = false;
         s_record_limit_deadline_s = 0.0;
+        s_record_limit_anchor_s = 0.0;
         s_record_limit_session_seen = false;
     }
 }
@@ -4230,9 +4280,9 @@ static void render_record_limit_window(gui_app_t *app)
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } }
             }) {}
         }
-        CLAY_TEXT(CLAY_STRING("Live rule: only longer limits apply while recording."),
+        CLAY_TEXT(CLAY_STRING("Armed while recording: counts from the Arm click."),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-        CLAY_TEXT(CLAY_STRING("Shorter changes are ignored until the next recording."),
+        CLAY_TEXT(CLAY_STRING("Once running, only longer limits apply live."),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
         // Level autostop (tape-end detection): ON/OFF toggle on one row,
@@ -9918,48 +9968,12 @@ void gui_handle_interactions(gui_app_t *app) {
                     s_record_limit_armed = false;
                     s_record_limit_deadline_active = false;
                     s_record_limit_deadline_s = 0.0;
+                    s_record_limit_anchor_s = 0.0;
                     gui_record_limit_sync_settings(app);
                     gui_record_limit_log_state(app, "Record timer disarmed");
                     gui_app_set_status(app, "Record time limit disarmed");
                 } else {
-                    if (s_record_limit_timecode_edit) {
-                        uint32_t staged_seconds = 0;
-                        if (parse_record_limit_timecode(s_record_limit_timecode_edit_buffer, &staged_seconds) && staged_seconds > 0) {
-                            s_record_limit_seconds = staged_seconds;
-                            format_record_limit_timecode(s_record_limit_timecode, sizeof(s_record_limit_timecode), staged_seconds);
-                        }
-                        s_record_limit_timecode_edit = false;
-                    }
-                    uint32_t parsed_seconds = 0;
-                    bool timecode_valid = parse_record_limit_timecode(s_record_limit_timecode, &parsed_seconds) && parsed_seconds > 0;
-                    if (!timecode_valid) {
-                        gui_record_limit_sync_settings(app);
-                        gui_app_set_status(app, "Invalid record limit timecode");
-                    } else {
-                        s_record_limit_seconds = parsed_seconds;
-                        s_record_limit_armed = true;
-                        gui_record_limit_sync_settings(app);
-                        gui_record_limit_log_state(app, "Record timer armed");
-                        if (app->is_recording) {
-                            double now = GetTime();
-                            double requested_deadline_s = app->recording_start_time + (double)s_record_limit_seconds;
-                            if (!s_record_limit_deadline_active || requested_deadline_s > s_record_limit_deadline_s) {
-                                if (requested_deadline_s > now) {
-                                    s_record_limit_deadline_active = true;
-                                    s_record_limit_deadline_s = requested_deadline_s;
-                                    gui_app_set_status(app, "Record time limit armed");
-                                } else {
-                                    s_record_limit_deadline_active = false;
-                                    s_record_limit_deadline_s = 0.0;
-                                    gui_app_set_status(app, "Record limit shorter than elapsed; ignored");
-                                }
-                            } else {
-                                gui_app_set_status(app, "Shorter record limit ignored while recording");
-                            }
-                        } else {
-                            gui_app_set_status(app, "Record time limit armed");
-                        }
-                    }
+                    gui_record_limit_arm(app);
                 }
                 gui_ui_set_click_consumed();
                 return;
