@@ -2158,7 +2158,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
      * video-module state or the two logs would disagree. */
     snprintf(msg, sizeof(msg), "Reference video: enabled=%s codec=%s",
              app->settings.video_record_enabled ? "on" : "off",
-             app->settings.video_record_codec == 1 ? "FFV1" : "H.264");
+             app->settings.usbref_codec == 1 ? "FFV1" : "H.264");
     gui_record_log_write_line_locked("INFO", msg);
 
     if (app->settings.video_record_enabled && app->settings.video_filename[0]) {
@@ -2169,13 +2169,13 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
 
     /* Settings only, for the same FLAC-vs-RAW ordering reason as above. */
     snprintf(msg, sizeof(msg), "Closed captions: enabled=%s device=%s",
-             app->settings.cc_record_enabled ? "on" : "off",
-             app->settings.cc_vbi_device[0] ? app->settings.cc_vbi_device : "(auto)");
+             app->settings.usbref_cc_enabled ? "on" : "off",
+             app->settings.usbref_cc_vbi_device[0] ? app->settings.usbref_cc_vbi_device : "(auto)");
     gui_record_log_write_line_locked("INFO", msg);
 
-    if (app->settings.cc_record_enabled && app->settings.cc_filename[0]) {
+    if (app->settings.usbref_cc_enabled && app->settings.usbref_cc_filename[0]) {
         snprintf(msg, sizeof(msg), "CC_FILE_PATH: %s/%s",
-                 app->settings.output_path, app->settings.cc_filename);
+                 app->settings.output_path, app->settings.usbref_cc_filename);
         gui_record_log_write_line_locked("INFO", msg);
     }
 
@@ -2317,11 +2317,11 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
      * that base already carries the record-start timestamp. Keep the two
      * blocks textually identical so a diff of them is empty. */
     char cc_tag[40] = {0};
-    sanitize_tag(cc_tag, sizeof(cc_tag), app->settings.cc_output_tag);
+    sanitize_tag(cc_tag, sizeof(cc_tag), app->settings.usbref_cc_tag);
     if (cc_tag[0]) {
-        snprintf(app->settings.cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+        snprintf(app->settings.usbref_cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
     } else {
-        snprintf(app->settings.cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+        snprintf(app->settings.usbref_cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
     }
 
     if (audio_tag_12[0]) {
@@ -2379,7 +2379,7 @@ int gui_record_video_settings_test_main(void)
     /* Values chosen to be different from every default, so a field that is
      * silently not persisted shows up as a mismatch rather than a coincidence. */
     a.video_record_enabled = true;
-    a.video_record_codec = 1;                       /* FFV1 */
+    a.usbref_codec = 1;                       /* FFV1 */
     snprintf(a.video_output_tag, sizeof(a.video_output_tag), "refcam");
     snprintf(a.ffmpeg_path, sizeof(a.ffmpeg_path), "/opt/custom/ffmpeg");
     gui_settings_save(&a);
@@ -2391,13 +2391,13 @@ int gui_record_video_settings_test_main(void)
     int rc = 0;
     printf("round-trip:\n");
     printf("  video_record_enabled : %d -> %d\n", a.video_record_enabled, b.video_record_enabled);
-    printf("  video_record_codec   : %d -> %d\n", a.video_record_codec, b.video_record_codec);
+    printf("  usbref_codec   : %d -> %d\n", a.usbref_codec, b.usbref_codec);
     printf("  video_output_tag     : %s -> %s\n", a.video_output_tag, b.video_output_tag);
     printf("  ffmpeg_path          : %s -> %s\n", a.ffmpeg_path, b.ffmpeg_path);
     printf("  video_filename       : %s\n", b.video_filename);
 
     if (a.video_record_enabled != b.video_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
-    if (a.video_record_codec != b.video_record_codec)     { printf("FAIL: codec\n"); rc = 1; }
+    if (a.usbref_codec != b.usbref_codec)     { printf("FAIL: codec\n"); rc = 1; }
     if (strcmp(a.video_output_tag, b.video_output_tag))   { printf("FAIL: tag\n"); rc = 1; }
     if (strcmp(a.ffmpeg_path, b.ffmpeg_path))             { printf("FAIL: ffmpeg_path\n"); rc = 1; }
     /* The load path re-runs the namer, so the tag must have reached the name. */
@@ -2408,13 +2408,13 @@ int gui_record_video_settings_test_main(void)
     /* A hand-edited file must not be able to select a codec that does not
      * exist -- the loader clamps rather than trusting the number. */
     gui_settings_t c = b;
-    c.video_record_codec = 99;
+    c.usbref_codec = 99;
     gui_settings_save(&c);
     gui_settings_t d;
     memset(&d, 0, sizeof(d));
     gui_settings_load(&d);
-    printf("  out-of-range codec 99 -> %d (must be 0 or 1)\n", d.video_record_codec);
-    if (d.video_record_codec != 0 && d.video_record_codec != 1) {
+    printf("  out-of-range codec 99 -> %d (must be 0 or 1)\n", d.usbref_codec);
+    if (d.usbref_codec != 0 && d.usbref_codec != 1) {
         printf("FAIL: codec not clamped\n"); rc = 1;
     }
 
@@ -2452,9 +2452,9 @@ int gui_record_cc_settings_test_main(void)
     /* Deliberately unlike every default, so a field that is silently not
      * persisted shows up as a mismatch rather than a coincidence. The tag
      * carries characters a filename must not, to prove sanitising happens. */
-    a.cc_record_enabled = true;
-    snprintf(a.cc_output_tag, sizeof(a.cc_output_tag), "cc test/2");
-    snprintf(a.cc_vbi_device, sizeof(a.cc_vbi_device), "/dev/vbi7");
+    a.usbref_cc_enabled = true;
+    snprintf(a.usbref_cc_tag, sizeof(a.usbref_cc_tag), "cc test/2");
+    snprintf(a.usbref_cc_vbi_device, sizeof(a.usbref_cc_vbi_device), "/dev/vbi7");
     a.auto_names_enabled = true;
     snprintf(a.output_base_name, sizeof(a.output_base_name), "TESTTAPE");
     gui_settings_save(&a);
@@ -2465,38 +2465,38 @@ int gui_record_cc_settings_test_main(void)
 
     int rc = 0;
     printf("round-trip:\n");
-    printf("  cc_record_enabled : %d -> %d\n", a.cc_record_enabled, b.cc_record_enabled);
-    printf("  cc_output_tag     : %s -> %s\n", a.cc_output_tag, b.cc_output_tag);
-    printf("  cc_vbi_device     : %s -> %s\n", a.cc_vbi_device, b.cc_vbi_device);
-    printf("  cc_filename       : %s\n", b.cc_filename);
+    printf("  usbref_cc_enabled : %d -> %d\n", a.usbref_cc_enabled, b.usbref_cc_enabled);
+    printf("  usbref_cc_tag     : %s -> %s\n", a.usbref_cc_tag, b.usbref_cc_tag);
+    printf("  usbref_cc_vbi_device     : %s -> %s\n", a.usbref_cc_vbi_device, b.usbref_cc_vbi_device);
+    printf("  usbref_cc_filename       : %s\n", b.usbref_cc_filename);
 
-    if (a.cc_record_enabled != b.cc_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
-    if (strcmp(a.cc_output_tag, b.cc_output_tag))   { printf("FAIL: tag\n"); rc = 1; }
-    if (strcmp(a.cc_vbi_device, b.cc_vbi_device))   { printf("FAIL: vbi device\n"); rc = 1; }
+    if (a.usbref_cc_enabled != b.usbref_cc_enabled) { printf("FAIL: enabled\n"); rc = 1; }
+    if (strcmp(a.usbref_cc_tag, b.usbref_cc_tag))   { printf("FAIL: tag\n"); rc = 1; }
+    if (strcmp(a.usbref_cc_vbi_device, b.usbref_cc_vbi_device))   { printf("FAIL: vbi device\n"); rc = 1; }
 
     /* The load path re-runs the namer, so the tag must have reached the name,
      * sanitised, and the extension must still be the one the muxer writes. */
-    if (!strstr(b.cc_filename, "cc-test")) {
+    if (!strstr(b.usbref_cc_filename, "cc-test")) {
         printf("FAIL: sanitised tag did not reach the generated filename\n"); rc = 1;
     }
-    if (strstr(b.cc_filename, "/")) {
+    if (strstr(b.usbref_cc_filename, "/")) {
         printf("FAIL: the tag's path separator survived into the filename\n"); rc = 1;
     }
-    size_t n = strlen(b.cc_filename);
-    if (n < 4 || strcmp(b.cc_filename + n - 4, ".scc") != 0) {
+    size_t n = strlen(b.usbref_cc_filename);
+    if (n < 4 || strcmp(b.usbref_cc_filename + n - 4, ".scc") != 0) {
         printf("FAIL: generated caption filename does not end in .scc\n"); rc = 1;
     }
 
     /* An empty device means "derive it from the preview device", and must
      * survive as empty rather than being helpfully filled in on save. */
     gui_settings_t c = b;
-    c.cc_vbi_device[0] = '\0';
+    c.usbref_cc_vbi_device[0] = '\0';
     gui_settings_save(&c);
     gui_settings_t d;
     memset(&d, 0, sizeof(d));
     gui_settings_load(&d);
-    printf("  empty cc_vbi_device -> '%s' (must stay empty = auto)\n", d.cc_vbi_device);
-    if (d.cc_vbi_device[0]) { printf("FAIL: empty device did not survive\n"); rc = 1; }
+    printf("  empty usbref_cc_vbi_device -> '%s' (must stay empty = auto)\n", d.usbref_cc_vbi_device);
+    if (d.usbref_cc_vbi_device[0]) { printf("FAIL: empty device did not survive\n"); rc = 1; }
 
     printf("%s\n", rc ? "CC SETTINGS TEST FAILED" : "cc settings test passed");
     if (scratch_path[0]) remove(scratch_path);
@@ -2528,7 +2528,7 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
 
     char err[256] = {0};
     if (gui_video_record_start(s_record_path_video,
-                               app->settings.video_record_codec == 1 ? VIDEO_CODEC_FFV1
+                               app->settings.usbref_codec == 1 ? VIDEO_CODEC_FFV1
                                                                      : VIDEO_CODEC_H264,
                                pv.width, pv.height, pitch,
                                pv.fps_num, pv.fps_den, err, sizeof(err)) != 0) {
@@ -2554,7 +2554,7 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
     snprintf(s_video_start_msg, sizeof(s_video_start_msg),
              "Reference video started: %s (%s, %ux%u @ %.2f fps)",
              s_record_path_video,
-             app->settings.video_record_codec == 1 ? "FFV1" : "H.264",
+             app->settings.usbref_codec == 1 ? "FFV1" : "H.264",
              pv.width, pv.height,
              pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0);
 }
@@ -2565,13 +2565,13 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
  * coupling them to one would be a false dependency. */
 static void gui_record_start_cc_if_enabled(gui_app_t *app)
 {
-    if (!app->settings.cc_record_enabled) return;
+    if (!app->settings.usbref_cc_enabled) return;
 
     snprintf(s_record_path_cc, sizeof(s_record_path_cc), "%s/%s",
-             app->settings.output_path, app->settings.cc_filename);
+             app->settings.output_path, app->settings.usbref_cc_filename);
 
     char err[256] = {0};
-    if (gui_cc_record_start(app->settings.cc_vbi_device, s_record_path_cc,
+    if (gui_cc_record_start(app->settings.usbref_cc_vbi_device, s_record_path_cc,
                             err, sizeof(err)) != 0) {
         /* Not fatal, for the same reason the reference video is not: the RF
          * writers are already running. Preflight is where a missing device or
@@ -2638,7 +2638,7 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
     app.settings.capture_a = true;
     app.settings.capture_b = true;
     app.settings.video_record_enabled = with_video;
-    app.settings.cc_record_enabled = with_cc;
+    app.settings.usbref_cc_enabled = with_cc;
     app.settings.enable_audio_4ch = false;
     app.settings.enable_audio_2ch_12 = false;
     app.settings.enable_audio_2ch_34 = false;
@@ -2710,7 +2710,7 @@ int gui_record_name_test_main(void)
 
     snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "tapetest");
     snprintf(app.settings.video_output_tag, sizeof(app.settings.video_output_tag), "ref cam");
-    snprintf(app.settings.cc_output_tag, sizeof(app.settings.cc_output_tag), "cc one");
+    snprintf(app.settings.usbref_cc_tag, sizeof(app.settings.usbref_cc_tag), "cc one");
     snprintf(app.settings.rf_channel_tags[0], sizeof(app.settings.rf_channel_tags[0]), "luma");
     snprintf(app.settings.audio_output_tags[0], sizeof(app.settings.audio_output_tags[0]), "quad");
     app.settings.auto_names_enabled = true;
@@ -2727,7 +2727,7 @@ int gui_record_name_test_main(void)
     snprintf(s_video, sizeof(s_video), "%s", app.settings.video_filename);
     snprintf(s_a, sizeof(s_a), "%s", app.settings.output_filename_a);
     snprintf(s_4ch, sizeof(s_4ch), "%s", app.settings.audio_4ch_filename);
-    snprintf(s_cc, sizeof(s_cc), "%s", app.settings.cc_filename);
+    snprintf(s_cc, sizeof(s_cc), "%s", app.settings.usbref_cc_filename);
 
     gui_record_apply_auto_names(&app);
     printf("no timestamp:\n");
@@ -2748,8 +2748,8 @@ int gui_record_name_test_main(void)
         printf("FAIL: 4ch names diverge with timestamping off\n"); rc = 1;
     }
     printf("  settings namer cc    : %s\n", s_cc);
-    printf("  record   namer cc    : %s\n", app.settings.cc_filename);
-    if (strcmp(s_cc, app.settings.cc_filename) != 0) {
+    printf("  record   namer cc    : %s\n", app.settings.usbref_cc_filename);
+    if (strcmp(s_cc, app.settings.usbref_cc_filename) != 0) {
         printf("FAIL: caption names diverge with timestamping off\n"); rc = 1;
     }
     if (strstr(s_cc, "cc-one") == NULL) {
@@ -2769,10 +2769,10 @@ int gui_record_name_test_main(void)
         printf("FAIL: timestamped video name is not base + timestamp + tag + suffix\n"); rc = 1;
     }
 
-    if (strcmp(s_cc, app.settings.cc_filename) == 0) {
+    if (strcmp(s_cc, app.settings.usbref_cc_filename) == 0) {
         printf("FAIL: timestamping had no effect on the caption name\n"); rc = 1;
-    } else if (strncmp(app.settings.cc_filename, "tapetest_", 9) != 0 ||
-               strstr(app.settings.cc_filename, "_cc-one_captions.scc") == NULL) {
+    } else if (strncmp(app.settings.usbref_cc_filename, "tapetest_", 9) != 0 ||
+               strstr(app.settings.usbref_cc_filename, "_cc-one_captions.scc") == NULL) {
         printf("FAIL: timestamped caption name is not base + timestamp + tag + suffix\n"); rc = 1;
     }
 
@@ -2846,8 +2846,8 @@ int gui_record_start(gui_app_t *app) {
     struct stat stat_cc;
     char path_cc[600];
     snprintf(path_cc, sizeof(path_cc), "%s/%s",
-             app->settings.output_path, app->settings.cc_filename);
-    bool file_cc_exists = app->settings.cc_record_enabled && (stat(path_cc, &stat_cc) == 0);
+             app->settings.output_path, app->settings.usbref_cc_filename);
+    bool file_cc_exists = app->settings.usbref_cc_enabled && (stat(path_cc, &stat_cc) == 0);
 
     // A finalizing session still owns its output files; refuse to reuse them.
     if (s_finalizing) {
@@ -2858,7 +2858,7 @@ int gui_record_start(gui_app_t *app) {
              strcmp(path_b, s_finalizing->path_b) == 0) ||
             (app->settings.video_record_enabled && s_finalizing->path_video[0] &&
              strcmp(path_video, s_finalizing->path_video) == 0) ||
-            (app->settings.cc_record_enabled && s_finalizing->path_cc[0] &&
+            (app->settings.usbref_cc_enabled && s_finalizing->path_cc[0] &&
              strcmp(path_cc, s_finalizing->path_cc) == 0);
         if (clash) {
             gui_app_set_status(app, "Previous recording is still finalizing these files");
@@ -3103,13 +3103,13 @@ static int gui_record_start_confirmed(gui_app_t *app) {
      * hardware does not have. */
     s_record_path_cc[0] = '\0';
     s_cc_start_msg[0] = '\0';
-    if (app->settings.cc_record_enabled) {
+    if (app->settings.usbref_cc_enabled) {
         /* Hand it the binary gui_video_record already resolved, so the two can
          * never disagree about which ffmpeg they are using. */
         gui_video_record_set_ffmpeg_path(app->settings.ffmpeg_path);
         gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
-        gui_cc_record_set_preview_device(app->settings.preview_device_path);
-        gui_cc_record_set_device(app->settings.cc_vbi_device);
+        gui_cc_record_set_preview_device(app->settings.usbref_device_path);
+        gui_cc_record_set_device(app->settings.usbref_cc_vbi_device);
         gui_cc_record_invalidate_probe();   /* a stale OK must not arm a recording */
         if (gui_cc_record_probe() != CC_PROBE_OK) {
             char msg[380];

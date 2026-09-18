@@ -21,6 +21,7 @@ Fork-only surfaces: `misrc_tools/misrc_gui/streaming/`, `misrc_tools/misrc_gui/i
 gui_preview_v4l2.c`, `misrc_tools/misrc_gui/input/gui_preview_sdtv.{c,h}`,
 `misrc_tools/misrc_gui/output/gui_video_record.c`,
 `misrc_tools/misrc_gui/visualization/gui_preview_panel.c`,
+`misrc_tools/misrc_gui/ui/gui_usbref_settings.{c,h}`,
 `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
 `scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `.claude/`, `.clangd`.
 

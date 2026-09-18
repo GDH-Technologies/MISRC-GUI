@@ -836,26 +836,26 @@ int main(int argc, char **argv) {
     /* Display geometry does not depend on a device being present, so it is
      * applied unconditionally: the panel must render a remembered crop and
      * aspect correctly even when the dongle shows up later. */
-    gui_preview_set_aspect_mode(app.settings.preview_aspect_mode);
-    gui_preview_set_crop(app.settings.preview_crop_top, app.settings.preview_crop_bottom,
-                         app.settings.preview_crop_left, app.settings.preview_crop_right);
+    gui_preview_set_aspect_mode(app.settings.usbref_aspect);
+    gui_preview_set_crop(app.settings.usbref_crop_top, app.settings.usbref_crop_bottom,
+                         app.settings.usbref_crop_left, app.settings.usbref_crop_right);
 
-    if (app.settings.preview_device_path[0]) {
+    if (app.settings.usbref_device_path[0]) {
         gui_preview_refresh_devices();
         size_t n_pv = 0;
         const preview_device_t *pv = gui_preview_devices(&n_pv);
         int want = -1;
         for (size_t i = 0; i < n_pv; i++) {
-            if (strcmp(pv[i].path, app.settings.preview_device_path) == 0) { want = (int)i; break; }
+            if (strcmp(pv[i].path, app.settings.usbref_device_path) == 0) { want = (int)i; break; }
         }
         if (want >= 0) {
             gui_preview_select(want, 0);
             /* Order matters: the standard rebuilds the mode list, so it has to
              * be chosen before a persisted mode can be matched against it. An
              * empty standard means auto-detect, which connect() does. */
-            gui_preview_select_standard_by_name(app.settings.preview_standard);
-            gui_preview_select_input_by_name(app.settings.preview_input);
-            gui_preview_select_mode_by_spec(app.settings.preview_mode_spec);
+            gui_preview_select_standard_by_name(app.settings.usbref_standard);
+            gui_preview_select_input_by_name(app.settings.usbref_input);
+            gui_preview_select_mode_by_spec(app.settings.usbref_mode_spec);
             if (gui_preview_connect() != 0) {
                 preview_status_t pst = gui_preview_get_status();
                 gui_app_set_status(&app, pst.err_text[0] ? pst.err_text

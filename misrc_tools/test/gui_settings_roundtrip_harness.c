@@ -276,7 +276,7 @@ int main(int argc, char **argv) {
 
     gui_settings_t j1 = a;
     strcpy(j1.ingest_notes, "say \"hi\" \\ back\ttab \xc3\xa9");
-    strcpy(j1.mediamtx_path, "C:\\Tools\\mediamtx.exe");
+    strcpy(j1.usbref_mediamtx_path, "C:\\Tools\\mediamtx.exe");
     static char json[GUI_SETTINGS_MAX_FILE_BYTES];
     size_t nj = gui_settings_to_json(&j1, 0, json, sizeof(json));
     check(nj > 0 && nj < sizeof(json) && json[0] == '{' && json[nj - 1] == '}', "JSON snapshot fits and is an object");
@@ -304,10 +304,10 @@ int main(int argc, char **argv) {
     gui_settings_t c;
     load_text(&c, "{\n  \"memory_budget_gb\": 0\n}\n");   check(c.memory_budget_gb == 4, "memory_budget_gb 0 -> 4");
     load_text(&c, "{\n  \"memory_budget_gb\": 99\n}\n");  check(c.memory_budget_gb == 16, "memory_budget_gb 99 -> 16");
-    load_text(&c, "{\n  \"video_record_codec\": 99\n}\n"); check(c.video_record_codec == 0, "video_record_codec 99 -> 0");
-    load_text(&c, "{\n  \"rtsp_stream_port\": 80\n}\n");  check(c.rtsp_stream_port == 0, "rtsp_stream_port 80 -> 0");
-    load_text(&c, "{\n  \"rtsp_stream_encoder\": 7\n}\n"); check(c.rtsp_stream_encoder == 0, "rtsp_stream_encoder 7 -> 0");
-    load_text(&c, "{\n  \"rtsp_stream_bitrate_kbps\": 5\n}\n"); check(c.rtsp_stream_bitrate_kbps == 0, "rtsp_stream_bitrate_kbps 5 -> 0");
+    load_text(&c, "{\n  \"usbref_codec\": 99\n}\n"); check(c.usbref_codec == 0, "usbref_codec 99 -> 0");
+    load_text(&c, "{\n  \"usbref_rtsp_port\": 80\n}\n");  check(c.usbref_rtsp_port == 0, "usbref_rtsp_port 80 -> 0");
+    load_text(&c, "{\n  \"usbref_rtsp_encoder\": 7\n}\n"); check(c.usbref_rtsp_encoder == 0, "usbref_rtsp_encoder 7 -> 0");
+    load_text(&c, "{\n  \"usbref_rtsp_bitrate_kbps\": 5\n}\n"); check(c.usbref_rtsp_bitrate_kbps == 0, "usbref_rtsp_bitrate_kbps 5 -> 0");
     load_text(&c, "{\n  \"ui_scale_percent\": junk\n}\n"); check(c.ui_scale_percent == 100, "ui_scale_percent junk -> default");
     load_text(&c, "{\n  \"net_mode\": 7\n}\n");            check(c.net_mode == 0, "net_mode 7 -> 0");
     load_text(&c, "{\n  \"net_server_port\": 70000\n}\n"); check(c.net_server_port == 8080 && strcmp(c.net_server_port_str, "8080") == 0, "net_server_port 70000 -> 8080 and mirror");

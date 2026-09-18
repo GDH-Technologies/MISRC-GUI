@@ -2310,8 +2310,8 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *cap = sizeof(app->settings.video_output_tag);
             return true;
         case UI_TEXT_FIELD_CC_TAG:
-            *dst = app->settings.cc_output_tag;
-            *cap = sizeof(app->settings.cc_output_tag);
+            *dst = app->settings.usbref_cc_tag;
+            *cap = sizeof(app->settings.usbref_cc_tag);
             return true;
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
             *dst = app->settings.audio_output_tags[0];
@@ -2528,13 +2528,13 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
         snprintf(msg, msg_cap, "bit depth follows the CXADC card mode on this server");
         return 409;
     }
-    if (strncmp(key, "rtsp_", 5) == 0 && strcmp(key, "rtsp_stream_enabled") != 0 &&
+    if (strncmp(key, "usbref_rtsp_", 12) == 0 && strcmp(key, "usbref_rtsp_enabled") != 0 &&
         gui_rtsp_stream_is_running()) {
         snprintf(msg, msg_cap, "stop the stream before changing its settings");
         return 409;
     }
-    if (strcmp(key, "rtsp_stream_lan") == 0 && strcmp(value, "true") == 0 &&
-        !app->settings.rtsp_lan_acknowledged) {
+    if (strcmp(key, "usbref_rtsp_lan") == 0 && strcmp(value, "true") == 0 &&
+        !app->settings.usbref_rtsp_lan_acknowledged) {
         snprintf(msg, msg_cap, "acknowledge the LAN warning on the server first");
         return 409;
     }
@@ -2546,7 +2546,7 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
         snprintf(msg, msg_cap, "not a directory on the server");
         return 422;
     }
-    if (strcmp(key, "rtsp_stream_enabled") == 0) {
+    if (strcmp(key, "usbref_rtsp_enabled") == 0) {
         bool want;
         if (strcmp(value, "true") == 0) want = true;
         else if (strcmp(value, "false") == 0) want = false;
@@ -2557,7 +2557,7 @@ int gui_ui_apply_remote_setting(gui_app_t *app, const char *key, const char *val
             snprintf(msg, msg_cap, "%s", app->status_message);
             return 409;
         }
-        snprintf(msg, msg_cap, "%s", app->settings.rtsp_stream_enabled ? "true" : "false");
+        snprintf(msg, msg_cap, "%s", app->settings.usbref_rtsp_enabled ? "true" : "false");
         return 200;
     }
 
@@ -3649,7 +3649,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         static char vr_hint[220];
                         if (ff_ok) {
                             snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s%s", gui_video_record_ffmpeg_path(),
-                                     app->settings.video_record_codec == 1
+                                     app->settings.usbref_codec == 1
                                        ? "   FFV1 is lossless, roughly 5-16 MB/s" : "   H.264 CRF 18, under 3 MB/s");
                         } else {
                             snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");

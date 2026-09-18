@@ -68,15 +68,15 @@ static void pv_remember_analog(gui_app_t *app)
 
     int in = gui_preview_selected_input();
     if (in >= 0 && in < d->n_inputs) {
-        snprintf(app->settings.preview_input, sizeof(app->settings.preview_input),
+        snprintf(app->settings.usbref_input, sizeof(app->settings.usbref_input),
                  "%s", d->inputs[in].name);
     }
     if (d->std_index >= 0 && d->std_index < d->n_stds) {
-        snprintf(app->settings.preview_standard, sizeof(app->settings.preview_standard),
+        snprintf(app->settings.usbref_standard, sizeof(app->settings.usbref_standard),
                  "%s", d->stds[d->std_index].name);
     }
-    gui_preview_mode_spec(app->settings.preview_mode_spec,
-                          sizeof(app->settings.preview_mode_spec));
+    gui_preview_mode_spec(app->settings.usbref_mode_spec,
+                          sizeof(app->settings.usbref_mode_spec));
     gui_settings_save(&app->settings);
 }
 

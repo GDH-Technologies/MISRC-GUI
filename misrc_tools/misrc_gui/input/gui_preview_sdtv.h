@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Persisted as gui_settings_t.preview_aspect_mode; the numbering is on disk,
+/* Persisted as gui_settings_t.usbref_aspect; the numbering is on disk,
  * so append new members, never renumber. */
 typedef enum {
     PREVIEW_ASPECT_AUTO   = 0,  /* 4:3 for SDTV -- what a tape actually is */
