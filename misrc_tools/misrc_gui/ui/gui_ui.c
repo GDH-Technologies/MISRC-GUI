@@ -1632,10 +1632,11 @@ static bool parse_record_limit_timecode(const char *src, uint32_t *out_seconds)
     unsigned int hh = 0;
     unsigned int mm = 0;
     unsigned int ss = 0;
-    char sep1 = 0;
-    char sep2 = 0;
+    // %1[ stores the separator AND a terminating NUL, so each needs two bytes.
+    char sep1[2] = {0};
+    char sep2[2] = {0};
 
-    int matched = sscanf(src, " %u%1[:/]%u%1[:/]%u ", &hh, &sep1, &mm, &sep2, &ss);
+    int matched = sscanf(src, " %u%1[:/]%u%1[:/]%u ", &hh, sep1, &mm, sep2, &ss);
     if (matched != 5) {
         return false;
     }
