@@ -3849,6 +3849,49 @@ def check_preview_sdtv_geometry_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_usbref_ui_stays_out_of_gui_ui(repo_root: Path) -> int:
+    """The USB reference video UI must stay in its own file.
+
+    ui/gui_ui.c is upstream's. Roughly 930 lines of this fork's reference-video
+    and streaming UI used to live in it, and every one was a conflict on every
+    upstream sync. Moving them out only helps for as long as they stay out, and
+    a new row is always easier to add where the other rows already are -- which
+    is exactly how it accumulated the first time.
+
+    gui_ui.c keeps the handful of wiring lines that raise the dialog. Anything
+    that draws or handles one of its controls belongs in
+    ui/gui_usbref_settings.c."""
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+
+    # Clay ids this fork's dialog owns. The wiring lines name the window itself,
+    # never a control inside it.
+    banned = ("RtspCodec", "RtspLanConfirm", "RtspBindBox", "RtspEncoderBox",
+              "RtspUrl", "RtspPassword", "RtspLiveBox", "ToggleRtsp",
+              "PreviewDeviceBox", "PreviewRescanBtn", "PreviewConnectBtn",
+              "PreviewAspectBox", "PreviewCrop", "ToggleCcRecord", "CcTagField",
+              "VideoCodecBox")
+    found = [b for b in banned if b in ui]
+    if found:
+        return fail(
+            "gui_ui.c draws or handles USB reference video controls again: "
+            + ", ".join(found) + ".\n"
+            "That file is upstream's. These belong in ui/gui_usbref_settings.c; "
+            "gui_ui.c keeps only the gear that opens the dialog and its five "
+            "wiring lines."
+        )
+
+    # Reading a usbref_* setting here is NOT banned, deliberately. Three
+    # legitimate readers remain and would be worse anywhere else:
+    #   - the text-field buffer map, because the edit machinery is gui_ui.c's;
+    #   - gui_ui_apply_remote_setting(), the server side of the net setter,
+    #     which gates by key string and must keep refusing stream changes
+    #     mid-stream;
+    #   - the Capture hint line, which names the codec in force for the
+    #     Reference video row that stays there.
+    # What must not come back is a CONTROL, which the ids above catch.
+    return 0
+
+
 def check_preview_crop_never_reaches_a_recording(repo_root: Path) -> int:
     """The preview crop is a viewing aid and must stay one.
 
@@ -4309,6 +4352,7 @@ def main() -> int:
         ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
         ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
+        ("USB reference video UI stays out of gui_ui.c", lambda: check_usbref_ui_stays_out_of_gui_ui(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
