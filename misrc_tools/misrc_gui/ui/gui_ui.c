@@ -2450,15 +2450,6 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
         return s_version_info_window_open;
     }
-    /* The caption tag lives in the USB Reference Video dialog, which opens
-     * independently of the settings panel -- from the preview overlay's gear
-     * with the panel shut. Gating it on settings_panel_open would leave a field
-     * that looks editable and silently is not. Same shape as the net fields
-     * above, which answer to the About window. */
-    if (field == UI_TEXT_FIELD_CC_TAG) {
-        return gui_usbref_settings_is_open() && !gui_ui_settings_locked(app) &&
-               app->settings.auto_names_enabled;
-    }
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
@@ -3656,6 +3647,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                         CLAY_TEXT(make_string(vr_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(ff_ok ? COLOR_TEXT_DIM : COLOR_SYNC_RED) }));
                     }
+                    // Closed captions record alongside the reference video.
+                    gui_usbref_settings_render_captions_row(app);
 
 
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -10854,6 +10847,9 @@ void gui_handle_interactions(gui_app_t *app) {
                     app->settings.video_record_enabled = !app->settings.video_record_enabled;
                     gui_settings_save(&app->settings);
                 }
+            }
+            if (gui_usbref_settings_handle_captions_click(app)) {
+                gui_ui_set_click_consumed();
             }
             if (Clay_PointerOver(CLAY_ID("ToggleAudio4ch"))) {
                 app->settings.enable_audio_4ch = !app->settings.enable_audio_4ch;
