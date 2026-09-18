@@ -37,7 +37,6 @@
       "Bash(curl:*)",
       "Bash(gh pr create:*)",
       "Bash(gh repo edit:*)",
-      "Bash(rm:*)",
       "Bash(git worktree remove:*)",
       "Bash(claude plugin install:*)",
       "Bash(scripts/build-appimage-local.sh*)"
