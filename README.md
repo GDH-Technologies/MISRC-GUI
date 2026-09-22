@@ -333,42 +333,73 @@ Log Example:
 ```````
 
 
-## History
-
-- December 2025 - Initial version presented by AlessandroAU (back and forth tinkering begins)
-- February 2026 - First testing version released by Harry Munday
-- April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
-- June 3rd 2026  - V1.0.7 Release first overall stable production release
-- August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
-- August 13th 2026 - Official release!
-- August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
-- September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
-- September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
-
-
 ## CLI & Automated Testing
 
 <details closed>
-<summary>CLI flags and headless mode</summary>
+<summary>GUI flags</summary>
 <br>
 
-The GUI binary doubles as the full `misrc_capture` CLI when capture options are passed. GUI-only flags are processed first; any other arg routes into headless CLI capture mode.
+These flags open the GUI window (no capture args):
 
-```bash
-# GUI flags (open the window)
-misrc_gui --help
-misrc_gui --version
-misrc_gui --smoke-test          # exit 0 if the binary loads OK
-misrc_gui --debug-view         # verbose runtime logs
-misrc_gui --config <path>     # load settings from <path> instead of the platform default
-misrc_gui --auto-connect       # auto-trigger server/client connection (requires --config)
+| Flag | Arg | Description |
+|------|-----|-------------|
+| `--help` / `-h` | — | Print usage and exit |
+| `--version` | — | Print version and exit |
+| `--smoke-test` | — | Exit 0 if the binary loads OK (no window) |
+| `--debug-view` | — | Verbose runtime logs |
+| `--config` | `<path>` | Load settings from `<path>` instead of the platform default |
+| `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
 
-# Headless CLI capture mode (any capture arg routes here)
-misrc_gui --device-list       # list available capture devices and exit
-misrc_gui -a FILE -b FILE ...  # full misrc_capture CLI (see --help for the full option list)
-```
+`--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
 
-`--auto-connect` requires `--config <path>` with a server or client config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
+</details>
+
+<details closed>
+<summary>Headless CLI capture mode (full arg list)</summary>
+<br>
+
+The GUI binary doubles as the full `misrc_capture` CLI when any capture option is passed. GUI-only flags are processed first; any other arg routes into headless CLI capture mode (no window opens).
+
+Run `misrc_gui --help` to see the full list with descriptions. Complete reference:
+
+| Short | Long | Arg | Description |
+|------|-----|-----|-------------|
+| `-d` | `--device` | `[index]` | Input device index/name (default: 0) |
+| | `--devices` / `--device-list` | — | List available capture devices and exit |
+| `-n` | `--count` | `[samples]` | Number of samples to read (0 = infinite) |
+| `-t` | `--time` | `[time]` | Capture duration: seconds, `m:s` or `h:m:s` (`-n` takes priority; assumes 40 MSPS) |
+| `-w` | `--overwrite` | — | Overwrite any files without asking |
+| `-a` | `--rf-adc-a` | `[filename]` | RF ADC A output file (`-` for stdout) |
+| `-b` | `--rf-adc-b` | `[filename]` | RF ADC B output file (`-` for stdout) |
+| `-x` | `--aux` | `[filename]` | AUX output file (`-` for stdout) |
+| `-r` | `--raw` | `[filename]` | Raw data output file (`-` for stdout) |
+| `-p` | `--pad` | — | Pad lower 4 bits of 16-bit output with 0 instead of upper 4 |
+| `-L` | `--level` | — | Display peak level of RF ADCs |
+| `-A` | `--suppress-clip-rf-a` | — | Suppress clipping messages for ADC A |
+| `-B` | `--suppress-clip-rf-b` | — | Suppress clipping messages for ADC B |
+| | `--8bit-a` | — | Reduce ADC A output from 12-bit to 8-bit (requires SoXR) |
+| | `--8bit-b` | — | Reduce ADC B output from 12-bit to 8-bit (requires SoXR) |
+| | `--resample-rf-a` | `[kHz]` | Resample ADC A to given sample rate (requires SoXR) |
+| | `--resample-rf-b` | `[kHz]` | Resample ADC B to given sample rate (requires SoXR) |
+| | `--resample-rf-quality-a` | `[0-4]` | Resample quality ADC A (0=quick ... 4=very high, default: 3) |
+| | `--resample-rf-quality-b` | `[0-4]` | Resample quality ADC B (0=quick ... 4=very high, default: 3) |
+| | `--resample-rf-gain-a` | `[dB]` | Apply gain during resampling of ADC A (-72 to +72) |
+| | `--resample-rf-gain-b` | `[dB]` | Apply gain during resampling of ADC B (-72 to +72) |
+| `-f` | `--rf-flac` | — | Compress RF ADC output as FLAC |
+| | `--rf-flac-12bit` | — | Set RF FLAC bit depth to 12 instead of 16 (legacy alias) |
+| | `--rf-flac-bits` | `[auto/12/16]` | Set the RF FLAC bit depth field |
+| `-l` | `--rf-flac-level` | `[0-8]` | RF FLAC compression level (0=lowest ... 8=highest, default: 1) |
+| `-v` | `--rf-flac-verification` | — | Enable verification of RF FLAC encoder output |
+| `-c` | `--rf-flac-threads` | `[threads]` | Number of RF FLAC encoding threads per file (0 = auto; requires FLAC >= 1.4.0) |
+| | `--audio-4ch` | `[filename]` | 4-channel audio output file (`-` for stdout) |
+| | `--audio-2ch-12` | `[filename]` | Stereo audio output of inputs 1/2 (`-` for stdout) |
+| | `--audio-2ch-34` | `[filename]` | Stereo audio output of inputs 3/4 (`-` for stdout) |
+| | `--audio-1ch-1` | `[filename]` | Mono audio output of input 1 (`-` for stdout) |
+| | `--audio-1ch-2` | `[filename]` | Mono audio output of input 2 (`-` for stdout) |
+| | `--audio-1ch-3` | `[filename]` | Mono audio output of input 3 (`-` for stdout) |
+| | `--audio-1ch-4` | `[filename]` | Mono audio output of input 4 (`-` for stdout) |
+
+SoXR resampling and FLAC compression options are only available when the binary is compiled with their respective libraries. Run `misrc_gui --help` to see which options are compiled in for your build.
 
 </details>
 
@@ -458,3 +489,15 @@ bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-ar
 ```
 
 </details>
+
+## History
+
+- December 2025 - Initial version presented by AlessandroAU (back and forth tinkering begins)
+- February 2026 - First testing version released by Harry Munday
+- April 4th 2026 - V1.0.0 Release (Basic HSDAOH support re-working by machcnz and vaguely stable)
+- June 3rd 2026  - V1.0.7 Release first overall stable production release
+- August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
+- August 13th 2026 - Official release!
+- August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
+- September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
+- September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
