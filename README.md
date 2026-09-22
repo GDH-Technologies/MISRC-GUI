@@ -401,6 +401,25 @@ Run `misrc_gui --help` to see the full list with descriptions. Complete referenc
 
 SoXR resampling and FLAC compression options are only available when the binary is compiled with their respective libraries. Run `misrc_gui --help` to see which options are compiled in for your build.
 
+### Real-world examples
+
+Capture 2 hours of VHS from device 0, both channels, FLAC level 8, 8 threads, resampled to 20 MSPS (A) and 10 MSPS (B), with stereo audio:
+
+```bash
+misrc_gui -d 0 -t 2:00:00 -w -f -l 8 -c 8 \
+  -a capture_A.flac -b capture_B.flac \
+  --resample-rf-a 20000 --resample-rf-b 10000 \
+  --audio-2ch-12 capture_audio_stereo.wav
+```
+
+Capture 30 minutes of LaserDisc from device 0, channel A only, raw 16-bit FLAC, peak level display, overwrite existing files:
+
+```bash
+misrc_gui -d 0 -t 30:00 -w -f -l 8 -c 8 -L \
+  -a laserdisc_rf.flac \
+  --audio-2ch-12 laserdisc_audio.wav
+```
+
 </details>
 
 <details closed>
