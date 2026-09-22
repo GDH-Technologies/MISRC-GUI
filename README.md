@@ -343,3 +343,118 @@ Log Example:
 - August 13th 2026 - Official release!
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
 - September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
+- September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
+
+
+## CLI & Automated Testing
+
+<details closed>
+<summary>CLI flags and headless mode</summary>
+<br>
+
+The GUI binary doubles as the full `misrc_capture` CLI when capture options are passed. GUI-only flags are processed first; any other arg routes into headless CLI capture mode.
+
+```bash
+# GUI flags (open the window)
+misrc_gui --help
+misrc_gui --version
+misrc_gui --smoke-test          # exit 0 if the binary loads OK
+misrc_gui --debug-view         # verbose runtime logs
+misrc_gui --config <path>     # load settings from <path> instead of the platform default
+misrc_gui --auto-connect       # auto-trigger server/client connection (requires --config)
+
+# Headless CLI capture mode (any capture arg routes here)
+misrc_gui --device-list       # list available capture devices and exit
+misrc_gui -a FILE -b FILE ...  # full misrc_capture CLI (see --help for the full option list)
+```
+
+`--auto-connect` requires `--config <path>` with a server or client config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
+
+</details>
+
+<details closed>
+<summary>Server/Client automated testing</summary>
+<br>
+
+Two GUI instances (server + client) can be launched with isolated configs and `--auto-connect` to test the full server/client chain without human intervention.
+
+Create test configs:
+
+```bash
+mkdir -p /tmp/misrc-net-tests
+cat > /tmp/misrc-net-tests/server_config.json <<'EOF'
+{
+  "net_mode": 1,
+  "net_server_port": 8095,
+  "net_server_port_str": "8095",
+  "net_client_host": "",
+  "net_client_port": 8095,
+  "net_client_port_str": "8095"
+}
+EOF
+cat > /tmp/misrc-net-tests/client_config.json <<'EOF'
+{
+  "net_mode": 2,
+  "net_server_port": 8095,
+  "net_server_port_str": "8095",
+  "net_client_host": "127.0.0.1",
+  "net_client_port": 8095,
+  "net_client_port_str": "8095"
+}
+EOF
+```
+
+Launch both:
+
+```bash
+misrc_gui --config /tmp/misrc-net-tests/server_config.json --auto-connect &
+sleep 3
+misrc_gui --config /tmp/misrc-net-tests/client_config.json --auto-connect &
+```
+
+Verify the chain:
+
+```bash
+# Server listening
+ss -ltn | grep :8095
+
+# Server /stats responds
+curl -s http://127.0.0.1:8095/stats
+
+# Client stderr shows connect + pump startup
+grep -E "worker started|pump /rf|pump /baseband" /tmp/misrc-net-tests/client.stderr.log
+```
+
+Kill the client and verify the server detects the disconnect and stays alive:
+
+```bash
+kill <client_pid>
+sleep 3
+pgrep -af misrc_gui   # server still alive, client gone
+curl -s http://127.0.0.1:8095/stats   # server still serving
+```
+
+The `misrc_tools/test/cxadc_remote_capture_ci.sh` script automates this full flow.
+
+```bash
+bash misrc_tools/test/cxadc_remote_capture_ci.sh ./build-local/misrc_gui 8095
+```
+
+</details>
+
+<details closed>
+<summary>CI guard tests</summary>
+<br>
+
+Static guard checks (no hardware required):
+
+```bash
+python3 misrc_tools/test/ci_guard_tests.py --static-only
+```
+
+Capture stability CI (requires a capture device or skips timed capture):
+```bash
+bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-artifacts
+```
+
+</details>
