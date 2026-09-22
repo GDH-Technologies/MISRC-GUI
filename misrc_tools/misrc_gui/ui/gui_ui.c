@@ -8978,6 +8978,20 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("FlacLevelMinus"))) {
                 if (app->settings.flac_level > 0) app->settings.flac_level--;
+                if (app->settings.flac_level >= 1 && app->settings.flac_level <= 3) {
+                    // Levels 1-3 give poor compression ratios for archival RF.
+                    // Warn that 6-8 should be used unless there are explicit
+                    // resource constraints (slow CPU, single-core, etc).
+                    gui_dropdown_close_all();
+                    gui_ui_clear_text_edit();
+                    gui_popup_info("FLAC level is low (1-3)",
+                        "FLAC compression level is now in the 1-3 range.\n\n"
+                        "Levels 6-8 are recommended for archival RF capture\n"
+                        "(best compression ratio, smallest files).\n\n"
+                        "Only use level 1-3 if you have explicit resource\n"
+                        "constraints (slow CPU, single-core, limited I/O).\n\n"
+                        "You can raise it with the + button.");
+                }
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("FlacLevelPlus"))) {

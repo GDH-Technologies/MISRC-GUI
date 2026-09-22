@@ -669,6 +669,9 @@ int main(int argc, char **argv) {
     // cores. The FlacThreadsMinus handler only fires on the 1->0 click
     // transition, so a session that starts at 0 would never warn without this.
     bool flac_threads_zero_warned = false;
+    // Same pattern for FLAC level 1-3: warn once on launch if the loaded
+    // settings have a low compression level.
+    bool flac_level_low_warned = false;
     gui_ui_zoom_state_t ui_zoom_state = {0};
     bool ui_scale_save_pending = false;
     double ui_scale_save_deadline = 0.0;
@@ -780,6 +783,20 @@ int main(int argc, char **argv) {
                     "For best encode throughput on multi-core systems, set an\n"
                     "explicit thread count (e.g. 4, 6, or 8) in Settings.\n\n"
                     "You can raise it with the + button.");
+            }
+        }
+        // One-time startup warning: if FLAC level is 1-3 (low compression),
+        // warn once. Same pattern as the threads=0 check above.
+        if (!flac_level_low_warned && !gui_popup_is_open()) {
+            flac_level_low_warned = true;
+            if (app.settings.flac_level >= 1 && app.settings.flac_level <= 3) {
+                gui_popup_info("FLAC level is low (1-3)",
+                    "FLAC compression level is in the 1-3 range.\n\n"
+                    "Levels 6-8 are recommended for archival RF capture\n"
+                    "(best compression ratio, smallest files).\n\n"
+                    "Only use level 1-3 if you have explicit resource\n"
+                    "constraints (slow CPU, single-core, limited I/O).\n\n"
+                    "You can raise it with the + button in Settings.");
             }
         }
 
