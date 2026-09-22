@@ -8064,6 +8064,21 @@ void gui_handle_interactions(gui_app_t *app) {
                 "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
                 "  sudo usermod -aG video $USER   (then log out/in)\n\n"
                 "8-bit capture needs no setup and still works.");
+        } else if (atomic_exchange(&app->cxadc_open_perm_help_pending, false)) {
+            gui_dropdown_close_all();
+            gui_ui_clear_text_edit();
+            gui_popup_info("CXADC card device permission denied",
+                "The /dev/cxadcN device nodes are root-only by default,\n"
+                "so capture could not open the card.\n\n"
+                "Fix this with a one-time udev rule + group membership:\n\n"
+                "  sudo chgrp video /dev/cxadc*\n"
+                "  sudo chmod g+rw /dev/cxadc*\n"
+                "  sudo usermod -aG video $USER   (then log out/in)\n\n"
+                "Or add a udev rule so it persists across reboots:\n\n"
+                "  echo 'KERNEL==\"cxadc*\", GROUP=\"video\", MODE=\"0660\"' | \\\n"
+                "  sudo tee /etc/udev/rules.d/99-cxadc.rules\n"
+                "  sudo udevadm control --reload-rules\n\n"
+                "Then log out and back in so the video group takes effect.\n");
         }
     }
 
