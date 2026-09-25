@@ -1293,6 +1293,26 @@ void gui_app_cleanup(gui_app_t *app) {
     if (app->is_capturing) {
         gui_app_stop_capture(app);
     }
+#ifdef ENABLE_DDD
+    // Safety net: ensure the DdD Clockgen Lite ALSA audio device is always
+    // closed on app exit, even if capture was already stopped (the normal
+    // stop path in gui_app_stop_capture calls gui_ddd_clockgen_stop, but a
+    // race or a non-capturing exit could leave the PCM1802 ALSA handle open,
+    // holding the audio device so the whole system needs a restart).
+    // gui_ddd_clockgen_stop is a no-op if the thread is already stopped + pcm
+    // is already closed, so calling it unconditionally is safe.
+    gui_ddd_clockgen_stop(app);
+#endif
+    // Safety net: ensure the CXADC clockgen audio device (ALSA on Linux,
+    // WASAPI on Windows) is always closed on app exit. The CXADC and
+    // MISRC Clockgen paths both use the same s_cxadc static context, and
+    // gui_cxadc_stop / gui_cxadc_stop_clockgen_audio are no-ops if the
+    // threads are already stopped and the pcm/WASAPI handle is already closed.
+    // Without this, a race or non-capturing exit could leave the ALSA/WASAPI
+    // audio handle open, holding the clockgen audio device so the whole
+    // system needs a restart.
+    gui_cxadc_stop(app);
+    gui_cxadc_stop_clockgen_audio();
 
     // Free upstream dual-ADC pairing buffer
     if (s_upstream_chb_buf) {

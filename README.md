@@ -418,6 +418,177 @@ Log Example:
 ```````
 
 
+## CLI & Automated Testing
+
+<details closed>
+<summary>GUI flags</summary>
+<br>
+
+These flags open the GUI window (no capture args):
+
+| Flag | Arg | Description |
+|------|-----|-------------|
+| `--help` / `-h` | — | Print usage and exit |
+| `--version` | — | Print version and exit |
+| `--smoke-test` | — | Exit 0 if the binary loads OK (no window) |
+| `--debug-view` | — | Verbose runtime logs |
+| `--config` | `<path>` | Load settings from `<path>` instead of the platform default |
+| `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
+
+`--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
+
+</details>
+
+<details closed>
+<summary>Headless CLI capture mode (full arg list)</summary>
+<br>
+
+The GUI binary doubles as the full `misrc_capture` CLI when any capture option is passed. GUI-only flags are processed first; any other arg routes into headless CLI capture mode (no window opens).
+
+Run `misrc_gui --help` to see the full list with descriptions. Complete reference:
+
+| Short | Long | Arg | Description |
+|------|-----|-----|-------------|
+| `-d` | `--device` | `[index]` | Input device index/name (default: 0) |
+| | `--devices` / `--device-list` | — | List available capture devices and exit |
+| `-n` | `--count` | `[samples]` | Number of samples to read (0 = infinite) |
+| `-t` | `--time` | `[time]` | Capture duration: seconds, `m:s` or `h:m:s` (`-n` takes priority; assumes 40 MSPS) |
+| `-w` | `--overwrite` | — | Overwrite any files without asking |
+| `-a` | `--rf-adc-a` | `[filename]` | RF ADC A output file (`-` for stdout) |
+| `-b` | `--rf-adc-b` | `[filename]` | RF ADC B output file (`-` for stdout) |
+| `-x` | `--aux` | `[filename]` | AUX output file (`-` for stdout) |
+| `-r` | `--raw` | `[filename]` | Raw data output file (`-` for stdout) |
+| `-p` | `--pad` | — | Pad lower 4 bits of 16-bit output with 0 instead of upper 4 |
+| `-L` | `--level` | — | Display peak level of RF ADCs |
+| `-A` | `--suppress-clip-rf-a` | — | Suppress clipping messages for ADC A |
+| `-B` | `--suppress-clip-rf-b` | — | Suppress clipping messages for ADC B |
+| | `--8bit-a` | — | Reduce ADC A output from 12-bit to 8-bit (requires SoXR) |
+| | `--8bit-b` | — | Reduce ADC B output from 12-bit to 8-bit (requires SoXR) |
+| | `--resample-rf-a` | `[kHz]` | Resample ADC A to given sample rate (requires SoXR) |
+| | `--resample-rf-b` | `[kHz]` | Resample ADC B to given sample rate (requires SoXR) |
+| | `--resample-rf-quality-a` | `[0-4]` | Resample quality ADC A (0=quick ... 4=very high, default: 3) |
+| | `--resample-rf-quality-b` | `[0-4]` | Resample quality ADC B (0=quick ... 4=very high, default: 3) |
+| | `--resample-rf-gain-a` | `[dB]` | Apply gain during resampling of ADC A (-72 to +72) |
+| | `--resample-rf-gain-b` | `[dB]` | Apply gain during resampling of ADC B (-72 to +72) |
+| `-f` | `--rf-flac` | — | Compress RF ADC output as FLAC |
+| | `--rf-flac-12bit` | — | Set RF FLAC bit depth to 12 instead of 16 (legacy alias) |
+| | `--rf-flac-bits` | `[auto/12/16]` | Set the RF FLAC bit depth field |
+| `-l` | `--rf-flac-level` | `[0-8]` | RF FLAC compression level (0=lowest ... 8=highest, default: 1) |
+| `-v` | `--rf-flac-verification` | — | Enable verification of RF FLAC encoder output |
+| `-c` | `--rf-flac-threads` | `[threads]` | Number of RF FLAC encoding threads per file (0 = auto; requires FLAC >= 1.4.0) |
+| | `--audio-4ch` | `[filename]` | 4-channel audio output file (`-` for stdout) |
+| | `--audio-2ch-12` | `[filename]` | Stereo audio output of inputs 1/2 (`-` for stdout) |
+| | `--audio-2ch-34` | `[filename]` | Stereo audio output of inputs 3/4 (`-` for stdout) |
+| | `--audio-1ch-1` | `[filename]` | Mono audio output of input 1 (`-` for stdout) |
+| | `--audio-1ch-2` | `[filename]` | Mono audio output of input 2 (`-` for stdout) |
+| | `--audio-1ch-3` | `[filename]` | Mono audio output of input 3 (`-` for stdout) |
+| | `--audio-1ch-4` | `[filename]` | Mono audio output of input 4 (`-` for stdout) |
+
+SoXR resampling and FLAC compression options are only available when the binary is compiled with their respective libraries. Run `misrc_gui --help` to see which options are compiled in for your build.
+
+### Real-world examples
+
+Capture 2 hours of VHS from device 0, both channels, FLAC level 8, 8 threads, resampled to 20 MSPS (A) and 10 MSPS (B), with stereo audio:
+
+```
+misrc_gui -d 0 -t 2:00:00 -w -f -l 8 -c 8 -a capture_A.flac -b capture_B.flac --resample-rf-a 20000 --resample-rf-b 10000 --audio-2ch-12 baseband_audio_stereo.wav
+```
+
+Capture 30 minutes of Video8 from device 0, channel A only, raw 16-bit FLAC, peak level display, overwrite existing files:
+
+```
+misrc_gui -d 0 -t 30:00 -w -f -l 8 -c 8 -L -a video8_rf.flac --audio-2ch-12 baseband_stereo_audio.wav
+```
+
+</details>
+
+<details closed>
+<summary>Server/Client automated testing</summary>
+<br>
+
+Two GUI instances (server + client) can be launched with isolated configs and `--auto-connect` to test the full server/client chain without human intervention.
+
+Create test configs:
+
+```bash
+mkdir -p /tmp/misrc-net-tests
+cat > /tmp/misrc-net-tests/server_config.json <<'EOF'
+{
+  "net_mode": 1,
+  "net_server_port": 8095,
+  "net_server_port_str": "8095",
+  "net_client_host": "",
+  "net_client_port": 8095,
+  "net_client_port_str": "8095"
+}
+EOF
+cat > /tmp/misrc-net-tests/client_config.json <<'EOF'
+{
+  "net_mode": 2,
+  "net_server_port": 8095,
+  "net_server_port_str": "8095",
+  "net_client_host": "127.0.0.1",
+  "net_client_port": 8095,
+  "net_client_port_str": "8095"
+}
+EOF
+```
+
+Launch both:
+
+```bash
+misrc_gui --config /tmp/misrc-net-tests/server_config.json --auto-connect &
+sleep 3
+misrc_gui --config /tmp/misrc-net-tests/client_config.json --auto-connect &
+```
+
+Verify the chain:
+
+```bash
+# Server listening
+ss -ltn | grep :8095
+
+# Server /stats responds
+curl -s http://127.0.0.1:8095/stats
+
+# Client stderr shows connect + pump startup
+grep -E "worker started|pump /rf|pump /baseband" /tmp/misrc-net-tests/client.stderr.log
+```
+
+Kill the client and verify the server detects the disconnect and stays alive:
+
+```bash
+kill <client_pid>
+sleep 3
+pgrep -af misrc_gui   # server still alive, client gone
+curl -s http://127.0.0.1:8095/stats   # server still serving
+```
+
+The `misrc_tools/test/cxadc_remote_capture_ci.sh` script automates this full flow.
+
+```bash
+bash misrc_tools/test/cxadc_remote_capture_ci.sh ./build-local/misrc_gui 8095
+```
+
+</details>
+
+<details closed>
+<summary>CI guard tests</summary>
+<br>
+
+Static guard checks (no hardware required):
+
+```bash
+python3 misrc_tools/test/ci_guard_tests.py --static-only
+```
+
+Capture stability CI (requires a capture device or skips timed capture):
+```bash
+bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-artifacts
+```
+
+</details>
+
 ## History
 
 - December 2025 - Initial version presented by AlessandroAU (back and forth tinkering begins)
@@ -428,3 +599,4 @@ Log Example:
 - August 13th 2026 - Official release!
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
 - September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
+- September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
