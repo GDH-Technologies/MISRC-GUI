@@ -2213,13 +2213,24 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 
         if (cxadc_open_cards(&s_cxadc, open_count) != 0) {
 #if !defined(_WIN32)
+            int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to open /dev/cxadc0..%d: %s (errno %d)\n",
-                    open_count - 1, strerror(errno), errno);
+                    open_count - 1, strerror(saved_errno), saved_errno);
             fprintf(stderr, "[CXADC] check the cxadc driver is loaded and /dev/cxadcN exists (ls -l /dev/cxadc*)\n");
+            if (saved_errno == EACCES || saved_errno == EPERM) {
+                // /dev/cxadcN is root:root 0600 by default. The user
+                // needs to be in a group with read access (e.g. video)
+                // or the node needs a udev rule. Defer a help popup to the
+                // UI thread so the user sees the one-time setup instructions.
+                atomic_store(&app->cxadc_open_perm_help_pending, true);
+                gui_app_set_status(app, "CXADC: card device permission denied (see popup)");
+            } else {
+                gui_app_set_status(app, "CXADC: failed to open card device(s)");
+            }
 #else
             fprintf(stderr, "[CXADC] failed to open card device(s)\\n");
-#endif
             gui_app_set_status(app, "CXADC: failed to open card device(s)");
+#endif
             return -1;
         }
     }

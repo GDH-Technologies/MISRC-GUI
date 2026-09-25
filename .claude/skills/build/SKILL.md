@@ -67,7 +67,7 @@ checks and a manual GUI launch. `objdump` for the post-build hsdaoh-link guard i
 | a built target | `ci_guard_tests.py --post-build --gui-path build-local/misrc_gui` | guard count incl. binary-introspection |
 | `input/`, `processing/`, `common/buffer_manager*`, `output/gui_record*` | + `build-local/misrc_gui --rtsp-soak`; then validate **RF** (waveform present, stable) and **audio monitor** (`Audio Mon` audible, `BUF_CAPTURE_AUDIO` not pinned at 0%) as two separate checks | soak's RF throughput and recorder frame counters stream-off vs stream-on |
 | `streaming/`, `gui_video_record*`, `gui_preview_v4l2*` | + `--rtsp-soak`, `--mediamtx-test`, `--rtsp-fault-test`, `--video-tap-test` | each exit code |
-| `net/` | + `--config <server.json>` / `--config <client.json>` pair on localhost per `PROMPT_SERVER_CLIENT_README.md` | `[NET]` log lines quoted |
+| `net/` | + `--config <server.json>` / `--config <client.json>` pair on localhost per `misrc_tools/misrc_gui/dev/prompt_server_client_readme.md` | `[NET]` log lines quoted |
 | `ui/`, `gui_ui_scale*` | + the UI-scale harness runs inside the guard suite | guard names that cover it |
 | `.github/workflows/selfhosted-deploy.yml` | push the branch; watch the wm run (`gh run watch`) | run URL and conclusion |
 | `misrc_tools/meson.build` | `scripts/build-local.sh --clean` (reconfigure from scratch) | that it reconfigured |

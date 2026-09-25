@@ -9,9 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <math.h>
 #include <errno.h>
-
+#include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #else
@@ -30,6 +32,17 @@
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#endif
+// CPU core detection for the FLAC thread default. get_num_cores() is
+// defined in the CLI lib (misrc_capture_cli.a, compiled from
+// misrc_capture.c which includes numcores.h) and linked into the GUI
+// binary, so declare it extern here instead of including the header
+// (which would cause a multiple-definition link error).
+// Stock threads = min(8, available cores) so an 8+-core system gets 8,
+// a smaller system gets its core count, and a detection failure falls
+// back to 0 (auto).
+#if !defined(__ANDROID__)
+extern uint32_t get_num_cores(void);
 #endif
 
 bool gui_settings_path_is_dir(const char *path) {

@@ -87,6 +87,12 @@ static bool s_capture_mode_render_last_recording = false;
 static bool s_capture_mode_render_last_capturing = false;
 static bool s_capture_mode_render_last_source_runtime = false;
 static bool s_capture_b_forced_off_by_single_channel = false;
+// Track whether the clockgen audio outputs (CH3/headswitch + stereo CH1/2)
+// were auto-enabled by a clockgen profile (CXADC Clockgen, MISRC Clockgen, or
+// DdD Clockgen). When leaving clockgen mode for a non-clockgen device (MISRC/
+// HSDAOH/etc.), if these were auto-enabled (not manually by the user), disable
+// them so they don't persist into a mode that has no clockgen audio feed.
+static bool s_clockgen_audio_auto_enabled = false;
 static int s_cxadc_dc_anchor_device_index = -1;
 static bool s_cxadc_dc_anchor_valid[2] = { false, false };
 static int s_cxadc_dc_anchor_raw[2] = { 0, 0 };
@@ -1491,10 +1497,23 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     bool fx3_mode = false;
 #endif
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, NULL);
+    bool cxadc_clockgen = false;
+    if (cxadc_mode) {
+        gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen);
+    }
     bool cxadc_has_channel_b = false;
     if (cxadc_mode && app->selected_device >= 0 && app->selected_device < app->device_count) {
         cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
     }
+    // Clockgen mode: CXADC Clockgen (2-card), MISRC Clockgen, or DdD Clockgen.
+    // These auto-enable CH3 (headswitch) + stereo CH1/2 in their capture profiles.
+    bool misrc_clockgen = gui_ui_selected_device_is_misrc_clockgen(app);
+#ifdef ENABLE_DDD
+    bool ddd_clockgen = gui_ui_selected_device_is_ddd_clockgen(app);
+#else
+    bool ddd_clockgen = false;
+#endif
+    bool is_clockgen_mode = cxadc_clockgen || misrc_clockgen || ddd_clockgen;
     bool single_channel_device = ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_channel_b);
     bool expected_mode = s_capture_mode_state_misrc;
     if (cxadc_mode) {
@@ -1579,6 +1598,32 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
         }
     }
 #endif
+    // Clockgen audio auto-enable tracking: when in clockgen mode, the clockgen
+    // profile auto-enables CH3 (headswitch) + stereo CH1/2. Mark that so when
+    // leaving clockgen mode for a non-clockgen device (MISRC/HSDAOH/etc.),
+    // we can disable them if the user didn't manually enable them.
+    if (is_clockgen_mode) {
+        s_clockgen_audio_auto_enabled = true;
+    } else if (s_clockgen_audio_auto_enabled) {
+        // Leaving clockgen mode: disable the clockgen-specific audio outputs
+        // (CH3/headswitch + stereo CH1/2) that were auto-enabled by the
+        // clockgen profile, unless the user manually enabled them in this
+        // non-clockgen mode. The user can re-enable them manually if needed.
+        bool clockgen_audio_changed = false;
+        if (app->settings.enable_audio_1ch[2]) {
+            app->settings.enable_audio_1ch[2] = false;
+            clockgen_audio_changed = true;
+        }
+        if (app->settings.enable_audio_2ch_12) {
+            app->settings.enable_audio_2ch_12 = false;
+            clockgen_audio_changed = true;
+        }
+        s_clockgen_audio_auto_enabled = false;
+        if (clockgen_audio_changed) {
+            gui_settings_save(&app->settings);
+        }
+    }
+
     if (!single_channel_device) {
         bool restore_capture_b = false;
         if (s_capture_b_forced_off_by_single_channel && !app->settings.capture_b) {
@@ -9475,6 +9520,21 @@ void gui_handle_interactions(gui_app_t *app) {
                 "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
                 "  sudo usermod -aG video $USER   (then log out/in)\n\n"
                 "8-bit capture needs no setup and still works.");
+        } else if (atomic_exchange(&app->cxadc_open_perm_help_pending, false)) {
+            gui_dropdown_close_all();
+            gui_ui_clear_text_edit();
+            gui_popup_info("CXADC card device permission denied",
+                "The /dev/cxadcN device nodes are root-only by default,\n"
+                "so capture could not open the card.\n\n"
+                "Fix this with a one-time udev rule + group membership:\n\n"
+                "  sudo chgrp video /dev/cxadc*\n"
+                "  sudo chmod g+rw /dev/cxadc*\n"
+                "  sudo usermod -aG video $USER   (then log out/in)\n\n"
+                "Or add a udev rule so it persists across reboots:\n\n"
+                "  echo 'KERNEL==\"cxadc*\", GROUP=\"video\", MODE=\"0660\"' | \\\n"
+                "  sudo tee /etc/udev/rules.d/99-cxadc.rules\n"
+                "  sudo udevadm control --reload-rules\n\n"
+                "Then log out and back in so the video group takes effect.\n");
         }
     }
 
@@ -10544,6 +10604,20 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("FlacLevelMinus"))) {
                 if (app->settings.flac_level > 0) app->settings.flac_level--;
+                if (app->settings.flac_level >= 1 && app->settings.flac_level <= 3) {
+                    // Levels 1-3 give poor compression ratios for archival RF.
+                    // Warn that 6-8 should be used unless there are explicit
+                    // resource constraints (slow CPU, single-core, etc).
+                    gui_dropdown_close_all();
+                    gui_ui_clear_text_edit();
+                    gui_popup_info("FLAC level is low (1-3)",
+                        "FLAC compression level is now in the 1-3 range.\n\n"
+                        "Levels 6-8 are recommended for archival RF capture\n"
+                        "(best compression ratio, smallest files).\n\n"
+                        "Only use level 1-3 if you have explicit resource\n"
+                        "constraints (slow CPU, single-core, limited I/O).\n\n"
+                        "You can raise it with the + button.");
+                }
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("FlacLevelPlus"))) {

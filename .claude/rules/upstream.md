@@ -29,7 +29,7 @@ ride-along — ask harrypm first.
 - `.github/workflows/build.yml` — byte-identical to upstream, disabled by repo setting
   (`gh workflow disable`), never by editing. `ci_guard_tests.py` substring-matches it, so an
   edit both breaks guards and conflicts on every sync.
-- `PROMPT_*_README.md` — harrypm's agent working logs.
+- `misrc_tools/misrc_gui/dev/prompt_*.md` (root `PROMPT_*.md` before v1.2.2) — harrypm's agent working logs.
 - `third_party/` — vendored; fixes go to hsdaoh / tape-decode-rs directly.
 - `misrc_tools/git-version.sh` — the single version source `.github/CI_RULES.md` pins.
 

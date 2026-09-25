@@ -8,8 +8,8 @@
  * apart from the keys the old writer emitted twice.
  *
  * This file must compile without raylib: the settings round-trip guard
- * builds it standalone (with gui_ui_scale.c and a stub for
- * gui_settings_get_desktop_path).
+ * builds it standalone (with gui_ui_scale.c and stubs for
+ * gui_settings_get_desktop_path and get_num_cores).
  */
 
 #include "gui_settings.h"
@@ -22,9 +22,17 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Defined in the CLI lib (misrc_capture.c via numcores.h), which the GUI
+// links on every host but Android; declared here, not included, to avoid a
+// second definition.
+#if !defined(__ANDROID__)
+extern uint32_t get_num_cores(void);
+#endif
 
 /* ============================================================================
  * Defaults
@@ -130,7 +138,23 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->flac_12bit = false;
     settings->flac_level = 8;             // Max compression (best ratio for archival RF)
     settings->flac_verification = false;  // Faster
-    settings->flac_threads = 8;           // 8 encoder threads; 0 (auto) can under-use cores
+    // Stock FLAC encoder threads: min(8, available CPU cores), 0 (auto) if
+    // detection fails (upstream fa141e2). Android does not link the CLI lib
+    // that defines get_num_cores, so it stays at 0 (auto) there.
+#if !defined(__ANDROID__)
+    {
+        uint32_t cores = get_num_cores();
+        if (cores >= 8) {
+            settings->flac_threads = 8;
+        } else if (cores > 0) {
+            settings->flac_threads = cores;
+        } else {
+            settings->flac_threads = 0;  // auto fallback
+        }
+    }
+#else
+    settings->flac_threads = 0;  // auto (Android: no CLI lib / get_num_cores)
+#endif
     settings->flac_affinity_enabled = false;
     settings->flac_affinity_cpu_list[0] = '\0';
 

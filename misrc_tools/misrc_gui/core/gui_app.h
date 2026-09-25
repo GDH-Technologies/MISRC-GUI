@@ -336,6 +336,11 @@ typedef struct gui_app {
     // 10-bit mode sysfs write is denied (EACCES/EPERM); consumed by the UI
     // thread to show a help popup with the one-time chgrp setup instructions.
     atomic_bool cxadc_perm_help_pending;
+    // CXADC /dev/cxadcN open permission help: set by the capture
+    // thread when opening the card device fails with EACCES/EPERM (the
+    // /dev/cxadcN nodes are root:root 0600 by default); consumed by the
+    // UI thread to show a help popup with the udev/group setup instructions.
+    atomic_bool cxadc_open_perm_help_pending;
 
     // Device disconnect detection (timestamp of last successful callback)
     atomic_uint_fast64_t last_callback_time_ms;
