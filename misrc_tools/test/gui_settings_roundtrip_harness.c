@@ -36,6 +36,11 @@ const char *gui_settings_get_desktop_path(void) {
     return "/tmp/misrc-harness-desktop";
 }
 
+/* Nor is the CLI lib; the flac_threads default needs a core count. */
+uint32_t get_num_cores(void) {
+    return 8;
+}
+
 static int s_fails = 0;
 static int s_passes = 0;
 
