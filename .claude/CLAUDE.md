@@ -79,7 +79,10 @@ source check; the vendored library is what links.
 - **Never edit `.github/workflows/build.yml`.** It is upstream's, kept byte-identical and
   disabled as a repo setting (`gh workflow disable`), and `ci_guard_tests.py`
   substring-matches it. Fork CI lives in `selfhosted-deploy.yml`.
-- `PROMPT_*_README.md` are harrypm's agent working logs: read, never edit.
+- `misrc_tools/misrc_gui/dev/prompt_*.md` are harrypm's agent working logs (at the repo
+  root as `PROMPT_*.md` until v1.2.2): read, never edit. Upstream's rule
+  (`dev/README.md`) is that every prompt log, bug-tracking note and lock-step note lives
+  in `dev/`, never the repo root; the fork's own notes still go in `docs/gdh-*`.
 
 ## CI and deploy (fork-only)
 
@@ -94,9 +97,9 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 75
-  checks in a Linux `--post-build` run (v1.2.1 sync), several of which compile and run C
-  harnesses in `misrc_tools/test/*_harness.c`. Meson has ten `test()` targets
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 82
+  checks in a Linux `--post-build` run (v1.2.2 sync), several of which compile and run C
+  harnesses in `misrc_tools/test/*_harness.c`. Meson has twelve `test()` targets
   (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
   must keep the fork's `"Preview"` entry.
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
@@ -164,7 +167,7 @@ Fork-side:
   switch. Since v1.2.0 it ends the recording, not the capture, and its trigger is a
   normalized 0.1-0.8 string; a legacy percent ("33") is migrated on load, so a rollback to
   v1.1.9-gdh.4 or older reads a saved "0.2" as 0.2 %.
-- Recording locks (upstream v1.2.0, `PROMPT_WAVEFORM_READOUT_BUG.md`): `gui_app_cleanup` runs
+- Recording locks (upstream v1.2.0, `dev/prompt_waveform_readout_bug.md`): `gui_app_cleanup` runs
   `gui_record_cleanup()` before `bufmgr_cleanup()` (the async finalize still drains
   `BUF_RECORD_A/B`); Disconnect and Space are refused while this machine records; the
   capture-mode toggle stays locked while a recording finalizes. Keep all three on every sync.
@@ -201,11 +204,14 @@ Fork-side:
   file of whoever runs them: `--auto-record` saves defaults before the override applies, and
   `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
   file is the running server's; never run those bare on a host with a live GUI.
-- FLAC defaults are level 8 / threads 8 since the v1.2.1 sync (upstream's `c4bb577`, ported
-  into `gui_settings_table.c` because the fork's defaults live in the table, not in
-  `gui_settings.c`). Only new settings files get them, so an install that already saved
-  `flac_threads` 0 keeps 0 — and upstream's startup popup then fires once per launch on an
-  attended GUI until someone raises it. That popup lives in the render loop, so no headless
+- FLAC defaults are level 8 since the v1.2.1 sync (upstream's `c4bb577`) and threads
+  min(8, cores) since v1.2.2 (`fa141e2`, 0 = auto if detection fails), both ported into
+  `gui_settings_table.c` because the fork's defaults live in the table, not in
+  `gui_settings.c`. The table declares `get_num_cores` extern (the CLI lib defines it); the
+  round-trip harness stubs it to 8. Only new settings files get them, so an install that
+  already saved `flac_threads` 0 keeps 0 — and upstream's startup popup then fires once per
+  launch on an attended GUI until someone raises it (v1.2.2 adds a sibling popup for a saved
+  level 1-3). Both popups live in the render loop, so no headless
   mode can reach it: `--net-serve`, `--auto-record` and the preview/video/rtsp modes all
   return before `InitWindow`, which is why cs0's `--config ... --net-serve` unit is unaffected.
 

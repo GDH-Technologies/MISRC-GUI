@@ -40,7 +40,7 @@ Run `git fetch upstream --quiet` first so the base is current.
 6. **Version strings.** Added lines matching `[0-9]+\.[0-9]+\.[0-9]+` or `v1\.` in C, meson,
    scripts or workflows are a fail unless they come from `misrc_tools/git-version.sh`.
    `.github/CI_RULES.md` is the contract.
-7. **Untouchables.** The diff must not touch `PROMPT_*_README.md`, `third_party/`,
+7. **Untouchables.** The diff must not touch `misrc_tools/misrc_gui/dev/prompt_*.md`, `third_party/`,
    `misrc_tools/git-version.sh` or `.github/workflows/build.yml`.
 8. **Evidence.** The commit messages or the branch should carry something harrypm can run:
    a guard in `ci_guard_tests.py`, a harness under `misrc_tools/test/`, or a quoted log line.

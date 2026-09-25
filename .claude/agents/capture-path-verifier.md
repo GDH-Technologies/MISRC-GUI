@@ -22,7 +22,7 @@ the main checkout has the real prefixes). In order:
    the stream off vs on. Quote them; a soak that shows RF throughput dropping when the stream
    starts is a finding, not noise.
 5. If `misrc_gui/net/` changed: the localhost server/client pair from
-   `PROMPT_SERVER_CLIENT_README.md` (two `--config` files, ports ≥ 8090), and the `[NET]` log
+   `misrc_tools/misrc_gui/dev/prompt_server_client_readme.md` (two `--config` files, ports ≥ 8090), and the `[NET]` log
    lines from both sides.
 
 Do not run `scripts/build-appimage-local.sh` — it needs a container and can leave root-owned

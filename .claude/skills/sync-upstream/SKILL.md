@@ -32,7 +32,7 @@ load it and follow it. This file is the repo profile it asks for.
 | Base | `origin/main` |
 | Default target | harrypm's newest release (`git ls-remote --tags upstream`). Use `upstream/main` when asked. If `upstream/main` is past the tag, ask which |
 | Worktree | `EnterWorktree` name `chore/merge-upstream-YYYY-MM-DD`: `.claude/hooks/worktree-deps.py` bases it on `origin/main` and links `.deps`. Check `git status --short --branch`, `git merge-base --is-ancestor origin/main HEAD`, and `ls .deps` |
-| Upstream-owned | `.github/workflows/build.yml`, `PROMPT_*`, `third_party/`, `misrc_tools/git-version.sh` |
+| Upstream-owned | `.github/workflows/build.yml`, `misrc_tools/misrc_gui/dev/prompt_*`, `third_party/`, `misrc_tools/git-version.sh` |
 | Fork-only | `.claude/rules/upstream.md`. A conflict in one of these paths is a leak |
 | PR | `/open-pr`, kind **fork-only**. Follow-on commits are labelled upstream-bound or fork-only one by one |
 
@@ -40,7 +40,7 @@ Preflight:
 
 ```bash
 python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref> --upstream upstream \
-  --watch 'PROMPT_*' --watch 'misrc_tools/misrc_gui/dev/*' --watch 'misrc_tools/meson.build' \
+  --watch 'misrc_tools/misrc_gui/dev/*' --watch 'misrc_tools/meson.build' \
   --watch '.github/*' --watch 'misrc_tools/test/*' --watch 'scripts/*' \
   --invariant 'misrc_tools/misrc_gui/input/gui_capture.c' --invariant 'misrc_tools/misrc_gui/net/*' \
   --invariant 'misrc_tools/misrc_gui/core/gui_app.h' --invariant 'misrc_tools/misrc_gui/core/gui_settings*' \
@@ -85,8 +85,8 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 
 ```bash
 scripts/build-local.sh --clean                                   # build + --smoke-test
-python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 70 PASS at v1.2.0
-meson test -C build-local                                         # 10 targets at v1.2.0
+python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 82 PASS at v1.2.2
+meson test -C build-local                                         # 12 targets at v1.2.2
 bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # from the worktree root
 ```
 
@@ -123,6 +123,7 @@ upstream's tree on every machine.
 
 | Sync | Conflicts |
 | --- | --- |
+| 2026-09-25, v1.2.2 | `gui_settings.c` (upstream's defaults block against the fork's empty side -- took the fork's side); `gui_cxadc.c` (the fork's `open_count` + upstream's `saved_errno`). Silent clashes: upstream's `flac_threads` default (8 -> min(8, cores)) vanished with the fork's side of `gui_settings.c` again and was ported with a `get_num_cores` stub in the round-trip harness; the `PROMPT_*` logs moved into `dev/` |
 | 2026-09-17, v1.2.1 + `e8bf5d7` (`5a24859`) | `gui_settings.c` (upstream's whole hand-written block against the fork's empty side -- took the fork's side); `misrc_gui.c` (`print_usage`). Silent clashes: upstream's FLAC default change (level 4->8, threads 0->8) vanished with the fork's side of `gui_settings.c` and was ported by hand; `cxadc_perm_help_pending` (a `gui_app` struct-layout change -- build `--clean`); the new startup `flac_threads == 0` popup, which no headless mode can reach |
 | 2026-09-14, v1.2.0 + `c051361` (`7853b35`) | `gui_app.h` and `gui_settings.c` (settings port); `gui_capture.c` (autostop helpers next to the fork's effective state; `a7d1511` merged silently); `misrc_gui.c` (Space lock); `gui_net.c` (idle probe); `gui_ui.c` (mode lock). Silent clash: `cxadc_hw_rate_khz` |
 | 2026-09-06, v1.1.9 (`60f5d1d`) | `gui_ui.c` (toolbar); the stats harness `"Preview"` stub |
