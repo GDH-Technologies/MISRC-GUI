@@ -72,6 +72,17 @@ concurrency:
         && 'selfhosted-install' || format('selfhosted-{0}', github.ref) }}
   cancel-in-progress: true
 
+# Fork PRs never reach these machines. Every job here that a pull_request can start
+# carries the same-repo guard
+#   github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+# so a PR from someone else's fork is skipped, while the maintainers' own branches still
+# build on wm and win0. (bump-tag runs only on a push to main, so it needs none.) The
+# runners sit next to production env roots and credentials, and an approved fork PR would
+# otherwise run its own build scripts and guards on them. The org's approval requirement
+# for outside contributors' fork PRs is the primary control: a fork PR runs its own copy
+# of this file and could delete the guard, so a PR that edits a workflow still needs
+# reading before it is approved. This stops the approved-innocent case. A fork PR whose
+# head repository was deleted has no full_name and is skipped too.
 jobs:
   # --------------------------------------------------------------------------------
   # Is this commit even buildable content? A change confined to docs, Markdown, .claude/
@@ -97,6 +108,8 @@ jobs:
   # --------------------------------------------------------------------------------
   changes:
     name: Setup-only or code?
+    # Same-repo guard (see above jobs:): no fork PR runs on a self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, wm]
     timeout-minutes: 5
     permissions:
@@ -302,7 +315,11 @@ jobs:
   guards:
     name: Static guards (CI-only change)
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.ci_only == 'true'
+    # Same-repo guard (see above jobs:): no fork PR runs on a self-hosted runner.
+    if: >-
+      (needs.changes.outputs.code == 'true' && needs.changes.outputs.ci_only == 'true') &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, Linux, X64, wm]
     timeout-minutes: 10
     permissions:
@@ -331,10 +348,17 @@ jobs:
     # ci_only is its own clause for the same reason: a .github/-only change produces a
     # bit-identical binary, so the four-machine build and install would reinstall what is
     # already there. The `guards` job below covers that change instead.
+    #
+    # The last clause is the same-repo guard (see above jobs:). It is spelled out here
+    # rather than inherited through `needs: [changes]`: under !cancelled() a skipped
+    # dependency does not skip this job, so the guard must not hang on how another job's
+    # outputs happen to read when it is skipped.
     if: >-
-      !cancelled() && needs.changes.outputs.code == 'true' &&
+      !cancelled() && (needs.changes.outputs.code == 'true' &&
       needs.changes.outputs.ci_only != 'true' &&
-      (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')
+      (needs.bump-tag.result == 'success' || needs.bump-tag.result == 'skipped')) &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
     # runners. wm and win0 build every event; cs0 and air0 join only for the refs that
     # install.
