@@ -5918,7 +5918,7 @@ static gui_channel_stats_layout_t gui_ui_stats_layout(gui_app_t *app,
     // UINT64_MAX, without letting live recording bytes change the width.
     char record_size_max[32];
     snprintf(record_size_max, sizeof(record_size_max), "RAW: %.2f GB",
-             (double)UINT64_MAX / (1024.0 * 1024.0 * 1024.0));
+             (double)UINT64_MAX / 1000000000.0);
     int record_width = gui_ui_measure_text_width(app, record_size_max, FONT_SIZE_STATS, 1);
     width = fmaxf(width, record_width + padding * 2);
     if (!compact) width = fmaxf(width, ceilf(185 * gui_ui_stats_width_scale(s_ui_scale_percent)));
@@ -6144,21 +6144,24 @@ static void render_channel_stats(gui_app_t *app, int channel,
                 int d_secs = ((int)(shown_duration)) % 60;
 
                 snprintf(buf_rec_duration, 24, "Dur: %02d:%02d:%02d", d_hours, d_mins, d_secs);
-                if (raw_bytes >= 1073741824ULL) {
-                    double raw_gb = (double)raw_bytes / (1024.0 * 1024.0 * 1024.0);
+                // Decimal (SI) MB/GB so the readout matches `ls`/file-manager
+                // and is 1:1 with the on-disk file byte count (stat-driven
+                // above), irrespective of capture mode.
+                if (raw_bytes >= 1000000000ULL) {
+                    double raw_gb = (double)raw_bytes / 1000000000.0;
                     snprintf(buf_rec_raw, 32, "RAW: %.2f GB", raw_gb);
                 } else {
-                    double raw_mb = (double)raw_bytes / (1024.0 * 1024.0);
-                    snprintf(buf_rec_raw, 32, "RAW: %.1f MB", raw_mb);
+                    double raw_mb = (double)raw_bytes / 1000000.0;
+                    snprintf(buf_rec_raw, 32, "RAW: %.2f MB", raw_mb);
                 }
                 if (comp_bytes > 0 || app->settings.use_flac) {
                     double ratio = (comp_bytes > 0) ? ((double)raw_bytes / (double)comp_bytes) : 0.0;
-                    if (comp_bytes >= 1073741824ULL) {
-                        double comp_gb = (double)comp_bytes / (1024.0 * 1024.0 * 1024.0);
+                    if (comp_bytes >= 1000000000ULL) {
+                        double comp_gb = (double)comp_bytes / 1000000000.0;
                         snprintf(buf_rec_flac, 32, "FLAC: %.2f GB", comp_gb);
                     } else {
-                        double comp_mb = (double)comp_bytes / (1024.0 * 1024.0);
-                        snprintf(buf_rec_flac, 32, "FLAC: %.1f MB", comp_mb);
+                        double comp_mb = (double)comp_bytes / 1000000.0;
+                        snprintf(buf_rec_flac, 32, "FLAC: %.2f MB", comp_mb);
                     }
                     snprintf(buf_rec_ratio, 24, "Ratio: %.1fx", ratio);
                 } else {
@@ -6458,9 +6461,19 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
 #else
     bool fx3_single_channel = false;
 #endif
-    // DdD and FX3 are single-channel: hide the Channel B row and apply a
-    // natural fill layout for Channel A height (no reserved spacer/dead area).
-    bool single_channel_preview = ddd_single_channel || fx3_single_channel;
+    // Single-card CXADC has no RF channel-B source (capture_b is forced off in
+    // gui_ui_sync_capture_mode_state / gui_capture_apply_cxadc_profile), so
+    // treat it as single-channel too: hide the empty Channel B row and let
+    // Channel A fill the panel. dev->index is the CXADC card count (1 or 2);
+    // gui_ui_selected_device_is_cxadc sets clockgen = (index > 1), so a single
+    // stock card (index == 1) is cxadc_mode && !clockgen.
+    bool cxadc_clockgen_for_preview = false;
+    bool cxadc_single_card = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_for_preview) &&
+                              !cxadc_clockgen_for_preview;
+    // DdD, FX3 and single-card CXADC are single-channel: hide the Channel B
+    // row and apply a natural fill layout for Channel A height (no reserved
+    // spacer/dead area).
+    bool single_channel_preview = ddd_single_channel || fx3_single_channel || cxadc_single_card;
     Clay_SizingAxis channel_a_height = CLAY_SIZING_GROW(0);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
 
@@ -6472,6 +6485,44 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
           app->vu_b.peak_pos, app->vu_b.peak_neg,
           atomic_load(&app->recording_raw_b), atomic_load(&app->recording_compressed_b) }
     };
+    // Drive the on-disk size readout from stat() of the actual output file so
+    // it is 1:1 with `ls`/file-manager (kills the writer-atomic > file
+    // "over" report from the FILE* buffer lead, and the decimal-MB unit below
+    // kills the MiB-vs-decimal "under" report). Throttled to 5/s; falls back
+    // to the writer atomic when stat fails or recording is stopped.
+    {
+        static uint64_t s_live_file_size[2] = {0, 0};
+        static double s_live_file_size_last_update_s = 0.0;
+        #define LIVE_FILE_SIZE_REFRESH_INTERVAL_S 0.2
+        if (app->is_recording) {
+            double now = GetTime();
+            if (s_live_file_size_last_update_s == 0.0 ||
+                (now - s_live_file_size_last_update_s) >= LIVE_FILE_SIZE_REFRESH_INTERVAL_S) {
+                s_live_file_size_last_update_s = now;
+                uint64_t fa = 0, fb = 0;
+                if (gui_record_get_live_output_bytes(&fa, &fb)) {
+                    s_live_file_size[0] = fa;
+                    s_live_file_size[1] = fb;
+                }
+            }
+        } else {
+            s_live_file_size[0] = 0;
+            s_live_file_size[1] = 0;
+            s_live_file_size_last_update_s = 0.0;
+        }
+        if (app->is_recording) {
+            if (app->settings.use_flac) {
+                // FLAC mode: "FLAC:" readout = on-disk compressed file;
+                // "RAW:" readout stays the uncompressed input atomic (for ratio).
+                if (s_live_file_size[0] > 0) stats[0].compressed_bytes = s_live_file_size[0];
+                if (s_live_file_size[1] > 0) stats[1].compressed_bytes = s_live_file_size[1];
+            } else {
+                // RAW mode: "RAW:" readout = on-disk file.
+                if (s_live_file_size[0] > 0) stats[0].raw_bytes = s_live_file_size[0];
+                if (s_live_file_size[1] > 0) stats[1].raw_bytes = s_live_file_size[1];
+            }
+        }
+    }
     gui_channel_stats_layout_t stats_layout = gui_ui_stats_layout(app, compact,
                                                                  spacing.horizontal_gap);
 

@@ -239,6 +239,13 @@ static uint8_t rf_bits_for_raw(uint8_t requested) {
     return (requested == 8) ? 8 : 16;
 }
 
+// File extension for a RAW RF capture: unsigned 8-bit -> .u8, 16-bit -> .u16.
+// Matches the ld-decode/cxadc raw-sample convention so downstream tools pick
+// the right sample width from the extension without a sidecar.
+static const char *raw_ext_for_bits(uint8_t bits) {
+    return (bits == 8) ? "u8" : "u16";
+}
+
 static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {
     if (!dst || dst_len == 0) return;
     uint32_t khz_u = (uint32_t)(khz + 0.5f);
@@ -310,8 +317,12 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
             snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
         }
     } else {
+        // RAW: 8/16 only. Extension is per-channel (.u8 / .u16) so the
+        // filename advertises the on-disk sample width.
         uint8_t bits_a = rf_bits_for_raw(settings->rf_bits_a);
         uint8_t bits_b = rf_bits_for_raw(settings->rf_bits_b);
+        const char *ext_a = raw_ext_for_bits(bits_a);
+        const char *ext_b = raw_ext_for_bits(bits_b);
         char rate_tag_a[32] = {0};
         char rate_tag_b[32] = {0};
         char rf_tag_a[40] = {0};
@@ -322,22 +333,22 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
+            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
         } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_a, (unsigned)bits_a);
+            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
         } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.raw", base, (unsigned)bits_a, rate_tag_a);
+            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
         } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.raw", base, (unsigned)bits_a);
+            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
+            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
         } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_b, (unsigned)bits_b);
+            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
         } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.raw", base, (unsigned)bits_b, rate_tag_b);
+            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
         } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.raw", base, (unsigned)bits_b);
+            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
         }
     }
 

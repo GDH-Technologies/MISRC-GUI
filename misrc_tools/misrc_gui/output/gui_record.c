@@ -332,6 +332,14 @@ static const char *gui_record_device_type_name(const gui_app_t *app) {
         return "unknown";
     }
     device_type_t type = app->devices[app->selected_device].type;
+    // MISRC mode is an hsdaoh/MS2130 capture mode (the user_capture_mode_misrc
+    // toggle). When it is enabled, report the operational mode ("misrc") as the
+    // device type so the capture log reflects how the device is being driven,
+    // not just the backend driver name. Matches the misrc_mode field already
+    // logged on the Audio monitor line (gui_record.c:2040-2043).
+    if (type == DEVICE_TYPE_HSDAOH && app->user_capture_mode_misrc) {
+        return "misrc";
+    }
     switch (type) {
         case DEVICE_TYPE_HSDAOH:
             return "hsdaoh";
@@ -731,6 +739,29 @@ static uint64_t gui_record_get_effective_output_total_bytes(const gui_app_t *app
         return (encoded_total > 0) ? encoded_total : raw_total;
     }
     return raw_total;
+}
+
+// Live on-disk size of each channel's output file, via stat(). Used by the UI
+// readout so the displayed RAW/FLAC size is exactly the real file size on disk
+// (1:1 with `ls`/file-manager), not the writer-thread atomic which can lead
+// the flushed file by the FILE* buffer size (the "readout over the file"
+// report) and is also in 1024^2 units that don't match decimal file-manager MB.
+// Returns false when not recording or neither path is set; individual channels
+// are 0 when that channel's file isn't open / stat fails.
+bool gui_record_get_live_output_bytes(uint64_t *out_a, uint64_t *out_b) {
+    if (out_a) *out_a = 0;
+    if (out_b) *out_b = 0;
+    if (!s_recording_app || !s_recording_app->is_recording) return false;
+    bool any = false;
+    if (out_a && s_record_path_a[0]) {
+        struct stat st;
+        if (stat(s_record_path_a, &st) == 0) { *out_a = (uint64_t)st.st_size; any = true; }
+    }
+    if (out_b && s_record_path_b[0]) {
+        struct stat st;
+        if (stat(s_record_path_b, &st) == 0) { *out_b = (uint64_t)st.st_size; any = true; }
+    }
+    return any;
 }
 
 static uint64_t gui_record_estimate_output_bytes_from_raw_backlog(const gui_app_t *app,
@@ -1416,11 +1447,14 @@ static int raw_writer_thread(void *ctx) {
                     }
                     bufmgr_read_end(wctx->bufmgr, wctx->buf_id, in_len);
                     if (s_recording_app) {
-                        atomic_fetch_add(&s_recording_app->recording_bytes, in_len);
+                        // Count the bytes actually written to the RAW file on
+                        // recovery (matches the normal-path accounting above:
+                        // output bytes, not input int16 block bytes).
+                        atomic_fetch_add(&s_recording_app->recording_bytes, written);
                         if (wctx->channel == 0) {
-                            atomic_fetch_add(&s_recording_app->recording_raw_a, in_len);
+                            atomic_fetch_add(&s_recording_app->recording_raw_a, written);
                         } else {
-                            atomic_fetch_add(&s_recording_app->recording_raw_b, in_len);
+                            atomic_fetch_add(&s_recording_app->recording_raw_b, written);
                         }
                     }
                     continue;
@@ -1514,12 +1548,18 @@ static int raw_writer_thread(void *ctx) {
         }
 
         if (s_recording_app) {
-            // Approximate byte accounting: count input bytes consumed
-            atomic_fetch_add(&s_recording_app->recording_bytes, in_len);
+            // Count actual output bytes written to the RAW file, not the input
+            // int16 block bytes. The on-disk sample width is 1 byte (8-bit) or
+            // 2 bytes (16-bit), and soxr resampling changes the sample count, so
+            // in_len (input bytes) can differ from write_bytes by ~2x (8-bit) or
+            // by the resample ratio. Using write_bytes keeps the per-channel
+            // "RAW" readout, the status-bar runway and the disk-space guard
+            // aligned with the real on-disk file size when FLAC is off.
+            atomic_fetch_add(&s_recording_app->recording_bytes, write_bytes);
             if (wctx->channel == 0) {
-                atomic_fetch_add(&s_recording_app->recording_raw_a, in_len);
+                atomic_fetch_add(&s_recording_app->recording_raw_a, write_bytes);
             } else {
-                atomic_fetch_add(&s_recording_app->recording_raw_b, in_len);
+                atomic_fetch_add(&s_recording_app->recording_raw_b, write_bytes);
             }
         }
     }
@@ -1880,6 +1920,13 @@ static uint8_t rf_bits_for_raw(uint8_t requested) {
     return (requested == 8) ? 8 : 16;
 }
 
+// File extension for a RAW RF capture: unsigned 8-bit -> .u8, 16-bit -> .u16.
+// Matches the ld-decode/cxadc raw-sample convention so downstream tools pick
+// the right sample width from the extension without a sidecar.
+static const char *raw_ext_for_bits(uint8_t bits) {
+    return (bits == 8) ? "u8" : "u16";
+}
+
 static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {
     if (!dst || dst_len == 0) return;
     double msps = (double)khz / 1000.0;
@@ -2180,9 +2227,12 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
             snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
         }
     } else {
-        // RAW: 8/16 only
+        // RAW: 8/16 only. Extension is per-channel (.u8 / .u16) so the
+        // filename advertises the on-disk sample width.
         uint8_t bits_a = rf_bits_for_raw(app->settings.rf_bits_a);
         uint8_t bits_b = rf_bits_for_raw(app->settings.rf_bits_b);
+        const char *ext_a = raw_ext_for_bits(bits_a);
+        const char *ext_b = raw_ext_for_bits(bits_b);
         char rate_tag_a[32] = {0};
         char rate_tag_b[32] = {0};
         char rf_tag_a[40] = {0};
@@ -2193,22 +2243,22 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), app->settings.rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
+            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
         } else if (rf_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_a, (unsigned)bits_a);
+            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
         } else if (rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.raw", base, (unsigned)bits_a, rate_tag_a);
+            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
         } else {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.raw", base, (unsigned)bits_a);
+            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.raw", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
+            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
         } else if (rf_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.raw", base, rf_tag_b, (unsigned)bits_b);
+            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
         } else if (rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.raw", base, (unsigned)bits_b, rate_tag_b);
+            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
         } else {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.raw", base, (unsigned)bits_b);
+            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
         }
     }
 

@@ -83,4 +83,11 @@ bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,
 // Returns false when output_path is unset or the filesystem query fails.
 bool gui_record_get_output_free_space_bytes(const gui_app_t *app, uint64_t *free_bytes_out);
 
+// Live on-disk size of each channel's output file via stat(). For the UI
+// readout so it shows the exact file size (1:1 with `ls`/file-manager), not
+// the writer-thread atomic which can lead the flushed file by the FILE*
+// buffer. Returns false when not recording; per-channel 0 if that file
+// isn't open or stat fails.
+bool gui_record_get_live_output_bytes(uint64_t *out_a, uint64_t *out_b);
+
 #endif // GUI_RECORD_H

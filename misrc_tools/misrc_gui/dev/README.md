@@ -28,6 +28,7 @@ Use lowercase with underscores:
 | `prompt_server_client_readme.md` | Server/client networking feature prompt log |
 | `prompt_statusbar_readme.md` | Status bar compaction / toolbar scaling prompt log |
 | `prompt_waveform_readout_bug.md` | Waveform readout bug prompt log |
+| `prompt_raw_readout_cxadc_single_flacwarn_bug.md` | RAW readout fix + CXADC single-card mode + FLAC-off startup warning prompt log |
 | `cxadc_win_lockstep_notes.md` | CXADC-Win (Windows driver) lock-step dev notes |
 
 ### When starting a new prompt

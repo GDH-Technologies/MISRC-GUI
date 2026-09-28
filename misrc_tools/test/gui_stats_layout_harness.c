@@ -146,7 +146,10 @@ static void check_static_content(gui_channel_stats_layout_t layout,
                 "columns and insets exactly fill the sidebar width");
     expect_true(44 + layout.gap <= layout.view_width,
                 "two existing CXADC DC buttons retain their full width");
-    expect_true(text_width("RAW: 17179869184.00 GB") <= layout.width - layout.padding * 2,
+    /* The readout budget uses decimal (SI) GB = UINT64_MAX / 1e9, matching
+     * gui_ui_stats_layout's record_size_max formula. Keep this in sync with
+     * the division in gui_ui.c:gui_ui_stats_layout. */
+    expect_true(text_width("RAW: 18446744073.71 GB") <= layout.width - layout.padding * 2,
                 "the full RAW size readout does not gain another line");
     int slot = (layout.view_width - layout.gap) / 2;
     expect_true(text_width("+100%") <= slot && text_width("-100%") <= slot,
@@ -295,7 +298,7 @@ static void test_fractional_font_budget(void)
     gui_channel_stats_layout_t layout = gui_ui_stats_layout(&test_app, true, 1);
     int slot = (layout.view_width - layout.gap) / 2;
     int numeric_width = layout.label_width + layout.gap + text_width("+777M") * 2 + layout.gap;
-    int record_width = text_width("RAW: 17179869184.00 GB");
+    int record_width = text_width("RAW: 18446744073.71 GB");
     expect_true(near(layout.width, fmaxf(numeric_width, record_width) + layout.padding * 2),
                 "compact widths retain recording space without rounding counters glyph by glyph");
     check_static_content(layout, true, 1);
