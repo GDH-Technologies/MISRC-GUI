@@ -1465,19 +1465,25 @@ static int flac_writer_thread(void *ctx) {
 }
 #endif
 
+// RAW files are unsigned (offset binary): .u8 is the signed 8-bit sample +128,
+// .u16 is the signed sample +32768 in little-endian. That is what the .u8/.u16
+// names promise and what ld-decode/vhs-decode load for those extensions; a
+// signed sample read as unsigned wraps at zero and scrambles the waveform.
 static void convert_i16_to_raw_bytes(uint8_t *dst, const int16_t *src, size_t n, uint8_t bits) {
     if (!dst || !src || n == 0) return;
 
     if (bits == 8) {
-        int8_t *d = (int8_t *)dst;
         for (size_t i = 0; i < n; i++) {
-            d[i] = gui_record_sample_12bit_to_i8(src[i]);
+            dst[i] = (uint8_t)((int)gui_record_sample_12bit_to_i8(src[i]) + 128);
         }
         return;
     }
 
-    // 16-bit raw: write int16 as-is
-    memcpy(dst, src, n * sizeof(int16_t));
+    for (size_t i = 0; i < n; i++) {
+        uint16_t u = (uint16_t)((int32_t)src[i] + 32768);
+        dst[2 * i] = (uint8_t)(u & 0xFFu);
+        dst[2 * i + 1] = (uint8_t)(u >> 8);
+    }
 }
 
 // RAW file writer thread
