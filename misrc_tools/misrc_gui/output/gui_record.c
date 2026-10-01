@@ -1465,10 +1465,13 @@ static int flac_writer_thread(void *ctx) {
 }
 #endif
 
-// RAW files are unsigned (offset binary): .u8 is the signed 8-bit sample +128,
-// .u16 is the signed sample +32768 in little-endian. That is what the .u8/.u16
-// names promise and what ld-decode/vhs-decode load for those extensions; a
-// signed sample read as unsigned wraps at zero and scrambles the waveform.
+// RAW files are unsigned (offset binary), the layout a CX card writes natively
+// and what ld-decode/vhs-decode load for .u8/.u16; a signed sample read as
+// unsigned wraps at zero and scrambles the waveform. .u8 is the signed 8-bit
+// sample +128. .u16 is the 12-bit sample left-justified (<<4, low nibble 0)
+// +32768, little-endian, full 16-bit scale like the 16-bit FLAC path: a CX
+// card's 16-bit mode is itself 12 significant bits left-justified, so a CX
+// capture comes out byte-identical to `cat /dev/cxadcN` in either mode.
 static void convert_i16_to_raw_bytes(uint8_t *dst, const int16_t *src, size_t n, uint8_t bits) {
     if (!dst || !src || n == 0) return;
 
@@ -1480,7 +1483,12 @@ static void convert_i16_to_raw_bytes(uint8_t *dst, const int16_t *src, size_t n,
     }
 
     for (size_t i = 0; i < n; i++) {
-        uint16_t u = (uint16_t)((int32_t)src[i] + 32768);
+        // The resampler can overshoot the 12-bit range; clamp after the shift
+        // as the 16-bit FLAC path does.
+        int32_t v = (int32_t)src[i] << 4;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        uint16_t u = (uint16_t)(v + 32768);
         dst[2 * i] = (uint8_t)(u & 0xFFu);
         dst[2 * i + 1] = (uint8_t)(u >> 8);
     }
