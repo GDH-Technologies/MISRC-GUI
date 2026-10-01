@@ -98,7 +98,7 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 ## Testing
 
 - The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 82
-  checks in a Linux `--post-build` run (v1.2.2 sync), several of which compile and run C
+  checks in a Linux `--post-build` run (v1.2.3 sync), several of which compile and run C
   harnesses in `misrc_tools/test/*_harness.c`. Meson has twelve `test()` targets
   (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
   must keep the fork's `"Preview"` entry.
@@ -161,6 +161,13 @@ Fork-side:
   count, 0 past 2^36 (libFLAC wraps; ~28.6 min at 40 MSps). Upstream's finalize (9997eca)
   scales it to kHz, which truncates decodes in readers that trust it: on every sync keep the
   fork's `gui_record` finalize and resolve only `flac_writer.c` toward upstream.
+- RAW output is unsigned offset binary named `.u8` / `.u16` (signed sample +128 / +32768, LE),
+  what ld-decode and vhs-decode load for those extensions. Upstream v1.2.3 (f693070) adopted the
+  names but still writes signed samples; the fork's `convert_i16_to_raw_bytes` (27c020f) makes
+  them true and is owed upstream. Until harrypm takes it, keep the fork's side of that function
+  on every sync: signed data under a `.u8`/`.u16` name decodes as a scrambled waveform, no
+  error. Both auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in
+  the table) must agree; `--video-name-test` checks it for FLAC and RAW.
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
   `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate
@@ -211,7 +218,7 @@ Fork-side:
   round-trip harness stubs it to 8. Only new settings files get them, so an install that
   already saved `flac_threads` 0 keeps 0 — and upstream's startup popup then fires once per
   launch on an attended GUI until someone raises it (v1.2.2 adds a sibling popup for a saved
-  level 1-3). Both popups live in the render loop, so no headless
+  level 1-3; since v1.2.3 neither fires while `use_flac` is off). Both popups live in the render loop, so no headless
   mode can reach it: `--net-serve`, `--auto-record` and the preview/video/rtsp modes all
   return before `InitWindow`, which is why cs0's `--config ... --net-serve` unit is unaffected.
 
