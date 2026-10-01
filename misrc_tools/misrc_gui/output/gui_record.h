@@ -102,4 +102,11 @@ int gui_record_cc_settings_test_main(void);
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
                                 bool use_flac, bool with_cc);
 
+// Live on-disk size of each channel's output file via stat(). For the UI
+// readout so it shows the exact file size (1:1 with `ls`/file-manager), not
+// the writer-thread atomic which can lead the flushed file by the FILE*
+// buffer. Returns false when not recording; per-channel 0 if that file
+// isn't open or stat fails.
+bool gui_record_get_live_output_bytes(uint64_t *out_a, uint64_t *out_b);
+
 #endif // GUI_RECORD_H

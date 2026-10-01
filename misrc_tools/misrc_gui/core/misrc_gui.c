@@ -1144,7 +1144,9 @@ int main(int argc, char **argv) {
         // frame where no other popup is open.
         if (!flac_threads_zero_warned && !gui_popup_is_open()) {
             flac_threads_zero_warned = true;
-            if (app.settings.flac_threads == 0) {
+            // Suppress when FLAC is turned off: the encoder thread setting is
+            // meaningless (no FLAC writer runs), so a startup popup is noise.
+            if (app.settings.use_flac && app.settings.flac_threads == 0) {
                 gui_popup_info("FLAC threads set to auto (0)",
                     "FLAC encoder threads is 0 (auto).\n\n"
                     "Auto may not use all available CPU cores efficiently.\n"
@@ -1157,7 +1159,10 @@ int main(int argc, char **argv) {
         // warn once. Same pattern as the threads=0 check above.
         if (!flac_level_low_warned && !gui_popup_is_open()) {
             flac_level_low_warned = true;
-            if (app.settings.flac_level >= 1 && app.settings.flac_level <= 3) {
+            // Suppress when FLAC is turned off (same reason as the threads=0
+            // warning above): the compression level has no effect with no
+            // FLAC encoder running.
+            if (app.settings.use_flac && app.settings.flac_level >= 1 && app.settings.flac_level <= 3) {
                 gui_popup_info("FLAC level is low (1-3)",
                     "FLAC compression level is in the 1-3 range.\n\n"
                     "Levels 6-8 are recommended for archival RF capture\n"
