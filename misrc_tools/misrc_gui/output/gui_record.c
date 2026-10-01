@@ -2836,6 +2836,34 @@ int gui_record_name_test_main(void)
         printf("FAIL: tag was not sanitised (%s)\n", s_video); rc = 1;
     }
 
+    /* Pass 3: RAW mode, timestamping off. The RAW extension is per-channel
+     * (.u8 for 8-bit, .u16 for 16-bit) and both namers must agree on it. */
+    app.settings.append_timestamp_on_capture_start = false;
+    app.settings.use_flac = false;
+    app.settings.rf_bits_a = 8;
+    app.settings.rf_bits_b = 16;
+    gui_settings_refresh_auto_names(&app.settings);
+    char s_raw_a[MAX_FILENAME_LEN], s_raw_b[MAX_FILENAME_LEN];
+    snprintf(s_raw_a, sizeof(s_raw_a), "%s", app.settings.output_filename_a);
+    snprintf(s_raw_b, sizeof(s_raw_b), "%s", app.settings.output_filename_b);
+    gui_record_apply_auto_names(&app);
+    printf("raw, no timestamp:\n");
+    printf("  settings namer rfA   : %s\n", s_raw_a);
+    printf("  record   namer rfA   : %s\n", app.settings.output_filename_a);
+    printf("  settings namer rfB   : %s\n", s_raw_b);
+    printf("  record   namer rfB   : %s\n", app.settings.output_filename_b);
+    if (strcmp(s_raw_a, app.settings.output_filename_a) != 0 ||
+        strcmp(s_raw_b, app.settings.output_filename_b) != 0) {
+        printf("FAIL: RAW names diverge with timestamping off\n"); rc = 1;
+    }
+    size_t raw_a_len = strlen(s_raw_a), raw_b_len = strlen(s_raw_b);
+    if (raw_a_len < 3 || strcmp(s_raw_a + raw_a_len - 3, ".u8") != 0) {
+        printf("FAIL: 8-bit RAW name does not end in .u8 (%s)\n", s_raw_a); rc = 1;
+    }
+    if (raw_b_len < 4 || strcmp(s_raw_b + raw_b_len - 4, ".u16") != 0) {
+        printf("FAIL: 16-bit RAW name does not end in .u16 (%s)\n", s_raw_b); rc = 1;
+    }
+
     printf("%s\n", rc ? "NAME TEST FAILED" : "name test passed");
     return rc;
 }
