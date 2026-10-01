@@ -79,16 +79,25 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 - **Recording locks.** Keep the ones from upstream v1.2.0; a fork change must not drop
   them: `gui_record_cleanup()` before `bufmgr_cleanup()`, and Disconnect, Space and the
   mode toggle refused while recording or finalizing.
+- **RAW sample encoding.** Keep the fork's `convert_i16_to_raw_bytes` (unsigned offset
+  binary, 27c020f) until upstream carries an equivalent: its `.u8`/`.u16` names are only true
+  with it. Any upstream RAW-naming change goes into both auto-namers; `--video-name-test`
+  catches drift.
 - **`ci_guard_tests.py`.** Both sides append guards. Keep both, upstream's first.
 
 ## Verification (quote every number)
 
 ```bash
 scripts/build-local.sh --clean                                   # build + --smoke-test
-python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 82 PASS at v1.2.2
-meson test -C build-local                                         # 12 targets at v1.2.2
-bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # from the worktree root
+python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 82 PASS at v1.2.3
+meson test -C build-local                                         # 12 targets at v1.2.3
+bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # 33 PASS at v1.2.3, from the worktree root
+build-local/misrc_gui --video-name-test                           # both auto-namers agree, FLAC and RAW
 ```
+
+On wm, `build-local.sh` and `meson test` compile with no `-j` (ninja's `-j22`), which the
+box's build rule forbids. Run the script's `meson setup` step, then `ninja -j8 -C build-local`
+(all targets) and `meson test -C build-local --no-rebuild`.
 
 Then run the `dev-notes-auditor` agent, then the `capture-path-verifier` agent
 (`--rtsp-soak`, RF and monitor audio as separate checks). When a check fails, run it
@@ -123,6 +132,7 @@ upstream's tree on every machine.
 
 | Sync | Conflicts |
 | --- | --- |
+| 2026-10-01, v1.2.3 (`f693070`) | `gui_settings.c` (took the fork's side again; upstream's `.u8`/`.u16` change to `refresh_auto_names` vanished with it and was ported into the table, `--video-name-test` gained a RAW pass); `gui_record.h` (both appended); `gui_record.c` `raw_writer_thread` (bytes-written accounting in the fork's `wctx->app` form, `acc_raw[]` too). Silent clash: the new `gui_record_get_live_output_bytes` used `s_recording_app` / `s_record_path_a/b`, gone in the fork, rewritten on `s_active`. Upstream's `.u8`/`.u16` names on signed samples: Reece chose unsigned offset-binary data (27c020f, upstream-bound) |
 | 2026-09-25, v1.2.2 | `gui_settings.c` (upstream's defaults block against the fork's empty side -- took the fork's side); `gui_cxadc.c` (the fork's `open_count` + upstream's `saved_errno`). Silent clashes: upstream's `flac_threads` default (8 -> min(8, cores)) vanished with the fork's side of `gui_settings.c` again and was ported with a `get_num_cores` stub in the round-trip harness; the `PROMPT_*` logs moved into `dev/` |
 | 2026-09-17, v1.2.1 + `e8bf5d7` (`5a24859`) | `gui_settings.c` (upstream's whole hand-written block against the fork's empty side -- took the fork's side); `misrc_gui.c` (`print_usage`). Silent clashes: upstream's FLAC default change (level 4->8, threads 0->8) vanished with the fork's side of `gui_settings.c` and was ported by hand; `cxadc_perm_help_pending` (a `gui_app` struct-layout change -- build `--clean`); the new startup `flac_threads == 0` popup, which no headless mode can reach |
 | 2026-09-14, v1.2.0 + `c051361` (`7853b35`) | `gui_app.h` and `gui_settings.c` (settings port); `gui_capture.c` (autostop helpers next to the fork's effective state; `a7d1511` merged silently); `misrc_gui.c` (Space lock); `gui_net.c` (idle probe); `gui_ui.c` (mode lock). Silent clash: `cxadc_hw_rate_khz` |
