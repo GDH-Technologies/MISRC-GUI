@@ -161,12 +161,17 @@ Fork-side:
   count, 0 past 2^36 (libFLAC wraps; ~28.6 min at 40 MSps). Upstream's finalize (9997eca)
   scales it to kHz, which truncates decodes in readers that trust it: on every sync keep the
   fork's `gui_record` finalize and resolve only `flac_writer.c` toward upstream.
-- RAW output is unsigned offset binary named `.u8` / `.u16` (signed sample +128 / +32768, LE),
-  what ld-decode and vhs-decode load for those extensions. Upstream v1.2.3 (f693070) adopted the
-  names but still writes signed samples; the fork's `convert_i16_to_raw_bytes` (27c020f) makes
-  them true and is owed upstream. Until harrypm takes it, keep the fork's side of that function
-  on every sync: signed data under a `.u8`/`.u16` name decodes as a scrambled waveform, no
-  error. Both auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in
+- RAW output is a CX card's native layout: unsigned offset binary, `.u8` = 8-bit sample +128,
+  `.u16` = the 12-bit sample left-justified (`<<4`, low nibble 0) +32768, LE, full 16-bit scale
+  like the 16-bit FLAC path. A CX card's 16-bit (`tenbit`) mode is itself 12 significant bits
+  left-justified (measured on wm's cxadc0, 2026-10-01: every one of 16.7M words a multiple
+  of 16), so the GUI's `(u16-32768)>>4` decode is lossless and a CX capture's `.u8`/`.u16`
+  is byte-identical to `cat /dev/cxadcN`. Upstream v1.2.3 (f693070) adopted the names but
+  still writes signed samples; the fork's `convert_i16_to_raw_bytes` (27c020f, then the
+  left-justify fix) makes them true and is owed upstream. Until harrypm takes it, keep the
+  fork's side of that function on every sync: signed data under a `.u8`/`.u16` name decodes
+  as a scrambled waveform, no error, and a 12-bit-scale `.u16` reads as 1/16 ADC occupancy
+  in the toolkit. v1.2.3-gdh.1 alone wrote that 12-bit-scale `.u16`. Both auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in
   the table) must agree; `--video-name-test` checks it for FLAC and RAW.
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when

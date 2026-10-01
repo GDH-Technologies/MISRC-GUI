@@ -80,8 +80,9 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
   them: `gui_record_cleanup()` before `bufmgr_cleanup()`, and Disconnect, Space and the
   mode toggle refused while recording or finalizing.
 - **RAW sample encoding.** Keep the fork's `convert_i16_to_raw_bytes` (unsigned offset
-  binary, 27c020f) until upstream carries an equivalent: its `.u8`/`.u16` names are only true
-  with it. Any upstream RAW-naming change goes into both auto-namers; `--video-name-test`
+  binary, `.u16` left-justified; 27c020f + the left-justify fix) until upstream carries an
+  equivalent: its `.u8`/`.u16` names are only true with it, and with it a CX capture is
+  byte-identical to the card's native output. Any upstream RAW-naming change goes into both auto-namers; `--video-name-test`
   catches drift.
 - **`ci_guard_tests.py`.** Both sides append guards. Keep both, upstream's first.
 
