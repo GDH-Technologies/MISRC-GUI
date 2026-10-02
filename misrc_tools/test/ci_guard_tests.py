@@ -4427,6 +4427,10 @@ def check_session_launch_file_contract(repo_root: Path) -> int:
     if "gui_capture_meta_set_linked(" not in apply_body:
         return fail("gui_session.c: gui_session_apply() must link the asset through "
                     "gui_capture_meta_set_linked() (capture metadata lives outside the settings)")
+    if not all(n in apply_body for n in ('"capture_a"', '"capture_b"', "gui_capture_meta_set_rf_request(")):
+        return fail("gui_session.c: gui_session_apply() must overlay rf_channels onto capture_a/capture_b "
+                    "(run-only, restored on save) and keep the request through "
+                    "gui_capture_meta_set_rf_request()")
     if "Session tag" in record_c:
         return fail("gui_record.c: the retired \"Session tag\" log lines are back; a session's asset "
                     "reaches the log as \"Capture metadata <key>: <value>\"")
@@ -4472,8 +4476,11 @@ CAPTURE_META_ASSET_KEYS = CAPTURE_META_FIELD_ORDER[:-1]   # operator is top-leve
 CAPTURE_META_SIDECAR_KEYS = (
     "schema", "state", "linked", "asset", "operator", "operator_source", "session_file",
     "misrc_gui_version", "computer_name", "device", "capture_format", "started_at",
-    "ended_at", "capture_seconds", "output_path", "base_name", "log_file", "files", "result",
+    "ended_at", "capture_seconds", "output_path", "base_name", "log_file", "rf_channels", "files",
+    "result",
 )
+# The two capture-log lines a --session "rf_channels" request adds (only then).
+CAPTURE_META_RF_LOG_KEYS = ("rf_channels_requested", "rf_channels_recorded")
 CAPTURE_META_AUDIO_KEYS = (
     "audio_4ch", "audio_2ch_12", "audio_2ch_34",
     "audio_1ch_1", "audio_1ch_2", "audio_1ch_3", "audio_1ch_4",
@@ -4494,7 +4501,8 @@ def check_capture_metadata_contract(repo_root: Path) -> int:
         meta_c = strip_c_comments(read_text(base / "core/gui_capture_meta.c"))
         record_c = strip_c_comments(read_text(base / "output/gui_record.c"))
         sidecar_h = read_text(base / "output/gui_capture_sidecar.h")
-        capture_c = strip_c_comments(read_text(base / "input/gui_capture.c"))
+        sidecar_c = strip_c_comments(read_text(base / "output/gui_capture_sidecar.c"))
+        capture_c =strip_c_comments(read_text(base / "input/gui_capture.c"))
         panel_c = strip_c_comments(read_text(base / "ui/gui_capture_meta_panel.c"))
         ui_c = strip_c_comments(read_text(base / "ui/gui_ui.c"))
         flac_c = strip_c_comments(read_text(repo_root / "misrc_tools/common/flac_writer.c"))
@@ -4530,6 +4538,15 @@ def check_capture_metadata_contract(repo_root: Path) -> int:
     for needle in ('"_capture_meta.json"', '"misrc-gui.capture-meta/1"'):
         if needle not in sidecar_h:
             return fail(f"gui_capture_sidecar.h: {needle} is gone (the sidecar's name/schema)")
+    # rf_channels: a --session's request beside what the recording used.
+    for key in CAPTURE_META_RF_LOG_KEYS:
+        if f'"Capture metadata %s: A=%s B=%s", "{key}"' not in record_c:
+            return fail(f"gui_record.c: the \"Capture metadata {key}: A=on|off B=on|off\" log line is "
+                        "gone (the toolkit reads the rf_channels request against what was recorded)")
+    for needle in ('"rf_channels"', '{\\"requested\\": ', '\\"recorded\\": {\\"a\\": '):
+        if needle not in sidecar_c:
+            return fail(f"gui_capture_sidecar.c: {needle} is gone (the sidecar's rf_channels key: "
+                        "requested {a, b} | null, recorded {a, b})")
     if "initial_tags" not in flac_c or "initial_tags_dropped" not in flac_c:
         return fail("common/flac_writer.c: the initial_tags hunk is gone -- the capture-metadata FLAC "
                     "tags would only be written at finalize, and a crash would lose the link. Keep "
@@ -4606,6 +4623,16 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
     for k in ("misrc_gui_version", "computer_name", "capture_format", "output_path", "base_name", "log_file"):
         if not isinstance(data[k], str):
             return f"{k} is not a string"
+    rf = data["rf_channels"]
+    if not isinstance(rf, dict) or tuple(rf.keys()) != ("requested", "recorded"):
+        return f"rf_channels {rf!r}"
+    for k in ("requested", "recorded"):
+        pair = rf[k]
+        if k == "requested" and pair is None:
+            continue
+        if not isinstance(pair, dict) or tuple(pair.keys()) != ("a", "b") or \
+                not all(isinstance(v, bool) for v in pair.values()):
+            return f"rf_channels.{k} {pair!r}"
     if data["capture_format"] not in ("FLAC", "RAW"):
         return f"capture_format {data['capture_format']!r}"
     dev = data["device"]
@@ -4707,9 +4734,18 @@ def check_capture_metadata_post_build(gui_path: Path) -> int:
             problem = _check_sidecar_json(sidecar, data)
             if problem:
                 return fail(f"{sidecar.parent.name}/{sidecar.name}: {problem}")
-        linked = [json.loads(p.read_text(encoding="utf-8"))["linked"] for p in sidecars]
+        loaded = [json.loads(p.read_text(encoding="utf-8")) for p in sidecars]
+        linked = [d["linked"] for d in loaded]
         if sorted(linked) != [False, True]:
             return fail(f"expected one linked and one unlinked sidecar, got linked={linked}")
+        # The linked run's session asked for A only and the run recorded A+B;
+        # the unlinked run had no request.
+        for d in loaded:
+            want = ({"requested": {"a": True, "b": False}, "recorded": {"a": True, "b": True}}
+                    if d["linked"] else {"requested": None, "recorded": {"a": True, "b": True}})
+            if d["rf_channels"] != want:
+                return fail(f"{'linked' if d['linked'] else 'unlinked'} sidecar rf_channels "
+                            f"{d['rf_channels']!r} != {want!r}")
         leftovers = [p.name for p in out.rglob("*.tmp.*")]
         if leftovers:
             return fail(f"sidecar temp files left behind: {leftovers}")

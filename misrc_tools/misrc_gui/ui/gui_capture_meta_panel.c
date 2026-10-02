@@ -42,6 +42,7 @@ static bool s_open = false;
 /* Formatted lines Clay draws after the layout pass returns: static, never
  * stack (the "Clay text outlives the layout pass" guard). */
 static char s_banner_title[GUI_META_NAME_CAP * 2 + 32];
+static char s_banner_rf[128];
 
 void gui_capture_meta_panel_open(void)  { s_open = true; }
 void gui_capture_meta_panel_close(void) { s_open = false; }
@@ -58,6 +59,22 @@ bool gui_capture_meta_panel_toggle(void)
 static bool meta_seat_records_elsewhere(const gui_app_t *app)
 {
     return gui_net_is_client(app) && !app->settings.net_client_record_local;
+}
+
+/* The selected device has no channel B: a single-channel device (DdD, FX3)
+ * or CXADC with one card. The same rule as gui_ui.c's settings_b_disabled,
+ * whose per-frame sync forces capture_b off in exactly these cases. */
+static bool meta_seat_has_no_channel_b(const gui_app_t *app)
+{
+    if (!app || app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    const device_info_t *dev = &app->devices[app->selected_device];
+#ifdef ENABLE_DDD
+    if (dev->type == DEVICE_TYPE_DDD) return true;
+#endif
+#ifdef ENABLE_FX3
+    if (dev->type == DEVICE_TYPE_FX3) return true;
+#endif
+    return dev->type == DEVICE_TYPE_CXADC && dev->index <= 1;
 }
 
 bool gui_capture_meta_panel_can_edit(const gui_app_t *app)
@@ -283,6 +300,26 @@ void gui_capture_meta_panel_render(gui_app_t *app)
             } else {
                 render_banner_line("Not linked to an asset - these values apply to this run only and are never saved",
                                    META_COLOR_AMBER_TX, FONT_SIZE_STATS);
+            }
+            /* The session's rf_channels request against what the next
+             * recording would use now (the settings after the hardware's
+             * own limits). The operator may change either; this only says so. */
+            bool req_a = false, req_b = false;
+            if (gui_capture_meta_rf_request(m, &req_a, &req_b)) {
+                bool cur_a = app->settings.capture_a;
+                bool cur_b = app->settings.capture_b;
+                bool b_impossible = req_b && meta_seat_has_no_channel_b(app);
+                if (b_impossible) {
+                    render_banner_line("This seat cannot record channel B; the asset is HiFi-equipped",
+                                       META_COLOR_AMBER_TX, FONT_SIZE_STATS);
+                }
+                if (cur_a != req_a || (cur_b != req_b && !b_impossible)) {
+                    snprintf(s_banner_rf, sizeof(s_banner_rf),
+                             "Channels differ from the toolkit's request (A %s, B %s): recording A %s, B %s",
+                             req_a ? "on" : "off", req_b ? "on" : "off",
+                             cur_a ? "on" : "off", cur_b ? "on" : "off");
+                    render_banner_line(s_banner_rf, META_COLOR_AMBER_TX, FONT_SIZE_STATS);
+                }
             }
             if (recording) {
                 render_banner_line("Locked while recording", META_COLOR_AMBER_TX, FONT_SIZE_STATS);

@@ -14,11 +14,18 @@
  *              "index": 3, "label": "Tape 3", "format": "VHS",
  *              "tape_speed": "SP", "video_system": "NTSC",
  *              "hifi_audio_equipped": true, "black_and_white": null,
- *              "notes": "..."}}
+ *              "notes": "..."},
+ *    "rf_channels": {"a": true, "b": false}}
  *
- * Every key but "schema" is optional. output_path / output_base_name overlay
- * the settings in memory only: gui_settings_save() writes their PRE-overlay
- * values (they are session-scoped, even if the operator edits them). An
+ * Every key but "schema" is optional. output_path / output_base_name and
+ * rf_channels (the capture_a / capture_b settings) overlay the settings in
+ * memory only: gui_settings_save() writes their PRE-overlay values (they are
+ * session-scoped, even if the operator edits them). rf_channels needs both
+ * "a" and "b" as JSON true/false (null or any other type is refused); the
+ * operator may still change either during the run, and the hardware's own
+ * limits (one CX card, a single-channel device) still turn B off. The
+ * request is also kept in the capture metadata, so the log and the sidecar
+ * record what was asked for beside what was recorded. An
  * "asset" LINKS the capture (gui_capture_meta.h): its fields are read-only
  * for the run and reach the capture log, the capture-meta sidecar and the RF
  * FLAC tags. When "asset" is present, asset_id, client_id, client_name,
@@ -60,6 +67,9 @@ typedef struct {
     char operator_name[GUI_META_OPERATOR_CAP];
     bool has_asset;
     gui_capture_meta_t asset;   /* the descriptor fields; linked is set on apply */
+    bool has_rf_channels;       /* "rf_channels": {"a": bool, "b": bool} */
+    bool rf_a;
+    bool rf_b;
 } gui_session_data_t;
 
 /* Parse and validate session-file text. Returns false (and a reason naming

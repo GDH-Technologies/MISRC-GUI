@@ -62,6 +62,10 @@ typedef struct {
     const char *output_path;
     const char *base_name;
     const char *log_file;                   /* basename */
+    /* "rf_channels": {"requested": {a, b} | null, "recorded": {a, b}}.
+     * requested comes from meta (null when the session asked for nothing);
+     * recorded is what the recording latched at start. */
+    bool rf_recorded_a, rf_recorded_b;
     gui_capture_sidecar_rf_t rf_a, rf_b;
     const char *video;                      /* basename or NULL */
     const char *closed_captions;            /* basename or NULL */

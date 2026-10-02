@@ -8,12 +8,13 @@
  * "asset", cannot list an object's keys and has no types. The small reader
  * below walks exactly this file's shape: one object of strings plus the
  * "asset" object of strings, one integer-or-null and two
- * boolean-or-null members. The asset's members are found through the
+ * boolean-or-null members, plus the "rf_channels" object of two strict
+ * booleans. The asset's members are found through the
  * capture-metadata descriptor table (gui_capture_meta_fields), so a field
  * the table gains is a field this parser reads, with no list here to keep
- * in step. Values that land in a setting (output_path, output_base_name)
- * are stored through gui_settings_apply_key() in strict mode, the same
- * validation a network /set gets.
+ * in step. Values that land in a setting (output_path, output_base_name,
+ * capture_a, capture_b) are stored through gui_settings_apply_key() in
+ * strict mode, the same validation a network /set gets.
  *
  * Licensed under GNU GPL v3 or later
  */
@@ -37,7 +38,7 @@
 /* ============================================================================
  * Module state
  * ============================================================================ */
-#define GUI_SESSION_MAX_OVERLAID 2   /* output_path, output_base_name */
+#define GUI_SESSION_MAX_OVERLAID 4   /* output_path, output_base_name, capture_a, capture_b */
 
 static bool s_active = false;
 static gui_settings_t *s_original = NULL;    /* the struct before the overlay */
@@ -434,9 +435,50 @@ static bool on_asset_member(reader_t *r, const char *key, void *vctx) {
     return false;
 }
 
+/* rf_channels members: "a" and "b", strict JSON booleans, both required. */
+enum { RF_SEEN_A = 1u << 0, RF_SEEN_B = 1u << 1 };
+
+typedef struct {
+    gui_session_data_t *data;
+    unsigned seen;
+} rf_ctx_t;
+
+static bool on_rf_member(reader_t *r, const char *key, void *vctx) {
+    rf_ctx_t *ctx = (rf_ctx_t *)vctx;
+    unsigned bit;
+    bool *out;
+    if (strcmp(key, "a") == 0) {
+        bit = RF_SEEN_A;
+        out = &ctx->data->rf_a;
+    } else if (strcmp(key, "b") == 0) {
+        bit = RF_SEEN_B;
+        out = &ctx->data->rf_b;
+    } else {
+        fprintf(stderr, "[SESSION] ignoring unknown key rf_channels.%s\n", key);
+        return rd_skip_value(r, 2);
+    }
+    if (ctx->seen & bit) {
+        rd_failf(r, "rf_channels.%s appears twice", key);
+        return false;
+    }
+    ctx->seen |= bit;
+    char word[8];
+    size_t wn = rd_word(r, word, sizeof(word));
+    if (wn == 4 && strcmp(word, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (wn == 5 && strcmp(word, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    rd_failf(r, "rf_channels.%s must be true or false", key);
+    return false;
+}
+
 /* Known top-level keys, one bit each (a duplicate is refused). */
 enum { TOP_SCHEMA = 1u << 0, TOP_OUTPUT_PATH = 1u << 1, TOP_BASE_NAME = 1u << 2,
-       TOP_OPERATOR = 1u << 3, TOP_ASSET = 1u << 4 };
+       TOP_OPERATOR = 1u << 3, TOP_ASSET = 1u << 4, TOP_RF_CHANNELS = 1u << 5 };
 
 static bool top_once(reader_t *r, parse_ctx_t *ctx, unsigned bit, const char *key) {
     if (ctx->top_seen & bit) {
@@ -489,6 +531,19 @@ static bool on_top_member(reader_t *r, const char *key, void *vctx) {
         if (r->p >= r->end || *r->p != '{') { rd_fail(r, "asset must be an object"); return false; }
         if (!rd_object(r, on_asset_member, ctx)) return false;
         d->has_asset = true;
+        return true;
+    }
+    if (strcmp(key, "rf_channels") == 0) {
+        if (!top_once(r, ctx, TOP_RF_CHANNELS, key)) return false;
+        rd_ws(r);
+        if (r->p >= r->end || *r->p != '{') { rd_fail(r, "rf_channels must be an object"); return false; }
+        rf_ctx_t rf = { d, 0 };
+        if (!rd_object(r, on_rf_member, &rf)) return false;
+        if (!(rf.seen & RF_SEEN_A) || !(rf.seen & RF_SEEN_B)) {
+            rd_failf(r, "rf_channels needs both \"a\" and \"b\" (true or false)");
+            return false;
+        }
+        d->has_rf_channels = true;
         return true;
     }
     /* Includes the retired "ingest" and "log_tags". */
@@ -634,9 +689,14 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
     const char *overlaid[GUI_SESSION_MAX_OVERLAID];
     size_t n_overlaid = 0;
     char why[128];
+    /* rf_channels goes through the same strict apply as a network /set. The
+     * hardware's limits are applied later, by the UI's per-frame sync, and
+     * win over the request (the panel says so). */
     const struct { bool present; const char *key; const char *value; } slots[GUI_SESSION_MAX_OVERLAID] = {
         { data->has_output_path,      "output_path",      data->output_path },
         { data->has_output_base_name, "output_base_name", data->output_base_name },
+        { data->has_rf_channels,      "capture_a",        data->rf_a ? "true" : "false" },
+        { data->has_rf_channels,      "capture_b",        data->rf_b ? "true" : "false" },
     };
     for (size_t i = 0; i < GUI_SESSION_MAX_OVERLAID; i++) {
         if (!slots[i].present) continue;
@@ -676,6 +736,12 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
         gui_capture_meta_set_linked(&linked, session_path);
     } else {
         gui_capture_meta_set_unlinked_session(op, session_path);
+    }
+    if (data->has_rf_channels) {
+        gui_capture_meta_set_rf_request(data->rf_a ? GUI_META_TRI_TRUE : GUI_META_TRI_FALSE,
+                                        data->rf_b ? GUI_META_TRI_TRUE : GUI_META_TRI_FALSE);
+    } else {
+        gui_capture_meta_set_rf_request(GUI_META_TRI_UNSET, GUI_META_TRI_UNSET);
     }
     return true;
 }
@@ -852,6 +918,10 @@ int gui_session_selftest_main(void) {
     snprintf(live->output_filename_a, sizeof(live->output_filename_a), "manual_a.flac");
     snprintf(live->output_filename_b, sizeof(live->output_filename_b), "manual_b.flac");
     snprintf(live->ffmpeg_path, sizeof(live->ffmpeg_path), "/opt/operator/ffmpeg");
+    /* The operator's channels are the opposite of the session's request on
+     * both, so a restore is visible on each key. */
+    live->capture_a = false;
+    live->capture_b = true;
     gui_settings_save(live);
 
     /* 2. Load them back the way main() does, then apply a linked session. */
@@ -859,6 +929,9 @@ int gui_session_selftest_main(void) {
     gui_settings_load(live);
     ST_CHECK(strcmp(live->output_path, "/operator/captures") == 0, "baseline did not round-trip (output_path=%s)", live->output_path);
     ST_CHECK(!live->auto_names_enabled, "baseline auto_names_enabled did not round-trip");
+    ST_CHECK(!live->capture_a && live->capture_b, "baseline capture_a/capture_b did not round-trip");
+    ST_CHECK(meta->rf_requested_a == GUI_META_TRI_UNSET && meta->rf_requested_b == GUI_META_TRI_UNSET,
+             "no session yet, but an rf_channels request is set");
 
     const char *session_text =
         "\xEF\xBB\xBF{\n"
@@ -875,7 +948,8 @@ int gui_session_selftest_main(void) {
         "            \"tape_speed\": \"SP\", \"video_system\": \"\",\n"
         "            \"hifi_audio_equipped\": true, \"black_and_white\": null,\n"
         "            \"notes\": \"caf\\u00e9 \\/ \\\\ \\ud83d\\udcfc\\r\\nline 2\\ttab\",\n"
-        "            \"not_a_field\": 3}\n"
+        "            \"not_a_field\": 3},\n"
+        "  \"rf_channels\": {\"a\": true, \"future\": [1, {\"x\": null}], \"b\": false}\n"
         "}\n";
     if (!st_write(ses_path, session_text)) {
         printf("FAIL: cannot write %s\n", ses_path);
@@ -907,8 +981,14 @@ int gui_session_selftest_main(void) {
     ST_CHECK(strcmp(meta->operator_name, "Session Operator") == 0 &&
              meta->operator_source == GUI_META_OPERATOR_SESSION, "session operator not taken");
     ST_CHECK(strcmp(meta->session_file, ses_path) == 0, "session_file not recorded (%s)", meta->session_file);
-    printf("  linked: %s / %s (%s) index=%s operator=%s\n", meta->client_name, meta->display_name,
-           meta->asset_id, meta->index_text, meta->operator_name);
+    ST_CHECK(live->capture_a && !live->capture_b, "rf_channels not overlaid (capture_a=%d capture_b=%d)",
+             (int)live->capture_a, (int)live->capture_b);
+    ST_CHECK(meta->rf_requested_a == GUI_META_TRI_TRUE && meta->rf_requested_b == GUI_META_TRI_FALSE,
+             "rf_channels request not kept in the capture metadata (a=%d b=%d)",
+             (int)meta->rf_requested_a, (int)meta->rf_requested_b);
+    printf("  linked: %s / %s (%s) index=%s operator=%s rf A=%s B=%s\n", meta->client_name, meta->display_name,
+           meta->asset_id, meta->index_text, meta->operator_name,
+           live->capture_a ? "on" : "off", live->capture_b ? "on" : "off");
 
     /* 4. The operator edits during the session: one overlaid field (session-
      *    scoped, must NOT persist) and one ordinary field (must persist). */
@@ -916,6 +996,7 @@ int gui_session_selftest_main(void) {
     snprintf(live->ffmpeg_path, sizeof(live->ffmpeg_path), "/opt/edited/ffmpeg");
     gui_settings_save(live);
     ST_CHECK(strcmp(live->output_path, "/edited/during/session") == 0, "saving changed the overlay in memory");
+    ST_CHECK(live->capture_a && !live->capture_b, "saving changed the rf_channels overlay in memory");
 
     /* 5. The file holds the operator's values for every overlaid key, and
      *    nothing of the asset (capture metadata is never a setting). */
@@ -926,6 +1007,9 @@ int gui_session_selftest_main(void) {
     ST_CHECK(strcmp(disk->output_filename_a, "manual_a.flac") == 0, "manual RF A name lost (%s)", disk->output_filename_a);
     ST_CHECK(strcmp(disk->output_filename_b, "manual_b.flac") == 0, "manual RF B name lost (%s)", disk->output_filename_b);
     ST_CHECK(strcmp(disk->ffmpeg_path, "/opt/edited/ffmpeg") == 0, "an ordinary field's edit did not persist (%s)", disk->ffmpeg_path);
+    ST_CHECK(!disk->capture_a && disk->capture_b,
+             "capture_a/capture_b persisted the rf_channels overlay (a=%d b=%d, want 0 1)",
+             (int)disk->capture_a, (int)disk->capture_b);
     char *raw = st_read(cfg_path);
     ST_CHECK(raw != NULL, "cannot read back %s", cfg_path);
     if (raw) {
@@ -934,11 +1018,14 @@ int gui_session_selftest_main(void) {
         ST_CHECK(strstr(raw, "Kuhn Family") == NULL && strstr(raw, "asset_019abc") == NULL,
                  "the asset leaked into the settings file");
         ST_CHECK(strstr(raw, "ingest_") == NULL, "a retired ingest_* key is still written");
+        ST_CHECK(strstr(raw, "rf_channels") == NULL && strstr(raw, "rf_requested") == NULL,
+                 "the rf_channels request leaked into the settings file");
         free(raw);
     }
-    printf("  on disk: output_path=%s base=%s auto_names=%d rfA=%s ffmpeg=%s\n",
+    printf("  on disk: output_path=%s base=%s auto_names=%d rfA=%s ffmpeg=%s capture A=%s B=%s\n",
            disk->output_path, disk->output_base_name, (int)disk->auto_names_enabled,
-           disk->output_filename_a, disk->ffmpeg_path);
+           disk->output_filename_a, disk->ffmpeg_path,
+           disk->capture_a ? "on" : "off", disk->capture_b ? "on" : "off");
 
     /* 6. With auto naming on in the operator's file, the restored derived
      *    names come from the operator's base name, not the session's. */
@@ -956,9 +1043,12 @@ int gui_session_selftest_main(void) {
     ST_CHECK(disk->auto_names_enabled, "auto naming lost on the second pass");
     ST_CHECK(strstr(disk->output_filename_a, "OperatorBase") != NULL, "auto name not rederived from the operator's base (%s)", disk->output_filename_a);
 
-    /* 7. A valid asset-less session: settings overlay, operator, no link. */
+    /* 7. A valid asset-less session: settings overlay, operator, no link.
+     *    It has no rf_channels: the channels stay the operator's and any
+     *    earlier request is cleared. */
     gui_session_clear();
     gui_capture_meta_init();
+    gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_TRUE);
     gui_settings_load(live);
     if (!st_write(ses_path, "{\"schema\": \"misrc-gui.session/1\", \"output_path\": \"/asset/less\", "
                             "\"operator\": \"Night Shift\"}")) {
@@ -973,6 +1063,30 @@ int gui_session_selftest_main(void) {
              "asset-less session operator not taken");
     ST_CHECK(strcmp(meta->session_file, ses_path) == 0, "asset-less session_file not recorded");
     ST_CHECK(strcmp(live->output_path, "/asset/less") == 0, "asset-less output_path not overlaid");
+    ST_CHECK(!live->capture_a && live->capture_b,
+             "a session without rf_channels changed the channels (a=%d b=%d)",
+             (int)live->capture_a, (int)live->capture_b);
+    ST_CHECK(meta->rf_requested_a == GUI_META_TRI_UNSET && meta->rf_requested_b == GUI_META_TRI_UNSET,
+             "a session without rf_channels left a request set");
+
+    /* 7b. rf_channels needs no asset: an asset-less session's request is
+     *     applied and kept too. */
+    gui_session_clear();
+    gui_capture_meta_init();
+    gui_settings_load(live);
+    if (!st_write(ses_path, "{\"schema\": \"misrc-gui.session/1\", "
+                            "\"rf_channels\": {\"b\": true, \"a\": true}}")) {
+        printf("FAIL: cannot write %s\n", ses_path);
+        s_failures++;
+    }
+    applied = gui_session_apply_file(ses_path, live, err, sizeof(err));
+    ST_CHECK(applied, "valid asset-less rf_channels session rejected: %s", err);
+    ST_CHECK(live->capture_a && live->capture_b, "asset-less rf_channels not overlaid");
+    ST_CHECK(meta->rf_requested_a == GUI_META_TRI_TRUE && meta->rf_requested_b == GUI_META_TRI_TRUE,
+             "asset-less rf_channels request not kept");
+    gui_settings_save(live);
+    gui_settings_load(disk);
+    ST_CHECK(!disk->capture_a && disk->capture_b, "asset-less rf_channels persisted the overlay");
 
     /* 8. Boundaries: notes of exactly 8191 bytes (CRLF stored as LF) and the
      *    largest index are accepted; one byte more is refused below. */
@@ -1084,6 +1198,51 @@ int gui_session_selftest_main(void) {
                        "{\"schema\": \"misrc-gui.session/1\", \"output_base_name\": \"12\\\" reel\"}", live);
     st_expect_rejected("empty output_base_name", bad_path,
                        "{\"schema\": \"misrc-gui.session/1\", \"output_base_name\": \"\"}", live);
+    /* rf_channels: strict booleans, both keys, an object, once. The good
+     * output_path beside each proves nothing of the file was applied. */
+    struct { const char *label; const char *rf; } bad_rf[] = {
+        { "rf_channels.b as a string",   "{\"a\": true, \"b\": \"false\"}" },
+        { "rf_channels.a null",          "{\"a\": null, \"b\": true}" },
+        { "rf_channels.b null",          "{\"a\": true, \"b\": null}" },
+        { "rf_channels.a as a number",   "{\"a\": 1, \"b\": true}" },
+        { "rf_channels.a as an object",  "{\"a\": {}, \"b\": true}" },
+        { "rf_channels.b misspelt",      "{\"a\": true, \"b\": tru}" },
+        { "rf_channels missing b",       "{\"a\": true}" },
+        { "rf_channels missing a",       "{\"b\": false, \"c\": true}" },
+        { "rf_channels empty",           "{}" },
+        { "rf_channels duplicate a",     "{\"a\": true, \"b\": true, \"a\": false}" },
+        { "rf_channels null",            "null" },
+        { "rf_channels as an array",     "[true, false]" },
+        { "rf_channels as a bool",       "true" },
+    };
+    for (size_t i = 0; i < sizeof(bad_rf) / sizeof(bad_rf[0]); i++) {
+        char text[256];
+        snprintf(text, sizeof(text), "{\"schema\": \"misrc-gui.session/1\", \"output_path\": \"/rf/refused\", "
+                                     "\"rf_channels\": %s}", bad_rf[i].rf);
+        st_expect_rejected(bad_rf[i].label, bad_path, text, live);
+    }
+    st_expect_rejected("rf_channels twice", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"rf_channels\": {\"a\": true, \"b\": true}, "
+                       "\"rf_channels\": {\"a\": true, \"b\": true}}", live);
+    {
+        /* A bad rf_channels refuses a valid asset with it: no link either. */
+        char *text = st_asset_session("\"a_rf\"", "");
+        if (text) {
+            size_t tl = strlen(text);
+            char *with_rf = malloc(tl + 64);
+            if (with_rf && tl >= 1) {
+                memcpy(with_rf, text, tl - 1);   /* drop the closing '}' */
+                snprintf(with_rf + tl - 1, 64, ", \"rf_channels\": {\"a\": true, \"b\": \"yes\"}}");
+                st_expect_rejected("asset with a bad rf_channels", bad_path, with_rf, live);
+            } else {
+                s_failures++;
+            }
+            free(with_rf);
+            free(text);
+        } else {
+            s_failures++;
+        }
+    }
     remove(bad_path);
     st_expect_rejected("unreadable file", bad_path, NULL, live);
 
