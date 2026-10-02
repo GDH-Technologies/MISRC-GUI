@@ -2,6 +2,7 @@
 #define GUI_UI_H
 
 #include "../core/gui_app.h"
+#include "../core/gui_capture_meta.h"
 #include "clay.h"
 #include "gui_ui_scale.h"
 
@@ -132,20 +133,22 @@ typedef enum {
     UI_TEXT_FIELD_AUDIO_LABEL_4,
     UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold (normalized 0.1-0.8)
     UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION,  // Level autostop sustain seconds
-    UI_TEXT_FIELD_INGEST_PROJECT,
-    UI_TEXT_FIELD_INGEST_TAPE_ID,
-    UI_TEXT_FIELD_INGEST_TAPE_FORMAT,
-    UI_TEXT_FIELD_INGEST_TAPE_SIZE,
-    UI_TEXT_FIELD_INGEST_TAPE_SPEED,
-    UI_TEXT_FIELD_INGEST_TAPE_CONDITION,
-    UI_TEXT_FIELD_INGEST_OPERATOR,
-    UI_TEXT_FIELD_INGEST_LOCATION,
-    UI_TEXT_FIELD_INGEST_NOTES,
+    // Capture metadata (ui/gui_capture_meta_panel.c): one identity per
+    // descriptor slot, META_FIRST + slot. The buffers live in
+    // core/gui_capture_meta.c, never in the settings.
+    UI_TEXT_FIELD_META_FIRST,
+    UI_TEXT_FIELD_META_LAST = UI_TEXT_FIELD_META_FIRST + GUI_META_FIELD_COUNT - 1,
     UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
     UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
     UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
     UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
 } ui_text_field_t;
+
+/* True for a capture-metadata field (edited in the Capture Metadata panel). */
+static inline bool gui_ui_is_meta_field(ui_text_field_t field)
+{
+    return field >= UI_TEXT_FIELD_META_FIRST && field <= UI_TEXT_FIELD_META_LAST;
+}
 
 bool gui_ui_is_text_field_active(ui_text_field_t field);
 void gui_ui_render_active_text(ui_text_field_t field, const char *text,

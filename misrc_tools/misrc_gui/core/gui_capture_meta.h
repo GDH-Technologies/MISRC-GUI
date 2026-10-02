@@ -94,6 +94,8 @@ typedef struct {
     unsigned flags;
 } gui_capture_meta_field_t;
 
+#define GUI_META_FIELD_COUNT 13   /* rows in the descriptor table (asserted) */
+
 /* The descriptor table, in its one order: client_name, display_name, index,
  * label, format, tape_speed, video_system, hifi_audio_equipped,
  * black_and_white, notes, asset_id, client_id, operator. */

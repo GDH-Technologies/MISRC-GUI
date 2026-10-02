@@ -1783,6 +1783,23 @@ SETTINGS_KEYS_V1_1_8 = (
     "playback_file_b",
 )
 
+# Keys deliberately RETIRED by the fork, kept out of the "no v1.1.8 key may be
+# dropped" rule. SETTINGS_KEYS_V1_1_8 stays the historical record of what that
+# release wrote; a key leaves the written set only by being listed here, with
+# the reason. A retired key may never come back as a table row (that would
+# re-persist what was retired).
+#
+# The nine ingest_* keys: capture metadata moved out of gui_settings_t into
+# core/gui_capture_meta.h -- per-run, linked from a --session asset or typed
+# for one unlinked run, and never saved. An older build loading a newer file
+# simply sees them absent (empty strings, their default); a newer build
+# loading an older file skips them as unknown keys.
+SETTINGS_KEYS_RETIRED = frozenset((
+    "ingest_project", "ingest_tape_id", "ingest_tape_format", "ingest_tape_size",
+    "ingest_tape_speed", "ingest_tape_condition", "ingest_operator", "ingest_location",
+    "ingest_notes",
+))
+
 # Fields that describe the machine running this GUI rather than the capture,
 # so a net client keeps its own and never sends them to a server.
 SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
@@ -1847,8 +1864,15 @@ def check_settings_table_covers_struct(repo_root: Path) -> int:
             "gui_settings_table.c (or, if the field must never persist, to SETTINGS_UNPERSISTED_FIELDS)."
         )
 
+    revived = sorted(SETTINGS_KEYS_RETIRED & set(keys))
+    if revived:
+        return fail(
+            f"retired settings keys are table rows again: {', '.join(revived)}. They were retired on "
+            "purpose (see SETTINGS_KEYS_RETIRED); capture metadata lives in core/gui_capture_meta.h "
+            "and is never saved."
+        )
     written = {k for k, _, rest in rows if "GS_LOAD_ONLY" not in rest}
-    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - written)
+    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - SETTINGS_KEYS_RETIRED - written)
     if dropped:
         return fail(
             f"settings keys written at v1.1.8 are no longer written: {', '.join(dropped)}. "

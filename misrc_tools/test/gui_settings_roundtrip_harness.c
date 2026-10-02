@@ -283,12 +283,12 @@ int main(int argc, char **argv) {
     check(fv_ok, "every entry round-trips through format_value -> strict apply_key");
 
     gui_settings_t j1 = a;
-    strcpy(j1.ingest_notes, "say \"hi\" \\ back\ttab \xc3\xa9");
+    strcpy(j1.ffmpeg_path, "say \"hi\" \\ back\ttab \xc3\xa9");
     strcpy(j1.usbref_mediamtx_path, "C:\\Tools\\mediamtx.exe");
     static char json[GUI_SETTINGS_MAX_FILE_BYTES];
     size_t nj = gui_settings_to_json(&j1, 0, json, sizeof(json));
     check(nj > 0 && nj < sizeof(json) && json[0] == '{' && json[nj - 1] == '}', "JSON snapshot fits and is an object");
-    check(strstr(json, "\"ingest_notes\":\"say \\\"hi\\\" \\\\ back\\ttab \xc3\xa9\"") != NULL, "JSON escapes quotes, backslashes and tabs; UTF-8 passes through");
+    check(strstr(json, "\"ffmpeg_path\":\"say \\\"hi\\\" \\\\ back\\ttab \xc3\xa9\"") != NULL, "JSON escapes quotes, backslashes and tabs; UTF-8 passes through");
     gui_settings_t j2;
     gui_settings_init_defaults(&j2);
     bool json_ok = true;
@@ -378,8 +378,8 @@ int main(int argc, char **argv) {
     check(gui_settings_apply_key(&c, "capture_a", "yes", false, err, sizeof(err)) == 0 && c.capture_a == false, "loose: bool 'yes' reads as false (as it always has)");
     check(gui_settings_apply_key(&c, "flac_threads", "12abc", true, err, sizeof(err)) == -2, "strict: '12abc' refused");
     check(gui_settings_apply_key(&c, "flac_threads", "12abc", false, err, sizeof(err)) == 0 && c.flac_threads == 12, "loose: '12abc' reads 12 (atoi semantics)");
-    check(gui_settings_apply_key(&c, "ingest_notes", "a \"quoted\" note", true, err, sizeof(err)) == -2, "strict: a quote in a string refused");
-    check(gui_settings_apply_key(&c, "ingest_notes", "line\nbreak", true, err, sizeof(err)) == -2, "strict: a line break refused");
+    check(gui_settings_apply_key(&c, "ffmpeg_path", "a \"quoted\" path", true, err, sizeof(err)) == -2, "strict: a quote in a string refused");
+    check(gui_settings_apply_key(&c, "ffmpeg_path", "line\nbreak", true, err, sizeof(err)) == -2, "strict: a line break refused");
     char longv[400];
     memset(longv, 'x', sizeof(longv) - 1);
     longv[sizeof(longv) - 1] = '\0';

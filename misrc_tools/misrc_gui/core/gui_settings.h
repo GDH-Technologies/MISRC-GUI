@@ -188,16 +188,8 @@ typedef struct {
     bool usbref_rtsp_password;               // false = anyone who can reach it can watch
     char usbref_mediamtx_path[512];                 // empty = bundled copy, then PATH
     char usbref_rtsp_audio_device[96];              // empty = resolve from the video device
-    // Ingest metadata (saved to settings and written to capture log at record start)
-    char ingest_project[128];
-    char ingest_tape_id[128];
-    char ingest_tape_format[128];
-    char ingest_tape_size[128];
-    char ingest_tape_speed[128];
-    char ingest_tape_condition[128];
-    char ingest_operator[128];
-    char ingest_location[128];
-    char ingest_notes[256];
+    // (The nine ingest metadata fields were retired: capture metadata lives
+    // in core/gui_capture_meta.h, outside the settings, and is never saved.)
 
     // Display settings (existing)
     bool show_grid;

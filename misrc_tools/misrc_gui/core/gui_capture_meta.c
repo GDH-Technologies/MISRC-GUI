@@ -51,6 +51,8 @@ static const gui_capture_meta_field_t s_fields[] = {
 };
 
 #define META_FIELD_COUNT (sizeof(s_fields) / sizeof(s_fields[0]))
+_Static_assert(sizeof(s_fields) / sizeof(s_fields[0]) == GUI_META_FIELD_COUNT,
+               "GUI_META_FIELD_COUNT must match the descriptor table (the UI's text-field block is sized by it)");
 
 /* Main thread only. */
 static gui_capture_meta_t s_meta;

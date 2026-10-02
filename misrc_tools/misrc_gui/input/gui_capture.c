@@ -45,6 +45,8 @@
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "../core/gui_capture_meta.h"
+#include "../ui/gui_popup.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
 #if defined(_WIN32)
@@ -2722,6 +2724,21 @@ int gui_app_start_recording(gui_app_t *app) {
     }
     // Client mode: forward record-on to the server (master controls recording).
     if (gui_net_is_client(app)) {
+        // A linked seat must not start a recording whose files it does not
+        // write: the server records with its OWN capture metadata, so the
+        // link would silently not reach the files.
+        const gui_capture_meta_t *meta = gui_capture_meta_get();
+        if (meta->linked) {
+            static char refusal[GUI_META_NAME_CAP * 2 + GUI_META_ID_CAP + 320];
+            snprintf(refusal, sizeof(refusal),
+                     "This seat is linked to %s \xC2\xB7 %s (%s) but records on the server - "
+                     "the server's files would not carry the link.\n\n"
+                     "Turn on Record locally, or launch the capture on the server.",
+                     meta->client_name, meta->display_name, meta->asset_id);
+            gui_popup_info("Recording not started", refusal);
+            gui_net_set_status(app, "Linked seat records on the server: not started");
+            return 0;
+        }
         gui_net_client_request_record(app, true);
         gui_net_set_status(app, "Requested record start on server");
         return 0;

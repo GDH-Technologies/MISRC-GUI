@@ -933,6 +933,7 @@ int gui_session_selftest_main(void) {
         ST_CHECK(strstr(raw, "/session/out") == NULL, "the session output_path leaked into the file");
         ST_CHECK(strstr(raw, "Kuhn Family") == NULL && strstr(raw, "asset_019abc") == NULL,
                  "the asset leaked into the settings file");
+        ST_CHECK(strstr(raw, "ingest_") == NULL, "a retired ingest_* key is still written");
         free(raw);
     }
     printf("  on disk: output_path=%s base=%s auto_names=%d rfA=%s ffmpeg=%s\n",

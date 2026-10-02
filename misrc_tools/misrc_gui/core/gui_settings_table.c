@@ -93,15 +93,6 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     for (int i = 0; i < 3; i++) {
         settings->audio_output_tags[i][0] = '\0';
     }
-    settings->ingest_project[0] = '\0';
-    settings->ingest_tape_id[0] = '\0';
-    settings->ingest_tape_format[0] = '\0';
-    settings->ingest_tape_size[0] = '\0';
-    settings->ingest_tape_speed[0] = '\0';
-    settings->ingest_tape_condition[0] = '\0';
-    settings->ingest_operator[0] = '\0';
-    settings->ingest_location[0] = '\0';
-    settings->ingest_notes[0] = '\0';
     // Optional per-channel RF tags
     for (int i = 0; i < 2; i++) {
         settings->rf_channel_tags[i][0] = '\0';
@@ -953,15 +944,9 @@ static const gui_setting_desc_t s_table[] = {
     GS_B  ("level_autostop_enabled",           level_autostop_enabled,      0),
     GS_SH ("level_autostop_level_str",         level_autostop_level_str,    0, hook_level_autostop_level),
     GS_S  ("level_autostop_duration_str",      level_autostop_duration_str, 0),
-    GS_S  ("ingest_project",                   ingest_project,              0),
-    GS_S  ("ingest_tape_id",                   ingest_tape_id,              0),
-    GS_S  ("ingest_tape_format",               ingest_tape_format,          0),
-    GS_S  ("ingest_tape_size",                 ingest_tape_size,            0),
-    GS_S  ("ingest_tape_speed",                ingest_tape_speed,           0),
-    GS_S  ("ingest_tape_condition",            ingest_tape_condition,       0),
-    GS_S  ("ingest_operator",                  ingest_operator,             0),
-    GS_S  ("ingest_location",                  ingest_location,             0),
-    GS_S  ("ingest_notes",                     ingest_notes,                0),
+    /* The nine ingest_* rows were here. Retired on purpose (fork): capture
+     * metadata is per-run and never saved (core/gui_capture_meta.h). A file
+     * that still has them loads fine -- unknown keys are skipped. */
     GS_B  ("enable_audio_1ch_1",               enable_audio_1ch[0],         0),
     GS_B  ("enable_audio_1ch_2",               enable_audio_1ch[1],         0),
     GS_B  ("enable_audio_1ch_3",               enable_audio_1ch[2],         0),
