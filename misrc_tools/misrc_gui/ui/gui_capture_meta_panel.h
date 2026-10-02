@@ -13,6 +13,10 @@
  *   - While recording (this machine's or, on a net client, the effective
  *     recording) everything is locked: the start snapshot is what the files
  *     carry, and an edit now would only mislead.
+ *   - When a --session asked for RF channels (rf_channels) and the current
+ *     capture_a / capture_b differ from it, the banner says so; when it
+ *     asked for B and this seat has no channel B, it says that instead. It
+ *     never changes the channels: the operator's toggles stay free.
  *
  * The rows come from the descriptor table, so the panel never names a field.
  * It replaces upstream's render_metadata_window in ui/gui_ui.c, which kept

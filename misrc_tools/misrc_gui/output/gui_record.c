@@ -2125,8 +2125,10 @@ static double gui_record_mono_seconds(void) {
 
 /* The capture-metadata block of the capture log, one line per key:
  * "Capture metadata <key>: <value>", in descriptor order between linked and
- * operator_source/sidecar. Values are escaped onto one line ((empty) /
- * (unset) for nothing). Caller holds the log lock. */
+ * operator_source / [rf_channels_requested, rf_channels_recorded] / sidecar.
+ * Values are escaped onto one line ((empty) / (unset) for nothing). The two
+ * rf_channels lines appear only when a --session requested channels. Caller
+ * holds the log lock. */
 static void gui_record_log_capture_meta_locked(const gui_record_session_t *ses) {
     if (!ses) return;
     const gui_capture_meta_t *m = &ses->meta;
@@ -2152,6 +2154,17 @@ static void gui_record_log_capture_meta_locked(const gui_record_session_t *ses) 
     snprintf(msg, cap + 64, "Capture metadata %s: %s", "operator_source",
              gui_capture_meta_operator_source_name(m->operator_source));
     gui_record_log_write_line_locked("INFO", msg);
+    /* Only when a --session asked for channels: what it asked for, and what
+     * this recording latched (the operator or the hardware may differ). */
+    bool req_a = false, req_b = false;
+    if (gui_capture_meta_rf_request(m, &req_a, &req_b)) {
+        snprintf(msg, cap + 64, "Capture metadata %s: A=%s B=%s", "rf_channels_requested",
+                 req_a ? "on" : "off", req_b ? "on" : "off");
+        gui_record_log_write_line_locked("INFO", msg);
+        snprintf(msg, cap + 64, "Capture metadata %s: A=%s B=%s", "rf_channels_recorded",
+                 ses->capture_a ? "on" : "off", ses->capture_b ? "on" : "off");
+        gui_record_log_write_line_locked("INFO", msg);
+    }
     const char *sidecar = gui_capture_sidecar_basename(ses->sidecar_path);
     snprintf(msg, cap + 64, "Capture metadata %s: %s", "sidecar",
              (sidecar && sidecar[0]) ? sidecar : "(empty)");
@@ -2202,6 +2215,8 @@ static bool gui_record_write_sidecar(gui_record_session_t *ses, bool complete,
     s.output_path = ses->output_path;
     s.base_name = ses->base_name;
     s.log_file = ses->log_path[0] ? gui_capture_sidecar_basename(ses->log_path) : NULL;
+    s.rf_recorded_a = ses->capture_a;
+    s.rf_recorded_b = ses->capture_b;
 
     const char *paths[2] = { ses->path_a, ses->path_b };
     bool on[2] = { ses->capture_a, ses->capture_b };
@@ -3173,6 +3188,9 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     snprintf(src.notes, sizeof(src.notes), "line one\nsaid \"hi\" caf\xC3\xA9");
     snprintf(src.operator_name, sizeof(src.operator_name), "Selftest Operator");
     gui_capture_meta_set_linked(&src, "/selftest/session.json");
+    /* The session asked for A only; the run records A and B (the operator
+     * turned B back on). Both reach the log and the sidecar. */
+    gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_FALSE);
 
     char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
     gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked" };
@@ -3194,6 +3212,9 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
                  strstr(side, "\"operator_source\": \"session\"") != NULL, "linked: sidecar operator");
         CM_CHECK(strstr(side, "\"session_file\": \"/selftest/session.json\"") != NULL, "linked: session_file");
         CM_CHECK(strstr(side, "\"capture_format\": \"FLAC\"") != NULL, "linked: capture_format");
+        CM_CHECK(strstr(side, "\"rf_channels\": {\"requested\": {\"a\": true, \"b\": false}, "
+                              "\"recorded\": {\"a\": true, \"b\": true}},\n") != NULL,
+                 "linked: sidecar rf_channels is not requested A-only / recorded A+B");
     }
     if (log_text) {
         CM_CHECK(strstr(log_text, "Capture metadata asset_id: st_asset_01\n") != NULL,
@@ -3203,6 +3224,10 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
         CM_CHECK(strstr(log_text, "Capture metadata linked: true\n") != NULL, "linked: log linked");
         CM_CHECK(strstr(log_text, "Capture metadata hifi_audio_equipped: true\n") != NULL, "linked: log hifi");
         CM_CHECK(strstr(log_text, "Capture metadata operator_source: session\n") != NULL, "linked: log source");
+        CM_CHECK(strstr(log_text, "Capture metadata rf_channels_requested: A=on B=off\n") != NULL,
+                 "linked: log has no 'Capture metadata rf_channels_requested: A=on B=off'");
+        CM_CHECK(strstr(log_text, "Capture metadata rf_channels_recorded: A=on B=on\n") != NULL,
+                 "linked: log has no 'Capture metadata rf_channels_recorded: A=on B=on'");
     }
 #if LIBFLAC_ENABLED == 1
     if (rc == 0) {
@@ -3242,11 +3267,16 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
         CM_CHECK(strstr(side, "\"operator_source\": \"os_login\"") != NULL, "unlinked: operator_source");
         CM_CHECK(strstr(side, "\"session_file\": null") != NULL, "unlinked: session_file is not null");
         CM_CHECK(strstr(side, "\"capture_format\": \"RAW\"") != NULL, "unlinked: capture_format");
+        CM_CHECK(strstr(side, "\"rf_channels\": {\"requested\": null, "
+                              "\"recorded\": {\"a\": true, \"b\": true}},\n") != NULL,
+                 "unlinked: sidecar rf_channels is not requested null / recorded A+B");
     }
     if (log_text) {
         CM_CHECK(strstr(log_text, "Capture metadata linked: false\n") != NULL, "unlinked: log linked");
         CM_CHECK(strstr(log_text, "Capture metadata asset_id: (empty)\n") != NULL, "unlinked: log asset_id");
         CM_CHECK(strstr(log_text, "Capture metadata index: (unset)\n") != NULL, "unlinked: log index");
+        CM_CHECK(strstr(log_text, "Capture metadata rf_channels_") == NULL,
+                 "unlinked: no session requested channels, but the log has rf_channels lines");
     }
     free(side);
     free(log_text);

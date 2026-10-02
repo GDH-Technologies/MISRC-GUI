@@ -121,6 +121,8 @@ void gui_capture_meta_init(void) {
     memset(&s_meta, 0, sizeof(s_meta));
     s_meta.hifi_audio_equipped = GUI_META_TRI_UNSET;
     s_meta.black_and_white = GUI_META_TRI_UNSET;
+    s_meta.rf_requested_a = GUI_META_TRI_UNSET;
+    s_meta.rf_requested_b = GUI_META_TRI_UNSET;
     gui_capture_meta_os_login(s_meta.operator_name, sizeof(s_meta.operator_name));
     s_meta.operator_source = GUI_META_OPERATOR_OS_LOGIN;
     static uint32_t s_init_generation = 0;
@@ -169,6 +171,28 @@ void gui_capture_meta_set_unlinked_session(const char *operator_name, const char
     meta_set_operator(&s_meta, operator_name);
     snprintf(s_meta.session_file, sizeof(s_meta.session_file), "%s", session_file ? session_file : "");
     s_meta.generation++;
+}
+
+static bool tri_is_set(int8_t v)
+{
+    return v == GUI_META_TRI_TRUE || v == GUI_META_TRI_FALSE;
+}
+
+void gui_capture_meta_set_rf_request(int8_t a, int8_t b) {
+    if (!tri_is_set(a) || !tri_is_set(b)) {
+        a = GUI_META_TRI_UNSET;
+        b = GUI_META_TRI_UNSET;
+    }
+    s_meta.rf_requested_a = a;
+    s_meta.rf_requested_b = b;
+    s_meta.generation++;
+}
+
+bool gui_capture_meta_rf_request(const gui_capture_meta_t *m, bool *a, bool *b) {
+    if (!m || !tri_is_set(m->rf_requested_a) || !tri_is_set(m->rf_requested_b)) return false;
+    if (a) *a = (m->rf_requested_a == GUI_META_TRI_TRUE);
+    if (b) *b = (m->rf_requested_b == GUI_META_TRI_TRUE);
+    return true;
 }
 
 static bool slot_editable(size_t slot, const gui_capture_meta_field_t **out) {

@@ -184,6 +184,8 @@ static void check_store(void)
     expect(m->operator_source == GUI_META_OPERATOR_OS_LOGIN, "init: operator_source os_login");
     expect(m->hifi_audio_equipped == GUI_META_TRI_UNSET && m->black_and_white == GUI_META_TRI_UNSET,
            "init: tri-states unset");
+    expect(m->rf_requested_a == GUI_META_TRI_UNSET && m->rf_requested_b == GUI_META_TRI_UNSET &&
+           !gui_capture_meta_rf_request(m, NULL, NULL), "init: no rf_channels request");
 
     char *buf = NULL;
     size_t cap = 0;
@@ -248,9 +250,28 @@ static void check_store(void)
     expect(strcmp(gui_capture_meta_operator_source_name(m->operator_source), "session") == 0,
            "operator source name");
 
+    /* The rf_channels request: none after init, both or neither, kept
+     * across a (re)link, part of the snapshot. */
+    bool ra = true, rb = true;
+    expect(!gui_capture_meta_rf_request(m, &ra, &rb), "rf request: set_linked does not invent one");
+    gen = m->generation;
+    gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_FALSE);
+    expect(gui_capture_meta_rf_request(m, &ra, &rb) && ra && !rb, "rf request: A on, B off kept");
+    expect(m->generation != gen, "rf request bumps the generation");
+    gui_capture_meta_set_linked(&src, "/tmp/s.json");
+    expect(gui_capture_meta_rf_request(m, &ra, &rb) && ra && !rb, "rf request survives set_linked");
+    gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_UNSET);
+    expect(!gui_capture_meta_rf_request(m, &ra, &rb) && m->rf_requested_a == GUI_META_TRI_UNSET,
+           "rf request: half a request clears both");
+    gui_capture_meta_set_rf_request(GUI_META_TRI_FALSE, GUI_META_TRI_TRUE);
+
     gui_capture_meta_t snap;
     gui_capture_meta_snapshot(&snap);
     expect(memcmp(&snap, m, sizeof(snap)) == 0, "snapshot is a copy");
+    expect(gui_capture_meta_rf_request(&snap, &ra, &rb) && !ra && rb, "snapshot carries the rf request");
+    gui_capture_meta_init();
+    expect(m->rf_requested_a == GUI_META_TRI_UNSET && m->rf_requested_b == GUI_META_TRI_UNSET,
+           "init clears the rf request");
 }
 
 /* ---- sidecar -------------------------------------------------------------- */
@@ -278,6 +299,9 @@ static void linked_fixture(gui_capture_meta_t *m)
     snprintf(m->operator_name, sizeof(m->operator_name), "Reece");
     m->operator_source = GUI_META_OPERATOR_SESSION;
     snprintf(m->session_file, sizeof(m->session_file), "/tmp/s.json");
+    /* The session asked for A+B; this seat recorded A only. */
+    m->rf_requested_a = GUI_META_TRI_TRUE;
+    m->rf_requested_b = GUI_META_TRI_TRUE;
 }
 
 static const char *const s_linked_golden =
@@ -312,6 +336,7 @@ static const char *const s_linked_golden =
     "  \"output_path\": \"/caps\",\n"
     "  \"base_name\": \"Kuhn_Tape_3\",\n"
     "  \"log_file\": \"Kuhn_Tape_3_2026.10.02_10.30.28_misrc_capture.log\",\n"
+    "  \"rf_channels\": {\"requested\": {\"a\": true, \"b\": true}, \"recorded\": {\"a\": true, \"b\": false}},\n"
     "  \"files\": {\n"
     "    \"rf_a\": {\"name\": \"rfA_Kuhn_Tape_3_16-bit.flac\", \"bits\": 16, \"sample_rate_hz\": 40000000, "
     "\"samples\": 16777216, \"bytes\": 13281290},\n"
@@ -356,6 +381,7 @@ static const char *const s_unlinked_golden =
     "  \"output_path\": \"/caps\",\n"
     "  \"base_name\": \"capture\",\n"
     "  \"log_file\": \"capture_2026.10.02_10.30.28_misrc_capture.log\",\n"
+    "  \"rf_channels\": {\"requested\": null, \"recorded\": {\"a\": true, \"b\": true}},\n"
     "  \"files\": {\n"
     "    \"rf_a\": {\"name\": \"rfA_capture_8-bit.u8\", \"bits\": 8, \"sample_rate_hz\": 28636363, "
     "\"samples\": null, \"bytes\": null},\n"
@@ -397,7 +423,9 @@ static void check_sidecar(void)
     s.output_path = "/caps";
     s.base_name = "Kuhn_Tape_3";
     s.log_file = "Kuhn_Tape_3_2026.10.02_10.30.28_misrc_capture.log";
-    s.rf_a = (gui_capture_sidecar_rf_t){ "rfA_Kuhn_Tape_3_16-bit.flac", 16, 40000000ULL,
+    s.rf_recorded_a = true;
+    s.rf_recorded_b = false;
+    s.rf_a =(gui_capture_sidecar_rf_t){ "rfA_Kuhn_Tape_3_16-bit.flac", 16, 40000000ULL,
                                          true, 16777216ULL, true, 13281290ULL };
     s.closed_captions = "Kuhn_Tape_3_captions.scc";
     s.audio[0] = "Kuhn_Tape_3_4ch.wav";
@@ -423,6 +451,8 @@ static void check_sidecar(void)
     memset(&u, 0, sizeof(u));
     u.hifi_audio_equipped = GUI_META_TRI_UNSET;
     u.black_and_white = GUI_META_TRI_TRUE;
+    u.rf_requested_a = GUI_META_TRI_UNSET;   /* no session request: "requested": null */
+    u.rf_requested_b = GUI_META_TRI_UNSET;
     snprintf(u.operator_name, sizeof(u.operator_name), "op");
     u.operator_source = GUI_META_OPERATOR_OS_LOGIN;
     gui_capture_sidecar_t r;
@@ -437,6 +467,8 @@ static void check_sidecar(void)
     r.output_path = "/caps";
     r.base_name = "capture";
     r.log_file = "capture_2026.10.02_10.30.28_misrc_capture.log";
+    r.rf_recorded_a = true;
+    r.rf_recorded_b = true;
     r.rf_a = (gui_capture_sidecar_rf_t){ "rfA_capture_8-bit.u8", 8, 28636363ULL, false, 0, false, 0 };
     r.rf_b = (gui_capture_sidecar_rf_t){ "rfB_capture_16-bit.u16", 16, 28636363ULL, false, 0, false, 0 };
     r.video = "capture_video.mkv";

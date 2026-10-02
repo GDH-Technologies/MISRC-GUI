@@ -69,6 +69,12 @@ typedef struct {
     char operator_name[GUI_META_OPERATOR_CAP];
     gui_meta_operator_source_t operator_source;
     char session_file[GUI_META_PATH_CAP]; /* "" = no session linked it */
+    /* The RF channels a --session file's "rf_channels" asked for
+     * (GUI_META_TRI_*; both UNSET = no request). Not a descriptor field: it
+     * is not part of the asset, nobody edits it, and the log block and the
+     * sidecar write it beside what the recording actually used. */
+    int8_t rf_requested_a;
+    int8_t rf_requested_b;
     uint32_t generation;                  /* bumped on every change */
 } gui_capture_meta_t;
 
@@ -125,6 +131,15 @@ void gui_capture_meta_set_linked(const gui_capture_meta_t *src, const char *sess
 /* A session with no asset: stays unlinked; records the session file and its
  * operator (an empty one keeps the OS login). */
 void gui_capture_meta_set_unlinked_session(const char *operator_name, const char *session_file);
+
+/* Record the session's rf_channels request (gui_session.c, after the whole
+ * file validated; linked or not). Each value is GUI_META_TRI_TRUE/FALSE, or
+ * pass GUI_META_TRI_UNSET for both when the session had no rf_channels. A
+ * request is both or neither: one UNSET clears both. */
+void gui_capture_meta_set_rf_request(int8_t a, int8_t b);
+
+/* True when m carries a request (both channels TRUE/FALSE); *a / *b get it. */
+bool gui_capture_meta_rf_request(const gui_capture_meta_t *m, bool *a, bool *b);
 
 /* The panel's edit buffer for descriptor slot `slot` (a STR or INDEX field).
  * False while linked, or when the field is not UNLINKED_EDITABLE. Edits go

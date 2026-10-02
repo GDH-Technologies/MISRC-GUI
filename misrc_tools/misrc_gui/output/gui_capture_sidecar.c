@@ -162,6 +162,19 @@ size_t gui_capture_sidecar_format(const gui_capture_sidecar_t *s, char *buf, siz
     sk_key(&k, 1, "output_path");      sk_str(&k, s->output_path); sk_puts(&k, ",\n");
     sk_key(&k, 1, "base_name");        sk_str(&k, s->base_name); sk_puts(&k, ",\n");
     sk_key(&k, 1, "log_file");         sk_str(&k, s->log_file); sk_puts(&k, ",\n");
+    sk_key(&k, 1, "rf_channels");
+    {
+        bool req_a = false, req_b = false;
+        sk_puts(&k, "{\"requested\": ");
+        if (gui_capture_meta_rf_request(m, &req_a, &req_b)) {
+            sk_puts(&k, req_a ? "{\"a\": true" : "{\"a\": false");
+            sk_puts(&k, req_b ? ", \"b\": true}" : ", \"b\": false}");
+        } else {
+            sk_puts(&k, "null");
+        }
+        sk_puts(&k, s->rf_recorded_a ? ", \"recorded\": {\"a\": true" : ", \"recorded\": {\"a\": false");
+        sk_puts(&k, s->rf_recorded_b ? ", \"b\": true}},\n" : ", \"b\": false}},\n");
+    }
     sk_key(&k, 1, "files");            sk_puts(&k, "{\n");
     sk_key(&k, 2, "rf_a");             sk_rf(&k, &s->rf_a); sk_puts(&k, ",\n");
     sk_key(&k, 2, "rf_b");             sk_rf(&k, &s->rf_b); sk_puts(&k, ",\n");
