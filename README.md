@@ -354,6 +354,7 @@ The Text Icon opens the **Capture Metadata** panel: what the next recording is *
 - **Operator** is always read-only: the session's `operator`, or else your OS login name.
 - **Locked while recording.** The values are latched when Record starts; nothing typed afterwards can reach that recording's files, so the panel locks until it stops.
 - **Net client.** A client that forwards Record to the server cannot edit here (the server's own metadata names the server's files). A **linked** client refuses to forward Record at all, with a dialog: turn on *Record locally*, or launch the capture on the server.
+- **RF channels.** When the session asked for RF channels (`rf_channels`) and Channel A / B as they stand now differ from that request, the banner says so, e.g. *Channels differ from the toolkit's request (A on, B off): recording A on, B on*. When it asked for B on a seat with no channel B (one CX card, or a single-channel device), it says *This seat cannot record channel B; the asset is HiFi-equipped*. It is a warning only: the channel toggles stay yours.
 
 Sidecar example (`<base>_<date>_capture_meta.json`, same stem as the capture log; written atomically with `"state": "recording"` when recording starts and rewritten with `"state": "complete"` when it finishes; a failed write is a warning in the log and never stops a recording):
 
@@ -389,6 +390,7 @@ Sidecar example (`<base>_<date>_capture_meta.json`, same stem as the capture log
   "output_path": "/captures/incoming",
   "base_name": "Kuhn_Tape_3",
   "log_file": "Kuhn_Tape_3_2026.10.02_10.48.19_misrc_capture.log",
+  "rf_channels": {"requested": {"a": true, "b": true}, "recorded": {"a": true, "b": false}},
   "files": {
     "rf_a": {"name": "rfA_Kuhn_Tape_3_16-bit.flac", "bits": 16, "sample_rate_hz": 40000000, "samples": 296964480000, "bytes": 268435456000},
     "rf_b": null,
@@ -400,7 +402,7 @@ Sidecar example (`<base>_<date>_capture_meta.json`, same stem as the capture log
 }
 ```
 
-Every key is always present. `index` is an integer or `null`, the two booleans `true`/`false`/`null`, empty strings are `""`, every file name is a basename (the files sit next to the sidecar), times are UTC. While `"recording"`, `ended_at`, `capture_seconds`, `samples`, `bytes` and `result` are `null`.
+Every key is always present. `index` is an integer or `null`, the two booleans `true`/`false`/`null`, empty strings are `""`, every file name is a basename (the files sit next to the sidecar), times are UTC. While `"recording"`, `ended_at`, `capture_seconds`, `samples`, `bytes` and `result` are `null`. `rf_channels.requested` is the session's `rf_channels` (`null` when it asked for none, or there was no session) and `rf_channels.recorded` the channels this recording used; they differ when the operator changed a toggle or the seat has no channel B.
 
 RF FLAC tags, written when the encoder starts (so a capture that never finishes still carries them), on each channel's file:
 
@@ -419,7 +421,7 @@ Notes are never written to tags; they are in the sidecar and the log.
 ## Logging 
 
 
-MISRC GUI has a perpetual logging system, as record is pressed your exact system and record config is saved to your log file along with the [capture metadata](#capture-metadata) (one `Capture metadata <key>: <value>` line per field: `(empty)` for an empty string, `(unset)` for an unset index or yes/no, and notes escaped onto one line as `\n`, `\r`, `\t`, `\\` and `\xHH`), and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
+MISRC GUI has a perpetual logging system, as record is pressed your exact system and record config is saved to your log file along with the [capture metadata](#capture-metadata) (one `Capture metadata <key>: <value>` line per field: `(empty)` for an empty string, `(unset)` for an unset index or yes/no, and notes escaped onto one line as `\n`, `\r`, `\t`, `\\` and `\xHH`; when a session requested RF channels, `rf_channels_requested` and `rf_channels_recorded` lines as `A=on|off B=on|off`), and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
 
 It is highly recommended to preserve these files alongside your captures, however unlike previous capture applications you're encoded FLAC files we'll have the correct duration on both the RF and standard audio files, and can have common metadata embedded into them. This allows for tools such as [FLAC Chop](https://github.com/harrypm/FLAC-Chop) to easily cut up or target or just remove dead space at the start and end of your capture sets.
 
@@ -480,6 +482,8 @@ Log Example:
 [2026-07-31 03:00:26] [INFO] Capture metadata client_id: client_7
 [2026-07-31 03:00:26] [INFO] Capture metadata operator: Reece
 [2026-07-31 03:00:26] [INFO] Capture metadata operator_source: session
+[2026-07-31 03:00:26] [INFO] Capture metadata rf_channels_requested: A=on B=off
+[2026-07-31 03:00:26] [INFO] Capture metadata rf_channels_recorded: A=on B=on
 [2026-07-31 03:00:26] [INFO] Capture metadata sidecar: Test_Capture_2026.07.31_03.00.26_capture_meta.json
 [2026-07-31 03:00:26] [INFO] FLAC settings: level=8 verify=off threads=8
 [2026-07-31 03:00:26] [INFO] FLAC affinity: enabled=off cpu_list=(none) support=unsupported
@@ -538,12 +542,14 @@ These flags open the GUI window (no capture args):
            "index": 3, "label": "Tape 3", "format": "VHS",
            "tape_speed": "SP", "video_system": "NTSC",
            "hifi_audio_equipped": true, "black_and_white": null,
-           "notes": "Label reads \"XMAS 94\".\nTracking noise near the end."}}
+           "notes": "Label reads \"XMAS 94\".\nTracking noise near the end."},
+ "rf_channels": {"a": true, "b": true}}
 ```
 
 - `schema` is required and must be exactly `misrc-gui.session/1`. Every other key is optional, and only the keys present change anything.
 - `output_path` and `output_base_name` set the output folder and base name. A base name only names files while auto naming is on, so a session that sets `output_base_name` also turns auto naming on for the run. Whether the record-start timestamp is appended stays the operator's setting. Neither may be empty, or contain a double quote or a control character (the settings file's own rule).
 - `operator` names who runs the capture (otherwise the OS login name is used).
+- `rf_channels` turns RF Channel A and B recording on or off for the run (the `capture_a` / `capture_b` settings). Both `a` and `b` are required and must be JSON `true` or `false`; `null`, a string or a number is refused, and unknown keys inside it are ignored with a note on stderr. Without `rf_channels` the channels stay as the operator saved them. The operator can still change either channel during the run, and the hardware still wins (one CX card or a single-channel device turns B off); the [Capture Metadata](#capture-metadata) panel warns when the channels differ from the request, and the capture log and sidecar record both what was requested and what was recorded.
 - `asset` **links** the capture to an asset: its fields fill the [Capture Metadata](#capture-metadata) panel read-only for the run and reach the capture log, the `_capture_meta.json` sidecar and the RF FLAC tags.
 
 | Field | Type | Max bytes | Required when `asset` is given |
@@ -561,9 +567,10 @@ These flags open the GUI window (no capture args):
 | `black_and_white` | `true` / `false` / `null` | - | no |
 | `notes` | string (`""` = none) | 8191 | no |
 | `operator` (top level) | string | 127 | no |
+| `rf_channels` (top level) | `{"a": true/false, "b": true/false}`, both keys | - | no |
 
-- Validation is strict and all-or-nothing. Types are exact: `"3"` for `index`, `2.5`, `-1`, or `"true"` for a yes/no field are refused. Strings must be valid UTF-8 and within their cap. No control characters, except that `notes` may hold line breaks and tabs (CRLF is stored as LF). A key repeated inside `asset` is refused. Required fields must be non-empty.
-- **Session values are never saved.** The settings file always keeps the operator's own output folder, base name, auto-naming switch and file names for every key the session set. This holds even if the operator edits one of those fields during the run: the edit lasts for that run only. Settings the session did not touch save normally. Capture metadata is never saved at all.
+- Validation is strict and all-or-nothing. Types are exact: `"3"` for `index`, `2.5`, `-1`, or `"true"` for a yes/no field are refused. Strings must be valid UTF-8 and within their cap. No control characters, except that `notes` may hold line breaks and tabs (CRLF is stored as LF). A key repeated inside `asset` or `rf_channels` is refused. Required fields must be non-empty.
+- **Session values are never saved.** The settings file always keeps the operator's own output folder, base name, auto-naming switch, file names and RF channel switches for every key the session set. This holds even if the operator edits one of those fields during the run: the edit lasts for that run only. Settings the session did not touch save normally. Capture metadata is never saved at all.
 - Strings are standard JSON (escapes and `\u` sequences are decoded to UTF-8). Unknown keys are ignored with a note on stderr, so newer callers can add keys. The retired `ingest` and `log_tags` objects are ignored the same way.
 - If the file is missing, unreadable, larger than 64 KiB, not valid JSON, has a different `schema`, or breaks any rule above, nothing from it is applied -- not the settings, not the link: the GUI prints `[SESSION] ERROR: ...` on stderr, shows a "Session file rejected" dialog (the capture is NOT linked to an asset), and starts with the saved settings. A good file prints `[SESSION] Linked: <client> · <title> (<asset_id>)` and shows it in the status bar.
 
