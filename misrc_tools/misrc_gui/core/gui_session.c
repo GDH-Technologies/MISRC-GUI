@@ -979,11 +979,15 @@ int gui_session_selftest_main(void) {
     {
         /* 8190 bytes + CRLF: 8192 as sent, 8191 once CRLF is stored as LF. */
         size_t notes_cap = GUI_META_NOTES_CAP - 1;
-        char *extra = malloc(notes_cap + 128);
+        size_t extra_size = notes_cap + 128;
+        char *extra = malloc(extra_size);
         if (extra) {
-            int at = snprintf(extra, notes_cap + 128, ", \"index\": 9007199254740991, \"notes\": \"");
+            int at = snprintf(extra, extra_size, ", \"index\": 9007199254740991, \"notes\": \"");
             memset(extra + at, 'n', notes_cap - 1);
-            snprintf(extra + at + notes_cap - 1, 32, "\\r\\n\"");
+            /* The bound is what is left of the buffer: a fortified snprintf
+             * (macOS by default) traps on a bound larger than that. */
+            size_t used = (size_t)at + notes_cap - 1;
+            snprintf(extra + used, extra_size - used, "\\r\\n\"");
             char *text = st_asset_session("\"a_cap\"", extra);
             gui_session_clear();
             gui_capture_meta_init();
@@ -1038,11 +1042,13 @@ int gui_session_selftest_main(void) {
     {
         /* notes one byte over the cap */
         size_t over = GUI_META_NOTES_CAP;
-        char *extra = malloc(over + 32);
+        size_t extra_size = over + 32;
+        char *extra = malloc(extra_size);
         if (extra) {
-            int at = snprintf(extra, over + 32, ", \"notes\": \"");
+            int at = snprintf(extra, extra_size, ", \"notes\": \"");
             memset(extra + at, 'n', over);
-            snprintf(extra + at + over, 32, "\"");
+            size_t used = (size_t)at + over;
+            snprintf(extra + used, extra_size - used, "\"");
             char *text = st_asset_session("\"a1\"", extra);
             st_expect_rejected("notes over the cap", bad_path, text, live);
             free(text);
