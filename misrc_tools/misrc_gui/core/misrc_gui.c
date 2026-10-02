@@ -7,6 +7,11 @@
  * Licensed under GNU GPL v3 or later
  */
 
+// Window title the native window is created with. On X11 this becomes the
+// WM_CLASS class, which the desktop matches against StartupWMClass in the
+// launcher, so it must stay version-independent. See the InitWindow() call.
+#define MISRC_WINDOW_CLASS_TITLE "MISRC Capture"
+
 // Clay UI library (header-only, implementation here)
 #define CLAY_IMPLEMENTATION
 #include "../ui/clay.h"
@@ -514,7 +519,20 @@ int main(int argc, char **argv) {
     const int min_window_height = 360;
     char window_title[128];
     snprintf(window_title, sizeof(window_title), "MISRC Capture %s", MIRSC_TOOLS_VERSION);
-    InitWindow(default_window_width, default_window_height, window_title);
+#if defined(__linux__) && !defined(__ANDROID__)
+    /* X11 window identity for launcher/taskbar matching. GLFW (raylib) sets
+     * WM_CLASS = { RESOURCE_NAME env (else the title), the title } when the
+     * native window is created, so the class used to be the versioned title
+     * ("MISRC Capture v1.2.2") and changed every release, which left the
+     * desktop launcher's StartupWMClass stale after every update. Pin the
+     * instance name here (AppRun exports the same value) and create the window
+     * with the fixed title below; the versioned title is applied afterwards and
+     * only changes the title bar. Must match StartupWMClass in
+     * assets/appimage/misrc_gui.desktop and AppRun (checked by ci_guard_tests). */
+    setenv("RESOURCE_NAME", "misrc_gui", 0);
+#endif
+    InitWindow(default_window_width, default_window_height, MISRC_WINDOW_CLASS_TITLE);
+    SetWindowTitle(window_title);
     Image app_icon = LoadImageFromMemory(".png", misrc_icon_png_data, misrc_icon_png_data_size);
     if (app_icon.data != NULL) {
         SetWindowIcon(app_icon);

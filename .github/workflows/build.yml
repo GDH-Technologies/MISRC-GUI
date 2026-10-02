@@ -291,110 +291,11 @@ jobs:
           cp "$BUILD_DIR/misrc_capture" AppDir/usr/bin/
           cp "$BUILD_DIR/misrc_extract" AppDir/usr/bin/
 
-          cat > AppDir/AppRun <<'EOF'
-          #!/usr/bin/env bash
-          HERE="$(dirname "$(readlink -f "$0")")"
-          install_shortcuts() {
-            local appimage_path="${APPIMAGE:-}"
-            if [[ -z "$appimage_path" || ! -f "$appimage_path" ]]; then
-              return 0
-            fi
-            local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
-            local apps_dir="$data_home/applications"
-            local icons_dir="$data_home/icons/hicolor/512x512/apps"
-            local launcher="$apps_dir/misrc_gui.desktop"
-            local local_bin_dir="$HOME/.local/bin"
-            local stable_appimage="$local_bin_dir/misrc_gui.AppImage"
-            local launcher_exec_path="$appimage_path"
-
-            mkdir -p "$apps_dir" "$icons_dir" "$local_bin_dir"
-            if ln -sfn "$appimage_path" "$stable_appimage"; then
-              launcher_exec_path="$stable_appimage"
-              chmod +x "$stable_appimage" || true
-            fi
-            local escaped_launcher_exec_path="$launcher_exec_path"
-            escaped_launcher_exec_path="${escaped_launcher_exec_path//\\/\\\\}"
-            escaped_launcher_exec_path="${escaped_launcher_exec_path//\"/\\\"}"
-            local gui_version=""
-            local startup_wm_class="misrc_gui"
-            if [[ -x "$HERE/usr/bin/misrc_gui" ]]; then
-              gui_version="$("$HERE/usr/bin/misrc_gui" --version 2>/dev/null | head -n1 | tr -d '\r')"
-              if [[ -n "$gui_version" ]]; then
-                startup_wm_class="MISRC Capture $gui_version"
-              fi
-            fi
-            local escaped_startup_wm_class="$startup_wm_class"
-            escaped_startup_wm_class="${escaped_startup_wm_class//\\/\\\\}"
-            escaped_startup_wm_class="${escaped_startup_wm_class//\"/\\\"}"
-            if [[ -f "$HERE/misrc.png" ]]; then
-              cp -f "$HERE/misrc.png" "$icons_dir/misrc.png" || true
-            fi
-            {
-              printf '%s\n' \
-                "[Desktop Entry]" \
-                "Type=Application" \
-                "Name=MISRC GUI" \
-                "Exec=\"${escaped_launcher_exec_path}\" %U" \
-                "Icon=misrc" \
-                "Categories=Utility;" \
-                "StartupWMClass=${escaped_startup_wm_class}" \
-                "X-GNOME-WMClass=${escaped_startup_wm_class}" \
-                "Terminal=false" \
-                "StartupNotify=true"
-            } > "$launcher"
-            chmod +x "$launcher" || true
-
-            local desktop_dir=""
-            if command -v xdg-user-dir >/dev/null 2>&1; then
-              desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
-            fi
-            if [[ -z "$desktop_dir" ]]; then
-              desktop_dir="$HOME/Desktop"
-            fi
-            if [[ -d "$desktop_dir" ]]; then
-              cp -f "$launcher" "$desktop_dir/MISRC GUI.desktop" || true
-              chmod +x "$desktop_dir/MISRC GUI.desktop" || true
-            fi
-          }
-          if [[ "${1:-}" == "--create-shortcut" ]]; then
-            install_shortcuts
-            exit 0
-          fi
-          if [[ $# -eq 0 ]]; then
-            install_shortcuts
-            exec "$HERE/usr/bin/misrc_gui"
-          fi
-          case "$1" in
-            capture)
-              shift
-              exec "$HERE/usr/bin/misrc_capture" "$@"
-              ;;
-            extract)
-              shift
-              exec "$HERE/usr/bin/misrc_extract" "$@"
-              ;;
-            *)
-              if [[ "${1:-}" != "--smoke-test" ]]; then
-                install_shortcuts
-              fi
-              exec "$HERE/usr/bin/misrc_gui" "$@"
-              ;;
-          esac
-          EOF
-          chmod +x AppDir/AppRun
-
-          cat > AppDir/misrc.desktop <<EOF
-          [Desktop Entry]
-          Type=Application
-          Name=MISRC GUI
-          Exec=misrc_gui
-          Icon=misrc
-          Categories=Utility;
-          StartupWMClass=MISRC Capture ${BUILD_VERSION}
-          X-GNOME-WMClass=MISRC Capture ${BUILD_VERSION}
-          Terminal=false
-          StartupNotify=true
-          EOF
+          # AppRun and the desktop entry are real repo files (not inline heredocs:
+          # nested EOF / $ inside YAML broke earlier workflows). AppRun installs a
+          # launcher in ~/.local/share/applications only; it never writes ~/Desktop.
+          install -m 0755 assets/appimage/AppRun AppDir/AppRun
+          install -m 0644 assets/appimage/misrc_gui.desktop AppDir/misrc_gui.desktop
           ICON_SRC="assets/Icons/MISRC_Icon.png"
           test -f "$ICON_SRC"
           convert "$ICON_SRC" -resize 512x512\! AppDir/misrc.png
@@ -409,7 +310,7 @@ jobs:
           ARCH="$LINUXDEPLOY_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy \
             --appdir AppDir \
             -e AppDir/usr/bin/misrc_gui \
-            -d AppDir/misrc.desktop \
+            -d AppDir/misrc_gui.desktop \
             -i AppDir/misrc.png \
             --output appimage
 

@@ -42,6 +42,48 @@ installed), use:
 
     ./scripts/build-appimage-local.sh --native
 
+## Linux AppImage desktop integration (taskbar icon / pinning)
+
+An AppImage is never registered with the desktop by itself. The AppDir ships a
+real `assets/appimage/AppRun` and `assets/appimage/misrc_gui.desktop` (shared by
+the CI workflow and `scripts/build-appimage-local.sh`; not inline heredocs).
+
+What `AppRun` does:
+
+- Exports `RESOURCE_NAME=misrc_gui` (X11 `WM_CLASS` instance).
+- On plain GUI launches (no args, or only `--debug-view` / `--auto-connect` /
+  `--config <file>`) it installs
+  `~/.local/share/applications/misrc_gui.desktop` (`Exec` = the AppImage file
+  itself) and the hicolor icon. It rewrites them only when their content changes,
+  so the launcher follows whichever AppImage ran last.
+- It does nothing for `capture`, `extract`, `--smoke-test`, `--version`, `--help`,
+  when `APPIMAGE` is unset, or when the path contains `" ` $ \`.
+- It never writes to `~/Desktop`. A Desktop icon is created only on request:
+  `./<MISRC AppImage> --create-shortcut`. (Earlier builds copied one to the
+  Desktop on every launch, so it came back after being deleted.)
+- `MISRC_GUI_NO_INTEGRATION=1` skips the automatic launcher install.
+
+Window identity (`misrc_tools/misrc_gui/core/misrc_gui.c`): GLFW/raylib builds
+the X11 `WM_CLASS` from the window title at creation, so the window is created
+with the fixed title `MISRC Capture` and the versioned title is applied
+afterwards with `SetWindowTitle()`. Result: `WM_CLASS = "misrc_gui", "MISRC Capture"`
+on every release, matching `StartupWMClass=MISRC Capture`. Before this, the class
+was the versioned title (e.g. `MISRC Capture v1.2.2`) and changed every release.
+
+The desktop id (`misrc_gui.desktop`), `Icon=misrc` / `misrc.png`, the
+`RESOURCE_NAME` instance and `StartupWMClass` must stay in agreement;
+`misrc_tools/test/ci_guard_tests.py` enforces this (`window identity contract`,
+`AppRun static contract`, `AppRun runtime behavior`).
+
+To verify on X11, match the window by PID (never by name, another instance may
+be running) and only read the mapped main window:
+
+    xdotool search --onlyvisible --pid <pid>
+    xprop -id <window> WM_CLASS _NET_WM_PID WM_STATE
+
+The same recipe is used by FLAC-Chop and tape-decode-rust
+(`docs/DEV_NOTE_linux_appimage_taskbar_integration.md` in those repos).
+
 ## GUI Readout + Stats Breakdown
 
 This section documents what the GUI stats/readouts show, where each value comes

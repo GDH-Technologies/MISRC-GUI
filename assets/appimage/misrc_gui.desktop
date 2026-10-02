@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MISRC GUI
+Comment=MISRC capture GUI
+Exec=misrc_gui
+Icon=misrc
+Categories=Utility;
+Terminal=false
+StartupNotify=true
+StartupWMClass=MISRC Capture

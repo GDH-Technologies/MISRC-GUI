@@ -7,7 +7,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import textwrap
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -27,21 +26,6 @@ def extract_function_body(source: str, signature: str) -> str:
     if not match:
         raise RuntimeError(f"Could not find function body for {signature}")
     return match.group("body")
-
-
-def extract_apprun_script(workflow_text: str) -> str:
-    marker = "cat > AppDir/AppRun <<'EOF'"
-    start = workflow_text.find(marker)
-    if start < 0:
-        raise RuntimeError("Could not find AppRun heredoc start marker in workflow")
-    start = workflow_text.find("\n", start)
-    if start < 0:
-        raise RuntimeError("Malformed AppRun heredoc in workflow")
-    start += 1
-    end = workflow_text.find("\n          EOF", start)
-    if end < 0:
-        raise RuntimeError("Could not find AppRun heredoc end marker in workflow")
-    return textwrap.dedent(workflow_text[start:end]).lstrip("\n")
 
 
 def run_checked(command: List[str], *, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
@@ -311,21 +295,105 @@ def check_built_gui_has_fx3_symbols(repo_root: Path, gui_path: Optional[Path] = 
     return 0
 
 
-def check_linux_desktop_metadata(workflow_path: Path) -> int:
+APPIMAGE_ASSET_DIR = Path("assets/appimage")
+APPIMAGE_DESKTOP_ID = "misrc_gui"
+# X11 WM_CLASS class the GUI window is created with; the launcher's
+# StartupWMClass must equal it and must NOT contain the version.
+APPIMAGE_WM_CLASS = "MISRC Capture"
+
+
+def read_desktop_key(text: str, key: str) -> Optional[str]:
+    for line in text.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def check_linux_desktop_metadata(repo_root: Path, workflow_path: Path) -> int:
+    """The AppDir desktop entry and AppRun are real repo files shared by the CI
+    workflow and scripts/build-appimage-local.sh (inline heredocs in YAML broke
+    before). The desktop entry carries a version-independent StartupWMClass."""
     workflow_text = read_text(workflow_path)
-    required_desktop_fields = [
-        "cat > AppDir/misrc.desktop <<EOF",
-        "Exec=misrc_gui",
-        "Icon=misrc",
-        "StartupWMClass=MISRC Capture ${BUILD_VERSION}",
-        "X-GNOME-WMClass=MISRC Capture ${BUILD_VERSION}",
-        "Terminal=false",
-        "StartupNotify=true",
+    required_workflow = [
+        "install -m 0755 assets/appimage/AppRun AppDir/AppRun",
+        "install -m 0644 assets/appimage/misrc_gui.desktop AppDir/misrc_gui.desktop",
+        "-d AppDir/misrc_gui.desktop",
         "ln -sf misrc.png AppDir/.DirIcon",
     ]
-    for field in required_desktop_fields:
-        if field not in workflow_text:
-            return fail(f"Missing Linux desktop integration field in workflow/AppRun: {field}")
+    for snippet in required_workflow:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing Linux desktop integration snippet: {snippet}")
+    forbidden_workflow = [
+        "cat > AppDir/AppRun",
+        "cat > AppDir/misrc.desktop",
+        "MISRC Capture ${BUILD_VERSION}",
+    ]
+    for snippet in forbidden_workflow:
+        if snippet in workflow_text:
+            return fail(
+                "Workflow still contains a forbidden inline/versioned AppImage desktop snippet "
+                f"(use assets/appimage/* and a version-independent StartupWMClass): {snippet}"
+            )
+
+    local_script = read_text(repo_root / "scripts" / "build-appimage-local.sh")
+    for snippet in ('assets/appimage/AppRun', 'assets/appimage/misrc_gui.desktop'):
+        if snippet not in local_script:
+            return fail(f"scripts/build-appimage-local.sh must use the shared file: {snippet}")
+    for snippet in ('cat > "$appdir/AppRun"', 'cat > "$appdir/misrc.desktop"'):
+        if snippet in local_script:
+            return fail(f"scripts/build-appimage-local.sh still has an inline copy: {snippet}")
+
+    desktop_path = repo_root / APPIMAGE_ASSET_DIR / "misrc_gui.desktop"
+    if not desktop_path.exists():
+        return fail(f"Missing AppDir desktop entry: {desktop_path}")
+    desktop_text = read_text(desktop_path)
+    expected = {
+        "Type": "Application",
+        "Exec": "misrc_gui",
+        "Icon": "misrc",
+        "Terminal": "false",
+        "StartupNotify": "true",
+        "StartupWMClass": APPIMAGE_WM_CLASS,
+    }
+    for key, value in expected.items():
+        actual = read_desktop_key(desktop_text, key)
+        if actual != value:
+            return fail(f"{desktop_path.name}: expected {key}={value!r}, found {actual!r}")
+    if not (repo_root / APPIMAGE_ASSET_DIR / "AppRun").exists():
+        return fail("Missing assets/appimage/AppRun")
+    return 0
+
+
+def check_window_identity_contract(repo_root: Path) -> int:
+    """GLFW (raylib) builds X11 WM_CLASS from the window title at creation, so
+    the window must be created with a fixed title (the versioned title changed
+    the class every release and left StartupWMClass stale). The fixed title,
+    the launcher StartupWMClass and AppRun's launcher text must all agree."""
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    define = f'#define MISRC_WINDOW_CLASS_TITLE "{APPIMAGE_WM_CLASS}"'
+    required = [
+        define,
+        f'setenv("RESOURCE_NAME", "{APPIMAGE_DESKTOP_ID}", 0);',
+        "InitWindow(default_window_width, default_window_height, MISRC_WINDOW_CLASS_TITLE);",
+        "SetWindowTitle(window_title);",
+    ]
+    for snippet in required:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c is missing window identity snippet: {snippet}")
+    if "InitWindow(default_window_width, default_window_height, window_title)" in gui_c:
+        return fail("misrc_gui.c must not create the window with the versioned title (unstable WM_CLASS)")
+    init_pos = gui_c.find("InitWindow(default_window_width")
+    title_pos = gui_c.find("SetWindowTitle(window_title);")
+    if init_pos < 0 or title_pos < init_pos:
+        return fail("SetWindowTitle(window_title) must come after InitWindow()")
+
+    apprun = read_text(repo_root / APPIMAGE_ASSET_DIR / "AppRun")
+    if f'export RESOURCE_NAME="{APPIMAGE_DESKTOP_ID}"' not in apprun:
+        return fail(f'AppRun must export RESOURCE_NAME="{APPIMAGE_DESKTOP_ID}"')
+    if f"StartupWMClass={APPIMAGE_WM_CLASS}" not in apprun:
+        return fail(f"AppRun launcher text must use StartupWMClass={APPIMAGE_WM_CLASS}")
+    if f'launcher="${{data_home}}/applications/{APPIMAGE_DESKTOP_ID}.desktop"' not in apprun:
+        return fail(f"AppRun must install the launcher as {APPIMAGE_DESKTOP_ID}.desktop")
     return 0
 
 
@@ -781,31 +849,130 @@ def check_flac_large_file_offsets_contract(flac_writer_c_path: Path) -> int:
     return 0
 
 
-def check_apprun_static_contract(workflow_path: Path) -> int:
-    workflow_text = read_text(workflow_path)
-    apprun = extract_apprun_script(workflow_text)
+def check_apprun_static_contract(repo_root: Path) -> int:
+    apprun_path = repo_root / APPIMAGE_ASSET_DIR / "AppRun"
+    if not apprun_path.exists():
+        return fail(f"Missing AppRun: {apprun_path}")
+    apprun = read_text(apprun_path)
+    # Explanatory comments legitimately mention things the code must not do
+    # (e.g. "no set -e"), so scan code lines only.
+    code = "\n".join(line for line in apprun.splitlines()
+                     if not line.lstrip().startswith("#"))
     required_snippets = [
-        "install_shortcuts()",
+        "misrc_gui_integrate",
         "--create-shortcut",
-        "local stable_appimage=\"$local_bin_dir/misrc_gui.AppImage\"",
-        "ln -sfn \"$appimage_path\" \"$stable_appimage\"",
-        "local startup_wm_class=\"misrc_gui\"",
-        "\"$HERE/usr/bin/misrc_gui\" --version",
-        "startup_wm_class=\"MISRC Capture $gui_version\"",
+        "MISRC_GUI_NO_INTEGRATION",
+        "TryExec=${APPIMAGE}",
         "Icon=misrc",
-        "StartupWMClass=${escaped_startup_wm_class}",
-        "X-GNOME-WMClass=${escaped_startup_wm_class}",
         "StartupNotify=true",
+        "update-desktop-database",
+        "gtk-update-icon-cache",
     ]
     for snippet in required_snippets:
-        if snippet not in apprun:
+        if snippet not in code:
             return fail(f"AppRun shortcut contract is missing snippet: {snippet}")
-    if "Exec=\\\"${escaped_launcher_exec_path}\\\" %U" not in apprun and "Exec=\\\\\\\"${escaped_launcher_exec_path}\\\\\\\" %U" not in apprun:
-        return fail("AppRun shortcut contract is missing expected Exec launcher format")
+    forbidden_snippets = {
+        "set -e": "desktop integration must never be able to block launching the app",
+        ".local/bin": "no ~/.local/bin AppImage symlink side effect",
+        "%U": "the GUI takes no file arguments; a dropped file would route into CLI capture mode",
+        "X-GNOME-WMClass": "legacy key; StartupWMClass is the contract",
+        "--version": "launcher identity is version-independent; do not run the binary to build it",
+    }
+    for snippet, why in forbidden_snippets.items():
+        if snippet in code:
+            return fail(f"AppRun contains forbidden snippet {snippet!r}: {why}")
+
+    # The Desktop icon is user-requested only. Earlier builds copied one to
+    # ~/Desktop on every launch, so it reappeared after being deleted.
+    func_start = apprun.find("misrc_gui_create_desktop_icon() {")
+    if func_start < 0:
+        return fail("AppRun is missing misrc_gui_create_desktop_icon()")
+    func_end = apprun.find("\n}\n", func_start)
+    func_body = apprun[func_start:func_end]
+    outside = apprun[:func_start] + apprun[func_end:]
+    stray = [line for line in outside.splitlines()
+             if "MISRC GUI.desktop" in line and not line.lstrip().startswith("#")]
+    if stray:
+        return fail("AppRun writes 'MISRC GUI.desktop' outside misrc_gui_create_desktop_icon()")
+    if "MISRC GUI.desktop" not in func_body:
+        return fail("misrc_gui_create_desktop_icon() must be the only writer of the Desktop icon")
+    calls = [i for i in range(len(apprun)) if apprun.startswith("misrc_gui_create_desktop_icon", i)]
+    call_positions = [i for i in calls if i != func_start]
+    if len(call_positions) != 1:
+        return fail("misrc_gui_create_desktop_icon must be called exactly once (inside --create-shortcut)")
+    branch_start = apprun.find('if [ "${1:-}" = "--create-shortcut" ]; then')
+    branch_end = apprun.find("\nfi\n", branch_start)
+    if branch_start < 0 or not (branch_start < call_positions[0] < branch_end):
+        return fail("The Desktop icon may only be created inside the explicit --create-shortcut branch")
     return 0
 
 
-def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
+def _apprun_sandbox(root: Path, apprun_src: Path, icon_path: Path) -> Tuple[Path, Path]:
+    """AppDir with stub binaries that log their invocation. Returns (AppRun, calls log)."""
+    appdir = root / "AppDir"
+    (appdir / "usr/bin").mkdir(parents=True, exist_ok=True)
+    calls = root / "calls.log"
+    apprun = appdir / "AppRun"
+    apprun.write_text(read_text(apprun_src), encoding="utf-8")
+    apprun.chmod(apprun.stat().st_mode | stat.S_IXUSR)
+    for exe in ("misrc_gui", "misrc_capture", "misrc_extract"):
+        exe_path = appdir / "usr/bin" / exe
+        exe_path.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s RESOURCE_NAME=%s args=[%s]\\n' \"$(basename \"$0\")\" "
+            "\"${RESOURCE_NAME:-}\" \"$*\" >> \"${MISRC_TEST_CALLS}\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        exe_path.chmod(exe_path.stat().st_mode | stat.S_IXUSR)
+    icon_dir = appdir / "usr/share/icons/hicolor/512x512/apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    if icon_path.exists():
+        shutil.copy2(icon_path, icon_dir / "misrc.png")
+    else:
+        (icon_dir / "misrc.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    return apprun, calls
+
+
+def _apprun_home(root: Path, name: str) -> Path:
+    """Fresh HOME with a Desktop folder and a deterministic user-dirs config."""
+    home = root / name
+    (home / "Desktop").mkdir(parents=True, exist_ok=True)
+    (home / ".config").mkdir(parents=True, exist_ok=True)
+    (home / ".config/user-dirs.dirs").write_text(
+        'XDG_DESKTOP_DIR="$HOME/Desktop"\n', encoding="utf-8")
+    return home
+
+
+def _apprun_run(apprun: Path, calls: Path, home: Path, args: List[str],
+                appimage: Optional[Path] = None,
+                extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    # Environment is built from scratch so nothing can leak in from the real
+    # session (XDG_*, APPIMAGE) and xdg-user-dir can never resolve the real Desktop.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+           "LANG": "C", "MISRC_TEST_CALLS": str(calls)}
+    if appimage is not None:
+        env["APPIMAGE"] = str(appimage)
+    env.update(extra_env or {})
+    return subprocess.run(["bash", str(apprun), *args], env=env,
+                          capture_output=True, text=True)
+
+
+def _home_files(home: Path) -> List[str]:
+    baseline = {".config/user-dirs.dirs"}
+    # By-products of update-desktop-database / gtk-update-icon-cache when those
+    # tools exist on the host; benign and not something AppRun writes itself.
+    tool_cache_names = {"mimeinfo.cache", "icon-theme.cache"}
+    found = []
+    for path in sorted(home.rglob("*")):
+        if path.is_file() or path.is_symlink():
+            rel = path.relative_to(home).as_posix()
+            if rel not in baseline and path.name not in tool_cache_names:
+                found.append(rel)
+    return found
+
+
+def check_apprun_runtime_behavior(repo_root: Path, icon_path: Path) -> int:
     if not sys.platform.startswith("linux"):
         print("SKIP: AppRun runtime behavior (linux-only)")
         return 0
@@ -813,83 +980,128 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path) -> int:
         print("SKIP: AppRun runtime behavior (bash not available)")
         return 0
 
-    workflow_text = read_text(workflow_path)
-    script = extract_apprun_script(workflow_text)
-
+    apprun_src = repo_root / APPIMAGE_ASSET_DIR / "AppRun"
     with tempfile.TemporaryDirectory(prefix="misrc_ci_guard_") as temp_root:
         root = Path(temp_root)
-        appdir = root / "AppDir"
-        (appdir / "usr/bin").mkdir(parents=True, exist_ok=True)
+        apprun, calls = _apprun_sandbox(root, apprun_src, icon_path)
+        try:
+            run_checked(["bash", "-n", str(apprun)])
+        except subprocess.CalledProcessError as exc:
+            return fail(f"AppRun has a shell syntax error: {exc.stderr}")
 
-        apprun_path = appdir / "AppRun"
-        apprun_path.write_text(script, encoding="utf-8")
-        apprun_path.chmod(apprun_path.stat().st_mode | stat.S_IXUSR)
+        # A path with a space and a literal '%' exercises .desktop Exec escaping.
+        appimage = root / "MISRC 100% Test Build.AppImage"
+        appimage.write_text("fake", encoding="utf-8")
+        appimage.chmod(appimage.stat().st_mode | stat.S_IXUSR)
 
-        run_checked(["bash", "-n", str(apprun_path)])
+        # 1. Plain GUI launch installs the launcher + icon and nothing else.
+        home = _apprun_home(root, "home_plain")
+        res = _apprun_run(apprun, calls, home, [], appimage)
+        if res.returncode != 0:
+            return fail(f"AppRun plain launch failed (rc={res.returncode}): {res.stderr}")
+        launcher = home / ".local/share/applications/misrc_gui.desktop"
+        icon = home / ".local/share/icons/hicolor/512x512/apps/misrc.png"
+        if not launcher.exists() or not icon.exists():
+            return fail("AppRun plain launch did not install the launcher and icon")
+        text = read_text(launcher)
+        for required in (f'Exec="{str(appimage).replace("%", "%%")}"',
+                         f"TryExec={appimage}", "Icon=misrc", "Terminal=false",
+                         "StartupNotify=true", f"StartupWMClass={APPIMAGE_WM_CLASS}"):
+            if required not in text.splitlines():
+                return fail(f"Launcher is missing line: {required}\n{text}")
+        if "%U" in text or "X-GNOME-WMClass" in text:
+            return fail("Launcher must not contain %U or X-GNOME-WMClass")
+        if shutil.which("desktop-file-validate"):
+            check = subprocess.run(["desktop-file-validate", str(launcher)],
+                                   capture_output=True, text=True)
+            if check.returncode != 0:
+                return fail(f"Generated launcher failed desktop-file-validate: {check.stdout}{check.stderr}")
+        unexpected = [f for f in _home_files(home)
+                      if f not in (".local/share/applications/misrc_gui.desktop",
+                                   ".local/share/icons/hicolor/512x512/apps/misrc.png")]
+        if unexpected:
+            return fail(f"AppRun plain launch created unexpected files: {unexpected}")
+        if any((home / "Desktop").iterdir()):
+            return fail("AppRun plain launch must NEVER create a Desktop icon")
+        if "misrc_gui RESOURCE_NAME=misrc_gui args=[]" not in read_text(calls):
+            return fail("AppRun must exec misrc_gui with RESOURCE_NAME=misrc_gui exported")
 
-        for exe in ("misrc_gui", "misrc_capture", "misrc_extract"):
-            exe_path = appdir / "usr/bin" / exe
-            if exe == "misrc_gui":
-                exe_path.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "if [[ \"${1:-}\" == \"--version\" ]]; then\n"
-                    "  echo \"test-version\"\n"
-                    "  exit 0\n"
-                    "fi\n"
-                    "exit 0\n",
-                    encoding="utf-8",
-                )
-            else:
-                exe_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            exe_path.chmod(exe_path.stat().st_mode | stat.S_IXUSR)
+        # 2. Idempotent: a second launch must not rewrite anything.
+        before = (launcher.stat().st_mtime_ns, icon.stat().st_mtime_ns)
+        res = _apprun_run(apprun, calls, home, [], appimage)
+        after = (launcher.stat().st_mtime_ns, icon.stat().st_mtime_ns)
+        if res.returncode != 0 or before != after:
+            return fail("AppRun rewrote an unchanged launcher/icon on a repeat launch")
 
-        if icon_path.exists():
-            shutil.copy2(icon_path, appdir / "misrc.png")
-        else:
-            (appdir / "misrc.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        # 3. Re-pointing to a different AppImage rewrites Exec (follows the last-run copy).
+        other = root / "MISRC Other.AppImage"
+        other.write_text("fake", encoding="utf-8")
+        _apprun_run(apprun, calls, home, [], other)
+        if f'Exec="{other}"' not in read_text(launcher).splitlines():
+            return fail("AppRun did not re-point the launcher to the AppImage that ran last")
 
-        appimage_path = root / "MISRC Test Build.AppImage"
-        appimage_path.write_text("fake", encoding="utf-8")
-        appimage_path.chmod(appimage_path.stat().st_mode | stat.S_IXUSR)
+        # 4. GUI-only flags integrate too (mirrors misrc_gui.c main()).
+        for args in (["--debug-view"], ["--config", "/tmp/x.json"], ["--auto-connect", "--config", "/tmp/x.json"]):
+            fresh = _apprun_home(root, "home_flags_" + "_".join(a.strip("-/.") for a in args))
+            _apprun_run(apprun, calls, fresh, args, appimage)
+            if not (fresh / ".local/share/applications/misrc_gui.desktop").exists():
+                return fail(f"AppRun did not integrate for GUI launch args: {args}")
 
-        home = root / "home"
-        desktop_dir = home / "Desktop"
-        desktop_dir.mkdir(parents=True, exist_ok=True)
+        # 5. Non-GUI launches must not touch the desktop at all.
+        zero_touch = [
+            (["capture", "-h"], appimage, None, "misrc_capture"),
+            (["extract", "-h"], appimage, None, "misrc_extract"),
+            (["--smoke-test"], appimage, None, "misrc_gui"),
+            (["--version"], appimage, None, "misrc_gui"),
+            (["--help"], appimage, None, "misrc_gui"),
+            (["-a", "-r", "x"], appimage, None, "misrc_gui"),
+            ([], None, None, "misrc_gui"),
+            ([], appimage, {"MISRC_GUI_NO_INTEGRATION": "1"}, "misrc_gui"),
+            ([], root / "bad$name.AppImage", None, "misrc_gui"),
+            ([], root / 'bad"name.AppImage', None, "misrc_gui"),
+        ]
+        for idx, (args, image, extra, expected_exe) in enumerate(zero_touch):
+            if image is not None and not image.exists():
+                image.write_text("fake", encoding="utf-8")
+            fresh = _apprun_home(root, f"home_zero_{idx}")
+            calls.write_text("", encoding="utf-8")
+            res = _apprun_run(apprun, calls, fresh, args, image, extra)
+            if res.returncode != 0:
+                return fail(f"AppRun {args} failed (rc={res.returncode}): {res.stderr}")
+            touched = _home_files(fresh)
+            if touched or any((fresh / "Desktop").iterdir()):
+                return fail(f"AppRun {args} (extra={extra}) must not touch the desktop, but created: {touched}")
+            if not read_text(calls).startswith(expected_exe + " "):
+                return fail(f"AppRun {args} dispatched to the wrong binary; calls: {read_text(calls)!r}")
 
-        env = os.environ.copy()
-        env["HOME"] = str(home)
-        env["APPIMAGE"] = str(appimage_path)
-        env.pop("XDG_DATA_HOME", None)
+        # 6. Explicit --create-shortcut is the only way to get a Desktop icon,
+        #    and it does not start the GUI.
+        home = _apprun_home(root, "home_shortcut")
+        calls.write_text("", encoding="utf-8")
+        res = _apprun_run(apprun, calls, home, ["--create-shortcut"], appimage)
+        desktop_icon = home / "Desktop/MISRC GUI.desktop"
+        if res.returncode != 0 or not desktop_icon.exists():
+            return fail(f"--create-shortcut did not create the Desktop icon (rc={res.returncode}): {res.stderr}")
+        if read_text(desktop_icon) != read_text(home / ".local/share/applications/misrc_gui.desktop"):
+            return fail("Desktop icon must be a copy of the installed launcher")
+        if not os.access(desktop_icon, os.X_OK):
+            return fail("Desktop icon must be executable so the file manager will launch it")
+        if read_text(calls).strip():
+            return fail("--create-shortcut must not start the GUI")
+        res = _apprun_run(apprun, calls, _apprun_home(root, "home_shortcut_noimage"),
+                          ["--create-shortcut"], None)
+        if res.returncode == 0:
+            return fail("--create-shortcut without an AppImage file must fail instead of pretending")
 
-        run_checked(["bash", str(apprun_path), "--create-shortcut"], env=env)
-
-        launcher_path = home / ".local/share/applications/misrc_gui.desktop"
-        desktop_shortcut_path = home / "Desktop/MISRC GUI.desktop"
-        icon_install_path = home / ".local/share/icons/hicolor/512x512/apps/misrc.png"
-        stable_exec_path = home / ".local/bin/misrc_gui.AppImage"
-
-        if not launcher_path.exists():
-            return fail("AppRun --create-shortcut did not create launcher file")
-        if not desktop_shortcut_path.exists():
-            return fail("AppRun --create-shortcut did not create Desktop shortcut")
-        if not icon_install_path.exists():
-            return fail("AppRun --create-shortcut did not install icon")
-        if not stable_exec_path.exists():
-            return fail("AppRun --create-shortcut did not create stable AppImage launcher path")
-        if not os.path.samefile(stable_exec_path, appimage_path):
-            return fail("Stable AppImage launcher path does not resolve to current AppImage")
-
-        launcher = read_text(launcher_path)
-        expected_exec = f'Exec=\"{stable_exec_path}\" %U'
-        if expected_exec not in launcher:
-            return fail(f"Launcher Exec entry mismatch. Expected: {expected_exec}")
-        expected_wm_class = "MISRC Capture test-version"
-        for required in ("Icon=misrc", "Terminal=false", f"StartupWMClass={expected_wm_class}", f"X-GNOME-WMClass={expected_wm_class}", "StartupNotify=true"):
-            if required not in launcher:
-                return fail(f"Launcher is missing required key: {required}")
-
-        run_checked(["bash", str(apprun_path), "--smoke-test"], env=env)
-
+        # 7. Regression: a deleted Desktop icon must STAY deleted (it used to be
+        #    copied back on every launch).
+        desktop_icon.unlink()
+        for _ in range(2):
+            res = _apprun_run(apprun, calls, home, [], appimage)
+            if res.returncode != 0:
+                return fail(f"AppRun launch after deleting the Desktop icon failed: {res.stderr}")
+        if desktop_icon.exists() or any((home / "Desktop").iterdir()):
+            return fail("REGRESSION: AppRun re-created the deleted Desktop icon on launch")
     return 0
 
 
@@ -1534,7 +1746,8 @@ def main() -> int:
         ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
-        ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path)),
+        ("linux desktop metadata", lambda: check_linux_desktop_metadata(repo_root, workflow_path)),
+        ("window identity contract", lambda: check_window_identity_contract(repo_root)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_ui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
@@ -1547,7 +1760,7 @@ def main() -> int:
         ("UI scale integration contract", lambda: check_ui_scale_integration_contract(
             repo_root, gui_c_path, gui_settings_c_path, meson_path)),
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
-        ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
+        ("AppRun static contract", lambda: check_apprun_static_contract(repo_root)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
@@ -1559,7 +1772,7 @@ def main() -> int:
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
     ]
     if not args.static_only:
-        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
+        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
         checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
