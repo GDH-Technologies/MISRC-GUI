@@ -4355,6 +4355,72 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     return 0
 
 
+def check_session_launch_file_contract(repo_root: Path) -> int:
+    """--session <path.json> pre-fills one capture from a caller's file. It
+    must stay a GUI flag (an unrecognised arg routes the whole process into
+    headless CLI capture), its overlay must never reach the settings file
+    (gui_settings_save runs the persist filter on a copy), and its log tags
+    must reach the capture log next to the ingest metadata."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        gui_c = strip_c_comments(read_text(base / "core/misrc_gui.c"))
+        settings_c = strip_c_comments(read_text(base / "core/gui_settings.c"))
+        record_c = strip_c_comments(read_text(base / "output/gui_record.c"))
+        meson = read_text(repo_root / "misrc_tools/meson.build")
+    except OSError as exc:
+        return fail(f"session launch file guard: cannot read a source file: {exc}")
+    if "'misrc_gui/core/gui_session.c'" not in meson:
+        return fail("meson.build: misrc_gui/core/gui_session.c is not in the GUI sources")
+    session_pos = gui_c.find('strcmp(a, "--session") == 0')
+    capture_pos = gui_c.find("has_capture_arg = true;")
+    if session_pos < 0 or capture_pos < 0 or session_pos > capture_pos:
+        return fail("misrc_gui.c: --session must be classified as a GUI flag before the "
+                    "capture-arg fallthrough, or it routes into headless CLI capture mode")
+    if '"--session-selftest"' not in gui_c or "gui_session_selftest_main()" not in gui_c:
+        return fail("misrc_gui.c: --session-selftest no longer runs gui_session_selftest_main()")
+    load_pos = gui_c.find("gui_settings_load(&app.settings);")
+    apply_pos = gui_c.find("gui_session_apply_file(session_path, &app.settings")
+    if load_pos < 0 or apply_pos < 0 or apply_pos < load_pos:
+        return fail("misrc_gui.c: the --session overlay must be applied after gui_settings_load()")
+    if "[--session <path.json>]" not in gui_c:
+        return fail("misrc_gui.c: --help no longer lists [--session <path.json>] "
+                    "(callers detect support by grepping --help)")
+    try:
+        save_body = extract_function_body(settings_c, "void gui_settings_save(const gui_settings_t *settings)")
+    except RuntimeError as exc:
+        return fail(f"gui_settings.c: {exc}")
+    filter_pos = save_body.find("s_persist_filter(filtered)")
+    format_pos = save_body.find("gui_settings_format_file(")
+    if filter_pos < 0 or format_pos < 0 or filter_pos > format_pos:
+        return fail("gui_settings.c: gui_settings_save() must run the persist filter on a copy "
+                    "before formatting, or a --session overlay is saved over the operator's settings")
+    notes_pos = record_c.find('"Ingest metadata notes: %s"')
+    tag_pos = record_c.find('"Session tag %s: %s"')
+    if notes_pos < 0 or tag_pos < 0 or tag_pos < notes_pos:
+        return fail("gui_record.c: session log tags must be written as \"Session tag <key>: <value>\" "
+                    "after the ingest metadata block")
+    return 0
+
+
+def check_session_launch_file_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --session-selftest (overlay applied, never saved,
+    bad files refused) and confirm --help advertises --session."""
+    if gui_path.suffix != ".exe":
+        helped = subprocess.run([str(gui_path), "--help"], capture_output=True, text=True, timeout=60)
+        if "--session <path.json>" not in helped.stdout:
+            return fail("misrc_gui --help does not list --session <path.json>")
+    try:
+        ran = subprocess.run([str(gui_path), "--session-selftest"], capture_output=True,
+                             text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --session-selftest timed out")
+    if ran.returncode != 0:
+        return fail(f"misrc_gui --session-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    print(ran.stdout.strip().splitlines()[-1] if ran.stdout.strip() else "session selftest passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -4457,6 +4523,7 @@ def main() -> int:
         ("desktop-sized cursor", lambda: check_desktop_sized_cursor(repo_root)),
         ("About dialog never scrolls sideways", lambda: check_about_dialog_never_scrolls_sideways(repo_root)),
         ("UI zoom is relative to the desktop", lambda: check_ui_zoom_is_desktop_relative(repo_root)),
+        ("session launch file contract", lambda: check_session_launch_file_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
@@ -4492,6 +4559,7 @@ def main() -> int:
         checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
         checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
         checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
+        checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()

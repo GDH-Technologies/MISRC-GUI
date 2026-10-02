@@ -299,6 +299,11 @@ void gui_settings_set_override_path(const char *path);
 // True when a --config override path is active (so startup logic can
 // respect the config instead of forcing defaults like Local mode).
 bool gui_settings_override_active(void);
+// A hook gui_settings_save() runs on a COPY of the struct just before writing
+// it, so values that must not persist stay out of the file while the struct
+// in memory keeps them (gui_session.c: the --session overlay). NULL = none.
+typedef void (*gui_settings_persist_filter_fn)(gui_settings_t *to_write);
+void gui_settings_set_persist_filter(gui_settings_persist_filter_fn fn);
 const char* gui_settings_get_desktop_path(void);
 // True when path names an existing directory.
 bool gui_settings_path_is_dir(const char *path);

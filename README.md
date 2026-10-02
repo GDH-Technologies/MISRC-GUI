@@ -351,6 +351,8 @@ The Text Icon opens the metadata tab for logging information about your capture.
 
 <img width="665" height="486" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
 
+These fields can also be pre-filled for a single run by another program with `--session <path.json>` (see *Session launch file* under [CLI & Automated Testing](#cli--automated-testing)). Values from a session file are used for that run only and are never saved over the ones you typed here.
+
 
 ## Logging 
 
@@ -442,8 +444,43 @@ These flags open the GUI window (no capture args):
 | `--debug-view` | — | Verbose runtime logs |
 | `--config` | `<path>` | Load settings from `<path>` instead of the platform default |
 | `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
+| `--session` | `<path.json>` | Pre-fill this run for one capture from a session file (never saved; see below) |
+| `--session-selftest` | — | Headless check that a session overlay is applied, never saved, and that bad files are refused (no window) |
 
 `--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
+
+</details>
+
+<details closed>
+<summary>Session launch file (<code>--session</code>)</summary>
+<br>
+
+`--session <path.json>` lets another program (a capture scheduler, a tape database, a script) open the GUI pre-filled for one capture without changing the operator's saved settings. It is a GUI flag: it opens the window and never switches the binary into headless CLI capture mode. It combines with `--config`. Callers can detect support by checking that `misrc_gui --help` lists `--session`.
+
+```json
+{"schema": "misrc-gui.session/1",
+ "output_path": "/captures/incoming",
+ "output_base_name": "Family_Tape_03",
+ "ingest": {"project": "Family archive", "tape_id": "T-003", "tape_format": "VHS",
+            "tape_speed": "SP", "tape_size": "E-180", "tape_condition": "good",
+            "operator": "Sam", "location": "Bench 2", "notes": "label partly torn"},
+ "log_tags": {"job_id": "4711", "video_system": "NTSC"}}
+```
+
+- `schema` is required and must be exactly `misrc-gui.session/1`. Every other key is optional, and only the keys present change anything.
+- `output_path` and `output_base_name` set the output folder and base name. A base name only names files while auto naming is on, so a session that sets `output_base_name` also turns auto naming on for the run. Whether the record-start timestamp is appended stays the operator's setting.
+- `ingest.*` fills the [Capture Ingest Metadata](#capture-ingest-metadata) fields: `project`, `tape_id`, `tape_format`, `tape_size`, `tape_speed`, `tape_condition`, `operator`, `location`, `notes`. Each must fit its field (127 bytes, `notes` 255). `output_path` and `output_base_name` may not be empty, and no value that lands in a setting (these and the ingest fields) may contain a double quote or a control character, the settings file's own rule.
+- `log_tags` is up to 16 caller-chosen string pairs (keys: 1-63 characters of `A-Z a-z 0-9 _ . -`; values: up to 255 bytes, no control characters). The GUI does not interpret them. At record start they are written to the capture log, in file order, right after the ingest metadata:
+
+  ```
+  [2026-10-01 14:02:11] [INFO] Ingest metadata notes: label partly torn
+  [2026-10-01 14:02:11] [INFO] Session tag job_id: 4711
+  [2026-10-01 14:02:11] [INFO] Session tag video_system: NTSC
+  ```
+
+- **Session values are never saved.** The settings file always keeps the operator's own output folder, base name, auto-naming switch, file names and ingest fields for every key the session set. This holds even if the operator edits one of those fields during the run: the edit lasts for that run only. Settings the session did not touch save normally.
+- Strings are standard JSON (escapes and `\u` sequences are decoded to UTF-8). Unknown keys are ignored with a note on stderr, so newer callers can add keys.
+- If the file is missing, unreadable, larger than 64 KiB, not valid JSON, has a different `schema`, or has a value of the wrong type or size, nothing from it is applied: the GUI prints `[SESSION] ERROR: ...` on stderr, shows a "Session file rejected" dialog, and starts with the saved settings.
 
 </details>
 

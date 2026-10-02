@@ -110,6 +110,12 @@ bool gui_settings_override_active(void) {
     return s_override_settings_path != NULL;
 }
 
+static gui_settings_persist_filter_fn s_persist_filter = NULL;
+
+void gui_settings_set_persist_filter(gui_settings_persist_filter_fn fn) {
+    s_persist_filter = fn;
+}
+
 // Settings file location
 static const char* get_settings_file_path(void) {
     static char settings_path[512];
@@ -247,7 +253,22 @@ void gui_settings_save(const gui_settings_t *settings) {
     if (!text) {
         return;
     }
+    /* A persist filter edits a copy: what is in memory stays as it is. */
+    gui_settings_t *filtered = NULL;
+    if (s_persist_filter) {
+        filtered = malloc(sizeof(*filtered));
+        if (!filtered) {
+            /* Never write unfiltered values the filter exists to keep out. */
+            free(text);
+            return;
+        }
+        *filtered = *settings;
+        s_persist_filter(filtered);
+        settings = filtered;
+    }
     size_t needed = gui_settings_format_file(settings, text, GUI_SETTINGS_MAX_FILE_BYTES);
+    free(filtered);
+    settings = NULL;
     if (needed >= GUI_SETTINGS_MAX_FILE_BYTES) {
         /* Never write a file the loader would refuse. */
         free(text);
