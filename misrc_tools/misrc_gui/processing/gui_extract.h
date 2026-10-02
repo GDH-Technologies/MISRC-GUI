@@ -44,7 +44,12 @@ bool gui_extract_is_running(void);
 // rf_bits_* semantics:
 // - If use_flac=true: bits per sample for FLAC stream (8/12/16)
 // - If use_flac=false: bits per sample for RAW output (8/16)
-void gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b);
+// direct_a/direct_b: the channel is recorded via the direct native tap (its
+// record ringbuffer producer is the capture-side tap, not this thread), so
+// extraction skips that channel's record-buffer writes (single producer per
+// ring).
+void gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b,
+                               bool direct_a, bool direct_b);
 
 // Reset record buffers via buffer manager (call before starting writer threads)
 void gui_extract_reset_record_rbs(gui_app_t *app);

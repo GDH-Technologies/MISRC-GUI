@@ -232,8 +232,10 @@ static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
     }
     // Stock: detect the card's 8-bit rate; fall back to 28.6 MHz. Never
     // return 14.3 (the 10-bit half) as the base — stock is always 28.6.
+    // Uses the measured (effective) rate when a probe has run, so a
+    // stale sysfs crystal parameter on a modded card cannot cap this.
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx, false, &detected_hz) &&
+    if (gui_cxadc_get_effective_rate_hz(card_idx, false, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }
@@ -251,7 +253,7 @@ static float gui_ui_cxadc_hw_rate_for_tenbit(const gui_app_t *app, int card_idx,
         return tenbit ? 20000.0f : 40000.0f;
     }
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &detected_hz) &&
+    if (gui_cxadc_get_effective_rate_hz(card_idx, tenbit, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }

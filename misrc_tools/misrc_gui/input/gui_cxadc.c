@@ -4,9 +4,11 @@
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
+#include "../output/gui_record.h"
 #include "../signal/gui_headswitch_lock.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
+#include "../../common/cxadc_rate_tiers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -247,7 +249,7 @@ static const PROPERTYKEY s_PKEY_Device_InstanceId = {
 
 extern volatile atomic_int do_exit;
 
-#define CXADC_MAX_CARDS 2
+// CXADC_MAX_CARDS lives in gui_cxadc.h
 #define CXADC_SAMPLE_RATE_8BIT_HZ 40000000U
 #define CXADC_SAMPLE_RATE_TENBIT_HZ 20000000U
 // Stock CXADC card crystal is 28.636 MHz (8-bit 28.6 MSPS / 10-bit 14.3 MSPS).
@@ -772,6 +774,278 @@ static int cxadc_open_cards(cxadc_ctx_t *ctx, int card_count)
 #endif
     }
     return 0;
+}
+
+// --- Measured (empirical) card feed-rate check ---
+// sysfs crystal/tenxfsc report what the driver believes. A hardware-modded
+// card (e.g. a 40 MHz oscillator swap) can still carry the stock 28.636 MHz
+// crystal parameter, which caps the rate readout and the resample options
+// at 28.6 while the card actually feeds 40 MSPS. The measured rate times a
+// real blocking-read window from the card, so it is the hardware truth.
+// Cached per (card, tenbit mode) for the session (these statics deliberately
+// live outside the memset-on-stop s_cxadc context, so one measurement
+// corrects the whole session). Probed at startup enumeration (short window,
+// fresh open) and at every capture start (uses the already-open card fd).
+#define CXADC_RATE_PROBE_STARTUP_BYTES ((size_t)2 * 1024 * 1024)
+#define CXADC_RATE_PROBE_START_BYTES  ((size_t)4 * 1024 * 1024)
+#define CXADC_RATE_PROBE_CHUNK_BYTES  ((size_t)256 * 1024)
+#define CXADC_RATE_PROBE_MIN_ELAPSED_US 20000
+#define CXADC_RATE_PROBE_MAX_ELAPSED_US 2000000
+// Drain phase bounds: the card free-runs since boot/driver load, so
+// /dev/cxadcN holds a backlog that reads return far faster than the live
+// feed; a timed window over the backlog reports a bogus rate (observed on a
+// real 40 MSPS card: 50-72 MHz "measurements"). The probe first drains
+// until a chunk takes as long as a live one (256 KiB at <= 64 MB/s takes
+// >= 4 ms), then times the all-live window. Bounded by byte/time caps; if
+// the live stream is not reached within the caps the measurement fails and
+// the sysfs-derived rate stays (never a wrong override).
+#define CXADC_RATE_PROBE_DRAIN_CHUNK_MIN_US 4000
+#define CXADC_RATE_PROBE_DRAIN_MAX_BYTES ((size_t)1024 * 1024 * 1024)
+#define CXADC_RATE_PROBE_DRAIN_MAX_US (3ULL * 1000000ULL)
+static uint32_t s_cxadc_measured_rate_hz[CXADC_MAX_CARDS][2];
+typedef enum {
+    CXADC_RATE_STATE_UNKNOWN = 0,   // not measured this session (card, mode)
+    CXADC_RATE_STATE_TIER,          // measured and snapped to a known tier
+    CXADC_RATE_STATE_NO_TIER,       // measured but matched no tier / failed;
+                                    // sysfs-derived rate stays (negative
+                                    // cache so enumeration does not retry)
+} cxadc_rate_state_t;
+static cxadc_rate_state_t s_cxadc_measured_rate_state[CXADC_MAX_CARDS][2];
+
+// Time a blocking read window on the card and derive the feed rate
+// (samples/s = bytes read / elapsed / bytes-per-sample). Uses the capture
+// context's already-open fd while a capture is running; otherwise opens
+// the card fresh and closes it again. Returns false when no trustworthy
+// measurement was possible (open failure, read error, or a window too
+// short to be meaningful).
+static bool cxadc_measure_card_rate_hz(int card_idx, bool tenbit, size_t probe_bytes,
+                                        uint32_t *measured_hz_out)
+{
+    if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS || !measured_hz_out) {
+        return false;
+    }
+    *measured_hz_out = 0;
+
+    uint8_t *buf = (uint8_t *)malloc(CXADC_RATE_PROBE_CHUNK_BYTES);
+    if (!buf) {
+        return false;
+    }
+
+#if defined(_WIN32)
+    HANDLE h = INVALID_HANDLE_VALUE;
+    bool close_after = false;
+    if (atomic_load(&s_cxadc.running) &&
+        s_cxadc.card_handles[card_idx] != INVALID_HANDLE_VALUE) {
+        h = s_cxadc.card_handles[card_idx];
+    } else {
+        h = cxadc_open_card(card_idx);
+        close_after = true;
+    }
+#else
+    int fd = -1;
+    bool close_after = false;
+    if (atomic_load(&s_cxadc.running) && s_cxadc.card_fds[card_idx] >= 0) {
+        fd = s_cxadc.card_fds[card_idx];
+    } else {
+        fd = cxadc_open_card(card_idx);
+        close_after = true;
+    }
+#endif
+
+    bool ok = false;
+
+    // Phase 1: drain the driver's backlog until a chunk takes as long as a
+    // live one, so the timed window below measures the live feed only.
+    {
+        uint64_t drain_start_us = get_time_us();
+        size_t drained_bytes = 0;
+        bool reached_live = false;
+        while (drained_bytes < CXADC_RATE_PROBE_DRAIN_MAX_BYTES) {
+            uint64_t chunk_t0_us = get_time_us();
+            int got;
+#if defined(_WIN32)
+            got = (h != INVALID_HANDLE_VALUE)
+                      ? cxadc_read_card(h, buf, CXADC_RATE_PROBE_CHUNK_BYTES) : -1;
+#else
+            got = (fd >= 0) ? cxadc_read_card(fd, buf, CXADC_RATE_PROBE_CHUNK_BYTES) : -1;
+#endif
+            uint64_t chunk_us = get_time_us() - chunk_t0_us;
+            if (got < 0) {
+                break;
+            }
+            if (got == 0) {
+                thrd_sleep_ms(1);
+            } else {
+                drained_bytes += (size_t)got;
+                if (chunk_us >= CXADC_RATE_PROBE_DRAIN_CHUNK_MIN_US) {
+                    reached_live = true;
+                    break;
+                }
+            }
+            if ((get_time_us() - drain_start_us) >= CXADC_RATE_PROBE_DRAIN_MAX_US) {
+                break;
+            }
+        }
+        if (!reached_live) {
+            fprintf(stderr,
+                    "[CXADC] rate check: card %d could not reach the live stream while draining the backlog; using the sysfs-derived rate\n",
+                    card_idx);
+            goto probe_done;
+        }
+    }
+
+    // Phase 2: timed all-live window.
+    size_t total_bytes = 0;
+    uint64_t start_us = get_time_us();
+    uint64_t elapsed_us = 0;
+
+    while (total_bytes < probe_bytes) {
+        size_t want = probe_bytes - total_bytes;
+        if (want > CXADC_RATE_PROBE_CHUNK_BYTES) {
+            want = CXADC_RATE_PROBE_CHUNK_BYTES;
+        }
+        int got;
+#if defined(_WIN32)
+        got = (h != INVALID_HANDLE_VALUE) ? cxadc_read_card(h, buf, want) : -1;
+#else
+        got = (fd >= 0) ? cxadc_read_card(fd, buf, want) : -1;
+#endif
+        if (got < 0) {
+            break;  // read error: no trustworthy measurement
+        }
+        if (got == 0) {
+            thrd_sleep_ms(1);
+        } else {
+            total_bytes += (size_t)got;
+        }
+        elapsed_us = get_time_us() - start_us;
+        if (elapsed_us >= CXADC_RATE_PROBE_MAX_ELAPSED_US) {
+            break;
+        }
+    }
+
+    elapsed_us = get_time_us() - start_us;
+    if (total_bytes > 0 && elapsed_us >= CXADC_RATE_PROBE_MIN_ELAPSED_US) {
+        uint64_t bytes_per_sample = tenbit ? 2u : 1u;
+        uint64_t hz = ((uint64_t)total_bytes * 1000000ULL) /
+                      (elapsed_us * bytes_per_sample);
+        if (hz > 0 && hz <= 100000000ULL) {  // sanity: 0 < rate <= 100 MSPS
+            *measured_hz_out = (uint32_t)hz;
+            ok = true;
+        }
+    }
+
+probe_done:
+    free(buf);
+#if defined(_WIN32)
+    if (close_after && h != INVALID_HANDLE_VALUE) {
+        cxadc_close_handle(&h);
+    }
+#else
+    if (close_after && fd >= 0) {
+        close(fd);
+    }
+#endif
+    return ok;
+}
+
+// Probe one card in the given mode, snap to a known tier, cache it, and
+// compare with the sysfs-derived rate. Logs agreement, disagreement (the
+// stale-sysfs case) and measurement failures; sets a status line when a
+// correction was applied and app is available.
+static void cxadc_probe_and_cache_card_rate(gui_app_t *app, int card_idx, bool tenbit,
+                                             size_t probe_bytes)
+{
+    int t = tenbit ? 1 : 0;
+    uint32_t measured_hz = 0;
+    if (!cxadc_measure_card_rate_hz(card_idx, tenbit, probe_bytes, &measured_hz)) {
+        fprintf(stderr,
+                "[CXADC] rate check: card %d measurement failed; using the sysfs-derived rate\n",
+                card_idx);
+        s_cxadc_measured_rate_state[card_idx][t] = CXADC_RATE_STATE_NO_TIER;
+        return;
+    }
+    uint32_t snapped_hz = 0;
+    if (!cxadc_snap_rate_tier_hz(measured_hz, &snapped_hz)) {
+        fprintf(stderr,
+                "[CXADC] rate check: card %d measured %.3f MHz matches no known rate tier; using the sysfs-derived rate\n",
+                card_idx, (double)measured_hz / 1.0e6);
+        s_cxadc_measured_rate_state[card_idx][t] = CXADC_RATE_STATE_NO_TIER;
+        return;
+    }
+    s_cxadc_measured_rate_hz[card_idx][t] = snapped_hz;
+    s_cxadc_measured_rate_state[card_idx][t] = CXADC_RATE_STATE_TIER;
+
+    uint32_t sysfs_hz = 0;
+    bool have_sysfs = gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &sysfs_hz) &&
+                      sysfs_hz > 0;
+    if (have_sysfs) {
+        uint64_t diff = (snapped_hz > sysfs_hz) ? ((uint64_t)snapped_hz - sysfs_hz)
+                                                : ((uint64_t)sysfs_hz - snapped_hz);
+        bool agree = (diff * 100ULL) <= ((uint64_t)sysfs_hz * 2ULL);  // within 2%
+        if (agree) {
+            fprintf(stderr,
+                    "[CXADC] rate check: card %d measured %.3f MHz, sysfs %.3f MHz (agree)\n",
+                    card_idx, (double)snapped_hz / 1.0e6, (double)sysfs_hz / 1.0e6);
+            return;
+        }
+        fprintf(stderr,
+                "[CXADC] rate check: card %d sysfs says %.3f MHz but the card feeds %.3f MHz (measured) - using the measured rate (stale sysfs crystal parameter on a modded card?)\n",
+                card_idx, (double)sysfs_hz / 1.0e6, (double)snapped_hz / 1.0e6);
+        if (app) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "CXADC card %d: sysfs %.1f but measured %.1f MSPS - using measured",
+                     card_idx, (double)sysfs_hz / 1.0e6, (double)snapped_hz / 1.0e6);
+            gui_app_set_status(app, msg);
+        }
+    } else {
+        fprintf(stderr,
+                "[CXADC] rate check: card %d measured %.3f MHz (sysfs unreadable)\n",
+                card_idx, (double)snapped_hz / 1.0e6);
+    }
+}
+
+bool gui_cxadc_get_effective_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out)
+{
+    if (!rate_hz_out) return false;
+    if (card_idx >= 0 && card_idx < CXADC_MAX_CARDS) {
+        int t = tenbit ? 1 : 0;
+        if (s_cxadc_measured_rate_state[card_idx][t] == CXADC_RATE_STATE_TIER) {
+            *rate_hz_out = s_cxadc_measured_rate_hz[card_idx][t];
+            return true;
+        }
+    }
+    return gui_cxadc_get_sample_rate_hz(card_idx, tenbit, rate_hz_out);
+}
+
+int gui_cxadc_probe_card_rates(int card_count, const bool tenbit_modes[CXADC_MAX_CARDS])
+{
+    if (card_count < 0) card_count = 0;
+    if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
+    if (card_count == 0) return 0;
+    if (atomic_load(&s_cxadc.running)) {
+        // A capture owns the cards (and its own capture-start probe covers
+        // the rate check); do not read under it here.
+        return 0;
+    }
+    const char *opt_out = getenv("MISRC_GUI_NO_CXADC_RATE_PROBE");
+    if (opt_out && opt_out[0] == '1') {
+        return 0;
+    }
+    int probed = 0;
+    for (int i = 0; i < card_count; i++) {
+        int t = tenbit_modes[i] ? 1 : 0;
+        if (s_cxadc_measured_rate_state[i][t] != CXADC_RATE_STATE_UNKNOWN) {
+            continue;  // already measured (or ruled out) this session
+        }
+        cxadc_probe_and_cache_card_rate(NULL, i, tenbit_modes[i],
+                                         CXADC_RATE_PROBE_STARTUP_BYTES);
+        if (s_cxadc_measured_rate_state[i][t] == CXADC_RATE_STATE_TIER) {
+            probed++;
+        }
+    }
+    return probed;
 }
 
 int gui_cxadc_detect_cards(void)
@@ -1708,6 +1982,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
     }
     const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
     const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
+    uint32_t tap_frame_index = 0;
 
     atomic_store(&app->stream_synced, true);
     atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
@@ -1726,6 +2001,12 @@ static int cxadc_capture_thread(void *ctx_ptr)
             thrd_sleep_ms(1);
             continue;
         }
+
+        // Direct native RAW tap (card 0 -> channel A): the exact bytes just
+        // read, before the A/B pairing below (which truncates both reads to
+        // the shorter one and drops card A's data when card B returns 0).
+        // No-op unless channel A was set up as direct native at record start.
+        gui_record_direct_tap_push(0, card_buf_a, (size_t)read_a, tap_frame_index++);
 
         int output_samples = read_a / input_bytes_per_sample_a;
         if (output_samples <= 0) {
@@ -1746,6 +2027,9 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 thrd_sleep_ms(1);
                 continue;
             }
+            // Direct native RAW tap (card 1 -> channel B): exact bytes, before
+            // the pairing truncation below.
+            gui_record_direct_tap_push(1, card_buf_b, (size_t)read_b, tap_frame_index++);
             int output_samples_b = read_b / input_bytes_per_sample_b;
             if (output_samples_b < output_samples) {
                 output_samples = output_samples_b;
@@ -2046,6 +2330,22 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     (void)gui_audio_start(app, &app->buffers);
 
     atomic_store(&s_cxadc.running, true);
+    // Measured feed-rate check (uses the already-open card fds): corrects
+    // card_sample_rate_hz when the sysfs crystal/tenxfsc belief is stale
+    // (e.g. a 40 MHz-modded card still reporting the stock 28.636 crystal).
+    // Runs before the RF thread starts so the rate readout, resample options
+    // and the direct RAW availability check all use the measured truth.
+    if (card_count > 0) {
+        for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+            cxadc_probe_and_cache_card_rate(app, i, s_cxadc.tenbit_mode[i],
+                                             CXADC_RATE_PROBE_START_BYTES);
+            int t = s_cxadc.tenbit_mode[i] ? 1 : 0;
+            if (s_cxadc_measured_rate_state[i][t] == CXADC_RATE_STATE_TIER) {
+                s_cxadc.card_sample_rate_hz[i] = s_cxadc_measured_rate_hz[i][t];
+            }
+        }
+        s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
+    }
     // The RF card-reading thread only applies when there are cxadcN cards.
     // In audio-only MISRC Clockgen mode (card_count == 0) the clockgen USB-audio
     // feed is the sole source, so skip the RF thread and run audio-only.
@@ -2151,6 +2451,23 @@ void gui_cxadc_stop(gui_app_t *app)
 bool gui_cxadc_is_running(void)
 {
     return atomic_load(&s_cxadc.running);
+}
+
+bool gui_cxadc_direct_record_available(int channel, uint8_t rf_bits, size_t *bytes_per_sample_out)
+{
+    if (channel < 0 || channel >= CXADC_MAX_CARDS) return false;
+    if (!atomic_load(&s_cxadc.running)) return false;
+    if (channel >= s_cxadc.card_count) return false;
+    // The requested output width must match the card's live sample width so
+    // the passthrough bytes are exactly the requested samples (8-bit mode
+    // -> unsigned u8 bytes, tenbit mode -> unsigned u16 words).
+    bool tenbit = s_cxadc.tenbit_mode[channel];
+    bool want_tenbit = (rf_bits != 8);
+    if (tenbit != want_tenbit) return false;
+    if (bytes_per_sample_out) {
+        *bytes_per_sample_out = tenbit ? 2u : 1u;
+    }
+    return true;
 }
 
 int gui_cxadc_start_clockgen_audio(gui_app_t *app, bool misrc_clockgen_mode)

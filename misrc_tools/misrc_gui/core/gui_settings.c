@@ -239,11 +239,14 @@ static uint8_t rf_bits_for_raw(uint8_t requested) {
     return (requested == 8) ? 8 : 16;
 }
 
-// File extension for a RAW RF capture: unsigned 8-bit -> .u8, 16-bit -> .u16.
-// Matches the ld-decode/cxadc raw-sample convention so downstream tools pick
-// the right sample width from the extension without a sidecar.
+// File extension for a converted RAW RF capture (settings-load preview):
+// 8-bit -> .s8, 16-bit -> .s16, because the converting writer stores signed
+// samples (ld-decode .s8/.s16 convention). Direct native CXADC passthrough
+// (unsigned .u8/.u16) needs device knowledge, so it is decided by
+// gui_record.c's predicate at record start (gui_record_apply_auto_names
+// recomputes the name there); this load-time preview cannot see the device.
 static const char *raw_ext_for_bits(uint8_t bits) {
-    return (bits == 8) ? "u8" : "u16";
+    return (bits == 8) ? "s8" : "s16";
 }
 
 static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {

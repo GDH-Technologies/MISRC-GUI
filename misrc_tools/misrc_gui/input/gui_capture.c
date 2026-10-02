@@ -570,9 +570,9 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
         cxadc_base_rate_b_khz = tenbit_mode_b ? 20000.0f : 40000.0f;
     } else {
         uint32_t hz_a = 0, hz_b = 0;
-        if (!gui_cxadc_get_sample_rate_hz(0, tenbit_mode_a, &hz_a) || hz_a == 0)
+        if (!gui_cxadc_get_effective_rate_hz(0, tenbit_mode_a, &hz_a) || hz_a == 0)
             hz_a = tenbit_mode_a ? 14318181U : 28636363U;
-        if (!gui_cxadc_get_sample_rate_hz(1, tenbit_mode_b, &hz_b) || hz_b == 0)
+        if (!gui_cxadc_get_effective_rate_hz(1, tenbit_mode_b, &hz_b) || hz_b == 0)
             hz_b = tenbit_mode_b ? 14318181U : 28636363U;
         cxadc_base_rate_a_khz = (float)hz_a / 1000.0f;
         cxadc_base_rate_b_khz = (float)hz_b / 1000.0f;
@@ -1433,6 +1433,18 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     misrc_device_list_free(&devices);
 
     int cxadc_card_count = gui_cxadc_detect_cards();
+
+    // Startup rate probe: measure each present card's true feed rate once
+    // per session (short timed blocking read). sysfs crystal/tenxfsc can be
+    // stale on hardware-modded cards (e.g. a 40 MHz mod still reporting the
+    // stock 28.636 MHz crystal), which capped the rate readout and the
+    // resample options at 28.6; the measured rate corrects that before the
+    // user ever starts a capture. Skipped while a CXADC capture is running
+    // and via MISRC_GUI_NO_CXADC_RATE_PROBE=1 (it briefly reads the cards).
+    if (cxadc_card_count > 0) {
+        (void)gui_cxadc_probe_card_rates(cxadc_card_count,
+                                          app->settings.cxadc_tenbit_mode_card);
+    }
 
 #ifdef ENABLE_DDD
     // Add the synthetic "[DdD] Clockgen" entry when a DdD device is present,

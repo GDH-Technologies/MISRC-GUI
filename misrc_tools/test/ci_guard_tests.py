@@ -1502,6 +1502,294 @@ def check_local_deps_cache_contract(repo_root: Path,
     return 0
 
 
+def func_body_from(source: str, signature: str) -> str:
+    """Return the text of the function whose definition starts at
+    `signature`, from the signature up to the next column-0 closing brace.
+    All target functions keep nested braces indented, so this is exact."""
+    start = source.find(signature)
+    if start < 0:
+        raise RuntimeError(f"Function signature not found: {signature!r}")
+    end = source.find("\n}", start)
+    if end < 0:
+        raise RuntimeError(f"Function end not found for: {signature!r}")
+    return source[start:end]
+
+
+def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
+    """Static contract for the direct native RAW passthrough path (CXADC,
+    FLAC off, no resampling): tap placement before the A/B pairing
+    truncation, shared eligibility predicate, naming by content
+    (.u8/.u16 direct, .s8/.s16 converted), single producer per record
+    ring, and the start/stop tap handshakes."""
+    record_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
+    record_h = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.h")
+    direct_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c")
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+    cxadc_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.h")
+    extract_c = read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.c")
+    extract_h = read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.h")
+    settings_c = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+    harness_c = read_text(repo_root / "misrc_tools/test/gui_record_direct_harness.c")
+
+    required_snippets = [
+        (direct_c, "atomic_fetch_add(&ctx->tap_inflight, 1);", "producer marks in-flight"),
+        (direct_c, "atomic_load(&ctx->tap_enabled)", "producer checks the enabled flag"),
+        (direct_c, "bufmgr_fill_level(ctx->bufmgr, (buffer_id_t)ctx->buf_id)", "writer reads variable lengths"),
+        (direct_c, "GUI_RECORD_DIRECT_MAX_BLOCK_BYTES", "writer read granularity cap"),
+        (cxadc_c, "gui_record_direct_tap_push(0, card_buf_a", "card A native tap"),
+        (cxadc_c, "gui_record_direct_tap_push(1, card_buf_b", "card B native tap"),
+        (cxadc_h, "gui_cxadc_direct_record_available", "CXADC direct availability query"),
+        (record_h, "gui_record_direct_tap_push", "tap entry point declaration"),
+        (record_h, "gui_record_spill_read_block", "public spill read"),
+        (record_h, "gui_record_spill_backlog_bytes", "public spill backlog query"),
+        (record_c, '"Recording (RAW direct)..."', "direct status text"),
+        (record_c, "RAW direct native passthrough", "capture_format log line"),
+        (record_c, "gui_record_direct_channel_eligible", "shared eligibility predicate"),
+        (record_c, "Direct RAW channel A: bytes_read=", "end summary read vs written"),
+        (extract_h, "gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b,", "set_recording carries the direct mask"),
+        (meson, "'misrc_gui/output/gui_record_direct.c'", "module in the GUI build"),
+        (meson, "test('gui_record_direct'", "harness registered as a meson test"),
+        (harness_c, "gui_record_direct_push(", "harness drives the real push"),
+        (harness_c, "gui_record_direct_writer_thread", "harness drives the real writer"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"Direct RAW passthrough contract missing {label}: {snippet}")
+
+    # Tap placement: both taps must run before the A/B pairing truncation
+    # (output_samples = min(...)) so the direct bytes are the exact card
+    # reads, not truncated/paired samples.
+    tap_a = cxadc_c.find("gui_record_direct_tap_push(0, card_buf_a")
+    tap_b = cxadc_c.find("gui_record_direct_tap_push(1, card_buf_b")
+    pairing = cxadc_c.find("if (ctx->card_count > 1)")
+    truncation = cxadc_c.find("output_samples_b < output_samples")
+    if min(tap_a, tap_b, pairing, truncation) < 0:
+        return fail("Direct RAW tap placement anchors not found in gui_cxadc.c")
+    if not (tap_a < pairing < tap_b < truncation):
+        return fail("Direct RAW taps must sit before the A/B pairing truncation in the capture loop")
+
+    # Producer handshake: mark in-flight, THEN read enabled.
+    push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push")
+    if push_body.find("atomic_fetch_add(&ctx->tap_inflight, 1);") > push_body.find("atomic_load(&ctx->tap_enabled)"):
+        return fail("Direct RAW push must mark in-flight before reading tap_enabled")
+
+    # Producer ordering rule: while the spill backlog is non-zero, pushes go
+    # to the spill (never into the ring ahead of older spill data).
+    if "backlog > 0" not in push_body:
+        return fail("Direct RAW push must key its spill-vs-ring decision on the spill backlog")
+
+    # Writer drain order: ringbuffer before spill (oldest data first).
+    writer_body = func_body_from(direct_c, "int gui_record_direct_writer_thread(void *ctx_ptr)")
+    if writer_body.find("bufmgr_read_begin") > writer_body.find("ctx->cb.spill_read"):
+        return fail("Direct RAW writer must drain the ringbuffer before the spill backlog")
+
+    # Naming by content: direct -> .u8/.u16, converted -> .s8/.s16.
+    ext_body = func_body_from(record_c, "static const char *raw_ext_for_bits")
+    for snippet in ['"u8"', '"u16"', '"s8"', '"s16"']:
+        if snippet not in ext_body:
+            return fail(f"gui_record.c raw_ext_for_bits must map direct/converted to u8/u16/s8/s16: missing {snippet}")
+    settings_ext_body = func_body_from(settings_c, "static const char *raw_ext_for_bits")
+    for snippet in ['"s8"', '"s16"']:
+        if snippet not in settings_ext_body:
+            return fail(f"gui_settings.c raw_ext_for_bits (converted preview) missing {snippet}")
+    for snippet in ['"u8"', '"u16"']:
+        if snippet in settings_ext_body:
+            return fail(f"gui_settings.c load-time preview must not claim native naming: {snippet}")
+
+    # Predicate gates on: CXADC device, FLAC off, per-channel resample off,
+    # running capture, live card sample-width match.
+    pred_body = func_body_from(record_c, "static bool gui_record_direct_channel_eligible")
+    for snippet in ["DEVICE_TYPE_CXADC", "app->settings.use_flac", "enable_resample_a", "enable_resample_b",
+                    "gui_cxadc_is_running", "gui_cxadc_direct_record_available"]:
+        if snippet not in pred_body:
+            return fail(f"Direct RAW eligibility predicate missing required condition: {snippet}")
+
+    # Single producer per record ring: extraction skips direct channels.
+    extract_body = func_body_from(extract_c, "static int extraction_thread(void *ctx)")
+    for snippet in ["!atomic_load(&s_direct_channel_a)", "!atomic_load(&s_direct_channel_b)"]:
+        if snippet not in extract_body:
+            return fail(f"Extraction must skip record writes for direct channels: {snippet}")
+    set_rec_body = func_body_from(extract_c, "void gui_extract_set_recording")
+    for snippet in ["s_direct_channel_a", "s_direct_channel_b"]:
+        if snippet not in set_rec_body:
+            return fail(f"gui_extract_set_recording must carry the direct mask: {snippet}")
+
+    # Stop handshake: taps disabled and idle BEFORE is_recording clears.
+    stop_body = func_body_from(record_c, "void gui_record_stop(gui_app_t *app)")
+    tap_disable_pos = stop_body.find("gui_record_direct_tap_disable")
+    tap_idle_pos = stop_body.find("gui_record_direct_tap_wait_idle")
+    is_recording_pos = stop_body.find("app->is_recording = false;")
+    if min(tap_disable_pos, tap_idle_pos, is_recording_pos) < 0:
+        return fail("Direct RAW stop handshake anchors not found in gui_record_stop")
+    if not (tap_disable_pos < tap_idle_pos < is_recording_pos):
+        return fail("gui_record_stop must disable+idle the taps before clearing is_recording")
+
+    # Start order: writers, then taps, then extraction recording (skip mask).
+    start_writer = record_c.find("gui_record_direct_writer_thread")
+    start_tap = record_c.find("gui_record_direct_tap_enable(&s_direct_ctx_a)")
+    start_extract = record_c.find("gui_extract_set_recording(true, false, bits_a, bits_b, direct_a, direct_b)")
+    if min(start_writer, start_tap, start_extract) < 0:
+        return fail("Direct RAW start-order anchors not found in gui_record.c")
+    if not (start_writer < start_tap < start_extract):
+        return fail("Record start must start writers, then enable taps, then extraction recording")
+    return 0
+
+
+def check_gui_auto_test_flags(repo_root: Path) -> int:
+    """Static contract for the unattended local test flags
+    (--select-device / --auto-capture / --auto-record) and the
+    overwrite_files popup bypass that unattended runs depend on."""
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    record_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
+
+    required_snippets = [
+        (gui_c, 'strcmp(a, "--select-device")', "--select-device parsed as a GUI flag"),
+        (gui_c, 'strcmp(a, "--auto-capture")', "--auto-capture parsed as a GUI flag"),
+        (gui_c, 'strcmp(a, "--auto-record")', "--auto-record parsed as a GUI flag"),
+        (gui_c, "[AUTO] --select-device: no device matches", "--select-device fails fast on no match"),
+        (gui_c, "gui_strcasestr_local", "portable case-insensitive device name match"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"GUI auto-test flags contract missing {label}: {snippet}")
+
+    # The unattended record cycle must report each phase and exit nonzero on failure.
+    for marker in ["[AUTO] auto-capture armed", "[AUTO] recording started", "[AUTO] recording stopped",
+                   "[AUTO] record cycle complete", "return auto_rec_failed ? 1 : 0;"]:
+        if marker not in gui_c:
+            return fail(f"GUI auto-record cycle missing required marker: {marker}")
+
+    # usage text documents all three flags
+    for flag in ["--select-device", "--auto-capture", "--auto-record <seconds>"]:
+        if flag not in gui_c:
+            return fail(f"GUI usage text missing auto-test flag: {flag}")
+
+    # overwrite_files must bypass the overwrite confirmation popup so
+    # unattended runs cannot stall on it.
+    start_body = func_body_from(record_c, "int gui_record_start(gui_app_t *app)")
+    if "!app->settings.overwrite_files" not in start_body:
+        return fail("gui_record_start must skip the overwrite popup when overwrite_files is on")
+    return 0
+
+
+def check_cxadc_rate_probe_contract(repo_root: Path) -> int:
+    """Static contract for the CXADC measured feed-rate check: probe at
+    startup enumeration and capture start, tier snapping via the shared
+    dependency-free header, effective rate preferred by the UI/settings
+    rate getters, and the env opt-out."""
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+    cxadc_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.h")
+    capture_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_capture.c")
+    ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    tiers_h = read_text(repo_root / "misrc_tools/common/cxadc_rate_tiers.h")
+    tiers_test_c = read_text(repo_root / "misrc_tools/test/cxadc_rate_tiers_test.c")
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+
+    required_snippets = [
+        (cxadc_c, "cxadc_measure_card_rate_hz", "timed blocking-read measurement"),
+        (cxadc_c, "cxadc_probe_and_cache_card_rate", "probe + cache + sysfs comparison"),
+        (cxadc_c, "MISRC_GUI_NO_CXADC_RATE_PROBE", "probe env opt-out"),
+        (cxadc_c, "CXADC_RATE_PROBE_START_BYTES", "capture-start probe window"),
+        (cxadc_c, "gui_cxadc_get_effective_rate_hz", "effective-rate API"),
+        (cxadc_c, "cxadc_snap_rate_tier_hz", "tier snapping from the shared header"),
+        (cxadc_c, "s_cxadc_measured_rate_state", "measured-rate cache"),
+        (cxadc_c, "CXADC_RATE_PROBE_DRAIN_CHUNK_MIN_US", "backlog drain phase before the timed window"),
+        (cxadc_h, "gui_cxadc_get_effective_rate_hz", "effective-rate declaration"),
+        (cxadc_h, "gui_cxadc_probe_card_rates", "probe entry point declaration"),
+        (capture_c, "gui_cxadc_probe_card_rates(cxadc_card_count", "startup enumeration probe"),
+        (capture_c, "gui_cxadc_get_effective_rate_hz(0, tenbit_mode_a", "CXADC profile sync uses the effective rate"),
+        (ui_c, "gui_cxadc_get_effective_rate_hz(card_idx, false", "UI base rate uses the effective rate"),
+        (ui_c, "gui_cxadc_get_effective_rate_hz(card_idx, tenbit", "UI hw rate uses the effective rate"),
+        (tiers_h, "cxadc_snap_rate_tier_hz", "tier snap helper"),
+        (tiers_h, "35795454", "upsampled 35.8 exclusion documented/absent as tier"),
+        (tiers_test_c, "cxadc_snap_rate_tier_hz", "tier snap unit test drives the real helper"),
+        (meson, "test('cxadc_rate_tiers'", "tier snap test registered"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"CXADC rate probe contract missing {label}: {snippet}")
+
+    # The tier table must NOT contain the upsampled 35.8 feed (35795454 /
+    # 35800000 must appear only in comments, never as a tier value).
+    tiers_body = tiers_h[tiers_h.find("CXADC_RATE_TIER_HZ[] = {"):tiers_h.find("};")]
+    for forbidden in ("35795454U,", "35800000U,"):
+        if forbidden in tiers_body:
+            return fail(f"35.8 MHz upsampled feed must not be a snap tier: {forbidden}")
+
+    # The measured rate must override the sysfs belief when they disagree
+    # (the reported stale-crystal case), at every capture start.
+    start_body = func_body_from(cxadc_c, "int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)")
+    probe_pos = start_body.find("cxadc_probe_and_cache_card_rate")
+    override_pos = start_body.find("s_cxadc.card_sample_rate_hz[i] = s_cxadc_measured_rate_hz[i][t]")
+    # rfind: the probe block's re-assignment is the LAST occurrence (the
+    # original sysfs-derived assignment earlier in the function stays).
+    rf_pos = start_body.rfind("s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0]")
+    if min(probe_pos, override_pos, rf_pos) < 0:
+        return fail("Capture-start rate-probe anchors not found in gui_cxadc_start")
+    if not (probe_pos < override_pos < rf_pos):
+        return fail("gui_cxadc_start must probe, apply the measured rate, then set rf_sample_rate_hz")
+    return 0
+
+
+def check_raw_direct_writer_runtime(repo_root: Path) -> int:
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: direct RAW writer runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for direct RAW writer runtime guard")
+        print("SKIP: direct RAW writer runtime guard (cc not available)")
+        return 0
+
+    sources = [
+        repo_root / "misrc_tools/test/gui_record_direct_harness.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c",
+        repo_root / "misrc_tools/common/buffer_manager.c",
+        repo_root / "misrc_tools/common/ringbuffer.c",
+        repo_root / "misrc_tools/common/rb_event.c",
+    ]
+    for path in sources:
+        if not path.exists():
+            return fail(f"Direct RAW writer runtime source is missing: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_direct_raw_guard_") as temp_root:
+        exe_name = "gui_record_direct_guard.exe" if os.name == "nt" else "gui_record_direct_guard"
+        exe_path = Path(temp_root) / exe_name
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        compile_cmd += [str(p) for p in sources]
+        if sys.platform.startswith("linux"):
+            compile_cmd += ["-lpthread"]
+        compile_cmd += ["-o", str(exe_path)]
+        try:
+            run_checked(compile_cmd)
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "Failed to compile direct RAW writer runtime harness\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+        try:
+            run_checked([str(exe_path)])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "Direct RAW writer runtime harness failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+    return 0
+
+
 def check_record_ringbuffer_fallback_runtime(repo_root: Path) -> int:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         print("SKIP: record ringbuffer fallback runtime guard (Linux/macOS only)")
@@ -1770,12 +2058,16 @@ def main() -> int:
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
+        ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
+        ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
+        ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("UI scale policy runtime", lambda: check_ui_scale_policy_runtime(repo_root)))
-        checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
+        checks.insert(10, ("direct RAW writer runtime", lambda: check_raw_direct_writer_runtime(repo_root)))
+        checks.insert(11, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
     # that catches vendored-dep shadowing and silent FX3-disable on every build.

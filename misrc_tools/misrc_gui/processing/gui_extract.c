@@ -59,6 +59,11 @@ static atomic_bool s_recording_enabled = false;
 static atomic_bool s_use_flac = false;
 static atomic_uchar s_rf_bits_a = 16;
 static atomic_uchar s_rf_bits_b = 16;
+// Direct native RAW channels: their record ringbuffer is fed by the
+// capture-side tap (gui_record_direct_tap_push), so the extraction thread
+// must not write those rings (single producer per ring).
+static atomic_bool s_direct_channel_a = false;
+static atomic_bool s_direct_channel_b = false;
 
 // Record path should stay effectively non-blocking for extraction, but allow a
 // very short wait window so transient full-buffer spikes do not immediately
@@ -171,8 +176,13 @@ static int extraction_thread(void *ctx) {
                 }
             } else {
                 size_t sample_bytes = BUFFER_READ_SIZE * sizeof(int16_t);
-                bool want_a = s_extract_app->settings.capture_a;
-                bool want_b = s_b_present && s_extract_app->settings.capture_b;
+                // Direct native channels are recorded by the capture-side
+                // tap; skip their record writes so each record ringbuffer
+                // has exactly one producer.
+                bool want_a = s_extract_app->settings.capture_a &&
+                              !atomic_load(&s_direct_channel_a);
+                bool want_b = s_b_present && s_extract_app->settings.capture_b &&
+                              !atomic_load(&s_direct_channel_b);
                 int16_t *write_a = NULL;
                 int16_t *write_b = NULL;
                 bool drop_a = false;
@@ -530,15 +540,19 @@ bool gui_extract_is_running(void) {
 // Note: Record ringbuffers now accessed via app->buffers (buffer_manager)
 // Use BUF_RECORD_A and BUF_RECORD_B with bufmgr_read_begin/bufmgr_read_end
 
-void gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b) {
+void gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b,
+                               bool direct_a, bool direct_b) {
     atomic_store(&s_use_flac, use_flac);
     atomic_store(&s_rf_bits_a, rf_bits_a);
     atomic_store(&s_rf_bits_b, rf_bits_b);
+    atomic_store(&s_direct_channel_a, direct_a);
+    atomic_store(&s_direct_channel_b, direct_b);
     atomic_store(&s_recording_enabled, enabled);
-    fprintf(stderr, "[EXTRACT] Recording %s (FLAC: %s, bits A:%u B:%u)\n",
+    fprintf(stderr, "[EXTRACT] Recording %s (FLAC: %s, bits A:%u B:%u, direct A:%s B:%s)\n",
             enabled ? "enabled" : "disabled",
             use_flac ? "yes" : "no",
-            (unsigned)rf_bits_a, (unsigned)rf_bits_b);
+            (unsigned)rf_bits_a, (unsigned)rf_bits_b,
+            direct_a ? "yes" : "no", direct_b ? "yes" : "no");
 }
 
 void gui_extract_reset_record_rbs(gui_app_t *app) {

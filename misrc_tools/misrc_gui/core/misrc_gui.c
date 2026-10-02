@@ -43,6 +43,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <limits.h>
@@ -87,11 +88,26 @@ static void print_usage(const char *program_name) {
             "MISRC GUI %s\n"
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect]\n"
+            "     [--select-device <index-or-name>] [--auto-capture] [--auto-record <seconds>]\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
             "--config <path> loads settings from <path> instead of the default\n"
             "           location (useful for automated GUI testing).\n"
+            "--select-device <sel> pick the capture device at launch: a device-list\n"
+            "           index, or a case-insensitive name substring (first match,\n"
+            "           e.g. \"CXADC\"). Exits 1 if nothing matches. Needed for\n"
+            "           automated runs because startup otherwise prefers\n"
+            "           hsdaoh > MISRC Clockgen > CXADC.\n"
+            "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
+            "           no --config required).\n"
+            "--auto-record <seconds> runs a full unattended record cycle: start\n"
+            "           capture, settle 2 s, record <seconds> seconds, wait for\n"
+            "           the output file finalize, stop capture, exit 0 (exit 1 on\n"
+            "           failure). Set overwrite_files true (or timestamped\n"
+            "           auto-names) in the config so the overwrite confirmation\n"
+            "           popup cannot stall the run. Progress is logged with\n"
+            "           [AUTO] prefixes on stderr.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -146,6 +162,16 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
             return "Capture stopped: dropout detected";
     }
 }
+// --auto-record <seconds> unattended record cycle phases (local automated
+// load/capture testing; see the state machine in the main loop).
+typedef enum {
+    AUTO_REC_IDLE = 0,      // no --auto-record: normal interactive session
+    AUTO_REC_WAIT_CAPTURE,  // armed, waiting for capture to start
+    AUTO_REC_SETTLE,        // capture running, 2 s settle before recording
+    AUTO_REC_RECORDING,     // recording until the deadline
+    AUTO_REC_FINALIZING,    // recording stopped, waiting for the file finalize
+} auto_rec_phase_t;
+
 typedef struct {
     bool valid;
     device_type_t type;
@@ -157,6 +183,24 @@ typedef struct {
     char ddd_usb_path[DDD_STABLE_ID_MAX];
 #endif
 } gui_reconnect_target_t;
+// Portable case-insensitive substring search (POSIX strcasestr is not
+// available on every target; keeps the binary dependency-light).
+static const char *gui_strcasestr_local(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!needle[0]) return haystack;
+    for (const char *h = haystack; *h; h++) {
+        const char *hi = h;
+        const char *ni = needle;
+        while (*hi && *ni &&
+               tolower((unsigned char)*hi) == tolower((unsigned char)*ni)) {
+            hi++;
+            ni++;
+        }
+        if (!*ni) return h;
+    }
+    return NULL;
+}
+
 static int gui_find_first_device_of_type(const gui_app_t *app, device_type_t type) {
     if (!app) return -1;
     for (int i = 0; i < app->device_count; i++) {
@@ -402,6 +446,10 @@ int main(int argc, char **argv) {
     bool auto_connect = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
+    const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
+    bool auto_capture = false;             /* --auto-capture */
+    bool auto_record_given = false;        /* --auto-record <seconds> seen */
+    int auto_record_seconds = 0;           /* --auto-record seconds */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
@@ -438,6 +486,27 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (strcmp(a, "--select-device") == 0) {
+            // --select-device <index-or-name>: explicit device selection for
+            // automated runs. Consumes the next arg.
+            if (i + 1 < argc) {
+                select_device_arg = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(a, "--auto-capture") == 0) {
+            auto_capture = true;
+            continue;
+        }
+        if (strcmp(a, "--auto-record") == 0) {
+            // --auto-record <seconds>: unattended record cycle. Consumes the
+            // next arg.
+            if (i + 1 < argc) {
+                auto_record_given = true;
+                auto_record_seconds = atoi(argv[++i]);
+            }
+            continue;
+        }
         has_capture_arg = true;
     }
 #if !defined(__ANDROID__)
@@ -458,6 +527,10 @@ int main(int argc, char **argv) {
     }
     if (smoke_test) {
         return 0;
+    }
+    if (auto_record_given && auto_record_seconds < 1) {
+        fprintf(stderr, "--auto-record requires a positive <seconds> value\n");
+        return 1;
     }
     if (auto_connect && !config_path) {
         // --auto-connect requires --config so the net_mode/host are known.
@@ -679,9 +752,62 @@ int main(int argc, char **argv) {
     } else {
         gui_app_set_status(&app, "No devices found. Connect a device and retry.");
     }
+
+    // --select-device <index-or-name>: explicit device selection for automated
+    // runs (startup otherwise prefers hsdaoh > MISRC Clockgen > CXADC).
+    // Accepts a device-list index or a case-insensitive name substring
+    // (first match). Fails fast so scripts get a clear error.
+    if (select_device_arg) {
+        int sel = -1;
+        char *endp = NULL;
+        long idx = strtol(select_device_arg, &endp, 10);
+        if (endp && endp != select_device_arg && *endp == '\0') {
+            if (idx >= 0 && idx < app.device_count) {
+                sel = (int)idx;
+            }
+        } else {
+            for (int i = 0; i < app.device_count; i++) {
+                if (gui_strcasestr_local(app.devices[i].name, select_device_arg)) {
+                    sel = i;
+                    break;
+                }
+            }
+        }
+        if (sel < 0) {
+            fprintf(stderr,
+                    "[AUTO] --select-device: no device matches '%s' (%d device(s) enumerated)\n",
+                    select_device_arg, app.device_count);
+            CloseWindow();
+            return 1;
+        }
+        app.selected_device = sel;
+        fprintf(stderr, "[AUTO] --select-device: %d: %s\n", sel, app.devices[sel].name);
+    }
+
+    // --auto-capture / --auto-record: unattended local capture start. Uses the
+    // same reconnect-pending mechanism as --auto-connect in server mode: the
+    // main loop's reconnect logic starts capture ~1 s after launch (giving
+    // enumeration a stable window first). Local mode, no --config required.
+    if ((auto_capture || auto_record_seconds > 0) && !auto_connect &&
+        app.device_count > 0) {
+        app.reconnect_pending = true;
+        app.reconnect_attempt_time = GetTime() + 1.0;  // 1 s grace
+        app.reconnect_attempts = 0;
+        gui_set_reconnect_target_from_selected(&app, &reconnect_target);
+        gui_app_set_status(&app, "Auto-capture: starting capture...");
+        fprintf(stderr, "[AUTO] auto-capture armed (device %d: %s)\n",
+                app.selected_device, app.devices[app.selected_device].name);
+    }
     int last_layout_width = -1;
     int last_layout_height = -1;
     bool recording_fps_throttle = false;
+    // --auto-record state (phases above). auto_rec_failed drives the exit
+    // code so scripts can detect a failed cycle without parsing logs.
+    auto_rec_phase_t auto_rec_phase =
+        (auto_record_seconds > 0) ? AUTO_REC_WAIT_CAPTURE : AUTO_REC_IDLE;
+    double auto_rec_phase_start = GetTime();
+    double auto_rec_deadline = 0.0;
+    bool auto_rec_failed = false;
     // One-time startup warning: if FLAC threads is 0 (auto, e.g. loaded from
     // saved settings), warn once on launch so the user knows auto may under-use
     // cores. The FlacThreadsMinus handler only fires on the 1->0 click
@@ -865,6 +991,66 @@ int main(int argc, char **argv) {
                     gui_app_stop_recording(&app);
                 } else {
                     gui_app_start_recording(&app);
+                }
+            }
+        }
+
+        // --auto-record unattended record cycle (phases above). Progress is
+        // logged with [AUTO] prefixes so scripts can verify each step; a
+        // failure sets auto_rec_failed and finishes the cycle (nonzero exit).
+        if (auto_rec_phase != AUTO_REC_IDLE) {
+            double auto_now = GetTime();
+            if (auto_rec_phase == AUTO_REC_WAIT_CAPTURE) {
+                if (app.is_capturing) {
+                    auto_rec_phase = AUTO_REC_SETTLE;
+                    auto_rec_phase_start = auto_now;
+                    fprintf(stderr, "[AUTO] capture running; settling 2 s before recording\n");
+                } else if (auto_now - auto_rec_phase_start > 30.0) {
+                    fprintf(stderr, "[AUTO] ERROR: capture did not start within 30 s\n");
+                    auto_rec_failed = true;
+                    auto_rec_phase = AUTO_REC_FINALIZING;
+                }
+            } else if (auto_rec_phase == AUTO_REC_SETTLE) {
+                if (!app.is_capturing) {
+                    auto_rec_phase = AUTO_REC_WAIT_CAPTURE;
+                    auto_rec_phase_start = auto_now;
+                } else if (auto_now - auto_rec_phase_start >= 2.0) {
+                    int rec_rc = gui_app_start_recording(&app);
+                    if (rec_rc == RECORD_OK) {
+                        auto_rec_phase = AUTO_REC_RECORDING;
+                        auto_rec_deadline = auto_now + (double)auto_record_seconds;
+                        fprintf(stderr, "[AUTO] recording started (%d s)\n", auto_record_seconds);
+                    } else {
+                        if (rec_rc == RECORD_PENDING) {
+                            fprintf(stderr,
+                                    "[AUTO] ERROR: recording blocked by the overwrite confirmation popup; "
+                                    "set overwrite_files true (or timestamped auto-names) in the config\n");
+                        } else {
+                            fprintf(stderr, "[AUTO] ERROR: start recording failed (rc=%d)\n", rec_rc);
+                        }
+                        auto_rec_failed = true;
+                        auto_rec_phase = AUTO_REC_FINALIZING;
+                    }
+                }
+            } else if (auto_rec_phase == AUTO_REC_RECORDING) {
+                if (!app.is_recording) {
+                    fprintf(stderr, "[AUTO] recording stopped early; finishing\n");
+                    auto_rec_phase = AUTO_REC_FINALIZING;
+                } else if (auto_now >= auto_rec_deadline) {
+                    gui_app_stop_recording(&app);
+                    fprintf(stderr, "[AUTO] recording stopped after %d s\n", auto_record_seconds);
+                    auto_rec_phase = AUTO_REC_FINALIZING;
+                }
+            } else if (auto_rec_phase == AUTO_REC_FINALIZING) {
+                if (!app.is_recording && !gui_record_is_finalizing()) {
+                    if (app.is_capturing) {
+                        gui_app_stop_capture(&app);
+                        fprintf(stderr, "[AUTO] capture stopped\n");
+                    }
+                    fprintf(stderr, "[AUTO] record cycle complete%s; exiting\n",
+                            auto_rec_failed ? " (with errors)" : "");
+                    atomic_store(&do_exit, 1);
+                    auto_rec_phase = AUTO_REC_IDLE;
                 }
             }
         }
@@ -1159,5 +1345,7 @@ int main(int argc, char **argv) {
 
     CloseWindow();
 
-    return 0;
+    // Nonzero exit when the unattended --auto-record cycle failed (0 for
+    // normal interactive exits and successful cycles).
+    return auto_rec_failed ? 1 : 0;
 }

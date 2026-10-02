@@ -72,8 +72,26 @@ bool gui_record_spill_is_forced(int channel);
 // can be recycled via the existing drain path. Prevents a single
 // backpressure blip from permanently routing recording through disk.
 void gui_record_spill_clear_forced(int channel);
-bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *samples, size_t bytes,
+// Spillover support for record-path backpressure. Byte-generic: `data` may
+// be the extraction thread's int16 sample blocks or the direct RAW path's
+// native device bytes.
+bool gui_record_spill_enqueue(gui_app_t *app, int channel, const void *data, size_t bytes,
                               uint32_t frame_index, char *error_msg, size_t error_msg_size);
+
+// Read `bytes` from a channel's spill backlog into dst (byte-generic).
+// Returns false when less than `bytes` remains (or no spill file is open).
+bool gui_record_spill_read_block(int channel, void *dst, size_t bytes);
+
+// Current spill backlog in bytes for a channel (0 when none).
+uint64_t gui_record_spill_backlog_bytes(int channel);
+
+// Direct native RAW passthrough (CXADC, FLAC off, per-channel resampling
+// off): push the exact bytes just read from CXADC card `card` (0 = channel
+// A, 1 = channel B) into that channel's record path. No-op unless the
+// channel was set up as direct native at record start (decided by
+// gui_record.c). Drop handling (capture log + stop_on_dropout) mirrors the
+// extraction thread's record-drop path.
+void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint32_t frame_index);
 
 // Proactive low-disk guard for active recording paths.
 // Returns true when free space drops below threshold and capture should be stopped safely.

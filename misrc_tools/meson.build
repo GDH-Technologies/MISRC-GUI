@@ -412,6 +412,7 @@ if raylib_dep.found()
     'misrc_gui/net/gui_net.c',
     # Output
     'misrc_gui/output/gui_record.c',
+    'misrc_gui/output/gui_record_direct.c',
     'misrc_gui/output/gui_audio.c',
     'common/extract.c',
     'common/ringbuffer.c',
@@ -655,6 +656,28 @@ ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   c_args: cflags,
 )
 test('gui_ddd_async_policy', ddd_async_policy_test)
+
+# Byte-exact direct RAW record path: the real tap push + writer thread
+# against the real buffer manager/ringbuffer, with an in-memory spill stub
+# (no raylib/GUI dependency).
+gui_record_direct_test = executable('gui_record_direct_test',
+  ['test/gui_record_direct_harness.c',
+   'misrc_gui/output/gui_record_direct.c',
+   'common/buffer_manager.c',
+   'common/ringbuffer.c',
+   'common/rb_event.c'],
+  dependencies: [ meson.get_compiler('c').find_library('pthread', required: false) ],
+  c_args: cflags,
+)
+test('gui_record_direct', gui_record_direct_test)
+
+# CXADC measured feed-rate tier snapping (dependency-free header).
+cxadc_rate_tiers_test = executable('cxadc_rate_tiers_test',
+  'test/cxadc_rate_tiers_test.c',
+  dependencies: [],
+  c_args: cflags,
+)
+test('cxadc_rate_tiers', cxadc_rate_tiers_test)
 
 if ddd_enabled
   ddd_async_fault_test = executable('gui_ddd_async_fault_test',
