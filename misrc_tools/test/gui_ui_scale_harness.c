@@ -74,14 +74,20 @@ int main(void)
                  "stats preserve the default layout exactly");
     expect_float(gui_ui_stats_width_scale(0), 1.0f,
                  "invalid stats scale uses the default");
-    expect_float(gui_ui_stats_width_scale(137), 1.0f,
-                 "unsupported scale steps use the default");
+    // The effective scale (desktop x zoom) is off the 10% grid whenever the
+    // desktop is: a 137% scale is real, not invalid.
+    expect_float(gui_ui_stats_width_scale(137) * 1.37f, 1.222f,
+                 "an off-grid effective scale damps like any other");
     expect_float(gui_ui_stats_width_scale(110) * 1.1f, 1.06f,
                  "110 percent UI zoom gives 106 percent stats width");
     expect_float(gui_ui_stats_width_scale(150) * 1.5f, 1.3f,
                  "150 percent UI zoom gives 130 percent stats width");
     expect_float(gui_ui_stats_width_scale(200) * 2.0f, 1.6f,
                  "200 percent UI zoom gives 160 percent stats width");
+    expect_float(gui_ui_stats_width_scale(400) * 4.0f, 2.8f,
+                 "a 200 percent zoom on a 2x desktop gives 280 percent stats width");
+    expect_float(gui_ui_stats_width_scale(999) * 4.0f, 2.8f,
+                 "an effective scale past the ceiling clamps to it");
     float previous_stats_scale = 1.0f;
     for (int percent = 110; percent <= 200; percent += 10) {
         float scale = (float)percent / 100.0f;
@@ -320,17 +326,18 @@ int main(void)
     expect_true(result.changed && result.percent == 130,
                 "large modified wheel delta can cross multiple steps");
 
-    result = gui_ui_zoom_process(&state, 300, true, 0.0f, 1.0f);
+    // The wheel steps the desktop-relative zoom, 50-200%.
+    result = gui_ui_zoom_process(&state, 200, true, 0.0f, 1.0f);
     expect_true(result.consumed && result.step_attempted &&
-                    !result.changed && result.percent == 300,
+                    !result.changed && result.percent == 200,
                 "upper-bound wheel attempt remains visible to HUD routing");
-    result = gui_ui_zoom_process(&state, 75, true, 0.0f, -1.0f);
+    result = gui_ui_zoom_process(&state, 50, true, 0.0f, -1.0f);
     expect_true(result.consumed && result.step_attempted &&
-                    !result.changed && result.percent == 75,
+                    !result.changed && result.percent == 50,
                 "lower-bound wheel attempt remains visible to HUD routing");
-    result = gui_ui_zoom_process(&state, 75, true, 0.0f, 1.0f);
-    expect_true(result.changed && result.percent == 80,
-                "zooming in from 75 percent enters the 10-percent scale grid");
+    result = gui_ui_zoom_process(&state, 50, true, 0.0f, 1.0f);
+    expect_true(result.changed && result.percent == 60,
+                "zooming in from the 50 percent floor steps by 10");
 
     result = gui_ui_zoom_process(&state, 100, true, 0.75f, 0.0f);
     expect_true(!result.consumed && !result.changed,
@@ -417,6 +424,84 @@ int main(void)
                 "auto-follow is idle when the detected scale already applies");
     expect_true(!gui_ui_scale_should_follow(100, 200, false),
                 "a manually pinned scale is never overridden by auto-follow");
+
+    // --- desktop-relative zoom ----------------------------------------------
+
+    expect_true(gui_ui_zoom_sanitize_percent(50) == 50 &&
+                    gui_ui_zoom_sanitize_percent(200) == 200 &&
+                    gui_ui_zoom_sanitize_percent(130) == 130,
+                "zoom accepts 50-200 percent on the 10 percent grid");
+    expect_true(gui_ui_zoom_sanitize_percent(0) == 100,
+                "a zoom of 0 (no key saved yet) means 100 percent");
+    expect_true(gui_ui_zoom_sanitize_percent(40) == 100 &&
+                    gui_ui_zoom_sanitize_percent(210) == 100 &&
+                    gui_ui_zoom_sanitize_percent(75) == 100 &&
+                    gui_ui_zoom_sanitize_percent(-100) == 100,
+                "out-of-range or off-grid zoom falls back to 100 percent");
+    expect_true(gui_ui_zoom_parse_percent("150") == 150 &&
+                    gui_ui_zoom_parse_percent("50") == 50,
+                "a persisted zoom parses");
+    expect_true(gui_ui_zoom_parse_percent(NULL) == 100 &&
+                    gui_ui_zoom_parse_percent("") == 100 &&
+                    gui_ui_zoom_parse_percent("300") == 100 &&
+                    gui_ui_zoom_parse_percent("120junk") == 100 &&
+                    gui_ui_zoom_parse_percent("999999999999999999999") == 100,
+                "a malformed or out-of-range persisted zoom is 100 percent");
+    expect_true(gui_ui_zoom_step_percent(100, 1) == 110 &&
+                    gui_ui_zoom_step_percent(100, -1) == 90,
+                "zoom steps by 10 percent");
+    expect_true(gui_ui_zoom_step_percent(200, 1) == 200 &&
+                    gui_ui_zoom_step_percent(50, -1) == 50,
+                "zoom stops at its bounds");
+    expect_true(gui_ui_zoom_step_percent(60, -1) == 50 &&
+                    gui_ui_zoom_step_percent(130, 0) == 130,
+                "zoom steps down to the floor; a zero direction is a no-op");
+
+    // wm: a 2x GNOME desktop under XWayland. 100% zoom must draw at the size
+    // of every other app, i.e. 200% of the framebuffer -- not 100%, which
+    // was half size, nor 150%, which was three quarters.
+    expect_true(gui_ui_scale_effective_percent(200, 100) == 200,
+                "100 percent zoom on a 2x desktop draws at the desktop's size");
+    expect_true(gui_ui_scale_effective_percent(200, 150) == 300,
+                "150 percent zoom on a 2x desktop is 300 percent of the framebuffer");
+    expect_true(gui_ui_scale_effective_percent(200, 200) == 400,
+                "the largest zoom on a 2x desktop reaches the 400 percent ceiling");
+    expect_true(gui_ui_scale_effective_percent(100, 50) == 50,
+                "the smallest zoom on a 1x desktop reaches the 50 percent floor");
+    expect_true(gui_ui_scale_effective_percent(230, 110) == 253,
+                "an off-grid desktop scale gives an off-grid effective scale");
+    expect_true(gui_ui_scale_effective_percent(300, 200) == 400,
+                "the effective scale clamps to its ceiling");
+    expect_true(gui_ui_scale_effective_percent(0, 120) == 120 &&
+                    gui_ui_scale_effective_percent(-5, 120) == 120,
+                "an unknown desktop scale counts as 1x");
+    expect_true(gui_ui_scale_effective_percent(200, 0) == 200 &&
+                    gui_ui_scale_effective_percent(200, 37) == 200,
+                "an invalid zoom counts as 100 percent");
+    expect_true(gui_ui_scale_effective_percent(2000000000, 200) == 400,
+                "a wild desktop reading cannot overflow");
+    expect_true(gui_ui_scale_clamp_effective_percent(253) == 253 &&
+                    gui_ui_scale_clamp_effective_percent(10) == 50 &&
+                    gui_ui_scale_clamp_effective_percent(9999) == 400,
+                "the effective scale keeps any in-range value and clamps the rest");
+
+    // ui_scale_percent is what a pre-zoom build reads as the whole scale: it
+    // must land on that build's 75/80-300 grid or the build discards it.
+    expect_true(gui_ui_scale_legacy_percent(200) == 200,
+                "an on-grid effective scale is written as itself");
+    expect_true(gui_ui_scale_legacy_percent(253) == 250,
+                "an off-grid effective scale snaps to the old grid");
+    expect_true(gui_ui_scale_legacy_percent(400) == 300 &&
+                    gui_ui_scale_legacy_percent(50) == 75,
+                "an effective scale past the old range clamps into it");
+    for (int p = GUI_UI_SCALE_EFFECTIVE_MIN_PERCENT;
+         p <= GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT; p++) {
+        int legacy = gui_ui_scale_legacy_percent(p);
+        if (gui_ui_scale_sanitize_percent(legacy) != legacy) {
+            expect_true(0, "every effective scale is written as a value old builds accept");
+            break;
+        }
+    }
 
     if (failures != 0) {
         fprintf(stderr, "%d UI scale policy assertion(s) failed\n", failures);

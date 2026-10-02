@@ -72,6 +72,17 @@ Vector2 gui_ui_get_render_scale(void);
 // queries it must not depend on directly (that file is compiled standalone by
 // the CI guard). Safe to call every frame; requires an open window.
 int gui_ui_detect_display_scale_percent(void);
+// The effective scale percent last set (desktop x zoom).
+int gui_ui_get_scale_percent(void);
+// The desktop's scale as last detected. Applied only while the settings'
+// ui_scale_auto ("Follow desktop") is on; otherwise the desktop counts as 1x.
+void gui_ui_set_desktop_scale_percent(int percent);
+int gui_ui_get_desktop_scale_percent(void);
+// Sets the effective scale from settings->ui_zoom_percent on top of the
+// desktop scale, and mirrors it onto settings->ui_scale_percent for builds
+// that predate the desktop-relative zoom. The one way the scale changes.
+void gui_ui_apply_ui_scale(gui_settings_t *settings);
+// percent is the desktop-relative zoom.
 void gui_ui_show_scale_hud(int percent);
 int gui_ui_get_layout_width(void);
 int gui_ui_get_layout_height(void);

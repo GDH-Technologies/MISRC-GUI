@@ -3,8 +3,21 @@
 
 #include <stdbool.h>
 
+// The display-scale grid: what detection snaps to, and the range of the
+// persisted ui_scale_percent, which builds before the desktop-relative zoom
+// read as the whole scale and still do on a rollback.
 #define GUI_UI_SCALE_MIN_PERCENT 75
 #define GUI_UI_SCALE_MAX_PERCENT 300
+// The user's zoom is relative to the desktop's own scale: 100% draws at the
+// size every other app on the desktop does, whatever the display density.
+#define GUI_UI_ZOOM_MIN_PERCENT 50
+#define GUI_UI_ZOOM_MAX_PERCENT 200
+#define GUI_UI_ZOOM_DEFAULT_PERCENT 100
+// The effective scale, desktop x zoom, is what the renderer applies. 400% is
+// a 200% zoom on a 2x desktop; the 128px font atlas covers the 26px title
+// there (104px).
+#define GUI_UI_SCALE_EFFECTIVE_MIN_PERCENT 50
+#define GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT 400
 // Density the fixed pixel sizes throughout the UI were authored against, and
 // the millimetre conversion used to turn a monitor's physical size into one.
 #define GUI_UI_SCALE_REFERENCE_DPI 96.0f
@@ -86,20 +99,46 @@ int gui_ui_scale_from_display(float content_scale,
                               int monitor_mm_w,
                               float backing_scale);
 
-// Returns true when auto-follow should adopt a newly detected scale. A user who
-// has pinned the scale by zooming manually clears auto_enabled, so their choice
-// is never silently overridden when the window moves to another display.
+// Returns true when auto-follow should adopt a newly detected desktop scale.
+// Following is the "Follow desktop" setting; zooming never turns it off, since
+// the zoom is relative to whatever the desktop scale is.
 bool gui_ui_scale_should_follow(int applied_percent,
                                 int detected_percent,
                                 bool auto_enabled);
 
-// Applies one keyboard/wheel zoom step while preserving the special 75%-80%
-// transition and the configured scale bounds. A zero direction is a no-op.
+// Applies one step on the display-scale grid while preserving the special
+// 75%-80% transition and the grid's bounds. A zero direction is a no-op.
 int gui_ui_scale_step_percent(int current_percent, int direction);
 
-// Only the channel stats panel width grows by 60% of zoom above 100%.
-// Return its width relative to the globally scaled UI; text and controls
-// keep the global scale. Zoom-out and invalid values stay unchanged.
+// The desktop-relative zoom: 50-200% on the 10% grid. Anything else,
+// including 0 (no zoom saved yet), falls back to 100%.
+int gui_ui_zoom_sanitize_percent(int percent);
+
+// Parses a persisted zoom with the same strictness as
+// gui_ui_scale_parse_percent; malformed or out-of-range input returns 100%.
+int gui_ui_zoom_parse_percent(const char *text);
+
+// One keyboard/wheel/stepper zoom step, clamped to the zoom bounds. A zero
+// direction is a no-op.
+int gui_ui_zoom_step_percent(int current_percent, int direction);
+
+// The scale the renderer applies: desktop_percent x zoom_percent / 100,
+// rounded and clamped to the effective bounds. A non-positive desktop scale
+// counts as 100%, an invalid zoom as 100%.
+int gui_ui_scale_effective_percent(int desktop_percent, int zoom_percent);
+
+// Clamps an effective scale to its bounds. Unlike the display grid, any
+// integer in range is valid: a 230% panel at 110% zoom is 253%.
+int gui_ui_scale_clamp_effective_percent(int percent);
+
+// The effective scale snapped onto the display grid, for ui_scale_percent:
+// a build from before the desktop-relative zoom reads that key as the whole
+// scale and rejects anything off the grid.
+int gui_ui_scale_legacy_percent(int effective_percent);
+
+// Only the channel stats panel width grows by 60% of the effective scale
+// above 100%. Return its width relative to the globally scaled UI; text and
+// controls keep the global scale. Zoom-out and invalid values stay unchanged.
 float gui_ui_stats_width_scale(int percent);
 
 typedef struct gui_ui_channel_spacing {
@@ -154,7 +193,8 @@ bool gui_ui_status_uses_fault_summary(bool has_missed, bool has_errors,
                                       bool show_missed, bool show_errors);
 
 // Routes one frame of wheel input. Vertical Ctrl/Cmd+wheel is accumulated into
-// discrete scale steps and consumed so it cannot also scroll Clay or a panel.
+// discrete zoom steps and consumed so it cannot also scroll Clay or a panel.
+// current_percent and the result are the desktop-relative zoom.
 gui_ui_zoom_result_t gui_ui_zoom_process(gui_ui_zoom_state_t *state,
                                          int current_percent,
                                          bool primary_modifier_down,

@@ -728,18 +728,20 @@ int main(int argc, char **argv) {
     // report physical pixels while gui_ui_get_base_layout_width still treats
     // that number as logical -- leaving the UI exactly as small as it is now.
     // This app does its own scaling via rlScalef; raylib must stay out of it.
-    if (app.settings.ui_scale_auto) {
-        int detected = gui_ui_detect_display_scale_percent();
+    // The zoom is relative to the desktop's scale, so detect it even when
+    // Follow desktop is off: Settings shows it, and turning following back on
+    // applies it without waiting for the window to move.
+    {
+        int desktop = gui_ui_detect_display_scale_percent();
+        gui_ui_set_desktop_scale_percent(desktop);
+        gui_ui_apply_ui_scale(&app.settings);
         TraceLog(LOG_INFO, "DISPLAY: content scale %.2f, monitor %d (%dpx/%dmm)"
-                           " -> UI scale %d%%",
+                           " -> desktop %d%%%s, zoom %d%% -> UI scale %d%%",
                  (double)GetWindowScaleDPI().x, GetCurrentMonitor(),
                  GetMonitorWidth(GetCurrentMonitor()),
-                 GetMonitorPhysicalWidth(GetCurrentMonitor()), detected);
-        app.settings.ui_scale_percent = detected;
-        gui_ui_set_scale_percent(detected);
-    } else {
-        TraceLog(LOG_INFO, "DISPLAY: UI scale pinned at %d%% (auto-follow off)",
-                 app.settings.ui_scale_percent);
+                 GetMonitorPhysicalWidth(GetCurrentMonitor()), desktop,
+                 app.settings.ui_scale_auto ? "" : " (not followed)",
+                 app.settings.ui_zoom_percent, gui_ui_get_scale_percent());
     }
 
     // The stock 1425x720 is a logical extent, so a scaled UI needs a
@@ -782,7 +784,7 @@ int main(int argc, char **argv) {
                  want_width, want_height, monitor_width, monitor_height,
                  (int)((float)want_width / scale_factor),
                  (int)((float)want_height / scale_factor),
-                 app.settings.ui_scale_percent);
+                 gui_ui_get_scale_percent());
     }
     SetTargetFPS(60);
     SetExitKey(0);  // Disable escape key auto-close
@@ -981,7 +983,7 @@ int main(int argc, char **argv) {
     // Auto-follow tracks a candidate rather than applying immediately: a
     // window dragged across a monitor boundary would otherwise relayout on
     // every frame of the drag.
-    int ui_scale_auto_candidate = app.settings.ui_scale_percent;
+    int ui_scale_auto_candidate = gui_ui_get_desktop_scale_percent();
     double ui_scale_auto_deadline = 0.0;
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     double last_thread_promotion_time = 0.0;
@@ -1016,7 +1018,7 @@ int main(int argc, char **argv) {
         bool primary_modifier_down = gui_primary_modifier_down();
         gui_ui_zoom_result_t ui_zoom_result =
             gui_ui_zoom_process(&ui_zoom_state,
-                                app.settings.ui_scale_percent,
+                                app.settings.ui_zoom_percent,
                                 primary_modifier_down,
                                 wheel_delta.x,
                                 wheel_delta.y);
@@ -1035,27 +1037,24 @@ int main(int argc, char **argv) {
         if (keyboard_zoom_pressed) {
             ui_zoom_state.wheel_remainder = 0.0f;
             if (zoom_reset_pressed) {
-                ui_zoom_result.percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+                ui_zoom_result.percent = GUI_UI_ZOOM_DEFAULT_PERCENT;
             } else {
                 int direction = zoom_in_pressed ? 1 : -1;
                 ui_zoom_result.percent =
-                    gui_ui_scale_step_percent(app.settings.ui_scale_percent,
-                                              direction);
+                    gui_ui_zoom_step_percent(app.settings.ui_zoom_percent,
+                                             direction);
             }
         }
 
         ui_zoom_result.changed =
-            ui_zoom_result.percent != app.settings.ui_scale_percent;
+            ui_zoom_result.percent != app.settings.ui_zoom_percent;
 
         if (ui_zoom_result.changed) {
-            app.settings.ui_scale_percent = ui_zoom_result.percent;
-            gui_ui_set_scale_percent(ui_zoom_result.percent);
-            // Zooming by hand is a deliberate choice. Stop following the
-            // display so moving the window never overrides it; the Settings
-            // panel re-arms auto-follow.
-            app.settings.ui_scale_auto = false;
-            ui_scale_auto_deadline = 0.0;
-            ui_scale_auto_candidate = ui_zoom_result.percent;
+            // The zoom is relative to the desktop's scale, so following the
+            // desktop stays on: moving to another display keeps this zoom on
+            // top of that display's scale.
+            app.settings.ui_zoom_percent = ui_zoom_result.percent;
+            gui_ui_apply_ui_scale(&app.settings);
             last_layout_width = -1;
             last_layout_height = -1;
             ui_scale_save_pending = true;
@@ -1065,9 +1064,11 @@ int main(int argc, char **argv) {
         // Follow the display the window is on. Detection is a couple of GLFW
         // queries, so polling it is cheaper than tracking monitor changes, but
         // a change must hold for the debounce window before it is applied.
-        // This is layout-only and never touches the capture, extraction or
-        // display threads, so it is safe to let run mid-recording.
-        if (app.settings.ui_scale_auto) {
+        // It is tracked with following off too, so Settings shows the current
+        // desktop scale and re-arming applies it at once. This is layout-only
+        // and never touches the capture, extraction or display threads, so it
+        // is safe to let run mid-recording.
+        {
             int detected_percent = gui_ui_detect_display_scale_percent();
             if (detected_percent != ui_scale_auto_candidate) {
                 ui_scale_auto_candidate = detected_percent;
@@ -1075,19 +1076,18 @@ int main(int argc, char **argv) {
             } else if (ui_scale_auto_deadline > 0.0 &&
                        GetTime() >= ui_scale_auto_deadline) {
                 ui_scale_auto_deadline = 0.0;
-                if (gui_ui_scale_should_follow(app.settings.ui_scale_percent,
+                if (gui_ui_scale_should_follow(gui_ui_get_desktop_scale_percent(),
                                                detected_percent, true)) {
-                    app.settings.ui_scale_percent = detected_percent;
-                    gui_ui_set_scale_percent(detected_percent);
-                    last_layout_width = -1;
-                    last_layout_height = -1;
-                    gui_ui_show_scale_hud(detected_percent);
-                    ui_scale_save_pending = true;
-                    ui_scale_save_deadline = GetTime() + 0.4;
+                    gui_ui_set_desktop_scale_percent(detected_percent);
+                    if (app.settings.ui_scale_auto) {
+                        gui_ui_apply_ui_scale(&app.settings);
+                        last_layout_width = -1;
+                        last_layout_height = -1;
+                        ui_scale_save_pending = true;
+                        ui_scale_save_deadline = GetTime() + 0.4;
+                    }
                 }
             }
-        } else {
-            ui_scale_auto_deadline = 0.0;
         }
 
         if (show_ui_scale_hud) {

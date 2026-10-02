@@ -141,6 +141,7 @@ static const char *const s_transformed[] = {
     "audio_1ch_1_filename", "audio_1ch_2_filename", "audio_1ch_3_filename", "audio_1ch_4_filename",
     "net_server_port_str",     /* re-synced from the numeric port when empty */
     "level_autostop_level_str", /* legacy integer percent migrated to 0.X */
+    "ui_scale_auto",           /* a file without ui_zoom_percent starts following the desktop */
     NULL,
 };
 
@@ -255,6 +256,8 @@ int main(int argc, char **argv) {
           "renamed and array keys land in the right elements");
     check(strcmp(a.level_autostop_level_str, "0.45") == 0,
           "a legacy integer-percent level threshold (\"45\") migrates to the normalized 0.X form");
+    check(a.ui_zoom_percent == 100 && a.ui_scale_auto,
+          "a file from before the desktop-relative zoom (v1.1.8: 150, auto off) starts at 100% of the desktop, following it");
     check(strcmp(a.output_path, "C:\\Captures\\Tape 01") == 0, "a Windows path with backslashes loads verbatim");
     check(a.ui_scale_percent == 150 && a.memory_budget_gb == 9 && a.flac_level == 6 && a.rf_bits_a == 8 && a.rf_bits_b == 12,
           "numeric fixture values load");
@@ -299,6 +302,7 @@ int main(int argc, char **argv) {
     check(json_ok && structs_equal(&j1, &j2, "json"), "JSON snapshot -> find_value(json) -> apply_key restores every field");
     size_t nj_srv = gui_settings_to_json(&j1, GS_CLIENT_LOCAL | GS_WRITE_ONLY, json, sizeof(json));
     check(nj_srv > 0 && strstr(json, "\"net_mode\"") == NULL && strstr(json, "\"ui_scale_percent\"") == NULL
+              && strstr(json, "\"ui_zoom_percent\"") == NULL
               && strstr(json, "\"aux_filename\"") == NULL && strstr(json, "\"flac_level\"") != NULL,
           "exclude_flags drops client-local and write-only keys from the snapshot");
     char tiny[16];
@@ -314,6 +318,11 @@ int main(int argc, char **argv) {
     load_text(&c, "{\n  \"usbref_rtsp_encoder\": 7\n}\n"); check(c.usbref_rtsp_encoder == 0, "usbref_rtsp_encoder 7 -> 0");
     load_text(&c, "{\n  \"usbref_rtsp_bitrate_kbps\": 5\n}\n"); check(c.usbref_rtsp_bitrate_kbps == 0, "usbref_rtsp_bitrate_kbps 5 -> 0");
     load_text(&c, "{\n  \"ui_scale_percent\": junk\n}\n"); check(c.ui_scale_percent == 100, "ui_scale_percent junk -> default");
+    load_text(&c, "{\n  \"ui_zoom_percent\": 130,\n  \"ui_scale_auto\": false\n}\n");
+    check(c.ui_zoom_percent == 130 && !c.ui_scale_auto, "a saved zoom and Follow desktop off are kept, not migrated");
+    load_text(&c, "{\n  \"ui_zoom_percent\": junk,\n  \"ui_scale_auto\": false\n}\n");
+    check(c.ui_zoom_percent == 100 && !c.ui_scale_auto, "ui_zoom_percent junk -> 100, and is not mistaken for a pre-zoom file");
+    load_text(&c, "{\n  \"ui_zoom_percent\": 250\n}\n"); check(c.ui_zoom_percent == 100, "ui_zoom_percent 250 -> 100");
     load_text(&c, "{\n  \"net_mode\": 7\n}\n");            check(c.net_mode == 0, "net_mode 7 -> 0");
     load_text(&c, "{\n  \"net_server_port\": 70000\n}\n"); check(c.net_server_port == 8080 && strcmp(c.net_server_port_str, "8080") == 0, "net_server_port 70000 -> 8080 and mirror");
     /* The mirror is only re-synced when the file left it EMPTY; a file that
