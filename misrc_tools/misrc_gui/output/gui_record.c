@@ -12,7 +12,6 @@
 #include "gui_cc_record.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../core/gui_app.h"
-#include "../core/gui_session.h"
 #include "../processing/gui_extract.h"
 #include "../ui/gui_popup.h"
 #include "gui_audio.h"
@@ -2190,13 +2189,6 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     snprintf(msg, sizeof(msg), "Ingest metadata notes: %s",
              app->settings.ingest_notes[0] ? app->settings.ingest_notes : "(empty)");
     gui_record_log_write_line_locked("INFO", msg);
-    /* --session log tags: opaque caller-chosen pairs, in file order. */
-    for (size_t i = 0; i < gui_session_tag_count(); i++) {
-        const gui_session_tag_t *tag = gui_session_tag_at(i);
-        if (!tag) continue;
-        snprintf(msg, sizeof(msg), "Session tag %s: %s", tag->key, tag->value);
-        gui_record_log_write_line_locked("INFO", msg);
-    }
 
     if (app->settings.use_flac) {
         snprintf(msg, sizeof(msg), "FLAC settings: level=%d verify=%s threads=%d",

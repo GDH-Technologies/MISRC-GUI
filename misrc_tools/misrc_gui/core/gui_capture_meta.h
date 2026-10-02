@@ -36,7 +36,7 @@
 #define GUI_META_SHORT_CAP     32     /* format, tape_speed, video_system */
 #define GUI_META_NOTES_CAP     8192   /* notes (may hold \n \r \t) */
 #define GUI_META_OPERATOR_CAP  128    /* operator */
-#define GUI_META_INDEX_CAP     16     /* index as decimal text, "" = unset */
+#define GUI_META_INDEX_CAP     24     /* index as decimal text, "" = unset */
 #define GUI_META_PATH_CAP      1024   /* the --session file's path */
 
 /* The largest index accepted (2^53 - 1: exact in every JSON reader). */

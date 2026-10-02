@@ -36,6 +36,7 @@
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
 #include "gui_session.h"
+#include "gui_capture_meta.h"
 #include "../../common/threading.h"
 #include "version.h"
 
@@ -116,9 +117,11 @@ static void print_usage(const char *program_name) {
             "           location (useful for automated GUI testing).\n"
             "--session <path.json> pre-fills this run for one capture from a\n"
             "           \"misrc-gui.session/1\" file: output_path, output_base_name,\n"
-            "           ingest.* and log_tags (written to the capture log as\n"
-            "           \"Session tag <key>: <value>\"). Session values are never\n"
-            "           saved: the settings file keeps the operator's own.\n"
+            "           operator, and an \"asset\" that links the capture (read-only\n"
+            "           for the run; written to the capture log, the\n"
+            "           <base>_<date>_capture_meta.json sidecar and the RF FLAC\n"
+            "           tags). Session values are never saved: the settings file\n"
+            "           keeps the operator's own.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -711,17 +714,31 @@ int main(int argc, char **argv) {
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
 
-    // --session <path.json>: overlay one capture's fields in memory. A bad
-    // file is reported (stderr now, a popup on the first free frame) and the
-    // GUI starts exactly as it would without the flag.
+    // Capture metadata starts unlinked, operator = the OS login. It lives
+    // outside the settings: never saved, never sent to a net peer.
+    gui_capture_meta_init();
+
+    // --session <path.json>: overlay one capture's output fields in memory
+    // and link its asset. A bad file is reported (stderr now, a popup on the
+    // first free frame) and the GUI starts exactly as it would without the
+    // flag: saved settings, NOT linked.
     char session_error[320] = {0};
+    char session_status[640] = {0};
     if (session_flag) {
         char err[256] = {0};
         if (gui_session_apply_file(session_path, &app.settings, err, sizeof(err))) {
-            fprintf(stderr, "[SESSION] applied %s: output_path=%s output_base_name=%s, %u log tag(s);"
+            const gui_capture_meta_t *meta = gui_capture_meta_get();
+            fprintf(stderr, "[SESSION] applied %s: output_path=%s output_base_name=%s;"
                             " session values will not be saved\n",
-                    session_path, app.settings.output_path, app.settings.output_base_name,
-                    (unsigned)gui_session_tag_count());
+                    session_path, app.settings.output_path, app.settings.output_base_name);
+            if (meta->linked) {
+                snprintf(session_status, sizeof(session_status), "Linked: %s \xC2\xB7 %s (%s)",
+                         meta->client_name, meta->display_name, meta->asset_id);
+            } else {
+                snprintf(session_status, sizeof(session_status),
+                         "Session applied; not linked to an asset");
+            }
+            fprintf(stderr, "[SESSION] %s\n", session_status);
         } else {
             snprintf(session_error, sizeof(session_error), "%s", err);
             fprintf(stderr, "[SESSION] ERROR: session file not applied: %s\n", err);
@@ -1193,11 +1210,15 @@ int main(int argc, char **argv) {
             char session_msg[480];
             snprintf(session_msg, sizeof(session_msg),
                      "The --session file was not applied:\n\n%s\n\n"
-                     "The GUI started with your saved settings instead.\n"
-                     "Check the output folder, base name and ingest\n"
-                     "metadata before recording.", session_error);
+                     "The GUI started with your saved settings, and the\n"
+                     "capture is NOT linked to an asset. Check the output\n"
+                     "folder and base name before recording.", session_error);
             gui_popup_info("Session file rejected", session_msg);
-            gui_app_set_status(&app, "Session file rejected; using saved settings");
+            gui_app_set_status(&app, "Session file rejected; NOT linked to an asset");
+        }
+        if (session_status[0]) {
+            gui_app_set_status(&app, session_status);
+            session_status[0] = '\0';
         }
         // One-time startup warning: if FLAC threads is 0 (auto), warn once.
         // Uses a local bool so it fires only once per session, on the first

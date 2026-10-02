@@ -4394,11 +4394,15 @@ def check_session_launch_file_contract(repo_root: Path) -> int:
     if filter_pos < 0 or format_pos < 0 or filter_pos > format_pos:
         return fail("gui_settings.c: gui_settings_save() must run the persist filter on a copy "
                     "before formatting, or a --session overlay is saved over the operator's settings")
-    notes_pos = record_c.find('"Ingest metadata notes: %s"')
-    tag_pos = record_c.find('"Session tag %s: %s"')
-    if notes_pos < 0 or tag_pos < 0 or tag_pos < notes_pos:
-        return fail("gui_record.c: session log tags must be written as \"Session tag <key>: <value>\" "
-                    "after the ingest metadata block")
+    session_c = strip_c_comments(read_text(base / "core/gui_session.c"))
+    apply_pos = session_c.find("bool gui_session_apply(")
+    apply_body = session_c[apply_pos:session_c.find("\n}", apply_pos)] if apply_pos >= 0 else ""
+    if "gui_capture_meta_set_linked(" not in apply_body:
+        return fail("gui_session.c: gui_session_apply() must link the asset through "
+                    "gui_capture_meta_set_linked() (capture metadata lives outside the settings)")
+    if "Session tag" in record_c:
+        return fail("gui_record.c: the retired \"Session tag\" log lines are back; a session's asset "
+                    "reaches the log as \"Capture metadata <key>: <value>\"")
     return 0
 
 

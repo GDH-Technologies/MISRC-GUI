@@ -5,12 +5,15 @@
  *
  * The settings file is flat, so the settings loader's key finder
  * (gui_settings_find_value) cannot tell a top-level key from one inside
- * "ingest" or "log_tags", and cannot list an object's keys at all. The small
- * reader below walks exactly the shape this file has: one object of strings
- * and two nested objects of strings. Every overlaid value is then stored
- * through gui_settings_apply_key() in strict mode, the same validation a
- * network /set gets, so a session can never put a value in memory that the
- * settings table would refuse.
+ * "asset", cannot list an object's keys and has no types. The small reader
+ * below walks exactly this file's shape: one object of strings plus the
+ * "asset" object of strings, one integer-or-null and two
+ * boolean-or-null members. The asset's members are found through the
+ * capture-metadata descriptor table (gui_capture_meta_fields), so a field
+ * the table gains is a field this parser reads, with no list here to keep
+ * in step. Values that land in a setting (output_path, output_base_name)
+ * are stored through gui_settings_apply_key() in strict mode, the same
+ * validation a network /set gets.
  *
  * Licensed under GNU GPL v3 or later
  */
@@ -18,6 +21,7 @@
 #include "gui_session.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,34 +34,16 @@
 #define gui_session_getpid getpid
 #endif
 
-/* "ingest" member -> settings table key. Order is the log block's order. */
-static const struct {
-    const char *member;
-    const char *setting;
-} s_ingest_map[GUI_SESSION_INGEST_COUNT] = {
-    { "project",        "ingest_project" },
-    { "tape_id",        "ingest_tape_id" },
-    { "tape_format",    "ingest_tape_format" },
-    { "tape_size",      "ingest_tape_size" },
-    { "tape_speed",     "ingest_tape_speed" },
-    { "tape_condition", "ingest_tape_condition" },
-    { "operator",       "ingest_operator" },
-    { "location",       "ingest_location" },
-    { "notes",          "ingest_notes" },
-};
-
 /* ============================================================================
  * Module state
  * ============================================================================ */
-#define GUI_SESSION_MAX_OVERLAID (2 + GUI_SESSION_INGEST_COUNT)
+#define GUI_SESSION_MAX_OVERLAID 2   /* output_path, output_base_name */
 
 static bool s_active = false;
 static gui_settings_t *s_original = NULL;    /* the struct before the overlay */
 static const char *s_overlaid[GUI_SESSION_MAX_OVERLAID];  /* table keys */
 static size_t s_overlaid_count = 0;
 static bool s_base_name_overlaid = false;
-static size_t s_tag_count = 0;
-static gui_session_tag_t s_tags[GUI_SESSION_MAX_TAGS];
 
 static void set_err(char *err, size_t errcap, const char *fmt, ...) {
     if (!err || errcap == 0) return;
@@ -83,6 +69,15 @@ static void rd_fail(reader_t *r, const char *what) {
     if (r->err && r->errcap && !r->err[0]) {
         snprintf(r->err, r->errcap, "%s (at byte %ld)", what, (long)(r->p - r->start));
     }
+}
+
+static void rd_failf(reader_t *r, const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    rd_fail(r, msg);
 }
 
 static void rd_ws(reader_t *r) {
@@ -116,10 +111,9 @@ static int hex4(const char *p, const char *end) {
     return v;
 }
 
-static bool put_byte(char *out, size_t cap, size_t *len, unsigned char b, bool *too_long) {
-    if (*len + 1 >= cap) { *too_long = true; return true; }
+static void put_byte(char *out, size_t cap, size_t *len, unsigned char b, bool *too_long) {
+    if (*len + 1 >= cap) { *too_long = true; return; }
     out[(*len)++] = (char)b;
-    return true;
 }
 
 static void put_utf8(char *out, size_t cap, size_t *len, unsigned cp, bool *too_long) {
@@ -141,12 +135,11 @@ static void put_utf8(char *out, size_t cap, size_t *len, unsigned cp, bool *too_
 }
 
 /* Read a JSON string at r->p into out (decoded, NUL-terminated). Sets
- * *too_long when it did not fit; *has_ctrl when the DECODED text holds a
- * control character (a line break would split the capture log's line). */
-static bool rd_string(reader_t *r, char *out, size_t cap, bool *too_long, bool *has_ctrl) {
+ * *too_long when it did not fit. Raw control characters are not JSON and
+ * are refused here; escaped ones decode and are judged per field. */
+static bool rd_string(reader_t *r, char *out, size_t cap, bool *too_long) {
     size_t len = 0;
     *too_long = false;
-    *has_ctrl = false;
     rd_ws(r);
     if (r->p >= r->end || *r->p != '"') {
         rd_fail(r, "expected a string");
@@ -164,7 +157,6 @@ static bool rd_string(reader_t *r, char *out, size_t cap, bool *too_long, bool *
             return false;
         }
         if (c != '\\') {
-            if (c == 0x7F) *has_ctrl = true;
             put_byte(out, cap, &len, c, too_long);
             continue;
         }
@@ -202,7 +194,6 @@ static bool rd_string(reader_t *r, char *out, size_t cap, bool *too_long, bool *
                 rd_fail(r, "bad escape inside a string");
                 return false;
         }
-        if (cp < 0x20 || cp == 0x7F) *has_ctrl = true;
         put_utf8(out, cap, &len, cp, too_long);
     }
     rd_fail(r, "unterminated string");
@@ -217,8 +208,8 @@ static bool rd_skip_value(reader_t *r, int depth) {
     char c = *r->p;
     if (c == '"') {
         char scratch[8];
-        bool tl, hc;
-        return rd_string(r, scratch, sizeof(scratch), &tl, &hc);
+        bool tl;
+        return rd_string(r, scratch, sizeof(scratch), &tl);
     }
     if (c == '{' || c == '[') {
         char close = (c == '{') ? '}' : ']';
@@ -228,8 +219,8 @@ static bool rd_skip_value(reader_t *r, int depth) {
         for (;;) {
             if (c == '{') {
                 char scratch[8];
-                bool tl, hc;
-                if (!rd_string(r, scratch, sizeof(scratch), &tl, &hc)) return false;
+                bool tl;
+                if (!rd_string(r, scratch, sizeof(scratch), &tl)) return false;
                 if (!rd_expect(r, ':', "expected ':' after a key")) return false;
             }
             if (!rd_skip_value(r, depth + 1)) return false;
@@ -260,8 +251,8 @@ static bool rd_object(reader_t *r, member_fn fn, void *ctx) {
     if (r->p < r->end && *r->p == '}') { r->p++; return true; }
     for (;;) {
         char key[128];
-        bool too_long, has_ctrl;
-        if (!rd_string(r, key, sizeof(key), &too_long, &has_ctrl)) return false;
+        bool too_long;
+        if (!rd_string(r, key, sizeof(key), &too_long)) return false;
         if (too_long) { rd_fail(r, "a key is longer than 127 bytes"); return false; }
         if (!rd_expect(r, ':', "expected ':' after a key")) return false;
         if (!fn(r, key, ctx)) return false;
@@ -273,90 +264,186 @@ static bool rd_object(reader_t *r, member_fn fn, void *ctx) {
     }
 }
 
-/* A string-typed member, into out. where names it in errors. */
-static bool rd_member_string(reader_t *r, const char *where, char *out, size_t cap) {
+/* A bare word (true / false / null): the run of a-z at r->p. */
+static size_t rd_word(reader_t *r, char *out, size_t cap) {
     rd_ws(r);
-    if (r->p >= r->end || *r->p != '"') {
-        char msg[192];
-        snprintf(msg, sizeof(msg), "%s must be a string", where);
-        rd_fail(r, msg);
-        return false;
+    size_t n = 0;
+    while (r->p < r->end && *r->p >= 'a' && *r->p <= 'z') {
+        if (n + 1 < cap) out[n] = *r->p;
+        n++;
+        r->p++;
     }
-    bool too_long, has_ctrl;
-    if (!rd_string(r, out, cap, &too_long, &has_ctrl)) return false;
-    char msg[192];
-    if (too_long) {
-        snprintf(msg, sizeof(msg), "%s is longer than %u bytes", where, (unsigned)(cap - 1));
-        rd_fail(r, msg);
-        return false;
-    }
-    if (has_ctrl) {
-        snprintf(msg, sizeof(msg), "%s may not contain a control character (line break, tab, ...)", where);
-        rd_fail(r, msg);
-        return false;
-    }
-    return true;
+    if (cap) out[n < cap ? n : cap - 1] = '\0';
+    return n;
 }
 
+/* ============================================================================
+ * Field validation
+ * ============================================================================ */
 typedef struct {
     gui_session_data_t *data;
     bool has_schema;
+    unsigned top_seen;        /* bit per known top-level key */
+    uint32_t asset_seen;      /* bit per descriptor slot */
+    char *scratch;            /* decoded string values (file-sized) */
+    size_t scratch_cap;
 } parse_ctx_t;
 
-static bool on_ingest_member(reader_t *r, const char *key, void *vctx) {
-    parse_ctx_t *ctx = (parse_ctx_t *)vctx;
-    for (size_t i = 0; i < GUI_SESSION_INGEST_COUNT; i++) {
-        if (strcmp(key, s_ingest_map[i].member) != 0) continue;
-        char where[160];
-        snprintf(where, sizeof(where), "ingest.%s", key);
-        if (!rd_member_string(r, where, ctx->data->ingest[i], sizeof(ctx->data->ingest[i]))) return false;
-        ctx->data->has_ingest[i] = true;
-        return true;
+/* Validate a decoded string in place and copy it into out[cap]. `where`
+ * names the field in every refusal. Multiline fields keep \n \r \t and
+ * store CRLF as LF; every other control character is refused everywhere. */
+static bool take_string(reader_t *r, const char *where, char *value,
+                        char *out, size_t cap, bool multiline, bool id) {
+    size_t len = strlen(value);
+    if (!gui_capture_meta_utf8_valid(value, len)) {
+        rd_failf(r, "%s is not valid UTF-8", where);
+        return false;
     }
-    fprintf(stderr, "[SESSION] ignoring unknown key ingest.%s\n", key);
-    return rd_skip_value(r, 1);
-}
-
-static bool tag_key_ok(const char *k) {
-    size_t n = strlen(k);
-    if (n == 0 || n >= GUI_SESSION_TAG_KEY_MAX) return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = k[i];
-        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  c == '_' || c == '.' || c == '-';
-        if (!ok) return false;
+    if (multiline) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (value[i] == '\r' && value[i + 1] == '\n') continue;   /* CRLF -> LF */
+            value[w++] = value[i];
+        }
+        value[w] = '\0';
+        len = w;
     }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c >= 0x20 && c != 0x7F) continue;
+        if (multiline && (c == '\n' || c == '\r' || c == '\t')) continue;
+        rd_failf(r, multiline
+                     ? "%s may not contain a control character other than a line break or tab"
+                     : "%s may not contain a control character (line break, tab, ...)",
+                 where);
+        return false;
+    }
+    if (len >= cap) {
+        rd_failf(r, "%s is longer than %u bytes", where, (unsigned)(cap - 1));
+        return false;
+    }
+    if (id && len > 0) {
+        for (size_t i = 0; i < len; i++) {
+            char c = value[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '_' || c == '.' || c == '-';
+            if (!ok) {
+                rd_failf(r, "%s must be 1-%u characters of A-Z a-z 0-9 _ . -", where, (unsigned)(cap - 1));
+                return false;
+            }
+        }
+    }
+    memcpy(out, value, len + 1);
     return true;
 }
 
-static bool on_tag_member(reader_t *r, const char *key, void *vctx) {
-    parse_ctx_t *ctx = (parse_ctx_t *)vctx;
-    gui_session_data_t *d = ctx->data;
-    char msg[224];
-    if (!tag_key_ok(key)) {
-        snprintf(msg, sizeof(msg),
-                 "log_tags key \"%.80s\" must be 1-%d characters of A-Z a-z 0-9 _ . -",
-                 key, GUI_SESSION_TAG_KEY_MAX - 1);
-        rd_fail(r, msg);
+/* A string-typed member, decoded and validated into out[cap]. */
+static bool rd_member_string(reader_t *r, parse_ctx_t *ctx, const char *where,
+                             char *out, size_t cap, bool multiline, bool id) {
+    rd_ws(r);
+    if (r->p >= r->end || *r->p != '"') {
+        rd_failf(r, "%s must be a string", where);
         return false;
     }
-    for (size_t i = 0; i < d->tag_count; i++) {
-        if (strcmp(d->tags[i].key, key) == 0) {
-            snprintf(msg, sizeof(msg), "log_tags key \"%s\" appears twice", key);
-            rd_fail(r, msg);
-            return false;
+    bool too_long;
+    if (!rd_string(r, ctx->scratch, ctx->scratch_cap, &too_long)) return false;
+    if (too_long) {
+        rd_failf(r, "%s is longer than %u bytes", where, (unsigned)(cap - 1));
+        return false;
+    }
+    return take_string(r, where, ctx->scratch, out, cap, multiline, id);
+}
+
+static bool on_asset_member(reader_t *r, const char *key, void *vctx) {
+    parse_ctx_t *ctx = (parse_ctx_t *)vctx;
+    size_t n = 0;
+    const gui_capture_meta_field_t *fields = gui_capture_meta_fields(&n);
+    size_t slot = n;
+    for (size_t i = 0; i < n; i++) {
+        if (!(fields[i].flags & GUI_META_F_TOP_LEVEL) && strcmp(fields[i].key, key) == 0) {
+            slot = i;
+            break;
         }
     }
-    if (d->tag_count >= GUI_SESSION_MAX_TAGS) {
-        snprintf(msg, sizeof(msg), "more than %d log_tags", GUI_SESSION_MAX_TAGS);
-        rd_fail(r, msg);
+    if (slot == n) {
+        fprintf(stderr, "[SESSION] ignoring unknown key asset.%s\n", key);
+        return rd_skip_value(r, 1);
+    }
+    const gui_capture_meta_field_t *f = &fields[slot];
+    char where[96];
+    snprintf(where, sizeof(where), "asset.%s", f->key);
+    if (ctx->asset_seen & (1u << slot)) {
+        rd_failf(r, "%s appears twice", where);
         return false;
     }
-    gui_session_tag_t *t = &d->tags[d->tag_count];
-    snprintf(msg, sizeof(msg), "log_tags.%s", key);
-    if (!rd_member_string(r, msg, t->value, sizeof(t->value))) return false;
-    snprintf(t->key, sizeof(t->key), "%s", key);
-    d->tag_count++;
+    ctx->asset_seen |= 1u << slot;
+    gui_capture_meta_t *m = &ctx->data->asset;
+
+    if (f->type == GUI_META_STR) {
+        return rd_member_string(r, ctx, where, gui_capture_meta_str_mut(m, f), f->cap,
+                                (f->flags & GUI_META_F_MULTILINE) != 0,
+                                (f->flags & GUI_META_F_ID) != 0);
+    }
+    if (f->type == GUI_META_TRI) {
+        char word[8];
+        size_t wn = rd_word(r, word, sizeof(word));
+        int8_t v;
+        if (wn == 4 && strcmp(word, "true") == 0) v = GUI_META_TRI_TRUE;
+        else if (wn == 5 && strcmp(word, "false") == 0) v = GUI_META_TRI_FALSE;
+        else if (wn == 4 && strcmp(word, "null") == 0) v = GUI_META_TRI_UNSET;
+        else {
+            rd_failf(r, "%s must be true, false or null", where);
+            return false;
+        }
+        memcpy((char *)m + f->offset, &v, sizeof(v));
+        return true;
+    }
+    /* GUI_META_INDEX: a JSON integer >= 0, or null. */
+    char *out = gui_capture_meta_str_mut(m, f);
+    rd_ws(r);
+    if (r->p < r->end && *r->p == 'n') {
+        char word[8];
+        size_t wn = rd_word(r, word, sizeof(word));
+        if (wn == 4 && strcmp(word, "null") == 0) {
+            out[0] = '\0';
+            return true;
+        }
+    } else if (r->p < r->end && *r->p >= '0' && *r->p <= '9') {
+        const char *start = r->p;
+        while (r->p < r->end && *r->p >= '0' && *r->p <= '9') r->p++;
+        size_t digits = (size_t)(r->p - start);
+        bool fraction = r->p < r->end && (*r->p == '.' || *r->p == 'e' || *r->p == 'E');
+        bool leading_zero = digits > 1 && start[0] == '0';
+        if (!fraction && !leading_zero) {
+            uint64_t v = 0;
+            bool over = digits >= f->cap;
+            for (size_t i = 0; !over && i < digits; i++) {
+                unsigned d = (unsigned)(start[i] - '0');
+                if (v > (GUI_META_INDEX_MAX - d) / 10) over = true;
+                else v = v * 10 + d;
+            }
+            if (over) {
+                rd_failf(r, "%s is larger than %llu", where, (unsigned long long)GUI_META_INDEX_MAX);
+                return false;
+            }
+            snprintf(out, f->cap, "%llu", (unsigned long long)v);
+            return true;
+        }
+    }
+    rd_failf(r, "%s must be a non-negative integer or null", where);
+    return false;
+}
+
+/* Known top-level keys, one bit each (a duplicate is refused). */
+enum { TOP_SCHEMA = 1u << 0, TOP_OUTPUT_PATH = 1u << 1, TOP_BASE_NAME = 1u << 2,
+       TOP_OPERATOR = 1u << 3, TOP_ASSET = 1u << 4 };
+
+static bool top_once(reader_t *r, parse_ctx_t *ctx, unsigned bit, const char *key) {
+    if (ctx->top_seen & bit) {
+        rd_failf(r, "%s appears twice", key);
+        return false;
+    }
+    ctx->top_seen |= bit;
     return true;
 }
 
@@ -364,38 +451,47 @@ static bool on_top_member(reader_t *r, const char *key, void *vctx) {
     parse_ctx_t *ctx = (parse_ctx_t *)vctx;
     gui_session_data_t *d = ctx->data;
     if (strcmp(key, "schema") == 0) {
+        if (!top_once(r, ctx, TOP_SCHEMA, key)) return false;
         char schema[96];
-        if (!rd_member_string(r, "schema", schema, sizeof(schema))) return false;
+        if (!rd_member_string(r, ctx, "schema", schema, sizeof(schema), false, false)) return false;
         if (strcmp(schema, GUI_SESSION_SCHEMA) != 0) {
-            char msg[192];
-            snprintf(msg, sizeof(msg), "unsupported schema \"%s\" (this build reads \"%s\")",
-                     schema, GUI_SESSION_SCHEMA);
-            rd_fail(r, msg);
+            rd_failf(r, "unsupported schema \"%s\" (this build reads \"%s\")", schema, GUI_SESSION_SCHEMA);
             return false;
         }
         ctx->has_schema = true;
         return true;
     }
     if (strcmp(key, "output_path") == 0) {
-        if (!rd_member_string(r, "output_path", d->output_path, sizeof(d->output_path))) return false;
+        if (!top_once(r, ctx, TOP_OUTPUT_PATH, key)) return false;
+        if (!rd_member_string(r, ctx, "output_path", d->output_path, sizeof(d->output_path),
+                              false, false)) return false;
         d->has_output_path = true;
         return true;
     }
     if (strcmp(key, "output_base_name") == 0) {
-        if (!rd_member_string(r, "output_base_name", d->output_base_name, sizeof(d->output_base_name))) return false;
+        if (!top_once(r, ctx, TOP_BASE_NAME, key)) return false;
+        if (!rd_member_string(r, ctx, "output_base_name", d->output_base_name,
+                              sizeof(d->output_base_name), false, false)) return false;
         d->has_output_base_name = true;
         return true;
     }
-    if (strcmp(key, "ingest") == 0) {
-        rd_ws(r);
-        if (r->p >= r->end || *r->p != '{') { rd_fail(r, "ingest must be an object"); return false; }
-        return rd_object(r, on_ingest_member, ctx);
+    if (strcmp(key, "operator") == 0) {
+        if (!top_once(r, ctx, TOP_OPERATOR, key)) return false;
+        const gui_capture_meta_field_t *f = gui_capture_meta_find_field("operator");
+        if (!rd_member_string(r, ctx, "operator", d->operator_name, f ? f->cap : sizeof(d->operator_name),
+                              false, false)) return false;
+        d->has_operator = true;
+        return true;
     }
-    if (strcmp(key, "log_tags") == 0) {
+    if (strcmp(key, "asset") == 0) {
+        if (!top_once(r, ctx, TOP_ASSET, key)) return false;
         rd_ws(r);
-        if (r->p >= r->end || *r->p != '{') { rd_fail(r, "log_tags must be an object"); return false; }
-        return rd_object(r, on_tag_member, ctx);
+        if (r->p >= r->end || *r->p != '{') { rd_fail(r, "asset must be an object"); return false; }
+        if (!rd_object(r, on_asset_member, ctx)) return false;
+        d->has_asset = true;
+        return true;
     }
+    /* Includes the retired "ingest" and "log_tags". */
     fprintf(stderr, "[SESSION] ignoring unknown key %s\n", key);
     return rd_skip_value(r, 1);
 }
@@ -408,35 +504,51 @@ bool gui_session_parse_text(const char *text, gui_session_data_t *out,
         return false;
     }
     memset(out, 0, sizeof(*out));
-    reader_t r = { text, text, text + strlen(text), err, errcap };
+    out->asset.hifi_audio_equipped = GUI_META_TRI_UNSET;
+    out->asset.black_and_white = GUI_META_TRI_UNSET;
+    size_t text_len = strlen(text);
+    reader_t r = { text, text, text + text_len, err, errcap };
     /* A UTF-8 byte order mark is not JSON, but editors write one. */
     if (r.end - r.p >= 3 && (unsigned char)r.p[0] == 0xEF &&
         (unsigned char)r.p[1] == 0xBB && (unsigned char)r.p[2] == 0xBF) {
         r.p += 3;
     }
-    parse_ctx_t ctx = { out, false };
+    /* Every decoded string fits in the file it came from. */
+    parse_ctx_t ctx = { out, false, 0, 0, malloc(text_len + 1), text_len + 1 };
+    if (!ctx.scratch) {
+        set_err(err, errcap, "out of memory");
+        return false;
+    }
+    bool ok = false;
     rd_ws(&r);
     if (r.p >= r.end || *r.p != '{') {
         rd_fail(&r, "not a JSON object");
-        memset(out, 0, sizeof(*out));
-        return false;
+    } else if (rd_object(&r, on_top_member, &ctx)) {
+        rd_ws(&r);
+        if (r.p != r.end) {
+            rd_fail(&r, "trailing text after the JSON object");
+        } else if (!ctx.has_schema) {
+            set_err(err, errcap, "missing \"schema\" (expected \"%s\")", GUI_SESSION_SCHEMA);
+        } else {
+            ok = true;
+        }
     }
-    if (!rd_object(&r, on_top_member, &ctx)) {
-        memset(out, 0, sizeof(*out));
-        return false;
+    if (ok && out->has_asset) {
+        /* An asset is all of its required fields or it is refused. */
+        size_t n = 0;
+        const gui_capture_meta_field_t *fields = gui_capture_meta_fields(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (!(fields[i].flags & GUI_META_F_REQUIRED_LINKED)) continue;
+            if (fields[i].type == GUI_META_STR && gui_capture_meta_str(&out->asset, &fields[i])[0]) continue;
+            set_err(err, errcap, "asset.%s is required (non-empty) when an asset is given",
+                    fields[i].key);
+            ok = false;
+            break;
+        }
     }
-    rd_ws(&r);
-    if (r.p != r.end) {
-        rd_fail(&r, "trailing text after the JSON object");
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    if (!ctx.has_schema) {
-        set_err(err, errcap, "missing \"schema\" (expected \"%s\")", GUI_SESSION_SCHEMA);
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    return true;
+    free(ctx.scratch);
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
 }
 
 /* ============================================================================
@@ -487,12 +599,10 @@ void gui_session_clear(void) {
     s_active = false;
     s_overlaid_count = 0;
     s_base_name_overlaid = false;
-    s_tag_count = 0;
-    memset(s_tags, 0, sizeof(s_tags));
 }
 
 bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
-                       char *err, size_t errcap) {
+                       const char *session_path, char *err, size_t errcap) {
     if (err && errcap) err[0] = '\0';
     if (!data || !settings) {
         set_err(err, errcap, "nothing to apply");
@@ -508,7 +618,8 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
     }
 
     /* Build the overlaid struct on the side, so a refused value leaves the
-     * live settings exactly as loaded. */
+     * live settings exactly as loaded. The capture metadata was validated
+     * whole by the parser and is committed last, after nothing can fail. */
     gui_settings_t *next = malloc(sizeof(*next));
     gui_settings_t *orig = malloc(sizeof(*orig));
     if (!next || !orig) {
@@ -523,30 +634,16 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
     const char *overlaid[GUI_SESSION_MAX_OVERLAID];
     size_t n_overlaid = 0;
     char why[128];
-
-    /* Slot 0 output_path, 1 output_base_name, 2.. the ingest map. */
+    const struct { bool present; const char *key; const char *value; } slots[GUI_SESSION_MAX_OVERLAID] = {
+        { data->has_output_path,      "output_path",      data->output_path },
+        { data->has_output_base_name, "output_base_name", data->output_base_name },
+    };
     for (size_t i = 0; i < GUI_SESSION_MAX_OVERLAID; i++) {
-        bool present;
-        const char *setting, *value, *name;
-        if (i == 0) {
-            present = data->has_output_path;
-            setting = name = "output_path";
-            value = data->output_path;
-        } else if (i == 1) {
-            present = data->has_output_base_name;
-            setting = name = "output_base_name";
-            value = data->output_base_name;
-        } else {
-            present = data->has_ingest[i - 2];
-            setting = s_ingest_map[i - 2].setting;
-            name = s_ingest_map[i - 2].member;
-            value = data->ingest[i - 2];
-        }
-        if (!present) continue;
-        const gui_setting_desc_t *d = gui_settings_find(setting);
-        if (!d || gui_settings_apply_key(next, setting, value, true, why, sizeof(why)) != 0) {
-            set_err(err, errcap, "%s%s: %s", (i >= 2) ? "ingest." : "", name,
-                    (d && why[0]) ? why : "refused");
+        if (!slots[i].present) continue;
+        const gui_setting_desc_t *d = gui_settings_find(slots[i].key);
+        why[0] = '\0';
+        if (!d || gui_settings_apply_key(next, slots[i].key, slots[i].value, true, why, sizeof(why)) != 0) {
+            set_err(err, errcap, "%s: %s", slots[i].key, (d && why[0]) ? why : "refused");
             free(next);
             free(orig);
             return false;
@@ -561,7 +658,7 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
         gui_settings_refresh_auto_names(next);
     }
 
-    /* Commit. */
+    /* Commit: settings overlay first, then the capture metadata. */
     gui_session_clear();
     *settings = *next;
     free(next);
@@ -569,10 +666,17 @@ bool gui_session_apply(const gui_session_data_t *data, gui_settings_t *settings,
     memcpy(s_overlaid, overlaid, n_overlaid * sizeof(overlaid[0]));
     s_overlaid_count = n_overlaid;
     s_base_name_overlaid = data->has_output_base_name;
-    s_tag_count = data->tag_count;
-    memcpy(s_tags, data->tags, data->tag_count * sizeof(data->tags[0]));
     s_active = true;
     gui_settings_set_persist_filter(session_persist_filter);
+
+    const char *op = data->has_operator ? data->operator_name : "";
+    if (data->has_asset) {
+        gui_capture_meta_t linked = data->asset;
+        snprintf(linked.operator_name, sizeof(linked.operator_name), "%s", op);
+        gui_capture_meta_set_linked(&linked, session_path);
+    } else {
+        gui_capture_meta_set_unlinked_session(op, session_path);
+    }
     return true;
 }
 
@@ -621,7 +725,7 @@ bool gui_session_apply_file(const char *path, gui_settings_t *settings,
         return false;
     }
     bool ok = gui_session_parse_text(text, data, err, errcap) &&
-              gui_session_apply(data, settings, err, errcap);
+              gui_session_apply(data, settings, path, err, errcap);
     free(data);
     free(text);
     return ok;
@@ -629,15 +733,6 @@ bool gui_session_apply_file(const char *path, gui_settings_t *settings,
 
 bool gui_session_active(void) {
     return s_active;
-}
-
-size_t gui_session_tag_count(void) {
-    return s_active ? s_tag_count : 0;
-}
-
-const gui_session_tag_t *gui_session_tag_at(size_t index) {
-    if (!s_active || index >= s_tag_count) return NULL;
-    return &s_tags[index];
 }
 
 /* ============================================================================
@@ -668,7 +763,8 @@ static char *st_read(const char *path) {
     return buf;
 }
 
-/* A rejected file must leave the settings and the module untouched. */
+/* A rejected file must leave the settings, the capture metadata and the
+ * module untouched. */
 static void st_expect_rejected(const char *label, const char *path, const char *text,
                                gui_settings_t *settings) {
     if (text && !st_write(path, text)) {
@@ -677,16 +773,36 @@ static void st_expect_rejected(const char *label, const char *path, const char *
         return;
     }
     gui_settings_t *before = malloc(sizeof(*before));
-    if (!before) { s_failures++; return; }
+    gui_capture_meta_t *meta_before = malloc(sizeof(*meta_before));
+    if (!before || !meta_before) { free(before); free(meta_before); s_failures++; return; }
     *before = *settings;
+    gui_capture_meta_snapshot(meta_before);
+    bool active_before = gui_session_active();
     char err[256];
     bool ok = gui_session_apply_file(path, settings, err, sizeof(err));
     ST_CHECK(!ok, "%s: accepted, must be rejected", label);
     ST_CHECK(err[0] != '\0', "%s: rejected without a reason", label);
     ST_CHECK(memcmp(before, settings, sizeof(*before)) == 0, "%s: a rejected file changed the settings", label);
-    ST_CHECK(!gui_session_active(), "%s: a rejected file activated a session", label);
-    if (!ok) printf("  rejected %-28s -> %s\n", label, err);
+    ST_CHECK(memcmp(meta_before, gui_capture_meta_get(), sizeof(*meta_before)) == 0,
+             "%s: a rejected file changed the capture metadata", label);
+    ST_CHECK(gui_session_active() == active_before, "%s: a rejected file changed the session state", label);
+    if (!ok) printf("  rejected %-30s -> %s\n", label, err);
     free(before);
+    free(meta_before);
+}
+
+/* A valid linked asset, with `extra` spliced in after the required fields
+ * (it must start with ", " or be empty) and the given asset_id literal. */
+static char *st_asset_session(const char *asset_id_json, const char *extra) {
+    size_t cap = 1024 + strlen(extra);
+    char *s = malloc(cap);
+    if (!s) return NULL;
+    snprintf(s, cap,
+             "{\"schema\": \"misrc-gui.session/1\", \"asset\": {"
+             "\"asset_id\": %s, \"client_id\": \"c1\", \"client_name\": \"Client\", "
+             "\"display_name\": \"Title\", \"label\": \"Tape 1\", \"format\": \"VHS\"%s}}",
+             asset_id_json, extra);
+    return s;
 }
 
 int gui_session_selftest_main(void) {
@@ -713,6 +829,7 @@ int gui_session_selftest_main(void) {
     /* Never the live settings file, whatever else is on the command line. */
     gui_settings_set_override_path(cfg_path);
     gui_session_clear();
+    gui_capture_meta_init();
     printf("settings file: %s (scratch)\n", cfg_path);
     printf("session file:  %s (scratch)\n", ses_path);
 
@@ -724,6 +841,7 @@ int gui_session_selftest_main(void) {
         printf("SESSION SELFTEST FAILED: out of memory\n");
         return 1;
     }
+    const gui_capture_meta_t *meta = gui_capture_meta_get();
 
     /* 1. The operator's own settings, unlike any session value. Manual file
      *    names (auto naming off) are the hard case for the base-name rule. */
@@ -733,14 +851,10 @@ int gui_session_selftest_main(void) {
     live->auto_names_enabled = false;
     snprintf(live->output_filename_a, sizeof(live->output_filename_a), "manual_a.flac");
     snprintf(live->output_filename_b, sizeof(live->output_filename_b), "manual_b.flac");
-    snprintf(live->ingest_project, sizeof(live->ingest_project), "Operator Project");
-    snprintf(live->ingest_operator, sizeof(live->ingest_operator), "Operator Name");
-    snprintf(live->ingest_notes, sizeof(live->ingest_notes), "operator notes");
-    live->ingest_tape_id[0] = '\0';
-    live->ingest_location[0] = '\0';
+    snprintf(live->ffmpeg_path, sizeof(live->ffmpeg_path), "/opt/operator/ffmpeg");
     gui_settings_save(live);
 
-    /* 2. Load them back the way main() does, then apply a session. */
+    /* 2. Load them back the way main() does, then apply a linked session. */
     memset(live, 0, sizeof(*live));
     gui_settings_load(live);
     ST_CHECK(strcmp(live->output_path, "/operator/captures") == 0, "baseline did not round-trip (output_path=%s)", live->output_path);
@@ -751,12 +865,17 @@ int gui_session_selftest_main(void) {
         "  \"schema\": \"misrc-gui.session/1\",\n"
         "  \"output_path\": \"/session/out\",\n"
         "  \"output_base_name\": \"Session_Tape\",\n"
+        "  \"operator\": \"Session Operator\",\n"
         "  \"future_key\": {\"nested\": [1, 2.5, true, null, \"x\"]},\n"
-        "  \"ingest\": {\"project\": \"Session Project\", \"tape_id\": \"T-001\",\n"
-        "             \"tape_format\": \"VHS\", \"tape_speed\": \"SP\",\n"
-        "             \"notes\": \"caf\\u00e9 \\/ \\\\ \\ud83d\\udcfc\", \"not_a_field\": 3},\n"
-        "  \"log_tags\": {\"asset_id\": \"a_019\", \"output_path\": \"tag, not a setting\",\n"
-        "               \"hifi.equipped\": \"false\"}\n"
+        "  \"ingest\": {\"project\": \"retired\"},\n"
+        "  \"log_tags\": {\"asset_id\": \"retired\"},\n"
+        "  \"asset\": {\"asset_id\": \"asset_019abc\", \"client_id\": \"client.7\",\n"
+        "            \"client_name\": \"Kuhn Family\", \"display_name\": \"Christmas 1994\",\n"
+        "            \"index\": 3, \"label\": \"Tape 3 \\\"VHS-C\\\"\", \"format\": \"VHS\",\n"
+        "            \"tape_speed\": \"SP\", \"video_system\": \"\",\n"
+        "            \"hifi_audio_equipped\": true, \"black_and_white\": null,\n"
+        "            \"notes\": \"caf\\u00e9 \\/ \\\\ \\ud83d\\udcfc\\r\\nline 2\\ttab\",\n"
+        "            \"not_a_field\": 3}\n"
         "}\n";
     if (!st_write(ses_path, session_text)) {
         printf("FAIL: cannot write %s\n", ses_path);
@@ -764,67 +883,66 @@ int gui_session_selftest_main(void) {
     }
     char err[256];
     bool applied = gui_session_apply_file(ses_path, live, err, sizeof(err));
-    ST_CHECK(applied, "valid session rejected: %s", err);
+    ST_CHECK(applied, "valid linked session rejected: %s", err);
     ST_CHECK(gui_session_active(), "session not active after apply");
 
-    /* 3. The overlay is what is in memory. */
+    /* 3. The overlay and the link are what is in memory. */
     ST_CHECK(strcmp(live->output_path, "/session/out") == 0, "output_path not overlaid (%s)", live->output_path);
     ST_CHECK(strcmp(live->output_base_name, "Session_Tape") == 0, "output_base_name not overlaid (%s)", live->output_base_name);
     ST_CHECK(live->auto_names_enabled, "auto naming not turned on for the session's base name");
     ST_CHECK(strstr(live->output_filename_a, "Session_Tape") != NULL, "derived name ignores the base name (%s)", live->output_filename_a);
-    ST_CHECK(strcmp(live->ingest_project, "Session Project") == 0, "ingest.project not overlaid (%s)", live->ingest_project);
-    ST_CHECK(strcmp(live->ingest_tape_id, "T-001") == 0, "ingest.tape_id not overlaid");
-    ST_CHECK(strcmp(live->ingest_tape_format, "VHS") == 0, "ingest.tape_format not overlaid");
-    ST_CHECK(strcmp(live->ingest_tape_speed, "SP") == 0, "ingest.tape_speed not overlaid");
-    ST_CHECK(strcmp(live->ingest_notes, "caf\xC3\xA9 / \\ \xF0\x9F\x93\xBC") == 0, "ingest.notes escapes decoded wrong (%s)", live->ingest_notes);
-    ST_CHECK(strcmp(live->ingest_operator, "Operator Name") == 0, "an absent ingest key was overlaid");
-    ST_CHECK(gui_session_tag_count() == 3, "expected 3 log tags, got %u", (unsigned)gui_session_tag_count());
-    {
-        const gui_session_tag_t *t0 = gui_session_tag_at(0);
-        const gui_session_tag_t *t1 = gui_session_tag_at(1);
-        const gui_session_tag_t *t2 = gui_session_tag_at(2);
-        ST_CHECK(t0 && strcmp(t0->key, "asset_id") == 0 && strcmp(t0->value, "a_019") == 0, "log tag 0 wrong");
-        ST_CHECK(t1 && strcmp(t1->key, "output_path") == 0, "log tag 1 out of order");
-        ST_CHECK(t2 && strcmp(t2->key, "hifi.equipped") == 0 && strcmp(t2->value, "false") == 0, "log tag 2 wrong");
-    }
-    printf("  overlay: output_path=%s base=%s rfA=%s tags=%u\n",
-           live->output_path, live->output_base_name, live->output_filename_a,
-           (unsigned)gui_session_tag_count());
+    ST_CHECK(meta->linked, "the asset did not link the capture");
+    ST_CHECK(strcmp(meta->asset_id, "asset_019abc") == 0, "asset_id not linked (%s)", meta->asset_id);
+    ST_CHECK(strcmp(meta->client_id, "client.7") == 0, "client_id not linked");
+    ST_CHECK(strcmp(meta->client_name, "Kuhn Family") == 0, "client_name not linked");
+    ST_CHECK(strcmp(meta->display_name, "Christmas 1994") == 0, "display_name not linked");
+    ST_CHECK(strcmp(meta->index_text, "3") == 0, "index not linked (%s)", meta->index_text);
+    ST_CHECK(strcmp(meta->label, "Tape 3 \"VHS-C\"") == 0, "label with quotes not linked (%s)", meta->label);
+    ST_CHECK(strcmp(meta->format, "VHS") == 0 && strcmp(meta->tape_speed, "SP") == 0, "format/tape_speed not linked");
+    ST_CHECK(meta->video_system[0] == '\0', "an empty optional string is not empty");
+    ST_CHECK(meta->hifi_audio_equipped == GUI_META_TRI_TRUE, "hifi true not linked");
+    ST_CHECK(meta->black_and_white == GUI_META_TRI_UNSET, "black_and_white null is not unset");
+    ST_CHECK(strcmp(meta->notes, "caf\xC3\xA9 / \\ \xF0\x9F\x93\xBC\nline 2\ttab") == 0,
+             "notes escapes/CRLF decoded wrong (%s)", meta->notes);
+    ST_CHECK(strcmp(meta->operator_name, "Session Operator") == 0 &&
+             meta->operator_source == GUI_META_OPERATOR_SESSION, "session operator not taken");
+    ST_CHECK(strcmp(meta->session_file, ses_path) == 0, "session_file not recorded (%s)", meta->session_file);
+    printf("  linked: %s / %s (%s) index=%s operator=%s\n", meta->client_name, meta->display_name,
+           meta->asset_id, meta->index_text, meta->operator_name);
 
     /* 4. The operator edits during the session: one overlaid field (session-
      *    scoped, must NOT persist) and one ordinary field (must persist). */
-    snprintf(live->ingest_notes, sizeof(live->ingest_notes), "edited during the session");
-    snprintf(live->ingest_location, sizeof(live->ingest_location), "Bench 2");
+    snprintf(live->output_path, sizeof(live->output_path), "/edited/during/session");
+    snprintf(live->ffmpeg_path, sizeof(live->ffmpeg_path), "/opt/edited/ffmpeg");
     gui_settings_save(live);
-    ST_CHECK(strcmp(live->output_path, "/session/out") == 0, "saving changed the overlay in memory");
+    ST_CHECK(strcmp(live->output_path, "/edited/during/session") == 0, "saving changed the overlay in memory");
 
-    /* 5. The file holds the operator's values for every overlaid key. */
+    /* 5. The file holds the operator's values for every overlaid key, and
+     *    nothing of the asset (capture metadata is never a setting). */
     gui_settings_load(disk);
     ST_CHECK(strcmp(disk->output_path, "/operator/captures") == 0, "output_path persisted the overlay (%s)", disk->output_path);
     ST_CHECK(strcmp(disk->output_base_name, "OperatorBase") == 0, "output_base_name persisted the overlay (%s)", disk->output_base_name);
     ST_CHECK(!disk->auto_names_enabled, "auto_names_enabled persisted the session's forced on");
     ST_CHECK(strcmp(disk->output_filename_a, "manual_a.flac") == 0, "manual RF A name lost (%s)", disk->output_filename_a);
     ST_CHECK(strcmp(disk->output_filename_b, "manual_b.flac") == 0, "manual RF B name lost (%s)", disk->output_filename_b);
-    ST_CHECK(strcmp(disk->ingest_project, "Operator Project") == 0, "ingest_project persisted the overlay (%s)", disk->ingest_project);
-    ST_CHECK(disk->ingest_tape_id[0] == '\0', "ingest_tape_id persisted the overlay (%s)", disk->ingest_tape_id);
-    ST_CHECK(disk->ingest_tape_format[0] == '\0', "ingest_tape_format persisted the overlay (%s)", disk->ingest_tape_format);
-    ST_CHECK(strcmp(disk->ingest_notes, "operator notes") == 0, "an overlaid field's in-session edit persisted (%s)", disk->ingest_notes);
-    ST_CHECK(strcmp(disk->ingest_location, "Bench 2") == 0, "an ordinary field's edit did not persist (%s)", disk->ingest_location);
+    ST_CHECK(strcmp(disk->ffmpeg_path, "/opt/edited/ffmpeg") == 0, "an ordinary field's edit did not persist (%s)", disk->ffmpeg_path);
     char *raw = st_read(cfg_path);
     ST_CHECK(raw != NULL, "cannot read back %s", cfg_path);
     if (raw) {
         ST_CHECK(strstr(raw, "Session_Tape") == NULL, "the session base name leaked into the file");
         ST_CHECK(strstr(raw, "/session/out") == NULL, "the session output_path leaked into the file");
-        ST_CHECK(strstr(raw, "Session Project") == NULL, "the session ingest value leaked into the file");
+        ST_CHECK(strstr(raw, "Kuhn Family") == NULL && strstr(raw, "asset_019abc") == NULL,
+                 "the asset leaked into the settings file");
         free(raw);
     }
-    printf("  on disk: output_path=%s base=%s auto_names=%d rfA=%s notes=%s location=%s\n",
+    printf("  on disk: output_path=%s base=%s auto_names=%d rfA=%s ffmpeg=%s\n",
            disk->output_path, disk->output_base_name, (int)disk->auto_names_enabled,
-           disk->output_filename_a, disk->ingest_notes, disk->ingest_location);
+           disk->output_filename_a, disk->ffmpeg_path);
 
     /* 6. With auto naming on in the operator's file, the restored derived
      *    names come from the operator's base name, not the session's. */
     gui_session_clear();
+    gui_capture_meta_init();
     gui_settings_load(live);
     live->auto_names_enabled = true;
     gui_settings_refresh_auto_names(live);
@@ -836,10 +954,116 @@ int gui_session_selftest_main(void) {
     gui_settings_load(disk);
     ST_CHECK(disk->auto_names_enabled, "auto naming lost on the second pass");
     ST_CHECK(strstr(disk->output_filename_a, "OperatorBase") != NULL, "auto name not rederived from the operator's base (%s)", disk->output_filename_a);
-    gui_session_clear();
 
-    /* 7. Every bad file is refused whole, and changes nothing. */
+    /* 7. A valid asset-less session: settings overlay, operator, no link. */
+    gui_session_clear();
+    gui_capture_meta_init();
     gui_settings_load(live);
+    if (!st_write(ses_path, "{\"schema\": \"misrc-gui.session/1\", \"output_path\": \"/asset/less\", "
+                            "\"operator\": \"Night Shift\"}")) {
+        printf("FAIL: cannot write %s\n", ses_path);
+        s_failures++;
+    }
+    applied = gui_session_apply_file(ses_path, live, err, sizeof(err));
+    ST_CHECK(applied, "valid asset-less session rejected: %s", err);
+    ST_CHECK(!meta->linked, "an asset-less session linked the capture");
+    ST_CHECK(meta->asset_id[0] == '\0', "an asset-less session set an asset_id");
+    ST_CHECK(strcmp(meta->operator_name, "Night Shift") == 0 && meta->operator_source == GUI_META_OPERATOR_SESSION,
+             "asset-less session operator not taken");
+    ST_CHECK(strcmp(meta->session_file, ses_path) == 0, "asset-less session_file not recorded");
+    ST_CHECK(strcmp(live->output_path, "/asset/less") == 0, "asset-less output_path not overlaid");
+
+    /* 8. Boundaries: notes of exactly 8191 bytes (CRLF stored as LF) and the
+     *    largest index are accepted; one byte more is refused below. */
+    {
+        /* 8190 bytes + CRLF: 8192 as sent, 8191 once CRLF is stored as LF. */
+        size_t notes_cap = GUI_META_NOTES_CAP - 1;
+        char *extra = malloc(notes_cap + 128);
+        if (extra) {
+            int at = snprintf(extra, notes_cap + 128, ", \"index\": 9007199254740991, \"notes\": \"");
+            memset(extra + at, 'n', notes_cap - 1);
+            snprintf(extra + at + notes_cap - 1, 32, "\\r\\n\"");
+            char *text = st_asset_session("\"a_cap\"", extra);
+            gui_session_clear();
+            gui_capture_meta_init();
+            ST_CHECK(text && st_write(ses_path, text), "cannot write the boundary session");
+            applied = gui_session_apply_file(ses_path, live, err, sizeof(err));
+            ST_CHECK(applied, "notes at the cap / the largest index rejected: %s", err);
+            ST_CHECK(strlen(meta->notes) == notes_cap && meta->notes[notes_cap - 1] == '\n',
+                     "notes at the cap stored wrong (len %zu)", strlen(meta->notes));
+            ST_CHECK(strcmp(meta->index_text, "9007199254740991") == 0, "largest index stored wrong (%s)", meta->index_text);
+            free(text);
+        } else {
+            s_failures++;
+        }
+        free(extra);
+    }
+
+    /* 9. Every bad file is refused whole and changes nothing -- not the
+     *    settings, not the capture metadata. Start from a linked state so a
+     *    partial commit would show. */
+    gui_session_clear();
+    gui_capture_meta_init();
+    gui_settings_load(live);
+    if (!st_write(ses_path, session_text)) s_failures++;
+    applied = gui_session_apply_file(ses_path, live, err, sizeof(err));
+    ST_CHECK(applied && meta->linked, "could not re-link before the refusals: %s", err);
+    struct { const char *label; const char *asset_id; const char *extra; } bad_assets[] = {
+        { "asset_id with a space",       "\"asset 01\"", "" },
+        { "asset_id over 63 bytes",      "\"a123456789012345678901234567890123456789012345678901234567890123\"", "" },
+        { "empty required field",        "\"\"", "" },
+        { "index -1",                    "\"a1\"", ", \"index\": -1" },
+        { "index 2.5",                   "\"a1\"", ", \"index\": 2.5" },
+        { "index as a string",           "\"a1\"", ", \"index\": \"3\"" },
+        { "index with a leading zero",   "\"a1\"", ", \"index\": 03" },
+        { "index over 2^53-1",           "\"a1\"", ", \"index\": 9007199254740992" },
+        { "hifi as a string",            "\"a1\"", ", \"hifi_audio_equipped\": \"true\"" },
+        { "b&w as a number",             "\"a1\"", ", \"black_and_white\": 1" },
+        { "raw invalid UTF-8",           "\"a1\"", ", \"tape_speed\": \"S\xff\"" },
+        { "overlong UTF-8",              "\"a1\"", ", \"tape_speed\": \"\xc0\xaf\"" },
+        { "duplicate key in asset",      "\"a1\"", ", \"label\": \"again\"" },
+        { "control char in video_system", "\"a1\"", ", \"video_system\": \"NT\\u0007SC\"" },
+        { "line break in a non-notes",   "\"a1\"", ", \"tape_speed\": \"S\\nP\"" },
+        { "control char in notes",       "\"a1\"", ", \"notes\": \"bell \\u0007\"" },
+        { "tape_speed over 31 bytes",    "\"a1\"", ", \"tape_speed\": \"0123456789012345678901234567890123\"" },
+        { "string as an object",         "\"a1\"", ", \"notes\": {\"a\": 1}" },
+        { "asset_id as a number",        "7", "" },
+    };
+    for (size_t i = 0; i < sizeof(bad_assets) / sizeof(bad_assets[0]); i++) {
+        char *text = st_asset_session(bad_assets[i].asset_id, bad_assets[i].extra);
+        st_expect_rejected(bad_assets[i].label, bad_path, text, live);
+        free(text);
+    }
+    {
+        /* notes one byte over the cap */
+        size_t over = GUI_META_NOTES_CAP;
+        char *extra = malloc(over + 32);
+        if (extra) {
+            int at = snprintf(extra, over + 32, ", \"notes\": \"");
+            memset(extra + at, 'n', over);
+            snprintf(extra + at + over, 32, "\"");
+            char *text = st_asset_session("\"a1\"", extra);
+            st_expect_rejected("notes over the cap", bad_path, text, live);
+            free(text);
+            free(extra);
+        }
+    }
+    st_expect_rejected("control char in label", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"asset\": {\"asset_id\": \"a\", \"client_id\": \"c1\", "
+                       "\"client_name\": \"C\", \"display_name\": \"T\", \"label\": \"Ta\\u001bpe\", "
+                       "\"format\": \"VHS\"}}", live);
+    st_expect_rejected("missing asset_id", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"asset\": {\"client_id\": \"c1\", "
+                       "\"client_name\": \"C\", \"display_name\": \"T\", \"label\": \"L\", \"format\": \"VHS\"}}", live);
+    st_expect_rejected("missing display_name", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"asset\": {\"asset_id\": \"a\", \"client_id\": \"c1\", "
+                       "\"client_name\": \"C\", \"label\": \"L\", \"format\": \"VHS\"}}", live);
+    st_expect_rejected("asset not an object", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"asset\": \"a1\"}", live);
+    st_expect_rejected("operator with a tab", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"operator\": \"a\\tb\"}", live);
+    st_expect_rejected("duplicate top-level key", bad_path,
+                       "{\"schema\": \"misrc-gui.session/1\", \"operator\": \"a\", \"operator\": \"b\"}", live);
     st_expect_rejected("unknown schema", bad_path,
                        "{\"schema\": \"misrc-gui.session/2\", \"output_path\": \"/x\"}", live);
     st_expect_rejected("missing schema", bad_path, "{\"output_path\": \"/x\"}", live);
@@ -847,27 +1071,18 @@ int gui_session_selftest_main(void) {
                        "{\"schema\": \"misrc-gui.session/1\", \"output_path\": \"/x\"", live);
     st_expect_rejected("trailing text", bad_path,
                        "{\"schema\": \"misrc-gui.session/1\"} x", live);
-    st_expect_rejected("non-string value", bad_path,
+    st_expect_rejected("non-string output_path", bad_path,
                        "{\"schema\": \"misrc-gui.session/1\", \"output_path\": 5}", live);
-    st_expect_rejected("line break in a value", bad_path,
-                       "{\"schema\": \"misrc-gui.session/1\", \"ingest\": {\"notes\": \"a\\nb\"}}", live);
     st_expect_rejected("quote in a setting value", bad_path,
-                       "{\"schema\": \"misrc-gui.session/1\", \"ingest\": {\"notes\": \"12\\\" reel\"}}", live);
-    st_expect_rejected("over-long ingest value", bad_path,
-                       "{\"schema\": \"misrc-gui.session/1\", \"ingest\": {\"project\": "
-                       "\"0123456789012345678901234567890123456789012345678901234567890123"
-                       "4567890123456789012345678901234567890123456789012345678901234567890\"}}", live);
-    st_expect_rejected("bad log tag key", bad_path,
-                       "{\"schema\": \"misrc-gui.session/1\", \"log_tags\": {\"a b\": \"x\"}}", live);
-    st_expect_rejected("duplicate log tag", bad_path,
-                       "{\"schema\": \"misrc-gui.session/1\", \"log_tags\": {\"a\": \"x\", \"a\": \"y\"}}", live);
+                       "{\"schema\": \"misrc-gui.session/1\", \"output_base_name\": \"12\\\" reel\"}", live);
     st_expect_rejected("empty output_base_name", bad_path,
                        "{\"schema\": \"misrc-gui.session/1\", \"output_base_name\": \"\"}", live);
     remove(bad_path);
     st_expect_rejected("unreadable file", bad_path, NULL, live);
 
-    /* 8. No session: saves are unfiltered again. */
-    ST_CHECK(!gui_session_active() && gui_session_tag_count() == 0, "clear left a session active");
+    /* 10. Cleared: saves are unfiltered again. */
+    gui_session_clear();
+    ST_CHECK(!gui_session_active(), "clear left a session active");
 
     remove(cfg_path);
     remove(ses_path);
