@@ -10,8 +10,10 @@
 #include "gui_record.h"
 #include "gui_video_record.h"
 #include "gui_cc_record.h"
+#include "gui_capture_sidecar.h"
 #include "../input/gui_preview_v4l2.h"
 #include "../core/gui_app.h"
+#include "../core/gui_capture_meta.h"
 #include "../processing/gui_extract.h"
 #include "../ui/gui_popup.h"
 #include "gui_audio.h"
@@ -36,6 +38,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+#include <dirent.h>
 #include "version.h"
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -489,7 +492,24 @@ struct gui_record_session {
     writer_ctx_t ctx_a, ctx_b;
 
     FILE *log_file;
-    char log_path[512];
+    char log_path[640];
+
+    /* Capture metadata, latched at start: an edit made after the start can
+     * never reach this recording's log, sidecar or FLAC tags. ~10 KB. */
+    gui_capture_meta_t meta;
+    char stem[600];              /* {output_path}/{base}_{dateTag}: log + sidecar */
+    char sidecar_path[640];
+    char started_at[32];         /* UTC "YYYY-MM-DDTHH:MM:SSZ" */
+    char ended_at[32];           /* set at stop */
+    double start_mono_s, stop_mono_s;
+    char output_path[MAX_FILENAME_LEN];
+    char base_name[MAX_FILENAME_LEN];
+    char device_name[128];
+    char device_type[32];
+    char computer_name[128];
+    uint8_t rf_bits_a, rf_bits_b;
+    uint64_t rf_rate_hz_a, rf_rate_hz_b;
+    char audio_names[GUI_CAPTURE_SIDECAR_AUDIO_COUNT][MAX_FILENAME_LEN];
 
     /* Spill temp-file state and per-channel output write-error flags. */
     gui_record_spill_channel_t spill[GUI_RECORD_SPILL_CHANNELS];
@@ -2036,10 +2056,14 @@ static bool gui_record_cvbs_preview_enabled_locked(const channel_panel_config_t 
            (config->split && config->right_view == PANEL_VIEW_CVBS);
 }
 
-static void gui_record_open_session_log(gui_app_t *app, const char *path_a, const char *path_b) {
+/* {output_path}/{base}_{dateTag}: the one stem the capture log
+ * ({stem}_misrc_capture.log) and the capture-meta sidecar
+ * ({stem}_capture_meta.json) share, so a reader finds one from the other. */
+static void gui_record_build_capture_stem(const gui_app_t *app, const char *path_a,
+                                          const char *path_b, char *dst, size_t dst_len) {
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
     if (!app) return;
-
-    gui_record_close_session_log();
 
     const char *base_src = app->settings.output_base_name[0] ? app->settings.output_base_name : "capture";
     char base_name[128];
@@ -2067,8 +2091,194 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
         snprintf(date_tag, sizeof(date_tag), "%s", "session");
     }
 
-    snprintf(s_active->log_path, sizeof(s_active->log_path), "%s/%s_%s_misrc_capture.log",
-             app->settings.output_path, base_name, date_tag);
+    snprintf(dst, dst_len, "%s/%s_%s", app->settings.output_path, base_name, date_tag);
+}
+
+/* UTC "YYYY-MM-DDTHH:MM:SSZ" for the sidecar ("" if the clock fails). */
+static void gui_record_build_utc_iso8601(char *dst, size_t dst_len) {
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
+    time_t t = time(NULL);
+    if (t == (time_t)-1) return;
+    struct tm tmv;
+#if defined(_WIN32) || defined(_WIN64)
+    if (gmtime_s(&tmv, &t) != 0) return;
+#else
+    if (!gmtime_r(&t, &tmv)) return;
+#endif
+    snprintf(dst, dst_len, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+/* A monotonic clock that works without a window (raylib's GetTime() reads 0
+ * in the headless modes), for the sidecar's capture_seconds. */
+static double gui_record_mono_seconds(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+}
+
+/* The capture-metadata block of the capture log, one line per key:
+ * "Capture metadata <key>: <value>", in descriptor order between linked and
+ * operator_source/sidecar. Values are escaped onto one line ((empty) /
+ * (unset) for nothing). Caller holds the log lock. */
+static void gui_record_log_capture_meta_locked(const gui_record_session_t *ses) {
+    if (!ses) return;
+    const gui_capture_meta_t *m = &ses->meta;
+    /* Notes can be 8191 bytes and every byte can escape to four. */
+    size_t cap = 4 * GUI_META_NOTES_CAP + 64;
+    char *val = malloc(cap);
+    char *msg = malloc(cap + 64);
+    if (!val || !msg) {
+        free(val);
+        free(msg);
+        gui_record_log_write_line_locked("WARN", "Capture metadata: out of memory, block not written");
+        return;
+    }
+    snprintf(msg, cap + 64, "Capture metadata %s: %s", "linked", m->linked ? "true" : "false");
+    gui_record_log_write_line_locked("INFO", msg);
+    size_t n = 0;
+    const gui_capture_meta_field_t *f = gui_capture_meta_fields(&n);
+    for (size_t i = 0; i < n; i++) {
+        gui_capture_meta_format_log_value(m, &f[i], val, cap);
+        snprintf(msg, cap + 64, "Capture metadata %s: %s", f[i].key, val);
+        gui_record_log_write_line_locked("INFO", msg);
+    }
+    snprintf(msg, cap + 64, "Capture metadata %s: %s", "operator_source",
+             gui_capture_meta_operator_source_name(m->operator_source));
+    gui_record_log_write_line_locked("INFO", msg);
+    const char *sidecar = gui_capture_sidecar_basename(ses->sidecar_path);
+    snprintf(msg, cap + 64, "Capture metadata %s: %s", "sidecar",
+             (sidecar && sidecar[0]) ? sidecar : "(empty)");
+    gui_record_log_write_line_locked("INFO", msg);
+    free(val);
+    free(msg);
+}
+
+/* RF FLAC tags written at encoder init (so a crash keeps the link). No
+ * notes: the sidecar carries them. Returns the count; tags[] needs 6. */
+static size_t gui_record_build_flac_tags(const gui_record_session_t *ses, const char *channel,
+                                         flac_writer_tag_t *tags) {
+    size_t n = 0;
+    tags[n++] = (flac_writer_tag_t){ "MISRC_ASSET_ID", ses->meta.asset_id };
+    tags[n++] = (flac_writer_tag_t){ "MISRC_CLIENT_ID", ses->meta.client_id };
+    if (ses->meta.linked) {
+        tags[n++] = (flac_writer_tag_t){ "MISRC_ASSET_LABEL", ses->meta.label };
+    }
+    tags[n++] = (flac_writer_tag_t){ "MISRC_CAPTURE_LINKED", ses->meta.linked ? "true" : "false" };
+    tags[n++] = (flac_writer_tag_t){ "MISRC_CAPTURE_META", gui_capture_sidecar_basename(ses->sidecar_path) };
+    tags[n++] = (flac_writer_tag_t){ "MISRC_RF_CHANNEL", channel };
+    return n;
+}
+
+typedef struct {
+    bool have_samples_a, have_samples_b;
+    uint64_t samples_a, samples_b;
+    uint64_t drops, waits;
+} gui_record_sidecar_end_t;
+
+/* Write (or rewrite) the capture-meta sidecar. complete == false is the
+ * "recording" version written at start; true is the finalize version with
+ * the end time, duration, sample counts, sizes and result. A failure is a
+ * WARN in the capture log and the status bar; it never stops a recording. */
+static bool gui_record_write_sidecar(gui_record_session_t *ses, bool complete,
+                                     const gui_record_sidecar_end_t *end) {
+    if (!ses || !ses->sidecar_path[0]) return false;
+    gui_capture_sidecar_t s;
+    memset(&s, 0, sizeof(s));
+    s.complete = complete;
+    s.meta = &ses->meta;
+    s.misrc_gui_version = MIRSC_TOOLS_VERSION;
+    s.computer_name = ses->computer_name;
+    s.device_name = ses->device_name;
+    s.device_type = ses->device_type;
+    s.capture_format = ses->use_flac ? "FLAC" : "RAW";
+    s.started_at = ses->started_at[0] ? ses->started_at : NULL;
+    s.output_path = ses->output_path;
+    s.base_name = ses->base_name;
+    s.log_file = ses->log_path[0] ? gui_capture_sidecar_basename(ses->log_path) : NULL;
+
+    const char *paths[2] = { ses->path_a, ses->path_b };
+    bool on[2] = { ses->capture_a, ses->capture_b };
+    uint8_t bits[2] = { ses->rf_bits_a, ses->rf_bits_b };
+    uint64_t rates[2] = { ses->rf_rate_hz_a, ses->rf_rate_hz_b };
+    gui_capture_sidecar_rf_t *rf[2] = { &s.rf_a, &s.rf_b };
+    for (int c = 0; c < 2; c++) {
+        if (!on[c] || !paths[c][0]) continue;
+        rf[c]->name = gui_capture_sidecar_basename(paths[c]);
+        rf[c]->bits = bits[c];
+        rf[c]->sample_rate_hz = rates[c];
+        if (!complete || !end) continue;
+        struct stat st;
+        if (stat(paths[c], &st) == 0) {
+            rf[c]->have_bytes = true;
+            rf[c]->bytes = (uint64_t)st.st_size;
+        }
+        bool have = c == 0 ? end->have_samples_a : end->have_samples_b;
+        uint64_t samples = c == 0 ? end->samples_a : end->samples_b;
+        if (have) {
+            rf[c]->have_samples = true;
+            rf[c]->samples = samples;
+        } else if (!ses->use_flac && rf[c]->have_bytes) {
+            /* RAW: the file is the samples, 1 or 2 bytes each. */
+            rf[c]->have_samples = true;
+            rf[c]->samples = rf[c]->bytes / (bits[c] == 8 ? 1u : 2u);
+        }
+    }
+    s.video = ses->path_video[0] ? gui_capture_sidecar_basename(ses->path_video) : NULL;
+    s.closed_captions = ses->path_cc[0] ? gui_capture_sidecar_basename(ses->path_cc) : NULL;
+    for (int i = 0; i < GUI_CAPTURE_SIDECAR_AUDIO_COUNT; i++) {
+        if (!ses->audio_names[i][0]) continue;
+        /* Listed only once the file exists: an enabled output on a device
+         * with no audio never makes one. */
+        char full[MAX_FILENAME_LEN * 2 + 2];
+        snprintf(full, sizeof(full), "%s/%s", ses->output_path, ses->audio_names[i]);
+        struct stat st;
+        if (stat(full, &st) == 0) s.audio[i] = ses->audio_names[i];
+    }
+    if (complete) {
+        s.ended_at = ses->ended_at[0] ? ses->ended_at : NULL;
+        s.have_capture_seconds = ses->stop_mono_s > 0.0;
+        s.capture_seconds = ses->stop_mono_s - ses->start_mono_s;
+        if (end) {
+            s.have_result = true;
+            s.drops = end->drops;
+            s.waits = end->waits;
+        }
+    }
+
+    size_t len = 0;
+    char *text = gui_capture_sidecar_format_alloc(&s, &len);
+    char err[384] = {0};
+    bool ok = text && gui_capture_sidecar_write_atomic(ses->sidecar_path, text, len, err, sizeof(err));
+    free(text);
+    if (!ok) {
+        gui_record_log_writef_ses(ses, "WARN", "Capture metadata sidecar not written (%s): %s",
+                                  complete ? "complete" : "recording",
+                                  err[0] ? err : "out of memory");
+        if (ses->app) {
+            gui_app_set_status(ses->app, "Capture metadata sidecar not written (see the capture log); "
+                                         "the recording continues");
+        }
+    }
+    return ok;
+}
+
+static void gui_record_open_session_log(gui_app_t *app, const char *path_a, const char *path_b) {
+    if (!app) return;
+
+    gui_record_close_session_log();
+
+    const char *base_src = app->settings.output_base_name[0] ? app->settings.output_base_name : "capture";
+    if (!s_active->stem[0]) {
+        gui_record_build_capture_stem(app, path_a, path_b, s_active->stem, sizeof(s_active->stem));
+    }
+    snprintf(s_active->log_path, sizeof(s_active->log_path), "%s_misrc_capture.log", s_active->stem);
 
     bool cvbs_preview_a = false;
     bool cvbs_preview_b = false;
@@ -2162,33 +2372,8 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     snprintf(msg, sizeof(msg), "Dropout handling: stop_on_dropout=%s",
              app->settings.stop_on_dropout ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata project: %s",
-             app->settings.ingest_project[0] ? app->settings.ingest_project : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata tape_id: %s",
-             app->settings.ingest_tape_id[0] ? app->settings.ingest_tape_id : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata tape_format: %s",
-             app->settings.ingest_tape_format[0] ? app->settings.ingest_tape_format : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata tape_size: %s",
-             app->settings.ingest_tape_size[0] ? app->settings.ingest_tape_size : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata tape_speed: %s",
-             app->settings.ingest_tape_speed[0] ? app->settings.ingest_tape_speed : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata tape_condition: %s",
-             app->settings.ingest_tape_condition[0] ? app->settings.ingest_tape_condition : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata operator: %s",
-             app->settings.ingest_operator[0] ? app->settings.ingest_operator : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata location: %s",
-             app->settings.ingest_location[0] ? app->settings.ingest_location : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "Ingest metadata notes: %s",
-             app->settings.ingest_notes[0] ? app->settings.ingest_notes : "(empty)");
-    gui_record_log_write_line_locked("INFO", msg);
+    /* What the capture is of: the record-start snapshot (gui_capture_meta.h). */
+    gui_record_log_capture_meta_locked(s_active);
 
     if (app->settings.use_flac) {
         snprintf(msg, sizeof(msg), "FLAC settings: level=%d verify=%s threads=%d",
@@ -2685,28 +2870,37 @@ static void gui_record_flush_video_start_log(gui_app_t *app)
     s_video_start_msg[0] = '\0';
 }
 
-/* Headless record: captures from the simulated device straight to files, with
- * no window and no clicking. Exists for one comparison in particular -- the RF
- * outputs from a run with the reference video ON must be byte-identical to a
- * run with it OFF. That is the proof that the video path cannot perturb the
- * capture it sits beside. */
-int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
-                                bool use_flac, bool with_cc)
+/* One headless recording from the simulated device straight to files, with
+ * no window and no clicking: --auto-record and --capture-meta-selftest. The
+ * settings are built from defaults (never loaded), so two runs are directly
+ * comparable; the caller decides which settings file a save would reach. */
+typedef struct {
+    const char *out_dir;
+    int seconds;
+    bool with_video;
+    bool use_flac;
+    bool with_cc;
+    const char *base_name;     /* NULL = "auto" */
+} gui_record_headless_opts_t;
+
+static int gui_record_headless_run(const gui_record_headless_opts_t *o,
+                                   char *rf_a, size_t rf_a_cap, char *rf_b, size_t rf_b_cap)
 {
     static gui_app_t app;
     memset(&app, 0, sizeof(app));
     gui_settings_init_defaults(&app.settings);
 
-    snprintf(app.settings.output_path, sizeof(app.settings.output_path), "%s", out_dir);
-    snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "auto");
+    snprintf(app.settings.output_path, sizeof(app.settings.output_path), "%s", o->out_dir);
+    snprintf(app.settings.output_base_name, sizeof(app.settings.output_base_name), "%s",
+             o->base_name ? o->base_name : "auto");
     app.settings.auto_names_enabled = true;
     /* Deterministic filenames, so the two runs are directly comparable. */
     app.settings.append_timestamp_on_capture_start = false;
-    app.settings.use_flac = use_flac;
+    app.settings.use_flac = o->use_flac;
     app.settings.capture_a = true;
     app.settings.capture_b = true;
-    app.settings.video_record_enabled = with_video;
-    app.settings.usbref_cc_enabled = with_cc;
+    app.settings.video_record_enabled = o->with_video;
+    app.settings.usbref_cc_enabled = o->with_cc;
     app.settings.enable_audio_4ch = false;
     app.settings.enable_audio_2ch_12 = false;
     app.settings.enable_audio_2ch_34 = false;
@@ -2716,7 +2910,7 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
     /* main() does this for the real app; without it the preview singleton is
      * all zeros and reports UNSUPPORTED. */
     gui_preview_init(NULL);
-    if (with_video) gui_preview_refresh_devices();
+    if (o->with_video) gui_preview_refresh_devices();
     gui_app_enumerate_devices(&app);
 
     int sim = -1;
@@ -2741,23 +2935,26 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
         gui_app_stop_capture(&app);
         return 2;
     }
-    printf("recording %ds (video=%s, %s) -> %s\n", seconds, with_video ? "on" : "off",
-           use_flac ? "flac" : "raw", out_dir);
+    printf("recording %ds (video=%s, %s) -> %s\n", o->seconds, o->with_video ? "on" : "off",
+           o->use_flac ? "flac" : "raw", o->out_dir);
 
-    for (int i = 0; i < seconds; i++) {
+    for (int i = 0; i < o->seconds; i++) {
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
     }
 
     gui_app_stop_recording(&app);
-    /* Finalize runs on its own thread; wait it out rather than racing it. */
+    /* Finalize runs on its own thread; wait it out rather than racing it, and
+     * reap it (the thread stays "running" until joined, so polling
+     * gui_record_is_finalizing() alone always waited the full 30 s). */
     for (int i = 0; i < 300 && gui_record_is_finalizing(); i++) {
+        if (gui_record_collect_finalize_if_done()) break;
         struct timespec ts = { 0, 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
     gui_app_stop_capture(&app);
 
-    if (with_video) {
+    if (o->with_video) {
         gui_video_record_status_t vs = gui_video_record_get_status();
         printf("video: submitted=%llu written=%llu dropped=%llu bytes=%llu%s%s\n",
                (unsigned long long)vs.frames_submitted,
@@ -2766,7 +2963,307 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
                (unsigned long long)vs.output_bytes,
                vs.error ? " err=" : "", vs.error ? vs.err_text : "");
     }
-    printf("rfA=%s rfB=%s\n", app.settings.output_filename_a, app.settings.output_filename_b);
+    if (rf_a && rf_a_cap) snprintf(rf_a, rf_a_cap, "%s", app.settings.output_filename_a);
+    if (rf_b && rf_b_cap) snprintf(rf_b, rf_b_cap, "%s", app.settings.output_filename_b);
+    return 0;
+}
+
+/* Headless record: captures from the simulated device straight to files, with
+ * no window and no clicking. Exists for one comparison in particular -- the RF
+ * outputs from a run with the reference video ON must be byte-identical to a
+ * run with it OFF. That is the proof that the video path cannot perturb the
+ * capture it sits beside. */
+int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
+                                bool use_flac, bool with_cc)
+{
+    gui_record_headless_opts_t o = { out_dir, seconds, with_video, use_flac, with_cc, NULL };
+    char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
+    int rc = gui_record_headless_run(&o, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
+    if (rc != 0) return rc;
+    printf("rfA=%s rfB=%s\n", rf_a, rf_b);
+    return 0;
+}
+
+/* ---- --capture-meta-selftest --------------------------------------------- */
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <direct.h>
+#include <process.h>
+#define cm_getpid _getpid
+#define cm_rmdir_os _rmdir
+#else
+#define cm_getpid getpid
+#define cm_rmdir_os rmdir
+#endif
+
+static int s_cm_failures = 0;
+
+#define CM_CHECK(cond, ...) do { \
+        if (!(cond)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); s_cm_failures++; } \
+    } while (0)
+
+static int cm_mkdir(const char *path)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return _mkdir(path);
+#else
+    return mkdir(path, 0755);
+#endif
+}
+
+/* The one file in dir whose name ends in suffix, as a full path. */
+static bool cm_find(const char *dir, const char *suffix, char *out, size_t cap)
+{
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    bool found = false;
+    size_t sl = strlen(suffix);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t nl = strlen(e->d_name);
+        if (nl > sl && strcmp(e->d_name + nl - sl, suffix) == 0) {
+            snprintf(out, cap, "%s/%s", dir, e->d_name);
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static char *cm_read(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *buf = malloc(1 << 20);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, (1 << 20) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Remove every regular file in dir, then dir. */
+static void cm_rmdir(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char p[1024];
+            snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+            remove(p);
+        }
+        closedir(d);
+    }
+    cm_rmdir_os(dir);
+}
+
+#if LIBFLAC_ENABLED == 1
+static bool cm_flac_has_tag(const char *path, const char *entry)
+{
+    FLAC__StreamMetadata *tags = NULL;
+    if (!FLAC__metadata_get_tags(path, &tags) || !tags) return false;
+    bool found = false;
+    size_t len = strlen(entry);
+    for (uint32_t i = 0; i < tags->data.vorbis_comment.num_comments; i++) {
+        const FLAC__StreamMetadata_VorbisComment_Entry *c = &tags->data.vorbis_comment.comments[i];
+        if (c->length == len && memcmp(c->entry, entry, len) == 0) { found = true; break; }
+    }
+    FLAC__metadata_object_delete(tags);
+    return found;
+}
+#endif
+
+/* Checks common to both runs: the sidecar sits next to the log with the same
+ * stem, is complete, and names the RF files that really exist. */
+static char *cm_check_run(const char *label, const char *dir, const char *rf_a, const char *rf_b,
+                          char *log_text_out[1], char *sidecar_path, size_t sidecar_cap)
+{
+    char log_path[1024];
+    *log_text_out = NULL;
+    bool have_sidecar = cm_find(dir, GUI_CAPTURE_SIDECAR_SUFFIX, sidecar_path, sidecar_cap);
+    bool have_log = cm_find(dir, "_misrc_capture.log", log_path, sizeof(log_path));
+    CM_CHECK(have_sidecar, "%s: no *%s in %s", label, GUI_CAPTURE_SIDECAR_SUFFIX, dir);
+    CM_CHECK(have_log, "%s: no *_misrc_capture.log in %s", label, dir);
+    if (!have_sidecar || !have_log) return NULL;
+    size_t stem_s = strlen(sidecar_path) - strlen(GUI_CAPTURE_SIDECAR_SUFFIX);
+    size_t stem_l = strlen(log_path) - strlen("_misrc_capture.log");
+    CM_CHECK(stem_s == stem_l && strncmp(sidecar_path, log_path, stem_s) == 0,
+             "%s: the sidecar and the log do not share a stem (%s vs %s)", label, sidecar_path, log_path);
+    char tmp_probe[1100];
+    snprintf(tmp_probe, sizeof(tmp_probe), "%s.tmp.%d", sidecar_path, (int)cm_getpid());
+    struct stat st;
+    CM_CHECK(stat(tmp_probe, &st) != 0, "%s: a sidecar temp file was left behind", label);
+
+    char *side = cm_read(sidecar_path);
+    *log_text_out = cm_read(log_path);
+    CM_CHECK(side != NULL && *log_text_out != NULL, "%s: cannot read the sidecar or the log", label);
+    if (!side) return NULL;
+    CM_CHECK(strstr(side, "\"schema\": \"misrc-gui.capture-meta/1\"") != NULL, "%s: sidecar schema", label);
+    CM_CHECK(strstr(side, "\"state\": \"complete\"") != NULL, "%s: sidecar state is not complete", label);
+    CM_CHECK(strstr(side, "\"ended_at\": null") == NULL, "%s: complete sidecar has no ended_at", label);
+    CM_CHECK(strstr(side, "\"result\": {\"drops\": ") != NULL, "%s: complete sidecar has no result", label);
+    const char *names[2] = { rf_a, rf_b };
+    const char *keys[2] = { "rf_a", "rf_b" };
+    for (int c = 0; c < 2; c++) {
+        char want[600];
+        snprintf(want, sizeof(want), "\"%s\": {\"name\": \"%s\"", keys[c], names[c]);
+        CM_CHECK(strstr(side, want) != NULL, "%s: sidecar %s.name is not %s", label, keys[c], names[c]);
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir, names[c]);
+        CM_CHECK(stat(full, &st) == 0 && st.st_size > 0, "%s: %s does not exist", label, full);
+        char bytes[96];
+        snprintf(bytes, sizeof(bytes), "\"bytes\": %llu}", (unsigned long long)st.st_size);
+        CM_CHECK(strstr(side, bytes) != NULL, "%s: sidecar %s.bytes is not the file size", label, keys[c]);
+    }
+    char want_log[700];
+    snprintf(want_log, sizeof(want_log), "Capture metadata sidecar: %s",
+             gui_capture_sidecar_basename(sidecar_path));
+    CM_CHECK(*log_text_out && strstr(*log_text_out, want_log) != NULL, "%s: log does not name the sidecar", label);
+    CM_CHECK(*log_text_out && strstr(*log_text_out, "Ingest metadata") == NULL,
+             "%s: the retired Ingest metadata lines are in the log", label);
+    return side;
+}
+
+int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_seconds)
+{
+    s_cm_failures = 0;
+    if (linked_seconds <= 0) linked_seconds = 2;
+    char root[700], dir_linked[760], dir_unlinked[760], cfg[760];
+    if (keep_dir && keep_dir[0]) {
+        snprintf(root, sizeof(root), "%s", keep_dir);
+    } else {
+#if defined(_WIN32) || defined(_WIN64)
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !tmp[0]) tmp = ".";
+#else
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0]) tmp = "/tmp";
+#endif
+        snprintf(root, sizeof(root), "%s/misrc_capture_meta_selftest_%d", tmp, (int)cm_getpid());
+    }
+    snprintf(dir_linked, sizeof(dir_linked), "%s/linked", root);
+    snprintf(dir_unlinked, sizeof(dir_unlinked), "%s/unlinked", root);
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", root);
+    cm_mkdir(root);
+    cm_mkdir(dir_linked);
+    cm_mkdir(dir_unlinked);
+    /* Never the live settings file: gui_app_init() saves when no override is
+     * active, and on wm that file is the running server's. */
+    gui_settings_set_override_path(cfg);
+    printf("capture-meta selftest: %s%s\n", root, keep_dir ? " (kept)" : " (scratch)");
+
+    /* 1. Linked, FLAC, A+B. Notes carry a line break, a quote and an e-acute. */
+    gui_capture_meta_init();
+    gui_capture_meta_t src;
+    memset(&src, 0, sizeof(src));
+    snprintf(src.asset_id, sizeof(src.asset_id), "st_asset_01");
+    snprintf(src.client_id, sizeof(src.client_id), "st_client");
+    snprintf(src.client_name, sizeof(src.client_name), "Selftest Family");
+    snprintf(src.display_name, sizeof(src.display_name), "Selftest Tape");
+    snprintf(src.index_text, sizeof(src.index_text), "4");
+    snprintf(src.label, sizeof(src.label), "Tape 4");
+    snprintf(src.format, sizeof(src.format), "VHS");
+    snprintf(src.tape_speed, sizeof(src.tape_speed), "SP");
+    snprintf(src.video_system, sizeof(src.video_system), "NTSC");
+    src.hifi_audio_equipped = GUI_META_TRI_TRUE;
+    src.black_and_white = GUI_META_TRI_FALSE;
+    snprintf(src.notes, sizeof(src.notes), "line one\nsaid \"hi\" caf\xC3\xA9");
+    snprintf(src.operator_name, sizeof(src.operator_name), "Selftest Operator");
+    gui_capture_meta_set_linked(&src, "/selftest/session.json");
+
+    char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
+    gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked" };
+    int rc = gui_record_headless_run(&lo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
+    CM_CHECK(rc == 0, "linked run failed (%d)", rc);
+    char sidecar[1024];
+    char *log_text = NULL;
+    char *side = rc == 0 ? cm_check_run("linked", dir_linked, rf_a, rf_b, &log_text, sidecar, sizeof(sidecar)) : NULL;
+    if (side) {
+        CM_CHECK(strstr(side, "\"linked\": true") != NULL, "linked: sidecar linked is not true");
+        CM_CHECK(strstr(side, "\"asset_id\": \"st_asset_01\"") != NULL, "linked: sidecar asset_id");
+        CM_CHECK(strstr(side, "\"client_id\": \"st_client\"") != NULL, "linked: sidecar client_id");
+        CM_CHECK(strstr(side, "\"index\": 4,") != NULL, "linked: sidecar index");
+        CM_CHECK(strstr(side, "\"hifi_audio_equipped\": true,") != NULL, "linked: sidecar hifi");
+        CM_CHECK(strstr(side, "\"black_and_white\": false,") != NULL, "linked: sidecar b&w");
+        CM_CHECK(strstr(side, "\"notes\": \"line one\\nsaid \\\"hi\\\" caf\xC3\xA9\"") != NULL,
+                 "linked: sidecar notes are not JSON-escaped as expected");
+        CM_CHECK(strstr(side, "\"operator\": \"Selftest Operator\"") != NULL &&
+                 strstr(side, "\"operator_source\": \"session\"") != NULL, "linked: sidecar operator");
+        CM_CHECK(strstr(side, "\"session_file\": \"/selftest/session.json\"") != NULL, "linked: session_file");
+        CM_CHECK(strstr(side, "\"capture_format\": \"FLAC\"") != NULL, "linked: capture_format");
+    }
+    if (log_text) {
+        CM_CHECK(strstr(log_text, "Capture metadata asset_id: st_asset_01\n") != NULL,
+                 "linked: log has no 'Capture metadata asset_id: st_asset_01'");
+        CM_CHECK(strstr(log_text, "Capture metadata notes: line one\\nsaid \"hi\" caf\xC3\xA9\n") != NULL,
+                 "linked: log notes line is not escaped onto one line");
+        CM_CHECK(strstr(log_text, "Capture metadata linked: true\n") != NULL, "linked: log linked");
+        CM_CHECK(strstr(log_text, "Capture metadata hifi_audio_equipped: true\n") != NULL, "linked: log hifi");
+        CM_CHECK(strstr(log_text, "Capture metadata operator_source: session\n") != NULL, "linked: log source");
+    }
+#if LIBFLAC_ENABLED == 1
+    if (rc == 0) {
+        char want_meta[700];
+        snprintf(want_meta, sizeof(want_meta), "MISRC_CAPTURE_META=%s",
+                 gui_capture_sidecar_basename(sidecar));
+        const char *names[2] = { rf_a, rf_b };
+        const char *chan[2] = { "MISRC_RF_CHANNEL=A", "MISRC_RF_CHANNEL=B" };
+        for (int c = 0; c < 2; c++) {
+            char full[1024];
+            snprintf(full, sizeof(full), "%s/%s", dir_linked, names[c]);
+            CM_CHECK(cm_flac_has_tag(full, "MISRC_ASSET_ID=st_asset_01"), "linked: %s has no MISRC_ASSET_ID", names[c]);
+            CM_CHECK(cm_flac_has_tag(full, chan[c]), "linked: %s has no %s", names[c], chan[c]);
+            CM_CHECK(cm_flac_has_tag(full, "MISRC_CLIENT_ID=st_client"), "linked: %s has no MISRC_CLIENT_ID", names[c]);
+            CM_CHECK(cm_flac_has_tag(full, "MISRC_ASSET_LABEL=Tape 4"), "linked: %s has no MISRC_ASSET_LABEL", names[c]);
+            CM_CHECK(cm_flac_has_tag(full, "MISRC_CAPTURE_LINKED=true"), "linked: %s has no MISRC_CAPTURE_LINKED", names[c]);
+            CM_CHECK(cm_flac_has_tag(full, want_meta), "linked: %s has no %s", names[c], want_meta);
+            CM_CHECK(cm_flac_has_tag(full, "RF_SAMPLE_RATE=40000000"), "linked: %s lost the finalize tags", names[c]);
+        }
+    }
+#endif
+    free(side);
+    free(log_text);
+    printf("  linked run: %s\n", s_cm_failures ? "FAILED" : "ok");
+
+    /* 2. Unlinked, RAW: what nobody typed is "" / null, operator the OS login. */
+    int before = s_cm_failures;
+    gui_capture_meta_init();
+    gui_record_headless_opts_t uo = { dir_unlinked, 1, false, false, false, "Selftest_Unlinked" };
+    rc = gui_record_headless_run(&uo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
+    CM_CHECK(rc == 0, "unlinked run failed (%d)", rc);
+    side = rc == 0 ? cm_check_run("unlinked", dir_unlinked, rf_a, rf_b, &log_text, sidecar, sizeof(sidecar)) : NULL;
+    if (side) {
+        CM_CHECK(strstr(side, "\"linked\": false") != NULL, "unlinked: sidecar linked is not false");
+        CM_CHECK(strstr(side, "\"asset_id\": \"\"") != NULL, "unlinked: sidecar asset_id is not \"\"");
+        CM_CHECK(strstr(side, "\"index\": null") != NULL, "unlinked: sidecar index is not null");
+        CM_CHECK(strstr(side, "\"operator_source\": \"os_login\"") != NULL, "unlinked: operator_source");
+        CM_CHECK(strstr(side, "\"session_file\": null") != NULL, "unlinked: session_file is not null");
+        CM_CHECK(strstr(side, "\"capture_format\": \"RAW\"") != NULL, "unlinked: capture_format");
+    }
+    if (log_text) {
+        CM_CHECK(strstr(log_text, "Capture metadata linked: false\n") != NULL, "unlinked: log linked");
+        CM_CHECK(strstr(log_text, "Capture metadata asset_id: (empty)\n") != NULL, "unlinked: log asset_id");
+        CM_CHECK(strstr(log_text, "Capture metadata index: (unset)\n") != NULL, "unlinked: log index");
+    }
+    free(side);
+    free(log_text);
+    printf("  unlinked run: %s\n", s_cm_failures > before ? "FAILED" : "ok");
+
+    gui_settings_set_override_path(NULL);
+    remove(cfg);
+    if (!keep_dir) {
+        cm_rmdir(dir_linked);
+        cm_rmdir(dir_unlinked);
+        cm_rmdir(root);
+    }
+    if (s_cm_failures) {
+        printf("CAPTURE-META SELFTEST FAILED (%d check(s))\n", s_cm_failures);
+        return 1;
+    }
+    printf("capture-meta selftest passed\n");
     return 0;
 }
 
@@ -3232,6 +3729,45 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     if (ses->capture_b) {
         snprintf(ses->path_b, sizeof(ses->path_b), "%s", path_b);
     }
+
+    /* Capture metadata and the sidecar's start facts, latched now: nothing
+     * the operator does after this point reaches this recording's files. */
+    gui_capture_meta_snapshot(&ses->meta);
+    gui_record_build_capture_stem(app, path_a, path_b, ses->stem, sizeof(ses->stem));
+    snprintf(ses->sidecar_path, sizeof(ses->sidecar_path), "%s%s", ses->stem,
+             GUI_CAPTURE_SIDECAR_SUFFIX);
+    gui_record_build_utc_iso8601(ses->started_at, sizeof(ses->started_at));
+    ses->start_mono_s = gui_record_mono_seconds();
+    snprintf(ses->output_path, sizeof(ses->output_path), "%s", app->settings.output_path);
+    snprintf(ses->base_name, sizeof(ses->base_name), "%s",
+             app->settings.output_base_name[0] ? app->settings.output_base_name : "capture");
+    if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+        snprintf(ses->device_name, sizeof(ses->device_name), "%s",
+                 app->devices[app->selected_device].name);
+    } else {
+        snprintf(ses->device_name, sizeof(ses->device_name), "%s", "unknown");
+    }
+    snprintf(ses->device_type, sizeof(ses->device_type), "%s", gui_record_device_type_name(app));
+    gui_record_get_host_name(ses->computer_name, sizeof(ses->computer_name));
+    {
+        const bool audio_on[GUI_CAPTURE_SIDECAR_AUDIO_COUNT] = {
+            app->settings.enable_audio_4ch, app->settings.enable_audio_2ch_12,
+            app->settings.enable_audio_2ch_34, app->settings.enable_audio_1ch[0],
+            app->settings.enable_audio_1ch[1], app->settings.enable_audio_1ch[2],
+            app->settings.enable_audio_1ch[3],
+        };
+        const char *audio_name[GUI_CAPTURE_SIDECAR_AUDIO_COUNT] = {
+            app->settings.audio_4ch_filename, app->settings.audio_2ch_12_filename,
+            app->settings.audio_2ch_34_filename, app->settings.audio_1ch_filenames[0],
+            app->settings.audio_1ch_filenames[1], app->settings.audio_1ch_filenames[2],
+            app->settings.audio_1ch_filenames[3],
+        };
+        for (int i = 0; i < GUI_CAPTURE_SIDECAR_AUDIO_COUNT; i++) {
+            if (audio_on[i] && audio_name[i][0]) {
+                snprintf(ses->audio_names[i], sizeof(ses->audio_names[i]), "%s", audio_name[i]);
+            }
+        }
+    }
     s_active = ses;
     atomic_store(&app->recording_bytes, 0);
     atomic_store(&app->recording_raw_a, 0);
@@ -3340,6 +3876,17 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                                  : capture_rate_khz;
         ses->sample_rate_a = config_a.sample_rate;
         ses->sample_rate_b = config_b.sample_rate;
+        ses->rf_bits_a = bits_a;
+        ses->rf_bits_b = bits_b;
+        ses->rf_rate_hz_a = use_resample_a ? (uint64_t)config_a.sample_rate * 1000u : capture_rate_hz;
+        ses->rf_rate_hz_b = use_resample_b ? (uint64_t)config_b.sample_rate * 1000u : capture_rate_hz;
+
+        /* The capture-metadata link, in each RF file from its first byte. */
+        flac_writer_tag_t tags_a[6], tags_b[6];
+        config_a.initial_tags = tags_a;
+        config_a.initial_tag_count = gui_record_build_flac_tags(ses, "A", tags_a);
+        config_b.initial_tags = tags_b;
+        config_b.initial_tag_count = gui_record_build_flac_tags(ses, "B", tags_b);
 
         // bits_per_sample is set per-channel below
         config_a.bits_per_sample = 16;
@@ -3383,6 +3930,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                 return RECORD_ERROR;
             }
             ses->ctx_a.writer = ses->flac_a;
+            if (flac_writer_initial_tags_dropped(ses->flac_a) > 0) {
+                gui_record_log_writef("WARN", "FLAC A: %zu capture-metadata tag(s) could not be written",
+                                      flac_writer_initial_tags_dropped(ses->flac_a));
+            }
         } else {
             ses->flac_a = NULL;
             ses->ctx_a.writer = NULL;
@@ -3410,6 +3961,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                 return RECORD_ERROR;
             }
             ses->ctx_b.writer = ses->flac_b;
+            if (flac_writer_initial_tags_dropped(ses->flac_b) > 0) {
+                gui_record_log_writef("WARN", "FLAC B: %zu capture-metadata tag(s) could not be written",
+                                      flac_writer_initial_tags_dropped(ses->flac_b));
+            }
         } else {
             ses->flac_b = NULL;
             ses->ctx_b.writer = NULL;
@@ -3530,6 +4085,22 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         if (capture_rate_khz_f <= 0.0f) {
             capture_rate_khz_f = 40000.0f;
         }
+        ses->rf_bits_a = bits_a;
+        ses->rf_bits_b = bits_b;
+        {
+            /* The rate the RAW writer actually writes at: soxr only ever
+             * downsamples (ensure_soxr). */
+            bool rs_a = LIBSOXR_ENABLED && app->settings.enable_resample_a &&
+                        app->settings.resample_rate_a > 0.0f &&
+                        app->settings.resample_rate_a < capture_rate_khz_f;
+            bool rs_b = LIBSOXR_ENABLED && app->settings.enable_resample_b &&
+                        app->settings.resample_rate_b > 0.0f &&
+                        app->settings.resample_rate_b < capture_rate_khz_f;
+            ses->rf_rate_hz_a = rs_a ? (uint64_t)llround((double)app->settings.resample_rate_a * 1000.0)
+                                     : capture_rate_hz;
+            ses->rf_rate_hz_b = rs_b ? (uint64_t)llround((double)app->settings.resample_rate_b * 1000.0)
+                                     : capture_rate_hz;
+        }
 
         ses->ctx_a.bufmgr = &app->buffers;
         ses->ctx_a.buf_id = BUF_RECORD_A;
@@ -3648,6 +4219,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         gui_app_set_status(app, "Recording (RAW)...");
     }
 
+    /* The link is on disk before the first stop could ever be asked for. A
+     * failed write is a WARN in the log; the recording goes on regardless. */
+    gui_record_write_sidecar(ses, false, NULL);
+    gui_capture_meta_mark_used();
     return RECORD_OK;
 }
 
@@ -3854,6 +4429,24 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         gui_record_build_iso8601_timestamp(end_iso, sizeof(end_iso));
         gui_record_log_writef("INFO", "datetime_end: %s", end_iso[0] ? end_iso : "unknown");
     }
+    {
+        gui_record_sidecar_end_t end;
+        memset(&end, 0, sizeof(end));
+#if LIBFLAC_ENABLED == 1
+        if (ses->use_flac) {
+            end.have_samples_a = ses->capture_a;
+            end.samples_a = flac_samples_a;
+            end.have_samples_b = ses->capture_b;
+            end.samples_b = flac_samples_b;
+        }
+#endif
+        end.drops = rec_drops;
+        end.waits = rec_waits;
+        if (gui_record_write_sidecar(ses, true, &end)) {
+            gui_record_log_writef_ses(ses, "INFO", "Capture metadata sidecar complete: %s",
+                                      gui_capture_sidecar_basename(ses->sidecar_path));
+        }
+    }
     gui_record_log_writef_ses(ses, "INFO", "Session complete");
     gui_record_close_session_log_ses(ses);
 }
@@ -3895,6 +4488,8 @@ void gui_record_stop(gui_app_t *app) {
     }
     gui_record_reset_disk_guard_state();
     ses->stop_request_time = GetTime();
+    ses->stop_mono_s = gui_record_mono_seconds();
+    gui_record_build_utc_iso8601(ses->ended_at, sizeof(ses->ended_at));
 
     // Snapshot buffer-stat counters NOW: a new recording keeps incrementing
     // the shared buffer-manager counters while this session finalizes.

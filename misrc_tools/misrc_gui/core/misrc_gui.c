@@ -110,6 +110,7 @@ static void print_usage(const char *program_name) {
             "  --config <path> --net-serve [seconds]      (the net server, no window)\n"
             "  --net-client-probe <host> <port> [seconds] (mirror a server, print its settings)\n"
             "  --session-selftest                         (--session overlay is never saved)\n"
+            "  --capture-meta-selftest [keep_dir] [secs]  (sidecar, log block, FLAC tags)\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
@@ -520,6 +521,11 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--session-selftest") == 0) {
             return gui_session_selftest_main();
+        }
+        if (strcmp(a, "--capture-meta-selftest") == 0) {
+            const char *keep = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
+            int secs = (keep && i + 2 < argc) ? atoi(argv[i + 2]) : 0;
+            return gui_record_capture_meta_selftest_main(keep, secs);
         }
         /* Headless preview diagnostics. These run without a window so the
          * reader can be exercised -- and its unplug, teardown and scheduling

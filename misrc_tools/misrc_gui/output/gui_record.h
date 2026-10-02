@@ -102,6 +102,14 @@ int gui_record_cc_settings_test_main(void);
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
                                 bool use_flac, bool with_cc);
 
+/* --capture-meta-selftest [keep_dir] [linked_seconds]: headless. A linked
+ * FLAC A+B recording and an unlinked RAW one from the simulated device, then
+ * the sidecar, the capture log's metadata block and the RF FLAC tags are
+ * checked against what was linked. Uses a scratch settings file (never the
+ * live one). Outputs go to TMPDIR/TEMP and are removed, unless keep_dir is
+ * given (then they stay in keep_dir/{linked,unlinked}). Exit code 0 = pass. */
+int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_seconds);
+
 // Live on-disk size of each channel's output file via stat(). For the UI
 // readout so it shows the exact file size (1:1 with `ls`/file-manager), not
 // the writer-thread atomic which can lead the flushed file by the FILE*
