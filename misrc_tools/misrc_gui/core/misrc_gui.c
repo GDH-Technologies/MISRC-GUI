@@ -713,6 +713,12 @@ int main(int argc, char **argv) {
     InitWindow(default_window_width, default_window_height, GUI_WINDOW_CLASS_NAME);
     SetWindowTitle(window_title);
     gui_install_window_icons();
+    // Name the arrow explicitly. Left at raylib's default, the X11 window has
+    // no cursor of its own and inherits the root window's, which XWayland
+    // draws at 1x -- half the size of every other app on a 2x desktop. GLFW's
+    // standard cursor loads the theme at Xcursor.size instead. Set once:
+    // raylib allocates a new GLFW cursor on every call.
+    SetMouseCursor(MOUSE_CURSOR_ARROW);
     SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
 
     // Adopt the display's scale before the first frame so a HiDPI panel is

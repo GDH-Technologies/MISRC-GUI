@@ -2766,6 +2766,30 @@ def check_channel_gear_clearance(repo_root: Path) -> int:
     return 0
 
 
+def check_desktop_sized_cursor(repo_root: Path) -> int:
+    """Both windows name the arrow cursor right after InitWindow. With raylib's
+    default (no cursor) the X11 window inherits XWayland's root cursor, drawn
+    at 1x: half the size of every other app on a 2x desktop. GLFW's standard
+    cursor loads the theme at Xcursor.size instead."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    for rel in ("core/misrc_gui.c", "input/gui_preview_v4l2.c"):
+        try:
+            src = strip_c_comments(read_text(base / rel))
+        except OSError as exc:
+            return fail(f"desktop-sized cursor guard: cannot read {rel}: {exc}")
+        init = src.find("InitWindow(")
+        if init < 0:
+            return fail(f"{rel}: InitWindow( not found; the cursor guard needs updating")
+        cursor = src.find("SetMouseCursor(MOUSE_CURSOR_ARROW);", init)
+        if cursor < 0:
+            return fail(f"{rel}: no SetMouseCursor(MOUSE_CURSOR_ARROW) after InitWindow; "
+                        "the window falls back to the 1x X11 root cursor under XWayland")
+        if src.count("SetMouseCursor(") != 1:
+            return fail(f"{rel}: SetMouseCursor must be called exactly once "
+                        "(raylib allocates a new GLFW cursor per call)")
+    return 0
+
+
 def check_record_parity(repo_root: Path) -> int:
     """The Record button, its click and the R/Space keys read the effective
     recording and capture state (the server's on a net client that records on
@@ -4353,6 +4377,7 @@ def main() -> int:
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
         ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
         ("USB reference video UI stays out of gui_ui.c", lambda: check_usbref_ui_stays_out_of_gui_ui(repo_root)),
+        ("desktop-sized cursor", lambda: check_desktop_sized_cursor(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))

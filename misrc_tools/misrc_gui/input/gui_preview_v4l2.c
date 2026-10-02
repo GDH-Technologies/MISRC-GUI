@@ -1846,6 +1846,9 @@ int gui_preview_child_main(const char *device, const char *fmt_spec, int parent_
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(720, 576, title);
+    /* The themed arrow at the desktop's cursor size, not the inherited 1x X11
+     * root cursor -- see the matching call in misrc_gui.c. */
+    SetMouseCursor(MOUSE_CURSOR_ARROW);
     SetWindowMinSize(320, 240);
     SetTargetFPS(60);
     SetExitKey(KEY_ESCAPE);
