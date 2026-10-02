@@ -188,16 +188,8 @@ typedef struct {
     bool usbref_rtsp_password;               // false = anyone who can reach it can watch
     char usbref_mediamtx_path[512];                 // empty = bundled copy, then PATH
     char usbref_rtsp_audio_device[96];              // empty = resolve from the video device
-    // Ingest metadata (saved to settings and written to capture log at record start)
-    char ingest_project[128];
-    char ingest_tape_id[128];
-    char ingest_tape_format[128];
-    char ingest_tape_size[128];
-    char ingest_tape_speed[128];
-    char ingest_tape_condition[128];
-    char ingest_operator[128];
-    char ingest_location[128];
-    char ingest_notes[256];
+    // (The nine ingest metadata fields were retired: capture metadata lives
+    // in core/gui_capture_meta.h, outside the settings, and is never saved.)
 
     // Display settings (existing)
     bool show_grid;
@@ -299,6 +291,11 @@ void gui_settings_set_override_path(const char *path);
 // True when a --config override path is active (so startup logic can
 // respect the config instead of forcing defaults like Local mode).
 bool gui_settings_override_active(void);
+// A hook gui_settings_save() runs on a COPY of the struct just before writing
+// it, so values that must not persist stay out of the file while the struct
+// in memory keeps them (gui_session.c: the --session overlay). NULL = none.
+typedef void (*gui_settings_persist_filter_fn)(gui_settings_t *to_write);
+void gui_settings_set_persist_filter(gui_settings_persist_filter_fn fn);
 const char* gui_settings_get_desktop_path(void);
 // True when path names an existing directory.
 bool gui_settings_path_is_dir(const char *path);

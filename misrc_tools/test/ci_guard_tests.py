@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import getpass
+import json
 import os
 import re
 import shutil
@@ -1783,6 +1784,23 @@ SETTINGS_KEYS_V1_1_8 = (
     "playback_file_b",
 )
 
+# Keys deliberately RETIRED by the fork, kept out of the "no v1.1.8 key may be
+# dropped" rule. SETTINGS_KEYS_V1_1_8 stays the historical record of what that
+# release wrote; a key leaves the written set only by being listed here, with
+# the reason. A retired key may never come back as a table row (that would
+# re-persist what was retired).
+#
+# The nine ingest_* keys: capture metadata moved out of gui_settings_t into
+# core/gui_capture_meta.h -- per-run, linked from a --session asset or typed
+# for one unlinked run, and never saved. An older build loading a newer file
+# simply sees them absent (empty strings, their default); a newer build
+# loading an older file skips them as unknown keys.
+SETTINGS_KEYS_RETIRED = frozenset((
+    "ingest_project", "ingest_tape_id", "ingest_tape_format", "ingest_tape_size",
+    "ingest_tape_speed", "ingest_tape_condition", "ingest_operator", "ingest_location",
+    "ingest_notes",
+))
+
 # Fields that describe the machine running this GUI rather than the capture,
 # so a net client keeps its own and never sends them to a server.
 SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
@@ -1847,8 +1865,15 @@ def check_settings_table_covers_struct(repo_root: Path) -> int:
             "gui_settings_table.c (or, if the field must never persist, to SETTINGS_UNPERSISTED_FIELDS)."
         )
 
+    revived = sorted(SETTINGS_KEYS_RETIRED & set(keys))
+    if revived:
+        return fail(
+            f"retired settings keys are table rows again: {', '.join(revived)}. They were retired on "
+            "purpose (see SETTINGS_KEYS_RETIRED); capture metadata lives in core/gui_capture_meta.h "
+            "and is never saved."
+        )
     written = {k for k, _, rest in rows if "GS_LOAD_ONLY" not in rest}
-    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - written)
+    dropped = sorted(set(SETTINGS_KEYS_V1_1_8) - SETTINGS_KEYS_RETIRED - written)
     if dropped:
         return fail(
             f"settings keys written at v1.1.8 are no longer written: {', '.join(dropped)}. "
@@ -2171,7 +2196,8 @@ def check_clay_text_outlives_layout(repo_root: Path) -> int:
     # Both Clay-drawing UI files: the USB Reference Video dialog hands Clay the
     # same kind of formatted labels, and a dangling one there fails identically.
     paths = [repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c",
-             repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c"]
+             repo_root / "misrc_tools/misrc_gui/ui/gui_usbref_settings.c",
+             repo_root / "misrc_tools/misrc_gui/ui/gui_capture_meta_panel.c"]
     failures_before = 0
     for path in paths:
         rc = _check_clay_text_in_file(path)
@@ -4355,6 +4381,342 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     return 0
 
 
+def check_session_launch_file_contract(repo_root: Path) -> int:
+    """--session <path.json> pre-fills one capture from a caller's file. It
+    must stay a GUI flag (an unrecognised arg routes the whole process into
+    headless CLI capture), its overlay must never reach the settings file
+    (gui_settings_save runs the persist filter on a copy), and its "asset"
+    links the capture through the capture-metadata store, which lives
+    outside gui_settings_t (no ingest_* field may come back)."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        gui_c = strip_c_comments(read_text(base / "core/misrc_gui.c"))
+        settings_c = strip_c_comments(read_text(base / "core/gui_settings.c"))
+        record_c = strip_c_comments(read_text(base / "output/gui_record.c"))
+        meson = read_text(repo_root / "misrc_tools/meson.build")
+    except OSError as exc:
+        return fail(f"session launch file guard: cannot read a source file: {exc}")
+    if "'misrc_gui/core/gui_session.c'" not in meson:
+        return fail("meson.build: misrc_gui/core/gui_session.c is not in the GUI sources")
+    session_pos = gui_c.find('strcmp(a, "--session") == 0')
+    capture_pos = gui_c.find("has_capture_arg = true;")
+    if session_pos < 0 or capture_pos < 0 or session_pos > capture_pos:
+        return fail("misrc_gui.c: --session must be classified as a GUI flag before the "
+                    "capture-arg fallthrough, or it routes into headless CLI capture mode")
+    if '"--session-selftest"' not in gui_c or "gui_session_selftest_main()" not in gui_c:
+        return fail("misrc_gui.c: --session-selftest no longer runs gui_session_selftest_main()")
+    load_pos = gui_c.find("gui_settings_load(&app.settings);")
+    apply_pos = gui_c.find("gui_session_apply_file(session_path, &app.settings")
+    if load_pos < 0 or apply_pos < 0 or apply_pos < load_pos:
+        return fail("misrc_gui.c: the --session overlay must be applied after gui_settings_load()")
+    if "[--session <path.json>]" not in gui_c:
+        return fail("misrc_gui.c: --help no longer lists [--session <path.json>] "
+                    "(callers detect support by grepping --help)")
+    try:
+        save_body = extract_function_body(settings_c, "void gui_settings_save(const gui_settings_t *settings)")
+    except RuntimeError as exc:
+        return fail(f"gui_settings.c: {exc}")
+    filter_pos = save_body.find("s_persist_filter(filtered)")
+    format_pos = save_body.find("gui_settings_format_file(")
+    if filter_pos < 0 or format_pos < 0 or filter_pos > format_pos:
+        return fail("gui_settings.c: gui_settings_save() must run the persist filter on a copy "
+                    "before formatting, or a --session overlay is saved over the operator's settings")
+    session_c = strip_c_comments(read_text(base / "core/gui_session.c"))
+    apply_pos = session_c.find("bool gui_session_apply(")
+    apply_body = session_c[apply_pos:session_c.find("\n}", apply_pos)] if apply_pos >= 0 else ""
+    if "gui_capture_meta_set_linked(" not in apply_body:
+        return fail("gui_session.c: gui_session_apply() must link the asset through "
+                    "gui_capture_meta_set_linked() (capture metadata lives outside the settings)")
+    if "Session tag" in record_c:
+        return fail("gui_record.c: the retired \"Session tag\" log lines are back; a session's asset "
+                    "reaches the log as \"Capture metadata <key>: <value>\"")
+    if "gui_capture_meta_init()" not in gui_c or gui_c.find("gui_capture_meta_init()") > gui_c.find(
+            "gui_session_apply_file(session_path, &app.settings"):
+        return fail("misrc_gui.c: gui_capture_meta_init() must run before the --session file is applied")
+    settings_h = strip_c_comments(read_text(base / "core/gui_settings.h"))
+    if "ingest_" in settings_h:
+        return fail("gui_settings.h: an ingest_* field is back in gui_settings_t. Capture metadata lives "
+                    "in core/gui_capture_meta.h and is never saved (SETTINGS_KEYS_RETIRED)")
+    return 0
+
+
+def check_session_launch_file_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --session-selftest (overlay applied, never saved,
+    bad files refused) and confirm --help advertises --session."""
+    if gui_path.suffix != ".exe":
+        helped = subprocess.run([str(gui_path), "--help"], capture_output=True, text=True, timeout=60)
+        if "--session <path.json>" not in helped.stdout:
+            return fail("misrc_gui --help does not list --session <path.json>")
+    try:
+        ran = subprocess.run([str(gui_path), "--session-selftest"], capture_output=True,
+                             text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --session-selftest timed out")
+    if ran.returncode != 0:
+        return fail(f"misrc_gui --session-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    print(ran.stdout.strip().splitlines()[-1] if ran.stdout.strip() else "session selftest passed")
+    return 0
+
+
+# The capture-metadata descriptor order. The session parser, the capture-log
+# block, the sidecar's asset object and the panel's rows all walk this one
+# table, so its order is the log's line order and the sidecar's key order --
+# what downstream readers (the toolkit) see. Change it deliberately or not at all.
+CAPTURE_META_FIELD_ORDER = (
+    "client_name", "display_name", "index", "label", "format", "tape_speed",
+    "video_system", "hifi_audio_equipped", "black_and_white", "notes",
+    "asset_id", "client_id", "operator",
+)
+CAPTURE_META_ASSET_KEYS = CAPTURE_META_FIELD_ORDER[:-1]   # operator is top-level
+CAPTURE_META_SIDECAR_KEYS = (
+    "schema", "state", "linked", "asset", "operator", "operator_source", "session_file",
+    "misrc_gui_version", "computer_name", "device", "capture_format", "started_at",
+    "ended_at", "capture_seconds", "output_path", "base_name", "log_file", "files", "result",
+)
+CAPTURE_META_AUDIO_KEYS = (
+    "audio_4ch", "audio_2ch_12", "audio_2ch_34",
+    "audio_1ch_1", "audio_1ch_2", "audio_1ch_3", "audio_1ch_4",
+)
+
+
+def check_capture_metadata_contract(repo_root: Path) -> int:
+    """Capture metadata (what a capture is OF) lives outside the settings, in
+    core/gui_capture_meta.c, and reaches three outputs that other programs
+    read: the capture log's "Capture metadata <key>: <value>" block, the
+    {base}_{dateTag}_capture_meta.json sidecar next to it, and the RF FLAC
+    tags written at encoder init. This pins the parts a reader depends on --
+    the descriptor order, the literals, the tag names, the shared stem -- and
+    the two refusals that keep a linked capture honest: a net client that
+    records on the server will not start, and the panel locks while recording."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        meta_c = strip_c_comments(read_text(base / "core/gui_capture_meta.c"))
+        record_c = strip_c_comments(read_text(base / "output/gui_record.c"))
+        sidecar_h = read_text(base / "output/gui_capture_sidecar.h")
+        capture_c = strip_c_comments(read_text(base / "input/gui_capture.c"))
+        panel_c = strip_c_comments(read_text(base / "ui/gui_capture_meta_panel.c"))
+        ui_c = strip_c_comments(read_text(base / "ui/gui_ui.c"))
+        flac_c = strip_c_comments(read_text(repo_root / "misrc_tools/common/flac_writer.c"))
+        meson = read_text(repo_root / "misrc_tools/meson.build")
+    except OSError as exc:
+        return fail(f"capture metadata guard: cannot read a source file: {exc}")
+
+    table = meta_c[meta_c.find("s_fields[] = {"):]
+    table = table[:table.find("};")]
+    keys = re.findall(r'(?:META_STR_FIELD\(|\{)\s*"([a-z_]+)"', table)
+    if tuple(keys) != CAPTURE_META_FIELD_ORDER:
+        return fail("gui_capture_meta.c: the descriptor order changed:\n"
+                    f"  now:    {', '.join(keys)}\n  pinned: {', '.join(CAPTURE_META_FIELD_ORDER)}\n"
+                    "It is the capture log's line order and the sidecar's key order; downstream "
+                    "readers see it. Update CAPTURE_META_FIELD_ORDER only on purpose.")
+
+    for needle, why in (
+        ('"Capture metadata %s: %s"', "the log block's line format"),
+        ('_misrc_capture.log', "the capture log's name (the sidecar shares its stem)"),
+        ('"MISRC_ASSET_ID"', "the RF FLAC asset tag"),
+        ('"MISRC_RF_CHANNEL"', "the RF FLAC channel tag"),
+        ('"MISRC_CAPTURE_META"', "the RF FLAC tag naming the sidecar"),
+        ("gui_record_build_capture_stem(", "the one stem the log and the sidecar share"),
+        ("initial_tags", "FLAC tags written at encoder init"),
+    ):
+        if needle not in record_c:
+            return fail(f"gui_record.c: {needle} is gone ({why})")
+    # (The selftest names "Ingest metadata" to assert its absence; a format
+    # string that writes the line is what must not come back.)
+    if re.search(r'"Ingest metadata [^"]*%s', record_c):
+        return fail("gui_record.c: the retired \"Ingest metadata\" lines are back; the block is "
+                    "\"Capture metadata <key>: <value>\" from the descriptor table")
+    for needle in ('"_capture_meta.json"', '"misrc-gui.capture-meta/1"'):
+        if needle not in sidecar_h:
+            return fail(f"gui_capture_sidecar.h: {needle} is gone (the sidecar's name/schema)")
+    if "initial_tags" not in flac_c or "initial_tags_dropped" not in flac_c:
+        return fail("common/flac_writer.c: the initial_tags hunk is gone -- the capture-metadata FLAC "
+                    "tags would only be written at finalize, and a crash would lose the link. Keep "
+                    "the fork's hunk on upstream syncs.")
+
+    start = capture_c.find("int gui_app_start_recording(gui_app_t *app)")
+    body = capture_c[start:capture_c.find("\n}", start)] if start >= 0 else ""
+    fwd = body.find("gui_net_client_request_record(app, true)")
+    linked = body.find("linked")
+    if fwd < 0 or linked < 0 or linked > fwd or "gui_popup_info(" not in body:
+        return fail("gui_capture.c: gui_app_start_recording() must refuse (with a popup) to forward "
+                    "Record to the server while the seat is linked -- the server's files would not "
+                    "carry the link")
+
+    start = panel_c.find("bool gui_capture_meta_panel_can_edit(")
+    can_edit = panel_c[start:panel_c.find("\n}", start)] if start >= 0 else ""
+    if "gui_app_effective_recording(" not in can_edit or "linked" not in can_edit:
+        return fail("gui_capture_meta_panel.c: can_edit must lock while linked and while "
+                    "gui_app_effective_recording() (the snapshot taken at start is what the files carry)")
+
+    start = ui_c.find("static void gui_ui_commit_text_edit(")
+    commit = ui_c[start:ui_c.find("\n}", start)] if start >= 0 else ""
+    meta_at = commit.find("gui_ui_is_meta_field(")
+    ret_at = commit.find("return;", meta_at)
+    save_at = commit.find("gui_settings_save(")
+    if meta_at < 0 or ret_at < 0 or save_at < 0 or not (meta_at < ret_at < save_at):
+        return fail("gui_ui.c: a capture-metadata edit must return before gui_settings_save() in "
+                    "gui_ui_commit_text_edit -- the values are per-run and never saved")
+    if "settings.ingest_" in ui_c or "UI_TEXT_FIELD_INGEST" in ui_c or "render_metadata_window" in ui_c:
+        return fail("gui_ui.c: the retired ingest metadata window is back; the panel lives in "
+                    "ui/gui_capture_meta_panel.c")
+
+    for src in ("'misrc_gui/core/gui_capture_meta.c'", "'misrc_gui/output/gui_capture_sidecar.c'",
+                "'misrc_gui/ui/gui_capture_meta_panel.c'"):
+        if src not in meson:
+            return fail(f"meson.build: {src} is not built")
+    return 0
+
+
+def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
+    """Key set and types of one capture-meta sidecar; None when it is valid."""
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    if tuple(data.keys()) != CAPTURE_META_SIDECAR_KEYS:
+        return f"top-level keys {list(data.keys())} != {list(CAPTURE_META_SIDECAR_KEYS)}"
+    if data["schema"] != "misrc-gui.capture-meta/1":
+        return f"schema {data['schema']!r}"
+    if data["state"] not in ("recording", "complete"):
+        return f"state {data['state']!r}"
+    if not isinstance(data["linked"], bool):
+        return "linked is not a bool"
+    asset = data["asset"]
+    if not isinstance(asset, dict) or tuple(asset.keys()) != CAPTURE_META_ASSET_KEYS:
+        return f"asset keys {list(asset.keys()) if isinstance(asset, dict) else asset!r}"
+    for k, v in asset.items():
+        if k == "index":
+            ok = v is None or (isinstance(v, int) and not isinstance(v, bool) and v >= 0)
+        elif k in ("hifi_audio_equipped", "black_and_white"):
+            ok = v is None or isinstance(v, bool)
+        else:
+            ok = isinstance(v, str)
+        if not ok:
+            return f"asset.{k} has the wrong type: {v!r}"
+    if data["linked"] and not all(asset[k] for k in ("asset_id", "client_id", "client_name",
+                                                      "display_name", "label", "format")):
+        return "linked but a required asset field is empty"
+    if not isinstance(data["operator"], str) or not data["operator"]:
+        return "operator is not a non-empty string"
+    if data["operator_source"] not in ("session", "os_login"):
+        return f"operator_source {data['operator_source']!r}"
+    for k in ("session_file",):
+        if data[k] is not None and not isinstance(data[k], str):
+            return f"{k} is not a string or null"
+    for k in ("misrc_gui_version", "computer_name", "capture_format", "output_path", "base_name", "log_file"):
+        if not isinstance(data[k], str):
+            return f"{k} is not a string"
+    if data["capture_format"] not in ("FLAC", "RAW"):
+        return f"capture_format {data['capture_format']!r}"
+    dev = data["device"]
+    if not isinstance(dev, dict) or set(dev) != {"name", "type"} or not all(isinstance(x, str) for x in dev.values()):
+        return f"device {dev!r}"
+    stamp = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+    if not isinstance(data["started_at"], str) or not stamp.match(data["started_at"]):
+        return f"started_at {data['started_at']!r}"
+    complete = data["state"] == "complete"
+    if complete:
+        if not isinstance(data["ended_at"], str) or not stamp.match(data["ended_at"]):
+            return f"complete but ended_at {data['ended_at']!r}"
+        if not isinstance(data["capture_seconds"], (int, float)) or isinstance(data["capture_seconds"], bool):
+            return f"complete but capture_seconds {data['capture_seconds']!r}"
+    files = data["files"]
+    if not isinstance(files, dict) or tuple(files.keys()) != ("rf_a", "rf_b", "video", "closed_captions", "audio"):
+        return f"files keys {list(files.keys()) if isinstance(files, dict) else files!r}"
+    names = [data["log_file"]]
+    for ch in ("rf_a", "rf_b"):
+        rf = files[ch]
+        if rf is None:
+            continue
+        if not isinstance(rf, dict) or tuple(rf.keys()) != ("name", "bits", "sample_rate_hz", "samples", "bytes"):
+            return f"files.{ch} keys {rf!r}"
+        if not isinstance(rf["name"], str) or not isinstance(rf["bits"], int) or not isinstance(rf["sample_rate_hz"], int):
+            return f"files.{ch} types {rf!r}"
+        for k in ("samples", "bytes"):
+            if rf[k] is not None and not isinstance(rf[k], int):
+                return f"files.{ch}.{k} {rf[k]!r}"
+            if complete and rf[k] is None:
+                return f"complete but files.{ch}.{k} is null"
+        names.append(rf["name"])
+        if complete and not (path.parent / rf["name"]).is_file():
+            return f"files.{ch}.name {rf['name']!r} is not a file next to the sidecar"
+        if complete and (path.parent / rf["name"]).stat().st_size != rf["bytes"]:
+            return f"files.{ch}.bytes does not match the file on disk"
+    for k in ("video", "closed_captions"):
+        if files[k] is not None and not isinstance(files[k], str):
+            return f"files.{k} {files[k]!r}"
+        names.append(files[k])
+    audio = files["audio"]
+    if not isinstance(audio, dict) or tuple(audio.keys()) != CAPTURE_META_AUDIO_KEYS:
+        return f"files.audio keys {audio!r}"
+    for k, v in audio.items():
+        if v is not None and not isinstance(v, str):
+            return f"files.audio.{k} {v!r}"
+        names.append(v)
+    for n in names:
+        if n is not None and ("/" in n or "\\" in n):
+            return f"{n!r} is not a basename"
+    if not (path.parent / data["log_file"]).is_file():
+        return f"log_file {data['log_file']!r} is not next to the sidecar"
+    if not path.name.endswith("_capture_meta.json") or \
+            data["log_file"][:-len("_misrc_capture.log")] != path.name[:-len("_capture_meta.json")]:
+        return "the sidecar and the log do not share a stem"
+    result = data["result"]
+    if complete:
+        if not isinstance(result, dict) or set(result) != {"drops", "waits"} or \
+                not all(isinstance(x, int) for x in result.values()):
+            return f"complete but result {result!r}"
+    elif result is not None:
+        return f"recording but result {result!r}"
+    return None
+
+
+def check_capture_metadata_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --capture-meta-selftest (a linked FLAC A+B and an
+    unlinked RAW recording from the Simulated device; it asserts the sidecar,
+    the log block and the FLAC tags itself), then json.loads every sidecar it
+    left and checks the key set and every type -- the contract a downstream
+    reader parses against."""
+    if gui_path.suffix == ".exe":
+        print("SKIP: capture metadata selftest (post-build) on Windows")
+        return 0
+    with tempfile.TemporaryDirectory(prefix="misrc_capture_meta_guard_") as temp_root:
+        out = Path(temp_root) / "out"
+        env = dict(os.environ, TMPDIR=temp_root)
+        try:
+            ran = subprocess.run([str(gui_path), "--capture-meta-selftest", str(out)],
+                                 capture_output=True, text=True, timeout=240, env=env)
+        except subprocess.TimeoutExpired:
+            return fail("misrc_gui --capture-meta-selftest timed out")
+        if ran.returncode == 2 or "no simulated device" in ran.stderr:
+            print("SKIP: capture metadata selftest (post-build): the Simulated device did not run "
+                  f"headless here (rc={ran.returncode}): {ran.stderr.strip().splitlines()[-1:]}")
+            return 0
+        if ran.returncode != 0:
+            return fail(f"misrc_gui --capture-meta-selftest failed (rc={ran.returncode}):\n"
+                        f"{ran.stdout.strip()}")
+        sidecars = sorted(out.rglob("*_capture_meta.json"))
+        if len(sidecars) != 2:
+            return fail(f"--capture-meta-selftest left {len(sidecars)} sidecar(s), expected 2 "
+                        "(linked + unlinked)")
+        for sidecar in sidecars:
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                return fail(f"{sidecar.name} is not valid JSON: {exc}")
+            problem = _check_sidecar_json(sidecar, data)
+            if problem:
+                return fail(f"{sidecar.parent.name}/{sidecar.name}: {problem}")
+        linked = [json.loads(p.read_text(encoding="utf-8"))["linked"] for p in sidecars]
+        if sorted(linked) != [False, True]:
+            return fail(f"expected one linked and one unlinked sidecar, got linked={linked}")
+        leftovers = [p.name for p in out.rglob("*.tmp.*")]
+        if leftovers:
+            return fail(f"sidecar temp files left behind: {leftovers}")
+    print(ran.stdout.strip().splitlines()[-1] if ran.stdout.strip() else "capture-meta selftest passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -4457,6 +4819,8 @@ def main() -> int:
         ("desktop-sized cursor", lambda: check_desktop_sized_cursor(repo_root)),
         ("About dialog never scrolls sideways", lambda: check_about_dialog_never_scrolls_sideways(repo_root)),
         ("UI zoom is relative to the desktop", lambda: check_ui_zoom_is_desktop_relative(repo_root)),
+        ("session launch file contract", lambda: check_session_launch_file_contract(repo_root)),
+        ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
@@ -4492,6 +4856,8 @@ def main() -> int:
         checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
         checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
         checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
+        checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
+        checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()

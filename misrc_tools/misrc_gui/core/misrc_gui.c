@@ -35,6 +35,8 @@
 #include "../output/gui_record.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "gui_session.h"
+#include "gui_capture_meta.h"
 #include "../../common/threading.h"
 #include "version.h"
 
@@ -87,6 +89,7 @@ static void print_usage(const char *program_name) {
             "MISRC GUI %s\n"
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect]\n"
+            "      [--session <path.json>]\n"
             "  %s --preview-only <device> [--preview-format YUYV:WxH@fps]\n"
             "  %s --preview-probe | --preview-probe-stream <device> [seconds]\n"
             "  %s --preview-selftest\n"
@@ -106,11 +109,20 @@ static void print_usage(const char *program_name) {
             "  --auto-record <dir> [seconds] [video|novideo] [flac|raw] [cc]\n"
             "  --config <path> --net-serve [seconds]      (the net server, no window)\n"
             "  --net-client-probe <host> <port> [seconds] (mirror a server, print its settings)\n"
+            "  --session-selftest                         (--session overlay is never saved)\n"
+            "  --capture-meta-selftest [keep_dir] [secs]  (sidecar, log block, FLAC tags)\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
             "--config <path> loads settings from <path> instead of the default\n"
             "           location (useful for automated GUI testing).\n"
+            "--session <path.json> pre-fills this run for one capture from a\n"
+            "           \"misrc-gui.session/1\" file: output_path, output_base_name,\n"
+            "           operator, and an \"asset\" that links the capture (read-only\n"
+            "           for the run; written to the capture log, the\n"
+            "           <base>_<date>_capture_meta.json sidecar and the RF FLAC\n"
+            "           tags). Session values are never saved: the settings file\n"
+            "           keeps the operator's own.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -458,6 +470,8 @@ int main(int argc, char **argv) {
     bool auto_connect = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
+    bool session_flag = false;       /* --session seen (with or without a path) */
+    const char *session_path = NULL; /* --session <path.json> overlay */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
@@ -493,6 +507,25 @@ int main(int argc, char **argv) {
                 config_path = argv[++i];
             }
             continue;
+        }
+        if (strcmp(a, "--session") == 0) {
+            // --session <path.json>: overlay one capture's output folder,
+            // base name, ingest metadata and log tags onto the loaded
+            // settings, in memory only (gui_session.h). A GUI flag, so it
+            // never routes into headless CLI capture mode.
+            session_flag = true;
+            if (i + 1 < argc) {
+                session_path = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(a, "--session-selftest") == 0) {
+            return gui_session_selftest_main();
+        }
+        if (strcmp(a, "--capture-meta-selftest") == 0) {
+            const char *keep = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
+            int secs = (keep && i + 2 < argc) ? atoi(argv[i + 2]) : 0;
+            return gui_record_capture_meta_selftest_main(keep, secs);
         }
         /* Headless preview diagnostics. These run without a window so the
          * reader can be exercised -- and its unplug, teardown and scheduling
@@ -686,6 +719,37 @@ int main(int argc, char **argv) {
     // so automated tests can launch the GUI with a pre-written config.
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
+
+    // Capture metadata starts unlinked, operator = the OS login. It lives
+    // outside the settings: never saved, never sent to a net peer.
+    gui_capture_meta_init();
+
+    // --session <path.json>: overlay one capture's output fields in memory
+    // and link its asset. A bad file is reported (stderr now, a popup on the
+    // first free frame) and the GUI starts exactly as it would without the
+    // flag: saved settings, NOT linked.
+    char session_error[320] = {0};
+    char session_status[640] = {0};
+    if (session_flag) {
+        char err[256] = {0};
+        if (gui_session_apply_file(session_path, &app.settings, err, sizeof(err))) {
+            const gui_capture_meta_t *meta = gui_capture_meta_get();
+            fprintf(stderr, "[SESSION] applied %s: output_path=%s output_base_name=%s;"
+                            " session values will not be saved\n",
+                    session_path, app.settings.output_path, app.settings.output_base_name);
+            if (meta->linked) {
+                snprintf(session_status, sizeof(session_status), "Linked: %s \xC2\xB7 %s (%s)",
+                         meta->client_name, meta->display_name, meta->asset_id);
+            } else {
+                snprintf(session_status, sizeof(session_status),
+                         "Session applied; not linked to an asset");
+            }
+            fprintf(stderr, "[SESSION] %s\n", session_status);
+        } else {
+            snprintf(session_error, sizeof(session_error), "%s", err);
+            fprintf(stderr, "[SESSION] ERROR: session file not applied: %s\n", err);
+        }
+    }
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
 
     // Capture limit should not persist across relaunches.
@@ -977,6 +1041,8 @@ int main(int argc, char **argv) {
     // Same pattern for FLAC level 1-3: warn once on launch if the loaded
     // settings have a low compression level.
     bool flac_level_low_warned = false;
+    // A rejected --session file is reported once, on the first free frame.
+    bool session_error_shown = (session_error[0] == '\0');
     gui_ui_zoom_state_t ui_zoom_state = {0};
     bool ui_scale_save_pending = false;
     double ui_scale_save_deadline = 0.0;
@@ -1145,6 +1211,21 @@ int main(int argc, char **argv) {
         gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
         gui_cc_record_poll();
 
+        if (!session_error_shown && !gui_popup_is_open()) {
+            session_error_shown = true;
+            char session_msg[480];
+            snprintf(session_msg, sizeof(session_msg),
+                     "The --session file was not applied:\n\n%s\n\n"
+                     "The GUI started with your saved settings, and the\n"
+                     "capture is NOT linked to an asset. Check the output\n"
+                     "folder and base name before recording.", session_error);
+            gui_popup_info("Session file rejected", session_msg);
+            gui_app_set_status(&app, "Session file rejected; NOT linked to an asset");
+        }
+        if (session_status[0]) {
+            gui_app_set_status(&app, session_status);
+            session_status[0] = '\0';
+        }
         // One-time startup warning: if FLAC threads is 0 (auto), warn once.
         // Uses a local bool so it fires only once per session, on the first
         // frame where no other popup is open.

@@ -7,6 +7,7 @@
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "gui_usbref_settings.h"
+#include "gui_capture_meta_panel.h"
 #include "gui_device_label.h"
 #include "../visualization/gui_fft.h"
 #include "../visualization/gui_oscilloscope.h"
@@ -756,8 +757,7 @@ static bool s_record_limit_window_open = false;
 static bool s_version_info_window_open = false;
 /* The stream's LAN confirmation, encoder sheet and bitrate bounds moved to
  * ui/gui_usbref_settings.c with the rest of the streaming UI. */
-// Metadata popup state (toolbar scroll badge button)
-static bool s_metadata_window_open = false;
+/* The metadata panel's open state is gui_capture_meta_panel_is_open(). */
 static bool s_record_limit_armed = false;
 static bool s_record_limit_timecode_edit = false;
 static double s_record_limit_backspace_repeat_at = 0.0;
@@ -2409,6 +2409,11 @@ static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
 static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, char **dst, size_t *cap)
 {
     if (!app || !dst || !cap) return false;
+    /* Capture metadata: the live record in core/gui_capture_meta.c, never a
+     * setting. False while linked or for a slot that is not editable. */
+    if (gui_ui_is_meta_field(field)) {
+        return gui_capture_meta_text_buffer((size_t)(field - UI_TEXT_FIELD_META_FIRST), dst, cap);
+    }
 
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
@@ -2475,42 +2480,6 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.level_autostop_duration_str;
             *cap = sizeof(app->settings.level_autostop_duration_str);
             return true;
-        case UI_TEXT_FIELD_INGEST_PROJECT:
-            *dst = app->settings.ingest_project;
-            *cap = sizeof(app->settings.ingest_project);
-            return true;
-        case UI_TEXT_FIELD_INGEST_TAPE_ID:
-            *dst = app->settings.ingest_tape_id;
-            *cap = sizeof(app->settings.ingest_tape_id);
-            return true;
-        case UI_TEXT_FIELD_INGEST_TAPE_FORMAT:
-            *dst = app->settings.ingest_tape_format;
-            *cap = sizeof(app->settings.ingest_tape_format);
-            return true;
-        case UI_TEXT_FIELD_INGEST_TAPE_SIZE:
-            *dst = app->settings.ingest_tape_size;
-            *cap = sizeof(app->settings.ingest_tape_size);
-            return true;
-        case UI_TEXT_FIELD_INGEST_TAPE_SPEED:
-            *dst = app->settings.ingest_tape_speed;
-            *cap = sizeof(app->settings.ingest_tape_speed);
-            return true;
-        case UI_TEXT_FIELD_INGEST_TAPE_CONDITION:
-            *dst = app->settings.ingest_tape_condition;
-            *cap = sizeof(app->settings.ingest_tape_condition);
-            return true;
-        case UI_TEXT_FIELD_INGEST_OPERATOR:
-            *dst = app->settings.ingest_operator;
-            *cap = sizeof(app->settings.ingest_operator);
-            return true;
-        case UI_TEXT_FIELD_INGEST_LOCATION:
-            *dst = app->settings.ingest_location;
-            *cap = sizeof(app->settings.ingest_location);
-            return true;
-        case UI_TEXT_FIELD_INGEST_NOTES:
-            *dst = app->settings.ingest_notes;
-            *cap = sizeof(app->settings.ingest_notes);
-            return true;
         case UI_TEXT_FIELD_NET_SERVER_PORT:
             *dst = app->settings.net_server_port_str;
             *cap = sizeof(app->settings.net_server_port_str);
@@ -2538,16 +2507,9 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) {
         return s_record_limit_window_open && app->settings.level_autostop_enabled;
     }
-    if (field == UI_TEXT_FIELD_INGEST_PROJECT ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_ID ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_FORMAT ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_SIZE ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_SPEED ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_CONDITION ||
-        field == UI_TEXT_FIELD_INGEST_OPERATOR ||
-        field == UI_TEXT_FIELD_INGEST_LOCATION ||
-        field == UI_TEXT_FIELD_INGEST_NOTES) {
-        return s_metadata_window_open;
+    if (gui_ui_is_meta_field(field)) {
+        return gui_capture_meta_panel_can_edit(app) &&
+               gui_capture_meta_text_buffer((size_t)(field - UI_TEXT_FIELD_META_FIRST), NULL, NULL);
     }
     // The RF tag fields have a second home in the per-channel gear popover, so
     // they must be editable there without the settings panel being open. Same
@@ -2735,17 +2697,13 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Decimal seconds: digits and a single '.' (allow typing; parse clamps).
         return (ch >= '0' && ch <= '9') || ch == '.';
     }
-    if (field == UI_TEXT_FIELD_INGEST_PROJECT ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_ID ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_FORMAT ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_SIZE ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_SPEED ||
-        field == UI_TEXT_FIELD_INGEST_TAPE_CONDITION ||
-        field == UI_TEXT_FIELD_INGEST_OPERATOR ||
-        field == UI_TEXT_FIELD_INGEST_LOCATION ||
-        field == UI_TEXT_FIELD_INGEST_NOTES) {
-        // Keep these permissive for ingest entry, but still block JSON-breaking quote chars.
-        return (ch >= 32 && ch < 127 && ch != '\"');
+    if (gui_ui_is_meta_field(field)) {
+        // Capture metadata: the index is digits only; everything else is
+        // printable ASCII (the sidecar JSON-escapes, so a quote is fine).
+        const gui_capture_meta_field_t *mf =
+            &gui_capture_meta_fields(NULL)[field - UI_TEXT_FIELD_META_FIRST];
+        if (mf->type == GUI_META_INDEX) return (ch >= '0' && ch <= '9');
+        return (ch >= 32 && ch < 127);
     }
     if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
         // Frequency in Hz: digits only (parsed to uint64 on commit).
@@ -2794,22 +2752,14 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION:
-        case UI_TEXT_FIELD_INGEST_PROJECT:
-        case UI_TEXT_FIELD_INGEST_TAPE_ID:
-        case UI_TEXT_FIELD_INGEST_TAPE_FORMAT:
-        case UI_TEXT_FIELD_INGEST_TAPE_SIZE:
-        case UI_TEXT_FIELD_INGEST_TAPE_SPEED:
-        case UI_TEXT_FIELD_INGEST_TAPE_CONDITION:
-        case UI_TEXT_FIELD_INGEST_OPERATOR:
-        case UI_TEXT_FIELD_INGEST_LOCATION:
-        case UI_TEXT_FIELD_INGEST_NOTES:
-            size = FONT_SIZE_STATS;
-            id = 1;
-            break;
         default:
             size = FONT_SIZE_NORMAL;
             id = 0;
             break;
+    }
+    if (gui_ui_is_meta_field(field)) {
+        size = FONT_SIZE_STATS;
+        id = 1;
     }
     if (font_size) *font_size = size;
     if (font_id) *font_id = id;
@@ -3155,6 +3105,18 @@ static bool gui_ui_text_delete(char *dst, int *cursor)
     return true;
 }
 
+/* Persist an edit to the active field. Settings fields save the settings
+ * file; capture-metadata fields are per-run and are NEVER saved -- an edit
+ * only bumps the metadata generation (gui_capture_meta_touch). */
+static void gui_ui_commit_text_edit(gui_app_t *app, bool changed)
+{
+    if (gui_ui_is_meta_field(s_active_text_field)) {
+        if (changed) gui_capture_meta_touch();
+        return;
+    }
+    gui_settings_save(&app->settings);
+}
+
 static void gui_ui_handle_active_text_edit(gui_app_t *app)
 {
     if (s_active_text_field == UI_TEXT_FIELD_NONE) return;
@@ -3258,7 +3220,7 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         }
         if (finish_edit_requested) {
             gui_ui_text_clamp_state(dst);
-            gui_settings_save(&app->settings);
+            gui_ui_commit_text_edit(app, changed);
             gui_ui_clear_text_edit();
             return;
         }
@@ -3316,11 +3278,11 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     gui_ui_text_clamp_state(dst);
 
     if (changed) {
-        gui_settings_save(&app->settings);
+        gui_ui_commit_text_edit(app, true);
     }
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_ESCAPE)) {
-        gui_settings_save(&app->settings);
+        gui_ui_commit_text_edit(app, false);
         gui_ui_clear_text_edit();
     }
 }
@@ -5217,356 +5179,8 @@ static void render_version_info_window(gui_app_t *app)
 
     }
 }
-// Metadata popup (opened by clicking the toolbar scroll badge)
-static void render_metadata_window(gui_app_t *app)
-{
-    if (!s_metadata_window_open) return;
-
-    int metadata_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 840);
-    int metadata_min_width = gui_ui_clamp_int(metadata_max_width, 1, 640);
-    int metadata_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
-
-    CLAY(CLAY_ID("MetadataBackdrop"), {
-        .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
-        },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP }
-        },
-        .backgroundColor = (Clay_Color){0, 0, 0, 140}
-    }) {}
-
-    CLAY(CLAY_ID("MetadataWindow"), {
-        .layout = {
-            .sizing = {
-                CLAY_SIZING_FIT(.min = metadata_min_width, .max = metadata_max_width),
-                CLAY_SIZING_FIT(.max = metadata_max_height)
-            },
-            .layoutDirection = CLAY_TOP_TO_BOTTOM,
-            .padding = { 16, 16, 16, 16 },
-            .childGap = 10
-        },
-        .floating = {
-            .attachTo = CLAY_ATTACH_TO_ROOT,
-            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
-        },
-        .clip = {
-            .horizontal = true,
-            .vertical = true,
-            .childOffset = Clay_GetScrollOffset()
-        },
-        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
-        .cornerRadius = CLAY_CORNER_RADIUS(8)
-    }) {
-        CLAY(CLAY_ID("MetadataHeader"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 8
-            }
-        }) {
-            CLAY_TEXT(CLAY_STRING("Capture Ingest Metadata"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_TITLE, .textColor = to_clay_color(COLOR_TEXT) }));
-            CLAY(CLAY_ID("MetadataHeaderSpacer"), {
-                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } }
-            }) {}
-            CLAY(CLAY_ID("MetadataCloseButton"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-                },
-                .backgroundColor = to_clay_color(COLOR_BUTTON),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                CLAY_TEXT(CLAY_STRING("X"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-            }
-        }
-
-        CLAY_TEXT(CLAY_STRING("These fields are saved to settings and written to the capture log at recording start."),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-        CLAY(CLAY_ID("MetadataProjectRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataProjectLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Project:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataProjectField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_project;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_PROJECT)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_PROJECT, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataTapeIdRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataTapeIdLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Tape ID:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataTapeIdField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_tape_id;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_TAPE_ID)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_TAPE_ID, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataTapeFormatRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataTapeFormatLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Tape Format:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataTapeFormatField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_tape_format;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_TAPE_FORMAT)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_TAPE_FORMAT, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataTapeSizeRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataTapeSizeLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Tape Size:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataTapeSizeField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_tape_size;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_TAPE_SIZE)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_TAPE_SIZE, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataTapeSpeedRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataTapeSpeedLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Tape Speed:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataTapeSpeedField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_tape_speed;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_TAPE_SPEED)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_TAPE_SPEED, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataTapeConditionRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataTapeConditionLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Tape Condition:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataTapeConditionField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_tape_condition;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_TAPE_CONDITION)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_TAPE_CONDITION, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-        CLAY(CLAY_ID("MetadataOperatorRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataOperatorLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Operator:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataOperatorField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_operator;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_OPERATOR)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_OPERATOR, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataLocationRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataLocationLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Location:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataLocationField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_location;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_LOCATION)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_LOCATION, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-
-        CLAY(CLAY_ID("MetadataNotesRow"), {
-            .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
-            }
-        }) {
-            CLAY(CLAY_ID("MetadataNotesLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIT(0) } } }) {
-                CLAY_TEXT(CLAY_STRING("Notes:"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-            CLAY(CLAY_ID("MetadataNotesField"), {
-                .layout = {
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
-                    .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
-                    .padding = { 8, 8, 0, 0 }
-                },
-                .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-                .cornerRadius = CLAY_CORNER_RADIUS(4)
-            }) {
-                const char *v = app->settings.ingest_notes;
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_INGEST_NOTES)) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_INGEST_NOTES, v, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                } else {
-                    CLAY_TEXT(v[0] ? make_string(v) : CLAY_STRING("(empty)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(v[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
-                }
-            }
-        }
-    }
-}
+/* The Capture Metadata panel (toolbar scroll badge) lives in
+ * ui/gui_capture_meta_panel.c. */
 
 static const char *toolbar_audio_channel_label(const gui_app_t *app,
                                                bool cxadc_mode, bool compact)
@@ -6246,7 +5860,9 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                     .sizing = { CLAY_SIZING_FIXED(toolbar_icon_button_size), CLAY_SIZING_FIXED(toolbar_icon_button_size) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                 },
-                .backgroundColor = to_clay_color(COLOR_BUTTON),
+                /* Linked: accent. Unlinked and used by a finished recording
+                 * since the last edit: amber. Colour only, never size. */
+                .backgroundColor = to_clay_color(gui_capture_meta_panel_toolbar_color(app)),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
                 CLAY(CLAY_ID("MetadataIcon"), {
@@ -8871,7 +8487,7 @@ void gui_render_layout(gui_app_t *app) {
     // Version info popup overlay (if open)
     render_version_info_window(app);
     // Metadata popup overlay (if open)
-    render_metadata_window(app);
+    gui_capture_meta_panel_render(app);
     // LAN confirmation, above everything including the settings panel it is
     // launched from.
     gui_usbref_settings_render(app);
@@ -9415,7 +9031,7 @@ void gui_handle_interactions(gui_app_t *app) {
                playback_mode &&
                !s_record_limit_window_open &&
                !s_version_info_window_open &&
-               !s_metadata_window_open) {
+               !gui_capture_meta_panel_is_open()) {
         if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
                                              gui_ui_get_mouse_position().x)) {
             s_playback_scrub_active = false;
@@ -9433,8 +9049,8 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_version_info_window_open = false;
     }
-    if (s_metadata_window_open && IsKeyPressed(KEY_ESCAPE)) {
-        s_metadata_window_open = false;
+    if (gui_capture_meta_panel_is_open() && IsKeyPressed(KEY_ESCAPE)) {
+        gui_capture_meta_panel_close();
     }
     // ESC closes the gear popover, but only once any active field edit inside
     // it has been dismissed -- otherwise a single ESC would both cancel the
@@ -9451,16 +9067,7 @@ void gui_handle_interactions(gui_app_t *app) {
     // so keep processing their keystrokes even while that window is open.
     bool las_text_field_active = (s_active_text_field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL ||
                                   s_active_text_field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION);
-    bool metadata_text_field_active =
-        (s_active_text_field == UI_TEXT_FIELD_INGEST_PROJECT ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_ID ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_FORMAT ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_SIZE ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_SPEED ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_CONDITION ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_OPERATOR ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_LOCATION ||
-         s_active_text_field == UI_TEXT_FIELD_INGEST_NOTES);
+    bool metadata_text_field_active = gui_ui_is_meta_field(s_active_text_field);
     // The RF tag fields are also reachable from the gear popover, which is not
     // the settings panel -- without this arm the catch-all below would clear
     // the edit every frame and typing there would be impossible.
@@ -9477,19 +9084,19 @@ void gui_handle_interactions(gui_app_t *app) {
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if (net_text_field_active && s_version_info_window_open &&
-               !s_record_limit_window_open && !s_metadata_window_open) {
+               !s_record_limit_window_open && !gui_capture_meta_panel_is_open()) {
         gui_ui_handle_active_text_edit(app);
         // Persist on each edit so the port/host survives a mode apply triggered
         // elsewhere; the string mirror is the source of truth while editing.
         gui_settings_save(&app->settings);
-    } else if (metadata_text_field_active && s_metadata_window_open &&
+    } else if (metadata_text_field_active && gui_capture_meta_panel_is_open() &&
                !s_record_limit_window_open && !s_version_info_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if (gear_text_field_active && !app->settings_panel_open &&
                !s_record_limit_window_open && !s_version_info_window_open &&
-               !s_metadata_window_open) {
+               !gui_capture_meta_panel_is_open()) {
         gui_ui_handle_active_text_edit(app);
-    } else if ((!app->settings_panel_open && !s_metadata_window_open) ||
+    } else if ((!app->settings_panel_open && !gui_capture_meta_panel_is_open()) ||
                s_record_limit_window_open || s_version_info_window_open) {
         gui_ui_clear_text_edit();
     } else {
@@ -9627,7 +9234,7 @@ void gui_handle_interactions(gui_app_t *app) {
     // other modals (which sit at the implicit 0), so it would paint over them.
     // Close it whenever one of them opens rather than trying to interleave.
     if (app->settings_panel_open || s_record_limit_window_open ||
-        s_version_info_window_open || s_metadata_window_open ||
+        s_version_info_window_open || gui_capture_meta_panel_is_open() ||
         gui_usbref_settings_is_open() || gui_popup_is_open()) {
         if (gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 0) ||
             gui_dropdown_is_open(DROPDOWN_CHANNEL_GEAR, 1) ||
@@ -10000,71 +9607,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             }
         }
-        // Metadata popup modal interactions (consume before toolbar underneath)
-        if (s_metadata_window_open) {
-            if (Clay_PointerOver(CLAY_ID("MetadataCloseButton")) ||
-                Clay_PointerOver(CLAY_ID("MetadataBackdrop"))) {
-                s_metadata_window_open = false;
-                if (s_active_text_field == UI_TEXT_FIELD_INGEST_PROJECT ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_ID ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_FORMAT ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_SIZE ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_SPEED ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_TAPE_CONDITION ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_OPERATOR ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_LOCATION ||
-                    s_active_text_field == UI_TEXT_FIELD_INGEST_NOTES) {
-                    gui_ui_clear_text_edit();
-                }
-                gui_ui_set_click_consumed();
-                return;
+        // Metadata panel interactions (consume before toolbar underneath)
+        if (gui_capture_meta_panel_is_open()) {
+            gui_meta_panel_click_t meta_click = gui_capture_meta_panel_handle_click(app);
+            if (meta_click == GUI_META_PANEL_CLICK_CLOSED && gui_ui_is_meta_field(s_active_text_field)) {
+                gui_ui_clear_text_edit();
             }
-            if (Clay_PointerOver(CLAY_ID("MetadataProjectField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_PROJECT, CLAY_ID("MetadataProjectField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataTapeIdField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_TAPE_ID, CLAY_ID("MetadataTapeIdField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataTapeFormatField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_TAPE_FORMAT, CLAY_ID("MetadataTapeFormatField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataTapeSizeField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_TAPE_SIZE, CLAY_ID("MetadataTapeSizeField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataTapeSpeedField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_TAPE_SPEED, CLAY_ID("MetadataTapeSpeedField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataTapeConditionField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_TAPE_CONDITION, CLAY_ID("MetadataTapeConditionField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataOperatorField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_OPERATOR, CLAY_ID("MetadataOperatorField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataLocationField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_LOCATION, CLAY_ID("MetadataLocationField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataNotesField"))) {
-                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_INGEST_NOTES, CLAY_ID("MetadataNotesField"), 8.0f, 8.0f);
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("MetadataWindow"))) {
+            if (meta_click != GUI_META_PANEL_CLICK_NONE) {
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -10164,7 +9713,7 @@ void gui_handle_interactions(gui_app_t *app) {
         if (Clay_PointerOver(CLAY_ID("VersionIconButton"))) {
             s_version_info_window_open = !s_version_info_window_open;
             if (s_version_info_window_open) {
-                s_metadata_window_open = false;
+                gui_capture_meta_panel_close();
             }
             gui_ui_set_click_consumed();
             return;
@@ -10218,8 +9767,7 @@ void gui_handle_interactions(gui_app_t *app) {
             return;
         }
         if (Clay_PointerOver(CLAY_ID("MetadataIconButton"))) {
-            s_metadata_window_open = !s_metadata_window_open;
-            if (s_metadata_window_open) {
+            if (gui_capture_meta_panel_toggle()) {
                 s_version_info_window_open = false;
             }
             gui_ui_set_click_consumed();

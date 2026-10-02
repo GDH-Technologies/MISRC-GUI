@@ -251,6 +251,7 @@ struct flac_writer {
     // Statistics
     uint64_t samples_written;
     uint64_t bytes_written;
+    size_t initial_tags_dropped;     // config.initial_tags libFLAC refused
 
     // Error state
     flac_writer_error_t last_error;
@@ -376,6 +377,8 @@ flac_writer_config_t flac_writer_default_config(void) {
         .enable_seektable = true,
         .seektable_spacing = 1 << 18,  // ~6.5 seconds at 40kHz
         .padding_bytes = 4096,
+        .initial_tags = NULL,
+        .initial_tag_count = 0,
         .error_cb = NULL,
         .bytes_cb = NULL,
         .callback_user_data = NULL
@@ -463,6 +466,27 @@ static flac_writer_error_t configure_encoder(flac_writer_t *writer) {
         }
         /* The encoder sets the vendor string during init; we leave it empty here. */
 
+        /* Caller tags go in now, at init, so they are on disk before the
+         * first audio frame and survive a capture that never reaches
+         * finalize. A refused tag is skipped, never fatal: losing a label
+         * must not lose a capture. */
+        for (size_t i = 0; i < writer->config.initial_tag_count; i++) {
+            const flac_writer_tag_t *t = &writer->config.initial_tags[i];
+            FLAC__StreamMetadata_VorbisComment_Entry entry;
+            if (!t->key || !t->value ||
+                !FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(
+                    &entry, t->key, t->value)) {
+                writer->initial_tags_dropped++;
+                continue;
+            }
+            /* copy=false transfers entry ownership to the block on success */
+            if (!FLAC__metadata_object_vorbiscomment_append_comment(
+                    writer->vorbis_comment, entry, false)) {
+                free(entry.entry);
+                writer->initial_tags_dropped++;
+            }
+        }
+
         writer->padding = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PADDING);
         if (!writer->padding) {
             report_error(writer, FLAC_WRITER_ERR_CONFIG, "Failed to allocate padding block");
@@ -472,6 +496,14 @@ static flac_writer_error_t configure_encoder(flac_writer_t *writer) {
         meta[n_meta++] = writer->vorbis_comment;
         meta[n_meta++] = writer->padding;
     }
+
+    if (!writer->vorbis_comment) {
+        /* Legacy layout (no padding, so no VORBIS_COMMENT block). */
+        writer->initial_tags_dropped += writer->config.initial_tag_count;
+    }
+    /* The caller's array need only live through create. */
+    writer->config.initial_tags = NULL;
+    writer->config.initial_tag_count = 0;
 
     if (n_meta > 0 && !FLAC__stream_encoder_set_metadata(enc, meta, n_meta)) {
         report_error(writer, FLAC_WRITER_ERR_CONFIG, "Failed to set encoder metadata");
@@ -876,6 +908,10 @@ uint64_t flac_writer_get_bytes_written(flac_writer_t *writer) {
     return writer ? writer->bytes_written : 0;
 }
 
+size_t flac_writer_initial_tags_dropped(const flac_writer_t *writer) {
+    return writer ? writer->initial_tags_dropped : 0;
+}
+
 bool flac_writer_available(void) {
     return true;
 }
@@ -949,6 +985,7 @@ const char *flac_writer_get_error_string(flac_writer_t *w) {
 
 uint64_t flac_writer_get_samples_written(flac_writer_t *w) { (void)w; return 0; }
 uint64_t flac_writer_get_bytes_written(flac_writer_t *w) { (void)w; return 0; }
+size_t flac_writer_initial_tags_dropped(const flac_writer_t *w) { (void)w; return 0; }
 bool flac_writer_available(void) { return false; }
 const char *flac_writer_get_flac_version(void) { return "N/A"; }
 bool flac_writer_multithreading_available(void) { return false; }

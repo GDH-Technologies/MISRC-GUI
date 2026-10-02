@@ -40,18 +40,32 @@ Clay_Dimensions Raylib_MeasureText(Clay_StringSlice text, Clay_TextElementConfig
 
     float scaleFactor = config->fontSize/(float)fontToUse.baseSize;
 
-    for (int i = 0; i < text.length; ++i, lineCharCount++)
+    for (int i = 0; i < text.length; lineCharCount++)
     {
         if (text.chars[i] == '\n') {
             maxTextWidth = fmax(maxTextWidth, lineTextWidth);
             maxLineCharCount = maxLineCharCount > lineCharCount ? maxLineCharCount : lineCharCount;
             lineTextWidth = 0;
             lineCharCount = 0;
+            i++;
             continue;
         }
-        int index = text.chars[i] - 32;
+        // Decode UTF-8, as DrawTextEx does. `chars[i] - 32` indexed the glyph
+        // table with a negative index for any byte >= 0x80 (a read before
+        // the array, and a garbage width that broke word wrap).
+        int cp_bytes = 1;
+        int cp = (unsigned char)text.chars[i];
+        if (cp >= 0x80) {
+            cp = GetCodepointNext(&text.chars[i], &cp_bytes);
+            if (cp_bytes < 1 || i + cp_bytes > text.length) { cp = '?'; cp_bytes = 1; }
+        }
+        // ASCII keeps the direct index (fonts load codepoints 32..); anything
+        // else, a control byte included, goes through raylib's lookup, which
+        // falls back to '?' like the draw does.
+        int index = (cp >= 32 && cp < 0x80) ? cp - 32 : GetGlyphIndex(fontToUse, cp);
         if (fontToUse.glyphs[index].advanceX != 0) lineTextWidth += fontToUse.glyphs[index].advanceX;
         else lineTextWidth += (fontToUse.recs[index].width + fontToUse.glyphs[index].offsetX);
+        i += cp_bytes;
     }
 
     maxTextWidth = fmax(maxTextWidth, lineTextWidth);

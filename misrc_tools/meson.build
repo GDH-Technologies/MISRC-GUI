@@ -408,6 +408,8 @@ if raylib_dep.found()
     'misrc_gui/core/misrc_gui.c',
     'misrc_gui/core/gui_settings.c',
     'misrc_gui/core/gui_settings_table.c',
+    'misrc_gui/core/gui_session.c',
+    'misrc_gui/core/gui_capture_meta.c',
     'misrc_gui/net/gui_net_query.c',
     # Input
     'misrc_gui/input/gui_capture.c',
@@ -449,12 +451,14 @@ if raylib_dep.found()
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
     'misrc_gui/ui/gui_usbref_settings.c',
+    'misrc_gui/ui/gui_capture_meta_panel.c',
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
     'misrc_gui/net/gui_net_fanout.c',
     # Output
     'misrc_gui/output/gui_record.c',
+    'misrc_gui/output/gui_capture_sidecar.c',
     'misrc_gui/output/gui_video_record.c',
     'misrc_gui/output/gui_cc_record.c',
     'misrc_gui/output/gui_audio.c',
@@ -704,6 +708,26 @@ device_label_test = executable('gui_device_label_test',
   c_args: cflags,
 )
 test('gui_device_label', device_label_test)
+
+# Capture metadata store and sidecar: descriptor table, log escape, UTF-8
+# validator, golden sidecar JSON, atomic write. The settings table is linked
+# for gui_settings_json_escape (the harness stubs its two outside symbols).
+capture_meta_test_sources = [
+  'test/gui_capture_meta_harness.c',
+  'misrc_gui/core/gui_capture_meta.c',
+  'misrc_gui/output/gui_capture_sidecar.c',
+  'misrc_gui/core/gui_settings_table.c',
+  'misrc_gui/ui/gui_ui_scale.c',
+]
+if ddd_enabled
+  capture_meta_test_sources += 'common/ddd_protocol.c'
+endif
+capture_meta_test = executable('gui_capture_meta_test',
+  capture_meta_test_sources,
+  dependencies: [meson.get_compiler('c').find_library('m', required: false)],
+  c_args: cflags,
+)
+test('gui_capture_meta', capture_meta_test)
 
 ddd_fifo_status_test = executable('gui_ddd_fifo_status_test',
   ['test/gui_ddd_fifo_status_test.c',
