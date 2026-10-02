@@ -215,6 +215,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
     settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+    /* 0 = not in the file. Post-load turns it into 100%, so a fresh install
+     * and an upgraded one both land at the desktop's own size. */
+    settings->ui_zoom_percent = 0;
     settings->waveform_scale_mode = 0;  // Basic (0.X, majors only +-0.5/0) by default
 
     // V4L2/simple_capture device discovery is opt-in (disabled by default).
@@ -754,6 +757,13 @@ static bool hook_ui_scale(const gui_setting_desc_t *d, gui_settings_t *s, const 
     return true;
 }
 
+static bool hook_ui_zoom(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                         bool strict, char *err, size_t errcap) {
+    (void)d; (void)strict; (void)err; (void)errcap;
+    s->ui_zoom_percent = gui_ui_zoom_parse_percent(value);
+    return true;
+}
+
 #ifdef ENABLE_DDD
 static bool hook_ddd_decimation(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
                                 bool strict, char *err, size_t errcap) {
@@ -1050,6 +1060,10 @@ static const gui_setting_desc_t s_table[] = {
     GS_IH ("usbref_crop_bottom",              usbref_crop_bottom,         0, hook_preview_crop),
     GS_IH ("usbref_crop_left",                usbref_crop_left,           0, hook_preview_crop),
     GS_IH ("usbref_crop_right",               usbref_crop_right,          0, hook_preview_crop),
+    /* The desktop-relative zoom. ui_scale_percent above stays, written as the
+     * effective scale, for builds that read it as the whole scale. Client-local
+     * like the rest of the display scale: it describes this machine's screen. */
+    GS_IH ("ui_zoom_percent",                 ui_zoom_percent,            GS_LOCAL, hook_ui_zoom),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))
@@ -1341,6 +1355,15 @@ void gui_settings_post_load(gui_settings_t *settings) {
     }
     if (settings->rf_bits_b != 8 && settings->rf_bits_b != 12 && settings->rf_bits_b != 16) {
         settings->rf_bits_b = settings->reduce_8bit_b ? 8 : (settings->use_flac && settings->flac_12bit ? 12 : 16);
+    }
+
+    // A file from before the desktop-relative zoom: its ui_scale_percent was a
+    // multiple of physical pixels, which is how a 2x desktop ended up at 150%
+    // = three quarters of every other app with following switched off by the
+    // zoom. Start it at the desktop's own size, following the desktop.
+    if (settings->ui_zoom_percent == 0) {
+        settings->ui_zoom_percent = GUI_UI_ZOOM_DEFAULT_PERCENT;
+        settings->ui_scale_auto = true;
     }
 
     // Default auto naming to ON if missing.

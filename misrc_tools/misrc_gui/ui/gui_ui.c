@@ -62,7 +62,11 @@ extern const char *android_get_storage_path(void);
 
 // Track if UI consumed the current frame's click (prevents click-through)
 static bool s_ui_consumed_click = false;
+// The effective scale the renderer applies: the desktop's scale x the user's
+// desktop-relative zoom (gui_ui_apply_ui_scale).
 static int s_ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+// The desktop's own scale as last detected, applied while Follow desktop is on.
+static int s_ui_desktop_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 static double s_ui_scale_hud_visible_until_s = 0.0;
 static char s_ui_scale_hud_title[32] = "UI Scale 100%";
 static bool s_toolbar_uses_two_rows = false;
@@ -100,7 +104,7 @@ static int s_cxadc_dc_relative[2] = { 0, 0 };
 
 void gui_ui_set_scale_percent(int percent)
 {
-    s_ui_scale_percent = gui_ui_scale_sanitize_percent(percent);
+    s_ui_scale_percent = gui_ui_scale_clamp_effective_percent(percent);
 }
 
 float gui_ui_get_scale_factor(void)
@@ -108,9 +112,35 @@ float gui_ui_get_scale_factor(void)
     return (float)s_ui_scale_percent / 100.0f;
 }
 
+int gui_ui_get_scale_percent(void)
+{
+    return s_ui_scale_percent;
+}
+
+void gui_ui_set_desktop_scale_percent(int percent)
+{
+    s_ui_desktop_percent = (percent > 0) ? percent : GUI_UI_SCALE_DEFAULT_PERCENT;
+}
+
+int gui_ui_get_desktop_scale_percent(void)
+{
+    return s_ui_desktop_percent;
+}
+
+void gui_ui_apply_ui_scale(gui_settings_t *settings)
+{
+    if (!settings) return;
+    settings->ui_zoom_percent = gui_ui_zoom_sanitize_percent(settings->ui_zoom_percent);
+    int desktop = settings->ui_scale_auto ? s_ui_desktop_percent
+                                          : GUI_UI_SCALE_DEFAULT_PERCENT;
+    int effective = gui_ui_scale_effective_percent(desktop, settings->ui_zoom_percent);
+    gui_ui_set_scale_percent(effective);
+    settings->ui_scale_percent = gui_ui_scale_legacy_percent(effective);
+}
+
 void gui_ui_show_scale_hud(int percent)
 {
-    int sanitized_percent = gui_ui_scale_sanitize_percent(percent);
+    int sanitized_percent = gui_ui_zoom_sanitize_percent(percent);
     snprintf(s_ui_scale_hud_title,
              sizeof(s_ui_scale_hud_title),
              "UI Scale %d%%",
@@ -4535,8 +4565,12 @@ static void render_version_info_window(gui_app_t *app)
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
         },
+        // Vertical only. Clay never shrinks children along an axis its parent
+        // clips, so a horizontal clip kept every hint at its one-line width:
+        // the rows overflowed the max width and the window scrolled sideways
+        // under a drag or a tilt-wheel, hiding the label column. Unclipped,
+        // the rows take the window's width and the hints wrap.
         .clip = {
-            .horizontal = true,
             .vertical = true,
             .childOffset = Clay_GetScrollOffset()
         },
@@ -4780,16 +4814,21 @@ static void render_version_info_window(gui_app_t *app)
             }
         }
 
-        // UI scale. The Ctrl/Cmd+wheel and Ctrl/Cmd +/-/0 shortcuts have
-        // always driven this, but nothing surfaced them, so a HiDPI display
-        // just looked broken. Auto-follow adopts the display's own scale;
-        // touching the stepper pins the value instead.
+        // UI scale: a zoom relative to the desktop's own scale, so 100% is the
+        // size of every other app. The same value the Ctrl/Cmd+wheel and
+        // Ctrl/Cmd +/-/0 shortcuts drive. Follow desktop picks up the
+        // desktop's scale; zooming never turns it off.
         {
             static char ui_scale_label[16];
-            snprintf(ui_scale_label, sizeof(ui_scale_label), "%d%%",
-                     app->settings.ui_scale_percent);
-            bool at_min = app->settings.ui_scale_percent <= GUI_UI_SCALE_MIN_PERCENT;
-            bool at_max = app->settings.ui_scale_percent >= GUI_UI_SCALE_MAX_PERCENT;
+            static char ui_desktop_hint[64];
+            int zoom = gui_ui_zoom_sanitize_percent(app->settings.ui_zoom_percent);
+            snprintf(ui_scale_label, sizeof(ui_scale_label), "%d%%", zoom);
+            snprintf(ui_desktop_hint, sizeof(ui_desktop_hint),
+                     app->settings.ui_scale_auto ? "desktop scale %d%%"
+                                                 : "desktop scale %d%% ignored (1x)",
+                     gui_ui_get_desktop_scale_percent());
+            bool at_min = zoom <= GUI_UI_ZOOM_MIN_PERCENT;
+            bool at_max = zoom >= GUI_UI_ZOOM_MAX_PERCENT;
 
             CLAY(CLAY_ID("VersionInfoUiScaleRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
@@ -4831,7 +4870,7 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(CLAY_STRING("+"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(at_max ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("75-300%; also Ctrl/Cmd+wheel or Ctrl/Cmd +/-/0"),
+                CLAY_TEXT(CLAY_STRING("of desktop size, 50-200%; also Ctrl/Cmd+wheel or Ctrl/Cmd +/-/0"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
 
@@ -4839,7 +4878,7 @@ static void render_version_info_window(gui_app_t *app)
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
                 CLAY(CLAY_ID("VersionInfoUiScaleAutoLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } } }) {
-                    CLAY_TEXT(CLAY_STRING("Match display:"),
+                    CLAY_TEXT(CLAY_STRING("Follow desktop:"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
                 CLAY(CLAY_ID("VersionInfoUiScaleAutoToggle"), {
@@ -4853,18 +4892,7 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(app->settings.ui_scale_auto ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY(CLAY_ID("VersionInfoUiScaleMatch"), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) },
-                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
-                    },
-                    .backgroundColor = to_clay_color(COLOR_BUTTON),
-                    .cornerRadius = CLAY_CORNER_RADIUS(4)
-                }) {
-                    CLAY_TEXT(CLAY_STRING("Match now"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                }
-                CLAY_TEXT(CLAY_STRING("follow the display's scale (X11 reports one scale for all monitors)"),
+                CLAY_TEXT(make_string(ui_desktop_hint),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
         }
@@ -9745,14 +9773,13 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleDec")) ||
                 Clay_PointerOver(CLAY_ID("VersionInfoUiScaleInc"))) {
                 int direction = Clay_PointerOver(CLAY_ID("VersionInfoUiScaleInc")) ? 1 : -1;
-                int next = gui_ui_scale_step_percent(app->settings.ui_scale_percent,
-                                                     direction);
-                if (next != app->settings.ui_scale_percent) {
-                    app->settings.ui_scale_percent = next;
-                    gui_ui_set_scale_percent(next);
-                    // Stepping by hand pins the value, exactly as Ctrl+wheel
-                    // does, so auto-follow cannot undo the choice later.
-                    app->settings.ui_scale_auto = false;
+                int next = gui_ui_zoom_step_percent(app->settings.ui_zoom_percent,
+                                                    direction);
+                if (next != app->settings.ui_zoom_percent) {
+                    // Relative to the desktop, exactly as Ctrl+wheel, so
+                    // Follow desktop stays as it is.
+                    app->settings.ui_zoom_percent = next;
+                    gui_ui_apply_ui_scale(&app->settings);
                     gui_settings_save(&app->settings);
                     gui_ui_show_scale_hud(next);
                 }
@@ -9762,31 +9789,15 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleAutoToggle"))) {
                 app->settings.ui_scale_auto = !app->settings.ui_scale_auto;
                 if (app->settings.ui_scale_auto) {
-                    // Re-arming should take effect now rather than waiting for
-                    // the window to be moved to a different display.
-                    int detected = gui_ui_detect_display_scale_percent();
-                    app->settings.ui_scale_percent = detected;
-                    gui_ui_set_scale_percent(detected);
-                    gui_ui_show_scale_hud(detected);
+                    // Re-arming takes effect now rather than when the window
+                    // next moves to a different display.
+                    gui_ui_set_desktop_scale_percent(gui_ui_detect_display_scale_percent());
                 }
+                gui_ui_apply_ui_scale(&app->settings);
                 gui_settings_save(&app->settings);
                 gui_app_set_status(app, app->settings.ui_scale_auto
-                    ? "UI scale now follows the display"
-                    : "UI scale pinned to the current value");
-                gui_ui_set_click_consumed();
-                return;
-            }
-            if (Clay_PointerOver(CLAY_ID("VersionInfoUiScaleMatch"))) {
-                int detected = gui_ui_detect_display_scale_percent();
-                app->settings.ui_scale_percent = detected;
-                app->settings.ui_scale_auto = true;
-                gui_ui_set_scale_percent(detected);
-                gui_settings_save(&app->settings);
-                gui_ui_show_scale_hud(detected);
-                char msg[64];
-                snprintf(msg, sizeof(msg), "UI scale matched to this display (%d%%)",
-                         detected);
-                gui_app_set_status(app, msg);
+                    ? "UI scale follows the desktop's scale"
+                    : "UI scale ignores the desktop's scale (1x)");
                 gui_ui_set_click_consumed();
                 return;
             }

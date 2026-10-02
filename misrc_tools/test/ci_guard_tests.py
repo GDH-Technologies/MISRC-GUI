@@ -1792,7 +1792,7 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     "demod_mode", "demod_bandwidth_hz", "demod_squelch", "demod_volume", "demod_output_pair",
     "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
     "net_client_port_str", "playback_file_a", "playback_file_b",
-    "waveform_scale_mode", "net_client_record_local",
+    "waveform_scale_mode", "net_client_record_local", "ui_zoom_percent",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to
@@ -2763,6 +2763,106 @@ def check_channel_gear_clearance(repo_root: Path) -> int:
     for test in ("test_scale_independence(&state);", "test_prefix_labels_clear_buttons(&state);"):
         if test not in harness:
             return fail(f"gui_waveform_overlay_harness.c: {test.split('(')[0]} is no longer run")
+    return 0
+
+
+def check_desktop_sized_cursor(repo_root: Path) -> int:
+    """Both windows name the arrow cursor right after InitWindow. With raylib's
+    default (no cursor) the X11 window inherits XWayland's root cursor, drawn
+    at 1x: half the size of every other app on a 2x desktop. GLFW's standard
+    cursor loads the theme at Xcursor.size instead."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    for rel in ("core/misrc_gui.c", "input/gui_preview_v4l2.c"):
+        try:
+            src = strip_c_comments(read_text(base / rel))
+        except OSError as exc:
+            return fail(f"desktop-sized cursor guard: cannot read {rel}: {exc}")
+        init = src.find("InitWindow(")
+        if init < 0:
+            return fail(f"{rel}: InitWindow( not found; the cursor guard needs updating")
+        cursor = src.find("SetMouseCursor(MOUSE_CURSOR_ARROW);", init)
+        if cursor < 0:
+            return fail(f"{rel}: no SetMouseCursor(MOUSE_CURSOR_ARROW) after InitWindow; "
+                        "the window falls back to the 1x X11 root cursor under XWayland")
+        if src.count("SetMouseCursor(") != 1:
+            return fail(f"{rel}: SetMouseCursor must be called exactly once "
+                        "(raylib allocates a new GLFW cursor per call)")
+    return 0
+
+
+def check_ui_zoom_is_desktop_relative(repo_root: Path) -> int:
+    """The UI zoom multiplies the desktop's own scale, so 100% is the size of
+    every other app. It used to multiply physical pixels: on wm's 2x desktop
+    100% was half size, and every zoom switched following off, which is how
+    the live settings sat at 150% (three quarters) for weeks.
+    gui_ui_scale_harness.c covers the arithmetic; this pins the wiring."""
+    base = repo_root / "misrc_tools/misrc_gui"
+    try:
+        gui_c = strip_c_comments(read_text(base / "core/misrc_gui.c"))
+        ui_c = strip_c_comments(read_text(base / "ui/gui_ui.c"))
+        table_c = strip_c_comments(read_text(base / "core/gui_settings_table.c"))
+    except OSError as exc:
+        return fail(f"desktop-relative zoom guard: cannot read a source file: {exc}")
+
+    for name, src in (("misrc_gui.c", gui_c), ("gui_ui.c", ui_c)):
+        if re.search(r"ui_scale_auto\s*=\s*false", src):
+            return fail(f"{name}: something sets ui_scale_auto = false again; the zoom is relative "
+                        "to the desktop, so zooming must never stop following it")
+    if "VersionInfoUiScaleMatch" in ui_c:
+        return fail("gui_ui.c: the Match now button is back; Follow desktop already applies the desktop scale")
+
+    init = gui_c.find("InitWindow(")
+    apply_after_init = gui_c.find("gui_ui_apply_ui_scale(&app.settings);", init)
+    detect_after_init = gui_c.find("gui_ui_set_desktop_scale_percent(", init)
+    if init < 0 or apply_after_init < 0 or detect_after_init < 0 or detect_after_init > apply_after_init:
+        return fail("misrc_gui.c: after InitWindow the desktop scale must be detected, then applied "
+                    "with gui_ui_apply_ui_scale(&app.settings), before the window is sized")
+    if gui_c.count("gui_ui_apply_ui_scale(&app.settings);") < 3:
+        return fail("misrc_gui.c: startup, the zoom shortcuts and desktop following must each apply "
+                    "the scale through gui_ui_apply_ui_scale")
+    if "gui_ui_zoom_step_percent(app->settings.ui_zoom_percent" not in ui_c:
+        return fail("gui_ui.c: the Settings stepper no longer steps ui_zoom_percent")
+
+    try:
+        apply_body = extract_function_body(ui_c, "void gui_ui_apply_ui_scale(gui_settings_t *settings)")
+    except RuntimeError as exc:
+        return fail(f"gui_ui.c: {exc}")
+    for snippet, why in (
+        ("gui_ui_scale_effective_percent(", "the effective scale is desktop x zoom"),
+        ("settings->ui_scale_auto ?", "Follow desktop off counts the desktop as 1x"),
+        ("settings->ui_scale_percent = gui_ui_scale_legacy_percent(", "ui_scale_percent is written on the old grid for rollback"),
+    ):
+        if snippet not in apply_body:
+            return fail(f"gui_ui.c: gui_ui_apply_ui_scale lost '{snippet}' ({why})")
+
+    if not re.search(r"if \(settings->ui_zoom_percent == 0\) \{\s*settings->ui_zoom_percent = GUI_UI_ZOOM_DEFAULT_PERCENT;\s*"
+                     r"settings->ui_scale_auto = true;", table_c):
+        return fail("gui_settings_table.c: gui_settings_post_load no longer starts a pre-zoom file at "
+                    "100% of the desktop with Follow desktop on")
+    return 0
+
+
+def check_about_dialog_never_scrolls_sideways(repo_root: Path) -> int:
+    """The About/settings window clips vertically only. Clay does not compress
+    children along a clipped axis (clay.h, "don't compress children"), so a
+    horizontal clip left every hint at its one-line width: the fork's rows
+    overflowed the 680 max and a drag or tilt-wheel scrolled the window
+    sideways, cutting off the label column."""
+    try:
+        ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+        body = extract_function_body(ui, "static void render_version_info_window(gui_app_t *app)")
+    except (OSError, RuntimeError) as exc:
+        return fail(f"About dialog guard: {exc}")
+    start = body.find('CLAY_ID("VersionInfoWindow")')
+    end = body.find('CLAY_ID("VersionInfoHeader")', start)
+    if start < 0 or end < 0:
+        return fail("gui_ui.c: VersionInfoWindow/VersionInfoHeader not found; the About dialog guard needs updating")
+    window_config = body[start:end]
+    if ".vertical = true" not in window_config:
+        return fail("gui_ui.c: VersionInfoWindow no longer clips (and scrolls) vertically")
+    if re.search(r"\.horizontal\s*=\s*true", window_config):
+        return fail("gui_ui.c: VersionInfoWindow clips horizontally again; Clay then never wraps its "
+                    "hints and the window scrolls sideways over the label column")
     return 0
 
 
@@ -4181,7 +4281,8 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
         (gui_c, "IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)", "100% reset shortcut"),
         (gui_c, "IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)", "keyboard zoom-in shortcut"),
         (gui_c, "IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)", "keyboard zoom-out shortcut"),
-        (gui_c, "gui_ui_scale_step_percent(app.settings.ui_scale_percent", "shared keyboard zoom-step policy"),
+        # The keyboard steps the desktop-relative zoom, the same value the wheel does.
+        (gui_c, "gui_ui_zoom_step_percent(app.settings.ui_zoom_percent", "shared keyboard zoom-step policy"),
         (gui_c, "ui_zoom_result.step_attempted || keyboard_zoom_pressed", "zoom HUD attempt feedback"),
         (gui_c, "gui_ui_show_scale_hud(ui_zoom_result.percent);", "zoom HUD trigger"),
         (gui_c, "ui_zoom_result.passthrough_x * 20.0f", "Clay horizontal wheel routing"),
@@ -4353,6 +4454,9 @@ def main() -> int:
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
         ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
         ("USB reference video UI stays out of gui_ui.c", lambda: check_usbref_ui_stays_out_of_gui_ui(repo_root)),
+        ("desktop-sized cursor", lambda: check_desktop_sized_cursor(repo_root)),
+        ("About dialog never scrolls sideways", lambda: check_about_dialog_never_scrolls_sideways(repo_root)),
+        ("UI zoom is relative to the desktop", lambda: check_ui_zoom_is_desktop_relative(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))

@@ -211,10 +211,13 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 ## UI Scale (HiDPI displays)
 
 The interface is laid out in fixed logical pixels, so on a high-density display
-it renders small unless it is scaled. MISRC GUI detects the display's scale at
-startup and adopts it, so a 4K or 5K panel should be readable without any setup.
+it renders small unless it is scaled. MISRC GUI detects the desktop's own scale
+(`Xft.dpi` on X11/XWayland, the Windows display scale, the compositor
+elsewhere) and draws at the same size as every other app, so a 4K or 5K panel
+should be readable without any setup.
 
-You can override it at any time:
+On top of that you can zoom. The zoom is relative to the desktop: **100% is the
+size of your other apps**, whatever the display's density.
 
 | Action | Shortcut |
 | --- | --- |
@@ -223,25 +226,30 @@ You can override it at any time:
 | Zoom out | `Ctrl` `-` |
 | Reset to 100% | `Ctrl` `0` |
 
-The scale ranges from 75% to 300% in 10% steps and is saved between runs.
+The zoom ranges from 50% to 200% of the desktop's size in 10% steps and is
+saved between runs.
 
 **Settings page → UI scale** exposes the same control, plus:
 
-- **Match display** — when ON, the scale follows the display's own scale and
-  re-applies it if the window is moved to another monitor. Zooming by hand
-  turns this OFF so your choice is not overridden later.
-- **Match now** — re-detect the current display and turn Match display back on.
+- **Follow desktop** — when ON (the default), the desktop's scale is the base
+  the zoom multiplies, re-detected if the window moves to another monitor.
+  Zooming leaves it ON. Turn it OFF only if detection gets your display wrong:
+  the desktop then counts as 1x, so 100% is one UI pixel per screen pixel.
+
+Settings files from before the desktop-relative zoom start at 100% of the
+desktop with Follow desktop ON. The old `ui_scale_percent` key is still written
+(as the resulting scale) so an older build reads a sensible value back.
 
 **Known limitation:** X11 and XWayland report a *single* content scale
 (`Xft.dpi`) shared by every monitor, so on a mixed-density X11 desktop the app
-cannot tell your displays apart and "Match display" will not change the scale
-when you move the window. Use the manual zoom on the odd panel out. Per-monitor
-following works where the compositor reports a per-window content scale.
+cannot tell your displays apart and moving the window will not change the
+scale. Use the zoom on the odd panel out. Per-monitor following works where
+the compositor reports a per-window content scale.
 
 Run with `--debug-view` to log what was detected:
 
 ```
-INFO: DISPLAY: content scale 2.00, monitor 0 (5120px/600mm) -> UI scale 200%
+INFO: DISPLAY: content scale 2.00, monitor 0 (5120px/600mm) -> desktop 200%, zoom 100% -> UI scale 200%
 INFO: DISPLAY: window 3584x2016 on a 5120x2880 monitor -> 1792x1008 logical at 200%
 ```
 

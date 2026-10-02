@@ -118,9 +118,70 @@ int gui_ui_scale_step_percent(int current_percent, int direction)
     return next_percent;
 }
 
+int gui_ui_zoom_sanitize_percent(int percent)
+{
+    if (percent >= GUI_UI_ZOOM_MIN_PERCENT && percent <= GUI_UI_ZOOM_MAX_PERCENT &&
+        (percent % GUI_UI_SCALE_STEP_PERCENT) == 0) return percent;
+    return GUI_UI_ZOOM_DEFAULT_PERCENT;
+}
+
+int gui_ui_zoom_parse_percent(const char *text)
+{
+    if (!text || text[0] == '\0') return GUI_UI_ZOOM_DEFAULT_PERCENT;
+
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' ||
+        parsed < INT_MIN || parsed > INT_MAX) {
+        return GUI_UI_ZOOM_DEFAULT_PERCENT;
+    }
+
+    return gui_ui_zoom_sanitize_percent((int)parsed);
+}
+
+int gui_ui_zoom_step_percent(int current_percent, int direction)
+{
+    int percent = gui_ui_zoom_sanitize_percent(current_percent);
+    if (direction == 0) return percent;
+
+    int next_percent = percent +
+        ((direction > 0) ? GUI_UI_SCALE_STEP_PERCENT : -GUI_UI_SCALE_STEP_PERCENT);
+    if (next_percent < GUI_UI_ZOOM_MIN_PERCENT) next_percent = GUI_UI_ZOOM_MIN_PERCENT;
+    if (next_percent > GUI_UI_ZOOM_MAX_PERCENT) next_percent = GUI_UI_ZOOM_MAX_PERCENT;
+    return next_percent;
+}
+
+int gui_ui_scale_clamp_effective_percent(int percent)
+{
+    if (percent < GUI_UI_SCALE_EFFECTIVE_MIN_PERCENT) return GUI_UI_SCALE_EFFECTIVE_MIN_PERCENT;
+    if (percent > GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT) return GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT;
+    return percent;
+}
+
+int gui_ui_scale_effective_percent(int desktop_percent, int zoom_percent)
+{
+    long desktop = (desktop_percent > 0) ? desktop_percent : GUI_UI_SCALE_DEFAULT_PERCENT;
+    long zoom = gui_ui_zoom_sanitize_percent(zoom_percent);
+    long product = desktop * zoom;
+    // Round half up; both factors are positive. Clamp before narrowing so a
+    // wild desktop reading cannot overflow the int.
+    long effective = (product + 50) / 100;
+    if (effective > GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT) effective = GUI_UI_SCALE_EFFECTIVE_MAX_PERCENT;
+    return gui_ui_scale_clamp_effective_percent((int)effective);
+}
+
+int gui_ui_scale_legacy_percent(int effective_percent)
+{
+    return gui_ui_scale_snap_percent((float)effective_percent / 100.0f);
+}
+
 float gui_ui_stats_width_scale(int percent)
 {
-    float scale = (float)gui_ui_scale_sanitize_percent(percent) / 100.0f;
+    // Clamped, not sanitized: the effective scale is off the 10% grid
+    // whenever the desktop is (230% x 110% = 253%).
+    if (percent <= 0) return 1.0f;
+    float scale = (float)gui_ui_scale_clamp_effective_percent(percent) / 100.0f;
     if (scale <= 1.0f) return 1.0f;
     return (1.0f + (scale - 1.0f) * 0.6f) / scale;
 }
@@ -212,7 +273,7 @@ gui_ui_zoom_result_t gui_ui_zoom_process(gui_ui_zoom_state_t *state,
                                          float wheel_y)
 {
     gui_ui_zoom_result_t result = {
-        .percent = gui_ui_scale_sanitize_percent(current_percent),
+        .percent = gui_ui_zoom_sanitize_percent(current_percent),
         .passthrough_x = wheel_x,
         .passthrough_y = wheel_y,
         .consumed = false,
@@ -255,7 +316,7 @@ gui_ui_zoom_result_t gui_ui_zoom_process(gui_ui_zoom_state_t *state,
            state->wheel_remainder <= -1.0f) {
         result.step_attempted = true;
         int direction = (state->wheel_remainder > 0.0f) ? 1 : -1;
-        int next_percent = gui_ui_scale_step_percent(result.percent, direction);
+        int next_percent = gui_ui_zoom_step_percent(result.percent, direction);
 
         if (next_percent == result.percent) {
             state->wheel_remainder = 0.0f;

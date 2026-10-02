@@ -203,10 +203,19 @@ typedef struct {
     bool show_grid;
     float time_scale;         // Time per division (ms)
     float amplitude_scale;    // Amplitude scale factor
-    int ui_scale_percent;     // Ctrl/Cmd+wheel or +/- UI zoom, persisted as 75-300
-    // While true the scale follows the display the window is on. Any manual
-    // zoom clears it, so a deliberate choice is never silently overridden.
+    // The effective scale (desktop x ui_zoom_percent) snapped onto the 75-300
+    // grid. Written for rollback only: builds before the desktop-relative zoom
+    // read it as the whole scale. This build derives it and never reads it
+    // back (gui_ui_apply_ui_scale).
+    int ui_scale_percent;
+    // "Follow desktop": while true the desktop's own scale (Xft.dpi, the
+    // compositor, the Windows DPI) is the base the zoom multiplies, re-detected
+    // as the window moves. Off, the desktop counts as 1x. Zooming leaves it on.
     bool ui_scale_auto;
+    // Ctrl/Cmd+wheel, Ctrl/Cmd +/-/0 and the Settings stepper: 50-200% of the
+    // desktop's size. 0 means the file predates the key (gui_settings_post_load
+    // migrates it to 100% and turns Follow desktop on).
+    int ui_zoom_percent;
     // Waveform amplitude scale mode (0=Basic majors-only, 1=Expanded thinned,
     // 2=Full all 0.1-0.8, 3=mV/1Vpp, 4=mV/2Vpp). Selected via a dropdown
     // on the waveform panel overlay beside the CH A/CH B label. Grid lines and

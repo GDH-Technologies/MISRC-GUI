@@ -212,6 +212,14 @@ Fork-side:
   `gui_settings.c`: on a sync take the fork's side of both and port each field into
   `gui_settings.h`, a default, and a row APPENDED to the table (row order is the file's write
   order and the round-trip harness compares positionally).
+- UI scale: `ui_zoom_percent` (50-200) is relative to the desktop's scale; effective =
+  desktop × zoom (50-400), applied only through `gui_ui_apply_ui_scale`. `ui_scale_percent`
+  is a rollback mirror written on the old 75-300 grid and never read back; nothing may set
+  `ui_scale_auto = false` on a zoom (guard "UI zoom is relative to the desktop"). Both windows
+  call `SetMouseCursor(MOUSE_CURSOR_ARROW)` once, or XWayland shows its 1x root cursor.
+  Synthetic X events (XSendEvent) do not reach the GUI on wm; to see a dialog in a scratch
+  `--config` instance, open it at startup in a throwaway local edit and grab the window with
+  python-xlib `get_image`.
 - Headless modes that call `gui_settings_load`/`save` without `--config` hit the LIVE settings
   file of whoever runs them: `--auto-record` saves defaults before the override applies, and
   `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
