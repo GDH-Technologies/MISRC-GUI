@@ -409,6 +409,7 @@ if raylib_dep.found()
     'misrc_gui/core/gui_settings.c',
     'misrc_gui/core/gui_settings_table.c',
     'misrc_gui/core/gui_session.c',
+    'misrc_gui/core/gui_capture_meta.c',
     'misrc_gui/net/gui_net_query.c',
     # Input
     'misrc_gui/input/gui_capture.c',
@@ -705,6 +706,14 @@ device_label_test = executable('gui_device_label_test',
   c_args: cflags,
 )
 test('gui_device_label', device_label_test)
+
+# Capture metadata store: descriptor table, log escape, UTF-8 validator.
+capture_meta_test = executable('gui_capture_meta_test',
+  ['test/gui_capture_meta_harness.c', 'misrc_gui/core/gui_capture_meta.c'],
+  dependencies: [],
+  c_args: cflags,
+)
+test('gui_capture_meta', capture_meta_test)
 
 ddd_fifo_status_test = executable('gui_ddd_fifo_status_test',
   ['test/gui_ddd_fifo_status_test.c',
