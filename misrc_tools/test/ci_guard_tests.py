@@ -2790,6 +2790,30 @@ def check_desktop_sized_cursor(repo_root: Path) -> int:
     return 0
 
 
+def check_about_dialog_never_scrolls_sideways(repo_root: Path) -> int:
+    """The About/settings window clips vertically only. Clay does not compress
+    children along a clipped axis (clay.h, "don't compress children"), so a
+    horizontal clip left every hint at its one-line width: the fork's rows
+    overflowed the 680 max and a drag or tilt-wheel scrolled the window
+    sideways, cutting off the label column."""
+    try:
+        ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+        body = extract_function_body(ui, "static void render_version_info_window(gui_app_t *app)")
+    except (OSError, RuntimeError) as exc:
+        return fail(f"About dialog guard: {exc}")
+    start = body.find('CLAY_ID("VersionInfoWindow")')
+    end = body.find('CLAY_ID("VersionInfoHeader")', start)
+    if start < 0 or end < 0:
+        return fail("gui_ui.c: VersionInfoWindow/VersionInfoHeader not found; the About dialog guard needs updating")
+    window_config = body[start:end]
+    if ".vertical = true" not in window_config:
+        return fail("gui_ui.c: VersionInfoWindow no longer clips (and scrolls) vertically")
+    if re.search(r"\.horizontal\s*=\s*true", window_config):
+        return fail("gui_ui.c: VersionInfoWindow clips horizontally again; Clay then never wraps its "
+                    "hints and the window scrolls sideways over the label column")
+    return 0
+
+
 def check_record_parity(repo_root: Path) -> int:
     """The Record button, its click and the R/Space keys read the effective
     recording and capture state (the server's on a net client that records on
@@ -4378,6 +4402,7 @@ def main() -> int:
         ("preview crop never reaches a recording", lambda: check_preview_crop_never_reaches_a_recording(repo_root)),
         ("USB reference video UI stays out of gui_ui.c", lambda: check_usbref_ui_stays_out_of_gui_ui(repo_root)),
         ("desktop-sized cursor", lambda: check_desktop_sized_cursor(repo_root)),
+        ("About dialog never scrolls sideways", lambda: check_about_dialog_never_scrolls_sideways(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))

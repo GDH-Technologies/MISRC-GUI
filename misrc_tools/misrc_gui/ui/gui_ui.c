@@ -4535,8 +4535,12 @@ static void render_version_info_window(gui_app_t *app)
             .attachTo = CLAY_ATTACH_TO_ROOT,
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
         },
+        // Vertical only. Clay never shrinks children along an axis its parent
+        // clips, so a horizontal clip kept every hint at its one-line width:
+        // the rows overflowed the max width and the window scrolled sideways
+        // under a drag or a tilt-wheel, hiding the label column. Unclipped,
+        // the rows take the window's width and the hints wrap.
         .clip = {
-            .horizontal = true,
             .vertical = true,
             .childOffset = Clay_GetScrollOffset()
         },
