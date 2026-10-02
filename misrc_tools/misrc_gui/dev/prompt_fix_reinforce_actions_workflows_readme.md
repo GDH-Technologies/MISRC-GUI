@@ -121,6 +121,23 @@
   - ci_guard_tests.py: MSYS2 toolchain policy now requires the llvm-openmp
     package so it cannot be silently dropped
 
+## Final verification run 37054722490 (after the follow-up commit a3c9b65)
+
+- Run conclusion: SUCCESS — all 12 jobs green:
+  - Preflight + cross-platform guard tests (ubuntu-22.04/windows-2022/
+    macos-14) — the new libc direct-include contract + MSYS2 toolchain
+    policy guards pass on every platform.
+  - Windows EXE build (x86_64) in 2m19s — UCRT64 migration verified
+    end-to-end (compile, -static link, subsystem/DLL assertions, smoke
+    test, post-build guards).
+  - Windows EXE build (arm64) in 4m42s — link fixed; meson now reports
+    'Message: libsoxr found, building with resample support' (feature
+    gap closed) and no msystem-mingw64 deprecation annotation remains.
+  - Linux AppImage (x86_64 + arm64), macOS (arm64/x86_64/universal),
+    Android APK — all green with the new -Werror flags in cflags.
+- Commits: 24ecc14 (fix + reinforcement) + a3c9b65 (arm64 OpenMP link fix)
+  on main; deps caches saved for the ucrt64/arm64 Windows jobs.
+
 ## Commands run (investigation + validation)
 
 - gh run view 37035393223 --repo harrypm/MISRC-GUI [--log-failed] [--job ...]
