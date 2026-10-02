@@ -18,7 +18,7 @@ Install FFTW development packages before running Meson:
 
 - Debian/Ubuntu/Linux Mint: `libfftw3-dev`
 - macOS (Homebrew): `fftw`
-- MSYS2 MinGW x86_64: `mingw-w64-x86_64-fftw`
+- MSYS2 UCRT64 x86_64: `mingw-w64-ucrt-x86_64-fftw`
 - MSYS2 MinGW arm64: `mingw-w64-clang-aarch64-fftw`
 
 If you already configured a Meson build directory before installing FFTW, wipe

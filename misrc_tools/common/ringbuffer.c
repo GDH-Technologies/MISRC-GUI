@@ -25,7 +25,6 @@
 #include <windows.h>
 #else
 #include "shm_anon.h"
-#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -34,6 +33,7 @@
 #endif
 #endif
 #include "ringbuffer.h"
+#include <string.h>
 
 
 int rb_init(ringbuffer_t *rb, char *name, size_t size) {

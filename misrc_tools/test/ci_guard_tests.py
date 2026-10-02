@@ -116,11 +116,52 @@ def check_macos_brew_install_policy(workflow_path: Path) -> int:
         if snippet not in workflow_text:
             return fail(f"Workflow is missing macOS conditional brew install snippet: {snippet}")
     return 0
+def check_msys2_toolchain_policy(workflow_path: Path) -> int:
+    """MSYS2 toolchain policy for the Windows CI jobs.
+
+    - MINGW64 is deprecated by MSYS2 (run 37035393223 emitted the
+      '[msystem-mingw64] MINGW64 is deprecated. Migrate to UCRT64 or CLANG64'
+      warning annotation); the x86_64 job must use UCRT64.
+    - Both Windows jobs must install libsoxr: run 37035393223's arm64 job
+      logged 'libsoxr not found, building without resample support' because
+      mingw-w64-clang-aarch64-libsoxr was missing from its install list, so
+      the ARM64 build silently shipped without resample support while
+      x86_64 had it.
+    - The Windows x86_64 deps cache key must name the ucrt64 toolchain so a
+      MINGW64-built .deps/install (msvcrt-based static libs) can never be
+      reused by the UCRT64 job.
+    """
+    workflow_text = read_text(workflow_path)
+    forbidden_snippets = [
+        "msystem: MINGW64",
+    ]
+    for snippet in forbidden_snippets:
+        if snippet in workflow_text:
+            return fail(f"Workflow uses the deprecated MSYS2 environment (migrate to UCRT64/CLANG64): {snippet}")
+    required_snippets = [
+        "msystem: UCRT64",
+        "msystem: CLANGARM64",
+        "mingw-w64-ucrt-x86_64-libsoxr",
+        "mingw-w64-clang-aarch64-libsoxr",
+    ]
+    for snippet in required_snippets:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing required MSYS2 toolchain/resample parity snippet: {snippet}")
+    if "deps-windows-ucrt64-x86_64-" not in workflow_text:
+        return fail(
+            "Windows x86_64 deps cache key must name the ucrt64 toolchain "
+            "(deps-windows-ucrt64-x86_64-) so a MINGW64-built cache entry "
+            "(msvcrt-based static libs) can never be reused after the "
+            "UCRT64 migration"
+        )
+    return 0
+
+
 def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
         "libfftw3-dev",
-        "mingw-w64-x86_64-fftw",
+        "mingw-w64-ucrt-x86_64-fftw",
         "mingw-w64-clang-aarch64-fftw",
         "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
     ]
@@ -132,6 +173,192 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
     fft_probe_count = workflow_text.count(fft_probe)
     if fft_probe_count != 4:
         return fail(f"Workflow must probe fftw3f exactly 4 times (linux/windows x86/windows arm64/macos), found {fft_probe_count}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Libc direct-include contract (include-what-you-use, libc subset).
+#
+# Regression this prevents (Actions run 37035393223): gui_record_direct.c
+# called malloc/free with no <stdlib.h> of its own. common/threading.h
+# includes <stdlib.h> only in its POSIX branch, so glibc builds got malloc
+# declared transitively while the MSYS2 (Windows) builds did not -> implicit
+# declaration: a hard error on MSYS2 GCC/clang, only a warning on
+# ubuntu-22.04 gcc 11 / Apple clang / NDK clang. The bug class is invisible
+# on every platform except the one it breaks. This static guard makes the
+# 10-second preflight (any platform, before any deps build) fail instead:
+# a .c/.h whose TOP-LEVEL code (outside any platform-conditional #if, so
+# compiled on every platform) calls a libc function must include the libc
+# header itself, or get it from a project header that includes it OUTSIDE
+# any platform-conditional #if. Platform-conditional provision (threading.h's
+# POSIX-only <stdlib.h>) does NOT count - that is exactly the provision
+# that compiles on glibc and breaks on MinGW. Calls inside platform-gated
+# regions are exempt: by construction their includes live in the same branch
+# (the threading.h/posix-branch pattern), and each platform's CI build
+# verifies those branches compile with their own branch-local includes.
+# ---------------------------------------------------------------------------
+
+_PLATFORM_MACRO_RE = re.compile(
+    r"\b(_WIN32|_WIN64|__CYGWIN__|__MINGW32__|__MINGW64__|MSVC|_MSC_VER|"
+    r"__APPLE__|__MACH__|__ANDROID__|__linux__|__unix__|__FreeBSD__|"
+    r"__NetBSD__|__OpenBSD__|__sun|__EMSCRIPTEN__)\b"
+)
+
+_LIBC_HEADER_FAMILIES = {
+    "stdlib.h": (
+        "malloc", "calloc", "realloc", "free", "exit", "abort", "atexit",
+        "atoi", "atol", "strtol", "strtoul", "strtoll", "strtod", "strtof",
+        "qsort", "bsearch", "abs", "labs", "rand", "srand", "getenv",
+        "posix_memalign", "aligned_alloc",
+    ),
+    "stdio.h": (
+        "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+        "vsnprintf", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell",
+        "feof", "ferror", "clearerr", "fflush", "rewind", "remove", "rename",
+        "fputs", "fgets", "fgetc", "fputc", "putchar", "puts", "scanf",
+        "sscanf", "getline", "perror", "fileno", "setvbuf", "ungetc",
+    ),
+    "string.h": (
+        "memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp",
+        "strncmp", "strcpy", "strncpy", "strcat", "strncat", "strchr",
+        "strrchr", "strstr", "strdup", "strndup", "strtok", "strtok_r",
+        "strcasecmp", "strncasecmp", "strerror", "strcspn", "strspn",
+        "strnlen",
+    ),
+    "time.h": (
+        "clock_gettime", "nanosleep", "localtime", "gmtime", "strftime",
+        "mktime", "difftime",
+    ),
+    "math.h": (
+        "sin", "cos", "tan", "sqrt", "pow", "floor", "ceil", "fabs",
+        "fmod", "round", "lround", "atan2", "exp", "log10", "asin",
+        "acos", "atan", "hypot", "fmin", "fmax", "trunc", "rint",
+    ),
+}
+
+
+def _strip_c_lines(text: str) -> List[str]:
+    strip = _make_c_stripper()
+    return [strip(line) for line in text.splitlines()]
+
+
+def _parse_source(path: Path) -> Tuple[set, List[Path], str]:
+    """Parse one source file for the libc direct-include contract.
+
+    Returns (unconditional_system_includes, unconditional_project_include_paths,
+    top_level_text) where top_level_text is the comment/string-stripped text
+    of the lines OUTSIDE any platform-conditional #if region (code compiled on
+    every platform).
+
+    - Directive recognition uses comment/string-stripped lines (a directive
+      inside a comment strips to nothing and is skipped), but include names
+      are extracted from the RAW line: the stripper blanks string literals,
+      which would destroy `#include "header.h"` names.
+    - An #include counts as unconditional only if no enclosing #if/#ifdef/#elif
+      condition mentions a platform macro. Include guards (#ifndef X_H) do not
+      mention platform macros, so guarded headers still count. threading.h's
+      POSIX-only <stdlib.h> sits inside `#else` of a _WIN32 chain and does not
+      count. Unresolvable project includes (e.g. generated version.h) are
+      dropped.
+    """
+    text = read_text(path)
+    raw_lines = text.splitlines()
+    stripped_lines = _strip_c_lines(text)
+    system: set = set()
+    project: List[Path] = []
+    top_level_lines: List[str] = []
+    stack: List[bool] = []
+    for raw_line, stripped_line in zip(raw_lines, stripped_lines):
+        s = stripped_line.strip()
+        m = re.match(r"#\s*(\w+)", s)
+        m_raw = re.match(r"#\s*\w+\s*(.*)", raw_line.strip())
+        rest = m_raw.group(1).strip() if m_raw else ""
+        if not m:
+            if not any(stack):
+                top_level_lines.append(stripped_line)
+            continue
+        if not any(stack):
+            top_level_lines.append(s)
+        directive = m.group(1)
+        if directive in ("if", "ifdef", "ifndef"):
+            stack.append(bool(_PLATFORM_MACRO_RE.search(rest)))
+        elif directive == "elif" and stack:
+            stack[-1] = stack[-1] or bool(_PLATFORM_MACRO_RE.search(rest))
+        elif directive == "endif":
+            if stack:
+                stack.pop()
+        elif directive == "include" and not any(stack):
+            inc_sys = re.match(r"<([^>]+)>", rest)
+            inc_proj = re.match(r'"([^"]+)"', rest)
+            if inc_sys:
+                system.add(inc_sys.group(1))
+            elif inc_proj:
+                cand = path.parent / inc_proj.group(1)
+                if cand.exists():
+                    project.append(cand)
+    return system, project, "\n".join(top_level_lines)
+
+
+def check_libc_direct_include_contract(repo_root: Path) -> int:
+    root = repo_root / "misrc_tools"
+    if not root.exists():
+        return 0
+    parsed: Dict[Path, Tuple[set, List[Path], str]] = {}
+
+    def parse(path: Path) -> Tuple[set, List[Path], str]:
+        if path not in parsed:
+            parsed[path] = _parse_source(path)
+        return parsed[path]
+
+    def available_headers(entry: Path) -> set:
+        seen = {entry}
+        stack = [entry]
+        available = set()
+        while stack:
+            path = stack.pop()
+            system, project_paths, _ = parse(path)
+            available |= system
+            for q in project_paths:
+                if q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        return available
+
+    failures: List[str] = []
+    files = sorted(
+        p for p in root.rglob("*")
+        if p.suffix in (".c", ".h") and p.is_file()
+        and ".deps" not in p.parts and "build" not in p.parts
+    )
+    for path in files:
+        _, _, top_level_text = parse(path)
+        if not top_level_text:
+            continue
+        available = available_headers(path)
+        for header, funcs in _LIBC_HEADER_FAMILIES.items():
+            if header in available:
+                continue
+            called = [
+                fn for fn in funcs
+                if re.search(rf"(?<![\w.>]){re.escape(fn)}\s*\(", top_level_text)
+            ]
+            if called:
+                rel = path.relative_to(repo_root)
+                failures.append(
+                    f"{rel}: top-level code calls {', '.join(called)} without {header} "
+                    f"(direct or via a non-platform-conditional project header)"
+                )
+    if failures:
+        for line in failures:
+            print(f"ERROR: libc direct-include violation: {line}", file=sys.stderr)
+        return fail(
+            "libc direct-include contract violated in "
+            f"{len(failures)} file(s); add the missing #include(s). A libc call "
+            "satisfied only via a platform-conditional transitive include "
+            "(e.g. malloc via threading.h's POSIX-only <stdlib.h>) compiles on "
+            "glibc but is an implicit-declaration hard error on MSYS2 "
+            "(Windows) - run 37035393223."
+        )
     return 0
 
 
@@ -2030,6 +2257,8 @@ def main() -> int:
         ("actions runtime policy", lambda: check_actions_runtime_policy(workflow_path)),
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
+        ("MSYS2 toolchain policy", lambda: check_msys2_toolchain_policy(workflow_path)),
+        ("libc direct-include contract", lambda: check_libc_direct_include_contract(repo_root)),
         ("meson FFT policy", lambda: check_meson_fft_policy(meson_path)),
         ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),

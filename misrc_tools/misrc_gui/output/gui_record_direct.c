@@ -11,6 +11,7 @@
 #include "../../common/threading.h"
 
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Same record-path policy as the extraction thread: a very short wait

@@ -9,6 +9,18 @@ warnings = [
   '-Wall',
   '-Wextra',
   '-Wshadow',
+  # GCC >= 14 and clang >= 16 make these four hard errors by default (C99+),
+  # but the older toolchains still used on some CI runners (ubuntu-22.04
+  # gcc 11, Apple clang, NDK clang 14) only warn. A missing libc include
+  # (e.g. malloc/free without <stdlib.h>) then breaks ONLY the MSYS2 Windows
+  # jobs, after a full vendored-deps rebuild (run 37035393223: gui_record_direct.c
+  # failed there while Linux/macOS passed). Promoting them to -Werror here
+  # makes every platform fail at the first compile instead, and keeps old
+  # compilers at the same strictness the Windows toolchain already enforces.
+  '-Werror=implicit-function-declaration',
+  '-Werror=implicit-int',
+  '-Werror=int-conversion',
+  '-Werror=incompatible-pointer-types',
 ]
 
 cflags = warnings + [

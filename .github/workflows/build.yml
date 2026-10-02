@@ -462,50 +462,59 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .deps/install
-          key: deps-windows-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
+          # Key names the ucrt64 toolchain: MINGW64 is deprecated by MSYS2
+          # (run 37035393223 emitted the deprecation annotation) and this job
+          # migrated to UCRT64, so a stale MINGW64-built (msvcrt-based)
+          # .deps/install must never be reused by the UCRT64 job.
+          key: deps-windows-ucrt64-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
 
+      # MINGW64 is deprecated by MSYS2 (run 37035393223 emitted the
+      # '[msystem-mingw64] MINGW64 is deprecated. Migrate to UCRT64 or
+      # CLANG64' annotation). UCRT64 keeps the gcc toolchain (same code path
+      # meson.build selects for gcc: -lgomp, no getopt shim) and statically
+      # links the UCRT via the existing -static ldflags.
       - name: Setup MSYS2 (cached)
         id: setup_msys2_cached
         continue-on-error: true
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           cache: true
           install: >-
             git
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-flac
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-libjpeg-turbo
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-libsoxr
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-flac
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           cache: false
           install: >-
             git
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-flac
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-libjpeg-turbo
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-libsoxr
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-flac
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Resolve build version
         id: version
@@ -684,6 +693,9 @@ jobs:
           msystem: CLANGARM64
           update: true
           cache: true
+          # libsoxr: resample parity with the x86_64 job (run 37035393223's
+          # arm64 log 'libsoxr not found, building without resample support'
+          # because the package was missing from this list).
           install: >-
             git
             mingw-w64-clang-aarch64-binutils
@@ -693,6 +705,7 @@ jobs:
             mingw-w64-clang-aarch64-flac
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
+            mingw-w64-clang-aarch64-libsoxr
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
@@ -713,6 +726,7 @@ jobs:
             mingw-w64-clang-aarch64-flac
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
+            mingw-w64-clang-aarch64-libsoxr
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
