@@ -344,20 +344,82 @@ Modes:
 There are plans to expand upon these to cover a full range of trigger modes you would typically see inside of an Siglent/Rigol oscilloscope.
 
 
-## Capture Ingest Metadata
+## Capture Metadata
 
 
-The Text Icon opens the metadata tab for logging information about your capture.
+The Text Icon opens the **Capture Metadata** panel: what the next recording is *of* (client, title, tape label, format, speed, video system, HiFi, black & white, notes) and who ran it. These values are written to the capture log, to a small JSON sidecar next to the capture, and (the ids) into the RF FLAC files. They are **never saved**: they live outside the settings file, are never sent to or taken from a net peer, and are gone when the GUI closes.
 
-<img width="665" height="486" alt="image" src="assets/images/MISRC_GUI_Window_Capture_Metdata_Current.png" />
+- **Linked.** When another program opens the GUI with a `--session` file that names an `asset` (see *Session launch file* under [CLI & Automated Testing](#cli--automated-testing)), the capture is linked to that asset. The panel shows *From toolkit: &lt;client&gt; · &lt;title&gt;* and every row is read-only: corrections are made in the program that launched the capture, so the files can never disagree with it. The toolbar badge is drawn in the accent colour while linked.
+- **Unlinked.** Without a session asset the panel says *Not linked to an asset - these values apply to this run only and are never saved* (amber). You may fill the descriptive rows for this run: free text, digits only for Index, and *- / Yes / No* for HiFi audio and Black & white. Asset ID and Client ID stay *- (not linked)*. After a recording has used the current values the toolbar badge turns amber until you edit one, so last tape's values are noticed before the next tape.
+- **Operator** is always read-only: the session's `operator`, or else your OS login name.
+- **Locked while recording.** The values are latched when Record starts; nothing typed afterwards can reach that recording's files, so the panel locks until it stops.
+- **Net client.** A client that forwards Record to the server cannot edit here (the server's own metadata names the server's files). A **linked** client refuses to forward Record at all, with a dialog: turn on *Record locally*, or launch the capture on the server.
 
-These fields can also be pre-filled for a single run by another program with `--session <path.json>` (see *Session launch file* under [CLI & Automated Testing](#cli--automated-testing)). Values from a session file are used for that run only and are never saved over the ones you typed here.
+Sidecar example (`<base>_<date>_capture_meta.json`, same stem as the capture log; written atomically with `"state": "recording"` when recording starts and rewritten with `"state": "complete"` when it finishes; a failed write is a warning in the log and never stops a recording):
+
+```json
+{
+  "schema": "misrc-gui.capture-meta/1",
+  "state": "complete",
+  "linked": true,
+  "asset": {
+    "client_name": "Kuhn Family",
+    "display_name": "Christmas 1994",
+    "index": 3,
+    "label": "Tape 3",
+    "format": "VHS",
+    "tape_speed": "SP",
+    "video_system": "NTSC",
+    "hifi_audio_equipped": true,
+    "black_and_white": null,
+    "notes": "Label reads \"XMAS 94\".\nTracking noise near the end.",
+    "asset_id": "asset_019abc",
+    "client_id": "client_7"
+  },
+  "operator": "Reece",
+  "operator_source": "session",
+  "session_file": "/captures/incoming/Kuhn_Tape_3.session.json",
+  "misrc_gui_version": "v1.2.3-gdh.9",
+  "computer_name": "capture-1",
+  "device": {"name": "[CXADC] CXADC Clockgen", "type": "cxadc"},
+  "capture_format": "FLAC",
+  "started_at": "2026-10-02T15:48:19Z",
+  "ended_at": "2026-10-02T17:52:03Z",
+  "capture_seconds": 7424.112,
+  "output_path": "/captures/incoming",
+  "base_name": "Kuhn_Tape_3",
+  "log_file": "Kuhn_Tape_3_2026.10.02_10.48.19_misrc_capture.log",
+  "files": {
+    "rf_a": {"name": "rfA_Kuhn_Tape_3_16-bit.flac", "bits": 16, "sample_rate_hz": 40000000, "samples": 296964480000, "bytes": 268435456000},
+    "rf_b": null,
+    "video": null,
+    "closed_captions": null,
+    "audio": {"audio_4ch": null, "audio_2ch_12": "Kuhn_Tape_3_Baseband_stereo_ch1_ch2.wav", "audio_2ch_34": null, "audio_1ch_1": null, "audio_1ch_2": null, "audio_1ch_3": null, "audio_1ch_4": null}
+  },
+  "result": {"drops": 0, "waits": 12}
+}
+```
+
+Every key is always present. `index` is an integer or `null`, the two booleans `true`/`false`/`null`, empty strings are `""`, every file name is a basename (the files sit next to the sidecar), times are UTC. While `"recording"`, `ended_at`, `capture_seconds`, `samples`, `bytes` and `result` are `null`.
+
+RF FLAC tags, written when the encoder starts (so a capture that never finishes still carries them), on each channel's file:
+
+| Tag | Value |
+|-----|-------|
+| `MISRC_ASSET_ID` | the asset id (`""` when unlinked) |
+| `MISRC_CLIENT_ID` | the client id (`""` when unlinked) |
+| `MISRC_ASSET_LABEL` | the tape label (linked captures only) |
+| `MISRC_CAPTURE_LINKED` | `true` / `false` |
+| `MISRC_CAPTURE_META` | the sidecar's file name |
+| `MISRC_RF_CHANNEL` | `A` / `B` |
+
+Notes are never written to tags; they are in the sidecar and the log.
 
 
 ## Logging 
 
 
-MISRC GUI has a perpetual logging system, as record is pressed your exact system and record config is saved to your log file along with any metadata saved in the fields provided under the metadata window, and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
+MISRC GUI has a perpetual logging system, as record is pressed your exact system and record config is saved to your log file along with the [capture metadata](#capture-metadata) (one `Capture metadata <key>: <value>` line per field: `(empty)` for an empty string, `(unset)` for an unset index or yes/no, and notes escaped onto one line as `\n`, `\r`, `\t`, `\\` and `\xHH`), and any configuration changes overall, this will also log any errors or buffering issues such as spillover usage to a temporary file, It will also confirm a file is properly encoded and saved so you know 100% the buffers were cleared correctly.
 
 It is highly recommended to preserve these files alongside your captures, however unlike previous capture applications you're encoded FLAC files we'll have the correct duration on both the RF and standard audio files, and can have common metadata embedded into them. This allows for tools such as [FLAC Chop](https://github.com/harrypm/FLAC-Chop) to easily cut up or target or just remove dead space at the start and end of your capture sets.
 
@@ -403,15 +465,22 @@ Log Example:
 [2026-07-31 03:00:26] [INFO] Audio monitor: playback=off monitor_ch34=off misrc_mode=on
 [2026-07-31 03:00:26] [INFO] MISRC V1.5/V2.5 A/B swap override: off
 [2026-07-31 03:00:26] [INFO] Dropout handling: stop_on_dropout=off
-[2026-07-31 03:00:26] [INFO] Ingest metadata project: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata tape_id: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata tape_format: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata tape_size: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata tape_speed: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata tape_condition: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata operator: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata location: (empty)
-[2026-07-31 03:00:26] [INFO] Ingest metadata notes: (empty)
+[2026-07-31 03:00:26] [INFO] Capture metadata linked: true
+[2026-07-31 03:00:26] [INFO] Capture metadata client_name: Kuhn Family
+[2026-07-31 03:00:26] [INFO] Capture metadata display_name: Christmas 1994
+[2026-07-31 03:00:26] [INFO] Capture metadata index: 3
+[2026-07-31 03:00:26] [INFO] Capture metadata label: Tape 3
+[2026-07-31 03:00:26] [INFO] Capture metadata format: VHS
+[2026-07-31 03:00:26] [INFO] Capture metadata tape_speed: SP
+[2026-07-31 03:00:26] [INFO] Capture metadata video_system: NTSC
+[2026-07-31 03:00:26] [INFO] Capture metadata hifi_audio_equipped: true
+[2026-07-31 03:00:26] [INFO] Capture metadata black_and_white: (unset)
+[2026-07-31 03:00:26] [INFO] Capture metadata notes: Label reads "XMAS 94".\nTracking noise near the end.
+[2026-07-31 03:00:26] [INFO] Capture metadata asset_id: asset_019abc
+[2026-07-31 03:00:26] [INFO] Capture metadata client_id: client_7
+[2026-07-31 03:00:26] [INFO] Capture metadata operator: Reece
+[2026-07-31 03:00:26] [INFO] Capture metadata operator_source: session
+[2026-07-31 03:00:26] [INFO] Capture metadata sidecar: Test_Capture_2026.07.31_03.00.26_capture_meta.json
 [2026-07-31 03:00:26] [INFO] FLAC settings: level=8 verify=off threads=8
 [2026-07-31 03:00:26] [INFO] FLAC affinity: enabled=off cpu_list=(none) support=unsupported
 [2026-07-31 03:00:26] [INFO] FILE_PATH_A: C:\Users\Harry\Desktop/rfA_Test_Capture_2026.07.31_03.00.26_8-bit_20msps.flac
@@ -424,6 +493,7 @@ Log Example:
 [2026-07-31 03:00:32] [INFO] Output data: compressedA=9.31 MB (9763449 bytes) compressedB=9.15 MB (9599031 bytes)
 [2026-07-31 03:00:32] [INFO] Compression ratio: total_raw=788.00 MB (826277888 bytes) total_compressed=18.47 MB (19362480 bytes) ratio=42.674x
 [2026-07-31 03:00:32] [INFO] datetime_end: 2026-07-31T03:00:32
+[2026-07-31 03:00:32] [INFO] Capture metadata sidecar complete: Test_Capture_2026.07.31_03.00.26_capture_meta.json
 [2026-07-31 03:00:32] [INFO] Session complete
 ```````
 
@@ -445,7 +515,8 @@ These flags open the GUI window (no capture args):
 | `--config` | `<path>` | Load settings from `<path>` instead of the platform default |
 | `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
 | `--session` | `<path.json>` | Pre-fill this run for one capture from a session file (never saved; see below) |
-| `--session-selftest` | — | Headless check that a session overlay is applied, never saved, and that bad files are refused (no window) |
+| `--session-selftest` | — | Headless check that a session overlay and asset link are applied, never saved, and that bad files are refused whole (no window) |
+| `--capture-meta-selftest` | `[keep_dir] [secs]` | Headless linked FLAC A+B and unlinked RAW recordings from the Simulated device; checks the sidecar, the log block and the FLAC tags (no window; a scratch settings file; outputs kept only in `keep_dir`) |
 
 `--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
 
@@ -460,27 +531,41 @@ These flags open the GUI window (no capture args):
 ```json
 {"schema": "misrc-gui.session/1",
  "output_path": "/captures/incoming",
- "output_base_name": "Family_Tape_03",
- "ingest": {"project": "Family archive", "tape_id": "T-003", "tape_format": "VHS",
-            "tape_speed": "SP", "tape_size": "E-180", "tape_condition": "good",
-            "operator": "Sam", "location": "Bench 2", "notes": "label partly torn"},
- "log_tags": {"job_id": "4711", "video_system": "NTSC"}}
+ "output_base_name": "Kuhn_Tape_3",
+ "operator": "Reece",
+ "asset": {"asset_id": "asset_019abc", "client_id": "client_7",
+           "client_name": "Kuhn Family", "display_name": "Christmas 1994",
+           "index": 3, "label": "Tape 3", "format": "VHS",
+           "tape_speed": "SP", "video_system": "NTSC",
+           "hifi_audio_equipped": true, "black_and_white": null,
+           "notes": "Label reads \"XMAS 94\".\nTracking noise near the end."}}
 ```
 
 - `schema` is required and must be exactly `misrc-gui.session/1`. Every other key is optional, and only the keys present change anything.
-- `output_path` and `output_base_name` set the output folder and base name. A base name only names files while auto naming is on, so a session that sets `output_base_name` also turns auto naming on for the run. Whether the record-start timestamp is appended stays the operator's setting.
-- `ingest.*` fills the [Capture Ingest Metadata](#capture-ingest-metadata) fields: `project`, `tape_id`, `tape_format`, `tape_size`, `tape_speed`, `tape_condition`, `operator`, `location`, `notes`. Each must fit its field (127 bytes, `notes` 255). `output_path` and `output_base_name` may not be empty, and no value that lands in a setting (these and the ingest fields) may contain a double quote or a control character, the settings file's own rule.
-- `log_tags` is up to 16 caller-chosen string pairs (keys: 1-63 characters of `A-Z a-z 0-9 _ . -`; values: up to 255 bytes, no control characters). The GUI does not interpret them. At record start they are written to the capture log, in file order, right after the ingest metadata:
+- `output_path` and `output_base_name` set the output folder and base name. A base name only names files while auto naming is on, so a session that sets `output_base_name` also turns auto naming on for the run. Whether the record-start timestamp is appended stays the operator's setting. Neither may be empty, or contain a double quote or a control character (the settings file's own rule).
+- `operator` names who runs the capture (otherwise the OS login name is used).
+- `asset` **links** the capture to an asset: its fields fill the [Capture Metadata](#capture-metadata) panel read-only for the run and reach the capture log, the `_capture_meta.json` sidecar and the RF FLAC tags.
 
-  ```
-  [2026-10-01 14:02:11] [INFO] Ingest metadata notes: label partly torn
-  [2026-10-01 14:02:11] [INFO] Session tag job_id: 4711
-  [2026-10-01 14:02:11] [INFO] Session tag video_system: NTSC
-  ```
+| Field | Type | Max bytes | Required when `asset` is given |
+|-------|------|-----------|-----------|
+| `asset_id` | string, `A-Z a-z 0-9 _ . -` | 63 | yes |
+| `client_id` | string, `A-Z a-z 0-9 _ . -` | 63 | yes |
+| `client_name` | string | 255 | yes |
+| `display_name` | string | 255 | yes |
+| `label` | string | 255 | yes |
+| `format` | string | 31 | yes |
+| `index` | integer >= 0, or `null` | - | no |
+| `tape_speed` | string (`""` = none) | 31 | no |
+| `video_system` | string (`""` = none) | 31 | no |
+| `hifi_audio_equipped` | `true` / `false` / `null` | - | no |
+| `black_and_white` | `true` / `false` / `null` | - | no |
+| `notes` | string (`""` = none) | 8191 | no |
+| `operator` (top level) | string | 127 | no |
 
-- **Session values are never saved.** The settings file always keeps the operator's own output folder, base name, auto-naming switch, file names and ingest fields for every key the session set. This holds even if the operator edits one of those fields during the run: the edit lasts for that run only. Settings the session did not touch save normally.
-- Strings are standard JSON (escapes and `\u` sequences are decoded to UTF-8). Unknown keys are ignored with a note on stderr, so newer callers can add keys.
-- If the file is missing, unreadable, larger than 64 KiB, not valid JSON, has a different `schema`, or has a value of the wrong type or size, nothing from it is applied: the GUI prints `[SESSION] ERROR: ...` on stderr, shows a "Session file rejected" dialog, and starts with the saved settings.
+- Validation is strict and all-or-nothing. Types are exact: `"3"` for `index`, `2.5`, `-1`, or `"true"` for a yes/no field are refused. Strings must be valid UTF-8 and within their cap. No control characters, except that `notes` may hold line breaks and tabs (CRLF is stored as LF). A key repeated inside `asset` is refused. Required fields must be non-empty.
+- **Session values are never saved.** The settings file always keeps the operator's own output folder, base name, auto-naming switch and file names for every key the session set. This holds even if the operator edits one of those fields during the run: the edit lasts for that run only. Settings the session did not touch save normally. Capture metadata is never saved at all.
+- Strings are standard JSON (escapes and `\u` sequences are decoded to UTF-8). Unknown keys are ignored with a note on stderr, so newer callers can add keys. The retired `ingest` and `log_tags` objects are ignored the same way.
+- If the file is missing, unreadable, larger than 64 KiB, not valid JSON, has a different `schema`, or breaks any rule above, nothing from it is applied -- not the settings, not the link: the GUI prints `[SESSION] ERROR: ...` on stderr, shows a "Session file rejected" dialog (the capture is NOT linked to an asset), and starts with the saved settings. A good file prints `[SESSION] Linked: <client> · <title> (<asset_id>)` and shows it in the status bar.
 
 </details>
 

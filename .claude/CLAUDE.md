@@ -22,6 +22,8 @@ gui_preview_v4l2.c`, `misrc_tools/misrc_gui/input/gui_preview_sdtv.{c,h}`,
 `misrc_tools/misrc_gui/output/gui_video_record.c`,
 `misrc_tools/misrc_gui/visualization/gui_preview_panel.c`,
 `misrc_tools/misrc_gui/ui/gui_usbref_settings.{c,h}`,
+`misrc_tools/misrc_gui/core/gui_capture_meta.{c,h}`, `misrc_tools/misrc_gui/output/gui_capture_sidecar.{c,h}`,
+`misrc_tools/misrc_gui/ui/gui_capture_meta_panel.{c,h}`,
 `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
 `scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `.claude/`, `.clangd`.
 
@@ -97,14 +99,16 @@ are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 82
-  checks in a Linux `--post-build` run (v1.2.3 sync), several of which compile and run C
-  harnesses in `misrc_tools/test/*_harness.c`. Meson has twelve `test()` targets
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 89
+  checks in a Linux `--post-build` run (capture metadata, 2026-10-02), several of which compile and run C
+  harnesses in `misrc_tools/test/*_harness.c`. Meson has thirteen `test()` targets
   (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
   must keep the fork's `"Preview"` entry.
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
   touches the capture path; run it and quote the numbers.
-- Headless modes for automation (`misrc_gui --help`): `--auto-record`, `--config <path>`
+- Headless modes for automation (`misrc_gui --help`): `--auto-record`,
+  `--session-selftest`, `--capture-meta-selftest [keep_dir] [secs]` (both on scratch settings
+  files), `--config <path>`
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
   `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`,
@@ -234,6 +238,26 @@ Fork-side:
   level 1-3; since v1.2.3 neither fires while `use_flac` is off). Both popups live in the render loop, so no headless
   mode can reach it: `--net-serve`, `--auto-record` and the preview/video/rtsp modes all
   return before `InitWindow`, which is why cs0's `--config ... --net-serve` unit is unaffected.
+
+- Capture metadata (what a capture is OF: the toolkit's asset ids, client, title, label,
+  format, notes, operator) lives in `core/gui_capture_meta.c`, OUTSIDE `gui_settings_t`: never
+  saved, never sent to or taken from a net peer. A `--session` asset links it read-only; unlinked
+  the operator types per-run values in `ui/gui_capture_meta_panel.c`. `gui_record.c` snapshots
+  it at record start into the log block (`Capture metadata <key>: <value>`), the
+  `{base}_{dateTag}_capture_meta.json` sidecar (same stem as the log, atomic, rewritten at
+  finalize) and the RF FLAC tags. One descriptor table drives all of them; its order is pinned
+  by the "capture metadata contract" guard. Upstream still has nine `ingest_*` settings and
+  `render_metadata_window` in `gui_ui.c`: on every sync DROP upstream's changes to both (the
+  fork retired them; `SETTINGS_KEYS_RETIRED` in the suite refuses a retired key as a table row)
+  and keep the fork's `UI_TEXT_FIELD_META_*` hooks.
+- `common/flac_writer.c`'s `initial_tags` hunk (tags appended to the VORBIS_COMMENT block at
+  encoder init, so a crash keeps the asset link) is fork-only: keep it on every upstream sync,
+  together with the finalize rule above. The block order and the 4096 padding must not change.
+- `ui/clay_renderer_raylib.c`'s `Raylib_MeasureText` decodes UTF-8 (upstream's indexed the glyph
+  table with a negative index for every byte >= 0x80, which broke Clay's wrap and sizing for any
+  non-ASCII text). Upstream-bound; keep the fork's side until harrypm takes it.
+- The UI fonts load codepoints 32-287 only: an em dash (U+2014) draws as `?`. The middle dot
+  (U+00B7) and Latin-1 letters are fine.
 
 ## Worktrees and git hygiene
 
