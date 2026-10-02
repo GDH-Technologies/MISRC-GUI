@@ -120,8 +120,9 @@ void gui_capture_meta_snapshot(gui_capture_meta_t *out);
  * the OS login (source os_login); a non-empty one is source "session". */
 void gui_capture_meta_set_linked(const gui_capture_meta_t *src, const char *session_file);
 
-/* A session that names an operator but no asset: the operator only. */
-void gui_capture_meta_set_operator(const char *operator_name);
+/* A session with no asset: stays unlinked; records the session file and its
+ * operator (an empty one keeps the OS login). */
+void gui_capture_meta_set_unlinked_session(const char *operator_name, const char *session_file);
 
 /* The panel's edit buffer for descriptor slot `slot` (a STR or INDEX field).
  * False while linked, or when the field is not UNLINKED_EDITABLE. Edits go

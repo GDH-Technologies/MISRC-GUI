@@ -163,8 +163,9 @@ void gui_capture_meta_set_linked(const gui_capture_meta_t *src, const char *sess
     s_used_since_edit = false;
 }
 
-void gui_capture_meta_set_operator(const char *operator_name) {
+void gui_capture_meta_set_unlinked_session(const char *operator_name, const char *session_file) {
     meta_set_operator(&s_meta, operator_name);
+    snprintf(s_meta.session_file, sizeof(s_meta.session_file), "%s", session_file ? session_file : "");
     s_meta.generation++;
 }
 

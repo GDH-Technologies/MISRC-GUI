@@ -88,6 +88,54 @@ static int find_metadata_block(const char *path, uint8_t type, uint32_t *out_len
     return found;
 }
 
+/* STREAMINFO -> SEEKTABLE -> VORBIS_COMMENT -> PADDING(last): the order both
+ * libFLAC metadata APIs need for in-place tag writes (see flac_writer.c). */
+static int expect_block_order(const char *path, const char *when) {
+    static const uint8_t want[4] = { 0 /* STREAMINFO */, 3 /* SEEKTABLE */,
+                                     4 /* VORBIS_COMMENT */, 1 /* PADDING */ };
+    uint8_t got[8];
+    int n = 0;
+    bool last_seen = false;
+    FILE *f = fopen(path, "rb");
+    uint8_t magic[4];
+    if (!f || fread(magic, 1, 4, f) != 4 || memcmp(magic, "fLaC", 4) != 0) {
+        fprintf(stderr, "FAIL: %s: cannot read the fLaC header\n", when);
+        if (f) fclose(f);
+        return -1;
+    }
+    while (n < 8) {
+        uint8_t hdr[4];
+        if (fread(hdr, 1, 4, f) != 4) break;
+        got[n++] = hdr[0] & 0x7F;
+        uint32_t length = ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) | hdr[3];
+        if (hdr[0] & 0x80) { last_seen = true; break; }
+        if (fseek(f, (long)length, SEEK_CUR) != 0) break;
+    }
+    fclose(f);
+    if (n != 4 || !last_seen || memcmp(got, want, 4) != 0) {
+        fprintf(stderr, "FAIL: %s: metadata block order is", when);
+        for (int i = 0; i < n; i++) fprintf(stderr, " %u", got[i]);
+        fprintf(stderr, " (want 0 3 4 1, PADDING last)\n");
+        return -1;
+    }
+    printf("PASS: block order STREAMINFO -> SEEKTABLE -> VORBIS_COMMENT -> PADDING (%s)\n", when);
+    return 0;
+}
+
+/* True when the file's VORBIS_COMMENT holds the exact entries (b may be NULL). */
+static bool has_tags(const char *path, const char *a, const char *b) {
+    FLAC__StreamMetadata *tags = NULL;
+    if (!FLAC__metadata_get_tags(path, &tags) || !tags) return false;
+    bool found_a = false, found_b = (b == NULL);
+    for (uint32_t i = 0; i < tags->data.vorbis_comment.num_comments; i++) {
+        const FLAC__StreamMetadata_VorbisComment_Entry *e = &tags->data.vorbis_comment.comments[i];
+        if (strlen(a) == e->length && memcmp(e->entry, a, e->length) == 0) found_a = true;
+        if (b && strlen(b) == e->length && memcmp(e->entry, b, e->length) == 0) found_b = true;
+    }
+    FLAC__metadata_object_delete(tags);
+    return found_a && found_b;
+}
+
 static int expect_total(const char *path, uint64_t expected, const char *label) {
     uint64_t total = 0;
     if (read_streaminfo_total_samples(path, &total) != 0) return -1;
@@ -117,14 +165,37 @@ int main(int argc, char **argv) {
     flac_writer_config_t config = flac_writer_default_config();
     config.compression_level = 0;
     config.num_threads = 1;
+    /* Tags written at encoder init (the capture-metadata link). "BAD=KEY" is
+     * not a legal vorbis field name: it must be skipped and counted, and the
+     * encode must go on. The array need only outlive create. */
+    flac_writer_tag_t initial[4] = {
+        { "MISRC_ASSET_ID", "asset_01" },
+        { "BAD=KEY", "x" },
+        { "MISRC_RF_CHANNEL", "A" },
+        { "MISRC_CAPTURE_META", "Tape_2026.10.02_10.00.00_capture_meta.json" },
+    };
+    config.initial_tags = initial;
+    config.initial_tag_count = 4;
 
     flac_writer_t *writer = flac_writer_create_file(f, &config);
+    memset(initial, 0, sizeof(initial));   /* create must not have kept them */
+    config.initial_tags = NULL;
+    config.initial_tag_count = 0;
     if (!writer) {
         fprintf(stderr, "FAIL: flac_writer_create_file failed\n");
         fclose(f);
         remove(path);
         return 1;
     }
+    if (flac_writer_initial_tags_dropped(writer) != 1) {
+        fprintf(stderr, "FAIL: initial_tags_dropped = %zu, expected 1 (the bad name)\n",
+                flac_writer_initial_tags_dropped(writer));
+        flac_writer_abort(writer);
+        fclose(f);
+        remove(path);
+        return 1;
+    }
+    printf("PASS: a refused initial tag is skipped and counted\n");
 
     int32_t block[4096];
     uint64_t remaining = TEST_SAMPLE_COUNT;
@@ -172,6 +243,14 @@ int main(int argc, char **argv) {
             break;
         }
         printf("PASS: encoder reserves a 4096-byte PADDING block\n");
+
+        if (expect_block_order(path, "with initial tags") != 0) break;
+        if (!has_tags(path, "MISRC_ASSET_ID=asset_01", "MISRC_RF_CHANNEL=A") ||
+            !has_tags(path, "MISRC_CAPTURE_META=Tape_2026.10.02_10.00.00_capture_meta.json", NULL)) {
+            fprintf(stderr, "FAIL: initial tags are not in the encoded file's VORBIS_COMMENT\n");
+            break;
+        }
+        printf("PASS: initial tags are written at encoder init\n");
 
         if (!flac_writer_finalize_streaminfo(path, TEST_SAMPLE_COUNT)) {
             fprintf(stderr, "FAIL: finalize_streaminfo returned false for in-range count\n");
@@ -226,6 +305,12 @@ int main(int argc, char **argv) {
             }
             printf("PASS: embedded tags round-trip\n");
         }
+        if (!has_tags(path, "MISRC_ASSET_ID=asset_01", "RF_TOTAL_SAMPLES=123457")) {
+            fprintf(stderr, "FAIL: the in-place embed lost the initial tags\n");
+            break;
+        }
+        if (expect_block_order(path, "after the in-place embed") != 0) break;
+        printf("PASS: initial tags survive the post-close embed\n");
 
         rc = 0;
     } while (0);

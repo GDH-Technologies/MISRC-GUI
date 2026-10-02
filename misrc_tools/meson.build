@@ -457,6 +457,7 @@ if raylib_dep.found()
     'misrc_gui/net/gui_net_fanout.c',
     # Output
     'misrc_gui/output/gui_record.c',
+    'misrc_gui/output/gui_capture_sidecar.c',
     'misrc_gui/output/gui_video_record.c',
     'misrc_gui/output/gui_cc_record.c',
     'misrc_gui/output/gui_audio.c',
@@ -707,10 +708,22 @@ device_label_test = executable('gui_device_label_test',
 )
 test('gui_device_label', device_label_test)
 
-# Capture metadata store: descriptor table, log escape, UTF-8 validator.
+# Capture metadata store and sidecar: descriptor table, log escape, UTF-8
+# validator, golden sidecar JSON, atomic write. The settings table is linked
+# for gui_settings_json_escape (the harness stubs its two outside symbols).
+capture_meta_test_sources = [
+  'test/gui_capture_meta_harness.c',
+  'misrc_gui/core/gui_capture_meta.c',
+  'misrc_gui/output/gui_capture_sidecar.c',
+  'misrc_gui/core/gui_settings_table.c',
+  'misrc_gui/ui/gui_ui_scale.c',
+]
+if ddd_enabled
+  capture_meta_test_sources += 'common/ddd_protocol.c'
+endif
 capture_meta_test = executable('gui_capture_meta_test',
-  ['test/gui_capture_meta_harness.c', 'misrc_gui/core/gui_capture_meta.c'],
-  dependencies: [],
+  capture_meta_test_sources,
+  dependencies: [meson.get_compiler('c').find_library('m', required: false)],
   c_args: cflags,
 )
 test('gui_capture_meta', capture_meta_test)

@@ -49,6 +49,13 @@ typedef void (*flac_bytes_written_callback_t)(
     size_t bytes_written
 );
 
+// One vorbis comment, for flac_writer_config_t.initial_tags and
+// flac_writer_embed_tags().
+typedef struct {
+    const char *key;
+    const char *value;
+} flac_writer_tag_t;
+
 /* ============================================================================
  * Configuration Structure
  * ============================================================================ */
@@ -75,6 +82,18 @@ typedef struct {
     // (vorbis tags) can be embedded in place instead of rewriting the whole
     // file. 0 disables. Default: 4096 bytes.
     uint32_t padding_bytes;
+
+    // Vorbis comments written into the VORBIS_COMMENT block when the encoder
+    // is initialised, so they are on disk from the first byte of the capture
+    // and survive a crash that never reaches finalize. Copied at create time
+    // (the array need only live through flac_writer_create_*). A tag libFLAC
+    // refuses (bad name, NULL key/value) is skipped and counted, never fatal:
+    // see flac_writer_initial_tags_dropped(). Needs padding_bytes > 0 (the
+    // legacy layout has no VORBIS_COMMENT block; every tag counts as dropped).
+    // Block order and padding are unchanged, so flac_writer_embed_tags() is
+    // still an in-place write. Default: NULL / 0.
+    const flac_writer_tag_t *initial_tags;
+    size_t initial_tag_count;
 
     // Callbacks (all optional - NULL disables)
     flac_error_callback_t error_cb;
@@ -146,12 +165,6 @@ flac_writer_error_t flac_writer_finish(flac_writer_t *writer);
 // Returns true on success or when no rewrite was needed.
 bool flac_writer_finalize_streaminfo(const char *path, uint64_t samples_written);
 
-// One vorbis comment for flac_writer_embed_tags().
-typedef struct {
-    const char *key;
-    const char *value;
-} flac_writer_tag_t;
-
 // Appends key=value comments to the file's VORBIS_COMMENT block (creating one
 // after STREAMINFO if absent). With the trailing PADDING block reserved at
 // encode time this is an in-place metadata write (milliseconds); on legacy
@@ -174,6 +187,9 @@ uint64_t flac_writer_get_samples_written(flac_writer_t *writer);
 
 // Get total compressed bytes written so far (stream mode only)
 uint64_t flac_writer_get_bytes_written(flac_writer_t *writer);
+
+// How many of config.initial_tags were skipped at create time.
+size_t flac_writer_initial_tags_dropped(const flac_writer_t *writer);
 
 // Check if FLAC support is compiled in
 bool flac_writer_available(void);

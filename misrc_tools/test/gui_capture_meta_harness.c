@@ -3,7 +3,9 @@
  * the descriptor table (order, offsets, caps, flags), the capture-log escape
  * (it must round-trip, so a notes field never splits a log line and can be
  * read back), the strict UTF-8 validator, and the linked/unlinked editing
- * rules the panel relies on. Run by meson (`meson test -C build-local`).
+ * rules the panel relies on; and the sidecar (output/gui_capture_sidecar.c):
+ * golden JSON for a linked and an unlinked record, and an atomic write that
+ * leaves no temp file. Run by meson (`meson test -C build-local`).
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -13,6 +15,15 @@
 #include <string.h>
 
 #include "../misrc_gui/core/gui_capture_meta.h"
+#include "../misrc_gui/output/gui_capture_sidecar.h"
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <process.h>
+#define getpid_portable _getpid
+#else
+#include <unistd.h>
+#define getpid_portable getpid
+#endif
 
 static int checks;
 static int failures;
@@ -242,12 +253,245 @@ static void check_store(void)
     expect(memcmp(&snap, m, sizeof(snap)) == 0, "snapshot is a copy");
 }
 
+/* ---- sidecar -------------------------------------------------------------- */
+
+/* gui_settings.c is not compiled here; the table's defaults need these. */
+const char *gui_settings_get_desktop_path(void) { return "/tmp/misrc-harness-desktop"; }
+uint32_t get_num_cores(void) { return 8; }
+
+static void linked_fixture(gui_capture_meta_t *m)
+{
+    memset(m, 0, sizeof(*m));
+    m->linked = true;
+    snprintf(m->asset_id, sizeof(m->asset_id), "asset_01");
+    snprintf(m->client_id, sizeof(m->client_id), "client.7");
+    snprintf(m->client_name, sizeof(m->client_name), "Kuhn Family");
+    snprintf(m->display_name, sizeof(m->display_name), "Christmas 1994");
+    snprintf(m->index_text, sizeof(m->index_text), "3");
+    snprintf(m->label, sizeof(m->label), "Tape 3");
+    snprintf(m->format, sizeof(m->format), "VHS");
+    snprintf(m->tape_speed, sizeof(m->tape_speed), "SP");
+    snprintf(m->video_system, sizeof(m->video_system), "NTSC");
+    m->hifi_audio_equipped = GUI_META_TRI_FALSE;
+    m->black_and_white = GUI_META_TRI_UNSET;
+    snprintf(m->notes, sizeof(m->notes), "line 1\nsaid \"hi\"\tcaf\xc3\xa9 \\ end");
+    snprintf(m->operator_name, sizeof(m->operator_name), "Reece");
+    m->operator_source = GUI_META_OPERATOR_SESSION;
+    snprintf(m->session_file, sizeof(m->session_file), "/tmp/s.json");
+}
+
+static const char *const s_linked_golden =
+    "{\n"
+    "  \"schema\": \"misrc-gui.capture-meta/1\",\n"
+    "  \"state\": \"complete\",\n"
+    "  \"linked\": true,\n"
+    "  \"asset\": {\n"
+    "    \"client_name\": \"Kuhn Family\",\n"
+    "    \"display_name\": \"Christmas 1994\",\n"
+    "    \"index\": 3,\n"
+    "    \"label\": \"Tape 3\",\n"
+    "    \"format\": \"VHS\",\n"
+    "    \"tape_speed\": \"SP\",\n"
+    "    \"video_system\": \"NTSC\",\n"
+    "    \"hifi_audio_equipped\": false,\n"
+    "    \"black_and_white\": null,\n"
+    "    \"notes\": \"line 1\\nsaid \\\"hi\\\"\\tcaf\xc3\xa9 \\\\ end\",\n"
+    "    \"asset_id\": \"asset_01\",\n"
+    "    \"client_id\": \"client.7\"\n"
+    "  },\n"
+    "  \"operator\": \"Reece\",\n"
+    "  \"operator_source\": \"session\",\n"
+    "  \"session_file\": \"/tmp/s.json\",\n"
+    "  \"misrc_gui_version\": \"v1.2.3-gdh.9\",\n"
+    "  \"computer_name\": \"wm\",\n"
+    "  \"device\": {\"name\": \"[Simulated] Test Signal\", \"type\": \"simulated\"},\n"
+    "  \"capture_format\": \"FLAC\",\n"
+    "  \"started_at\": \"2026-10-02T15:30:28Z\",\n"
+    "  \"ended_at\": \"2026-10-02T15:30:30Z\",\n"
+    "  \"capture_seconds\": 2.004,\n"
+    "  \"output_path\": \"/caps\",\n"
+    "  \"base_name\": \"Kuhn_Tape_3\",\n"
+    "  \"log_file\": \"Kuhn_Tape_3_2026.10.02_10.30.28_misrc_capture.log\",\n"
+    "  \"files\": {\n"
+    "    \"rf_a\": {\"name\": \"rfA_Kuhn_Tape_3_16-bit.flac\", \"bits\": 16, \"sample_rate_hz\": 40000000, "
+    "\"samples\": 16777216, \"bytes\": 13281290},\n"
+    "    \"rf_b\": null,\n"
+    "    \"video\": null,\n"
+    "    \"closed_captions\": \"Kuhn_Tape_3_captions.scc\",\n"
+    "    \"audio\": {\"audio_4ch\": \"Kuhn_Tape_3_4ch.wav\", \"audio_2ch_12\": null, \"audio_2ch_34\": null, "
+    "\"audio_1ch_1\": null, \"audio_1ch_2\": null, \"audio_1ch_3\": null, \"audio_1ch_4\": null}\n"
+    "  },\n"
+    "  \"result\": {\"drops\": 0, \"waits\": 5}\n"
+    "}\n";
+
+static const char *const s_unlinked_golden =
+    "{\n"
+    "  \"schema\": \"misrc-gui.capture-meta/1\",\n"
+    "  \"state\": \"recording\",\n"
+    "  \"linked\": false,\n"
+    "  \"asset\": {\n"
+    "    \"client_name\": \"\",\n"
+    "    \"display_name\": \"\",\n"
+    "    \"index\": null,\n"
+    "    \"label\": \"\",\n"
+    "    \"format\": \"\",\n"
+    "    \"tape_speed\": \"\",\n"
+    "    \"video_system\": \"\",\n"
+    "    \"hifi_audio_equipped\": null,\n"
+    "    \"black_and_white\": true,\n"
+    "    \"notes\": \"\",\n"
+    "    \"asset_id\": \"\",\n"
+    "    \"client_id\": \"\"\n"
+    "  },\n"
+    "  \"operator\": \"op\",\n"
+    "  \"operator_source\": \"os_login\",\n"
+    "  \"session_file\": null,\n"
+    "  \"misrc_gui_version\": \"dev\",\n"
+    "  \"computer_name\": \"wm\",\n"
+    "  \"device\": {\"name\": \"cxadc0\", \"type\": \"cxadc\"},\n"
+    "  \"capture_format\": \"RAW\",\n"
+    "  \"started_at\": \"2026-10-02T15:30:28Z\",\n"
+    "  \"ended_at\": null,\n"
+    "  \"capture_seconds\": null,\n"
+    "  \"output_path\": \"/caps\",\n"
+    "  \"base_name\": \"capture\",\n"
+    "  \"log_file\": \"capture_2026.10.02_10.30.28_misrc_capture.log\",\n"
+    "  \"files\": {\n"
+    "    \"rf_a\": {\"name\": \"rfA_capture_8-bit.u8\", \"bits\": 8, \"sample_rate_hz\": 28636363, "
+    "\"samples\": null, \"bytes\": null},\n"
+    "    \"rf_b\": {\"name\": \"rfB_capture_16-bit.u16\", \"bits\": 16, \"sample_rate_hz\": 28636363, "
+    "\"samples\": null, \"bytes\": null},\n"
+    "    \"video\": \"capture_video.mkv\",\n"
+    "    \"closed_captions\": null,\n"
+    "    \"audio\": {\"audio_4ch\": null, \"audio_2ch_12\": null, \"audio_2ch_34\": null, "
+    "\"audio_1ch_1\": null, \"audio_1ch_2\": null, \"audio_1ch_3\": null, \"audio_1ch_4\": null}\n"
+    "  },\n"
+    "  \"result\": null\n"
+    "}\n";
+
+static void report_diff(const char *what, const char *got, const char *want)
+{
+    size_t i = 0;
+    while (got[i] && got[i] == want[i]) i++;
+    fprintf(stderr, "FAIL: %s differs from the golden text at byte %zu:\n--- got\n%s\n--- want\n%s\n",
+            what, i, got, want);
+}
+
+static void check_sidecar(void)
+{
+    gui_capture_meta_t m;
+    linked_fixture(&m);
+    gui_capture_sidecar_t s;
+    memset(&s, 0, sizeof(s));
+    s.complete = true;
+    s.meta = &m;
+    s.misrc_gui_version = "v1.2.3-gdh.9";
+    s.computer_name = "wm";
+    s.device_name = "[Simulated] Test Signal";
+    s.device_type = "simulated";
+    s.capture_format = "FLAC";
+    s.started_at = "2026-10-02T15:30:28Z";
+    s.ended_at = "2026-10-02T15:30:30Z";
+    s.have_capture_seconds = true;
+    s.capture_seconds = 2.0041;
+    s.output_path = "/caps";
+    s.base_name = "Kuhn_Tape_3";
+    s.log_file = "Kuhn_Tape_3_2026.10.02_10.30.28_misrc_capture.log";
+    s.rf_a = (gui_capture_sidecar_rf_t){ "rfA_Kuhn_Tape_3_16-bit.flac", 16, 40000000ULL,
+                                         true, 16777216ULL, true, 13281290ULL };
+    s.closed_captions = "Kuhn_Tape_3_captions.scc";
+    s.audio[0] = "Kuhn_Tape_3_4ch.wav";
+    s.have_result = true;
+    s.drops = 0;
+    s.waits = 5;
+
+    size_t len = 0;
+    char *text = gui_capture_sidecar_format_alloc(&s, &len);
+    expect(text != NULL && len == strlen(text), "linked sidecar formats");
+    if (text && strcmp(text, s_linked_golden) != 0) {
+        report_diff("linked sidecar", text, s_linked_golden);
+        failures++;
+    }
+    checks++;
+    /* A short buffer truncates but still reports the whole length. */
+    char small[16];
+    expect(gui_capture_sidecar_format(&s, small, sizeof(small)) == len && strlen(small) == 15,
+           "format truncates and reports the full length");
+
+    /* Unlinked, mid-recording. */
+    gui_capture_meta_t u;
+    memset(&u, 0, sizeof(u));
+    u.hifi_audio_equipped = GUI_META_TRI_UNSET;
+    u.black_and_white = GUI_META_TRI_TRUE;
+    snprintf(u.operator_name, sizeof(u.operator_name), "op");
+    u.operator_source = GUI_META_OPERATOR_OS_LOGIN;
+    gui_capture_sidecar_t r;
+    memset(&r, 0, sizeof(r));
+    r.meta = &u;
+    r.misrc_gui_version = "dev";
+    r.computer_name = "wm";
+    r.device_name = "cxadc0";
+    r.device_type = "cxadc";
+    r.capture_format = "RAW";
+    r.started_at = "2026-10-02T15:30:28Z";
+    r.output_path = "/caps";
+    r.base_name = "capture";
+    r.log_file = "capture_2026.10.02_10.30.28_misrc_capture.log";
+    r.rf_a = (gui_capture_sidecar_rf_t){ "rfA_capture_8-bit.u8", 8, 28636363ULL, false, 0, false, 0 };
+    r.rf_b = (gui_capture_sidecar_rf_t){ "rfB_capture_16-bit.u16", 16, 28636363ULL, false, 0, false, 0 };
+    r.video = "capture_video.mkv";
+    char *utext = gui_capture_sidecar_format_alloc(&r, NULL);
+    expect(utext != NULL, "unlinked sidecar formats");
+    if (utext && strcmp(utext, s_unlinked_golden) != 0) {
+        report_diff("unlinked sidecar", utext, s_unlinked_golden);
+        failures++;
+    }
+    checks++;
+
+    /* Atomic write: the file holds the text and no temp file is left. */
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = getenv("TEMP");
+    if (!tmpdir || !tmpdir[0]) tmpdir = ".";
+    char path[512], tmp_path[600];
+    snprintf(path, sizeof(path), "%s/gui_capture_meta_harness_%d%s", tmpdir, (int)getpid_portable(),
+             GUI_CAPTURE_SIDECAR_SUFFIX);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, (int)getpid_portable());
+    char err[256];
+    bool wrote = text && gui_capture_sidecar_write_atomic(path, text, len, err, sizeof(err));
+    expect(wrote, "atomic write succeeds");
+    /* A second write replaces the first in place. */
+    wrote = utext && gui_capture_sidecar_write_atomic(path, utext, strlen(utext), err, sizeof(err));
+    expect(wrote, "atomic write replaces an existing sidecar");
+    FILE *f = fopen(path, "rb");
+    char back[8192] = {0};
+    size_t got = f ? fread(back, 1, sizeof(back) - 1, f) : 0;
+    if (f) fclose(f);
+    expect(utext && got == strlen(utext) && strcmp(back, utext) == 0, "the sidecar holds the last text");
+    FILE *t = fopen(tmp_path, "rb");
+    expect(t == NULL, "no .tmp file is left behind");
+    if (t) fclose(t);
+    remove(path);
+
+    char bad[600];
+    snprintf(bad, sizeof(bad), "%s/no_such_dir_%d/x%s", tmpdir, (int)getpid_portable(),
+             GUI_CAPTURE_SIDECAR_SUFFIX);
+    expect(!gui_capture_sidecar_write_atomic(bad, "{}", 2, err, sizeof(err)) && err[0],
+           "a write into a missing directory fails with a reason");
+
+    expect(strcmp(gui_capture_sidecar_basename("/a/b/c.flac"), "c.flac") == 0, "basename");
+    expect(strcmp(gui_capture_sidecar_basename("c.flac"), "c.flac") == 0, "basename without a dir");
+
+    free(text);
+    free(utext);
+}
+
 int main(void)
 {
     check_descriptors();
     check_escape();
     check_utf8();
     check_store();
+    check_sidecar();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
