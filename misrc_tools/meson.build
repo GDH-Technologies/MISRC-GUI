@@ -329,6 +329,16 @@ if host_system == 'windows' or host_system == 'cygwin'
   ldflags += [ '-static', '-static-libgcc' ]
   if meson.get_compiler('c').get_id() == 'gcc'
     ldflags += [ '-lgomp' ]
+  elif soxr_dep.found()
+    # MSYS2's clang-built static libsoxr.a is compiled with OpenMP enabled
+    # (soxr.c uses #pragma omp; filter.c uses omp_* locks), so the -static
+    # link needs the LLVM OpenMP runtime -lomp (shipped by
+    # mingw-w64-clang-aarch64-llvm-openmp; libomp.a). The gcc environments
+    # get the equivalent from -lgomp above. Run 37053411644 (Windows arm64)
+    # failed with: ld.lld: error: undefined symbol: __kmpc_fork_call /
+    # omp_init_lock ... >>> referenced by libsoxr.a(soxr.c.obj) /
+    # libsoxr.a(filter.c.obj).
+    ldflags += [ '-lomp' ]
   endif
   ldflags_capture += [ '-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lonecore' ]
   sources_capture += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'

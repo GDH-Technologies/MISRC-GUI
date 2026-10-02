@@ -696,6 +696,10 @@ jobs:
           # libsoxr: resample parity with the x86_64 job (run 37035393223's
           # arm64 log 'libsoxr not found, building without resample support'
           # because the package was missing from this list).
+          # llvm-openmp: MSYS2's clang-built static libsoxr.a references the
+          # LLVM OpenMP runtime (libomp.a) and meson links -lomp for the
+          # -static build (run 37053411644: undefined __kmpc_fork_call /
+          # omp_init_lock from libsoxr.a).
           install: >-
             git
             mingw-w64-clang-aarch64-binutils
@@ -706,6 +710,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
@@ -727,6 +732,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf

@@ -98,13 +98,28 @@
   rate probe) use HANDLE/INVALID_HANDLE_VALUE with windows.h included in
   the Windows block; top-level `free` is covered by the direct stdlib.h.
 
-## Not yet verified (needs real runners)
+## Verification run 37053411644 (dispatched on main after the fix commit)
 
-- The UCRT64 toolchain itself, both Windows jobs end-to-end, macOS jobs
-  with the new -Werror flags, and the Android job with the flags in cflags
-  can only be verified by a real Actions run. Plan: branch + PR
-  (pull_request triggers the full workflow on all platforms) before
-  merging to main.
+- Windows EXE build (x86_64): GREEN in 3m0s — the original failure is fixed
+  and the UCRT64 migration links + smoke-tests clean (subsystem/DLL
+  assertions passed under UCRT64).
+- All preflight guard jobs (ubuntu/windows/macos), Linux x86_64+arm64,
+  macOS x86_64+arm64+universal, Android: GREEN (the new -Werror flags and
+  the libc direct-include guard pass on every platform).
+- Windows EXE build (arm64): FAILED at link — NEW finding, caused by the
+  libsoxr addition itself: MSYS2's clang-built static libsoxr.a is compiled
+  with OpenMP enabled, so the -static link needs the LLVM OpenMP runtime:
+  ld.lld: undefined symbol: __kmpc_fork_call / omp_init_lock / ... >>>
+  referenced by libsoxr.a(soxr.c.obj) / libsoxr.a(filter.c.obj).
+  The gcc jobs already cover this (-lgomp in meson.build); the clang
+  environment needed -lomp + the mingw-w64-clang-aarch64-llvm-openmp
+  package (verified on packages.msys2.org: ships /clangarm64/lib/libomp.a,
+  version matched to the CI clang 22.1.8). Follow-up commit adds:
+  - meson.build: `elif soxr_dep.found()` -> `-lomp` in the Windows static
+    link block (gcc keeps -lgomp)
+  - build.yml: mingw-w64-clang-aarch64-llvm-openmp in both arm64 install lists
+  - ci_guard_tests.py: MSYS2 toolchain policy now requires the llvm-openmp
+    package so it cannot be silently dropped
 
 ## Commands run (investigation + validation)
 

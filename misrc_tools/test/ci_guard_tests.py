@@ -127,6 +127,10 @@ def check_msys2_toolchain_policy(workflow_path: Path) -> int:
       mingw-w64-clang-aarch64-libsoxr was missing from its install list, so
       the ARM64 build silently shipped without resample support while
       x86_64 had it.
+    - The arm64 job must install the LLVM OpenMP runtime: MSYS2's clang-built
+      static libsoxr.a references libomp (run 37053411644: ld.lld 'undefined
+      symbol: __kmpc_fork_call / omp_init_lock' referenced by
+      libsoxr.a(soxr.c.obj)/(filter.c.obj)); meson links -lomp for it.
     - The Windows x86_64 deps cache key must name the ucrt64 toolchain so a
       MINGW64-built .deps/install (msvcrt-based static libs) can never be
       reused by the UCRT64 job.
@@ -143,6 +147,7 @@ def check_msys2_toolchain_policy(workflow_path: Path) -> int:
         "msystem: CLANGARM64",
         "mingw-w64-ucrt-x86_64-libsoxr",
         "mingw-w64-clang-aarch64-libsoxr",
+        "mingw-w64-clang-aarch64-llvm-openmp",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
