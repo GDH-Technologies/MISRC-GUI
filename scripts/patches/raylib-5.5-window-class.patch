@@ -1,5 +1,5 @@
 diff --git a/src/platforms/rcore_desktop_glfw.c b/src/platforms/rcore_desktop_glfw.c
-index baf2967..5ccff75 100644
+index baf2967..1219814 100644
 --- a/src/platforms/rcore_desktop_glfw.c
 +++ b/src/platforms/rcore_desktop_glfw.c
 @@ -100,6 +100,24 @@ extern CoreData CORE;                   // Global CORE state context
@@ -27,7 +27,19 @@ index baf2967..5ccff75 100644
  //----------------------------------------------------------------------------------
  // Module Internal Functions Declaration
  //----------------------------------------------------------------------------------
-@@ -1306,6 +1324,9 @@ int InitPlatform(void)
+@@ -684,6 +702,11 @@ void SetWindowSize(int width, int height)
+     CORE.Window.screen.height = height;
+ 
+     glfwSetWindowSize(platform.handle, width, height);
++
++    // GDH patch: on Wayland a client-side resize gets no configure event, so
++    // GLFW never calls WindowSizeCallback and the viewport/render size stay at
++    // the old size (the UI drawn in the bottom-left corner). Do its work here.
++    if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) WindowSizeCallback(platform.handle, width, height);
+ }
+ 
+ // Set window opacity, value opacity is between 0.0 and 1.0
+@@ -1306,6 +1329,9 @@ int InitPlatform(void)
      // Initialize graphic device: display/window and graphic context
      //----------------------------------------------------------------------------
      glfwDefaultWindowHints();                       // Set default windows hints
