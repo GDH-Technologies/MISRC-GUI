@@ -2999,6 +2999,52 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
     return 0;
 }
 
+/* ---- --record-gate-selftest ---------------------------------------------- */
+
+/* No device, no files: a finalize is marked in flight and gui_record_start
+ * must refuse with the finalize status, in both phases of a finalize (the
+ * thread still running, and done but not yet joined); once it is collected
+ * the same call must get past the gate, and reaches "Start capture first". */
+int gui_record_finalize_gate_selftest_main(void)
+{
+    static gui_app_t app;
+    memset(&app, 0, sizeof(app));
+    gui_settings_init_defaults(&app.settings);
+    int failures = 0;
+    const char *want = "Finalizing previous recording";
+
+    struct { const char *phase; bool finalizing; bool thread_running; } held[] = {
+        { "finalize thread running", true, true },
+        { "finalize done, thread not yet joined", false, true },
+    };
+    for (size_t i = 0; i < sizeof(held) / sizeof(held[0]); i++) {
+        atomic_store(&s_record_stop_finalize_done, false);
+        atomic_store(&s_record_stop_finalizing, held[i].finalizing);
+        atomic_store(&s_finalize_thread_running, held[i].thread_running);
+        app.is_capturing = true;
+        app.status_message[0] = '\0';
+        int rc = gui_record_start(&app);
+        bool ok = rc == RECORD_ERROR && strstr(app.status_message, want) != NULL && !app.is_recording;
+        printf("%s: %s -> rc=%d status=\"%s\"\n", ok ? "PASS" : "FAIL", held[i].phase, rc,
+               app.status_message);
+        if (!ok) failures++;
+    }
+
+    atomic_store(&s_record_stop_finalizing, false);
+    atomic_store(&s_finalize_thread_running, false);
+    atomic_store(&s_record_stop_finalize_done, false);
+    app.is_capturing = false;
+    app.status_message[0] = '\0';
+    int rc = gui_record_start(&app);
+    bool past = rc == RECORD_ERROR && strstr(app.status_message, "Start capture first") != NULL;
+    printf("%s: no finalize -> past the gate (rc=%d status=\"%s\")\n", past ? "PASS" : "FAIL", rc,
+           app.status_message);
+    if (!past) failures++;
+
+    printf("%s\n", failures ? "record gate selftest FAILED" : "record gate selftest passed");
+    return failures ? 1 : 0;
+}
+
 /* ---- --capture-meta-selftest --------------------------------------------- */
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -3413,13 +3459,15 @@ int gui_record_start(gui_app_t *app) {
 
     (void)gui_record_collect_finalize_if_done();
 
-    /* The previous session's finalize releases the shared record ring buffers
-     * and the video encoder once its writer threads exit (drained). Until
-     * then a second consumer on the same ring buffers would corrupt both
-     * recordings. The slow legacy-metadata phase happens after drain, so this
-     * refusal window is the writer-drain tail only. */
-    if (s_finalizing && !atomic_load(&s_finalizing->drained)) {
-        gui_app_set_status(app, "Previous recording still draining buffers...");
+    /* No new recording until the previous one has fully finalized, as
+     * upstream does. The fork allowed a start once the writers drained
+     * (2026-08-18), which turned the orange "Finalize" button into a Record
+     * button: on 2026-10-02 a click meant to wait for finalize went down this
+     * path seconds before wm's Xwayland died and took the unfinished capture
+     * with it. Every start path (button, R key, a client's local start, the
+     * server's /record?on=1) ends here, so this one refusal covers them all. */
+    if (gui_record_is_finalizing()) {
+        gui_app_set_status(app, "Finalizing previous recording -- wait for it to finish");
         return RECORD_ERROR;
     }
 
@@ -3472,7 +3520,9 @@ int gui_record_start(gui_app_t *app) {
              app->settings.output_path, app->settings.usbref_cc_filename);
     bool file_cc_exists = app->settings.usbref_cc_enabled && (stat(path_cc, &stat_cc) == 0);
 
-    // A finalizing session still owns its output files; refuse to reuse them.
+    /* A finalizing session still owns its output files; refuse to reuse them.
+     * Unreachable while the finalize gate above holds -- kept as defence in
+     * depth should that gate ever be relaxed again. */
     if (s_finalizing) {
         bool clash =
             (app->settings.capture_a && s_finalizing->path_a[0] &&
@@ -4493,9 +4543,9 @@ void gui_record_stop(gui_app_t *app) {
     if (!app->is_recording) {
         return;
     }
-    // One finalize in flight: if the previous one is somehow still running
-    // (rare -- its slow phases are gone for padded captures), wait for it
-    // before handing over.
+    // One finalize in flight. gui_record_start() refuses while one runs, so
+    // a recording can no longer exist alongside a finalize; this wait is a
+    // safety net only and should never fire.
     if (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running)) {
         gui_app_set_status(app, "Waiting for previous finalize...");
         while (atomic_load(&s_record_stop_finalizing)) {

@@ -110,6 +110,11 @@ int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_vide
  * given (then they stay in keep_dir/{linked,unlinked}). Exit code 0 = pass. */
 int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_seconds);
 
+/* --record-gate-selftest: headless, no device and no files. With a finalize
+ * marked in flight gui_record_start must refuse ("Finalizing previous
+ * recording..."); with none it must get past that gate. Exit code 0 = pass. */
+int gui_record_finalize_gate_selftest_main(void);
+
 // Live on-disk size of each channel's output file via stat(). For the UI
 // readout so it shows the exact file size (1:1 with `ls`/file-manager), not
 // the writer-thread atomic which can lead the flushed file by the FILE*

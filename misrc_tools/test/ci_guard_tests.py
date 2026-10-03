@@ -1393,6 +1393,36 @@ def check_cc_sidecar_in_overwrite_set(repo_root: Path) -> int:
     return 0
 
 
+def check_record_start_refuses_while_finalizing(repo_root: Path) -> int:
+    """No new recording while the previous one finalizes, as upstream does.
+    The fork once allowed a start once the writers drained, which turned the
+    orange "Finalize" button into a Record button: on 2026-10-02 a click meant
+    to wait for finalize went down that path seconds before wm's Xwayland died
+    and took the unfinished capture with it. Every start path ends in
+    gui_record_start, so the refusal must sit there, before any output path is
+    built, and the button must not read as an action while it holds."""
+    code = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
+    try:
+        body = extract_function_body(code, "int gui_record_start(gui_app_t *app)")
+    except RuntimeError as exc:
+        return fail(f"gui_record.c: {exc}")
+    gate = body.find("if (gui_record_is_finalizing())")
+    if gate < 0:
+        return fail("gui_record_start does not refuse while gui_record_is_finalizing()")
+    for later in ("gui_record_apply_auto_names(app)", "settings.output_filename_a", "gui_record_start_confirmed(app)"):
+        at = body.find(later)
+        if 0 <= at < gate:
+            return fail(f"gui_record_start reaches {later} before the finalize refusal")
+    if "->drained" in body:
+        return fail("gui_record_start gates on drained again: a start during finalize's metadata tail is back")
+    ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    render_pos = ui.find('CLAY(CLAY_ID("RecordButton")')
+    window = ui[max(0, render_pos - 2600):render_pos]
+    if '"Finalize"' in window or '"Fin"' in window:
+        return fail('gui_ui.c: the Record button says "Finalize" again, which reads as an action')
+    return 0
+
+
 def check_cc_settings_have_defaults_and_rows(repo_root: Path) -> int:
     """A settings field with a default and no table row, or a row and no
     default, is silent: it appears to work until the file is reloaded and is
@@ -4444,6 +4474,21 @@ def check_session_launch_file_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_record_gate_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --record-gate-selftest: with a finalize in flight
+    gui_record_start refuses, and with none it gets past the gate."""
+    try:
+        ran = subprocess.run([str(gui_path), "--record-gate-selftest"], capture_output=True,
+                             text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --record-gate-selftest timed out")
+    if ran.returncode != 0 or "record gate selftest passed" not in ran.stdout:
+        return fail(f"misrc_gui --record-gate-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()}\n{ran.stderr.strip()}")
+    print("record gate selftest passed")
+    return 0
+
+
 def check_session_launch_file_post_build(gui_path: Path) -> int:
     """Run the built GUI's --session-selftest (overlay applied, never saved,
     bad files refused) and confirm --help advertises --session."""
@@ -4831,6 +4876,7 @@ def main() -> int:
         ("v4l2vbi is probed, never assumed", lambda: check_cc_record_probes_never_assumes(repo_root)),
         ("optional-output preflights refuse before any file is opened", lambda: check_cc_preflight_refuses_before_files(repo_root)),
         ("caption sidecar is in the overwrite set", lambda: check_cc_sidecar_in_overwrite_set(repo_root)),
+        ("no record start while finalizing", lambda: check_record_start_refuses_while_finalizing(repo_root)),
         ("caption settings have defaults and table rows", lambda: check_cc_settings_have_defaults_and_rows(repo_root)),
         ("every settings field is in the table", lambda: check_settings_table_covers_struct(repo_root)),
         ("net settings protocol contract", lambda: check_net_settings_protocol(repo_root)),
@@ -4894,6 +4940,7 @@ def main() -> int:
         checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
         checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
         checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
+        checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()

@@ -92,6 +92,15 @@ Gates change as follows:
   the new session. Finalize progress stays visible via the existing orange
   indicator/status text, including the red-blink write-error signal.
 
+> **Reverted 2026-10-02 (start gate only).** `gui_record_start()` again refuses while
+> `gui_record_is_finalizing()`, as upstream does. The orange idle button read
+> "Finalize" while it was really Record; on 2026-10-02 a click meant to wait for
+> finalize started down this path seconds before wm's Xwayland died, taking the
+> GNOME session and the unfinished capture with it. The button now reads "Saving..."
+> (dimmed) during finalize. The decoupled session/finalize thread, the path-clash guard
+> (now defence in depth) and the shutdown hold all stay. Guard:
+> `check_record_start_refuses_while_finalizing`.
+
 ## Change 4 — Shutdown safety (`core/misrc_gui.c`)
 
 - Wire `gui_record_cleanup()` into `main()`'s teardown (before `gui_app_cleanup`),
