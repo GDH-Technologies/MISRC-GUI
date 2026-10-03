@@ -778,9 +778,15 @@ int main(int argc, char **argv) {
     // name, then retitle -- the title bar still shows the version.
     char window_title[128];
     snprintf(window_title, sizeof(window_title), "%s %s", GUI_WINDOW_CLASS_NAME, MIRSC_TOOLS_VERSION);
+    gui_ui_prepare_window_platform();
     InitWindow(default_window_width, default_window_height, GUI_WINDOW_CLASS_NAME);
     SetWindowTitle(window_title);
-    gui_install_window_icons();
+    // Which display path this run took, for whoever reads the journal after a
+    // display-server crash (2026-10-02: Xwayland, under the old X11-only build).
+    fprintf(stderr, "[GUI] Display backend: %s\n", gui_ui_display_backend_name());
+    // Wayland has no client-set window icon (GLFW only warns); the dock icon
+    // comes from the .desktop file the app_id matches.
+    if (!gui_ui_display_is_wayland()) gui_install_window_icons();
     // Name the arrow explicitly. Left at raylib's default, the X11 window has
     // no cursor of its own and inherits the root window's, which XWayland
     // draws at 1x -- half the size of every other app on a 2x desktop. GLFW's
@@ -799,15 +805,18 @@ int main(int argc, char **argv) {
     // The zoom is relative to the desktop's scale, so detect it even when
     // Follow desktop is off: Settings shows it, and turning following back on
     // applies it without waiting for the window to move.
+    // Asked once: under Wayland every GetCurrentMonitor() is a failed
+    // window-position query and a GLFW warning, and its answer is a guess.
+    int startup_monitor = GetCurrentMonitor();
     {
         int desktop = gui_ui_detect_display_scale_percent();
         gui_ui_set_desktop_scale_percent(desktop);
         gui_ui_apply_ui_scale(&app.settings);
         TraceLog(LOG_INFO, "DISPLAY: content scale %.2f, monitor %d (%dpx/%dmm)"
                            " -> desktop %d%%%s, zoom %d%% -> UI scale %d%%",
-                 (double)GetWindowScaleDPI().x, GetCurrentMonitor(),
-                 GetMonitorWidth(GetCurrentMonitor()),
-                 GetMonitorPhysicalWidth(GetCurrentMonitor()), desktop,
+                 (double)GetWindowScaleDPI().x, startup_monitor,
+                 GetMonitorWidth(startup_monitor),
+                 GetMonitorPhysicalWidth(startup_monitor), desktop,
                  app.settings.ui_scale_auto ? "" : " (not followed)",
                  app.settings.ui_zoom_percent, gui_ui_get_scale_percent());
     }
@@ -822,9 +831,17 @@ int main(int argc, char **argv) {
         int want_width = (int)((float)default_window_width * scale_factor);
         int want_height = (int)((float)default_window_height * scale_factor);
 
-        int monitor = GetCurrentMonitor();
+        int monitor = startup_monitor;
         int monitor_width = GetMonitorWidth(monitor);
         int monitor_height = GetMonitorHeight(monitor);
+        // Wayland reports the monitor in physical pixels but sizes windows in
+        // logical units; the compositor's scale is the ratio between them.
+        bool wayland = gui_ui_display_is_wayland();
+        float compositor_scale = GetWindowScaleDPI().x;
+        if (wayland && compositor_scale > 1.0f) {
+            monitor_width = (int)((float)monitor_width / compositor_scale);
+            monitor_height = (int)((float)monitor_height / compositor_scale);
+        }
         if (monitor_width > 0 && monitor_height > 0) {
             int fit_width = (int)((float)monitor_width * 0.7f);
             int fit_height = (int)((float)monitor_height * 0.7f);
@@ -838,9 +855,9 @@ int main(int argc, char **argv) {
             want_height != default_window_height) {
             SetWindowSize(want_width, want_height);
             // GLFW keeps the top-left corner, so a grown window can hang off
-            // the bottom-right of the display. (A no-op under Wayland, where
-            // the compositor places windows itself.)
-            if (monitor_width > 0 && monitor_height > 0) {
+            // the bottom-right of the display. Skipped under Wayland, where
+            // the compositor places windows itself and GLFW only warns.
+            if (!wayland && monitor_width > 0 && monitor_height > 0) {
                 Vector2 monitor_pos = GetMonitorPosition(monitor);
                 SetWindowPosition(
                     (int)monitor_pos.x + (monitor_width - want_width) / 2,

@@ -95,7 +95,10 @@ build mirroring upstream's `windows-exe` job, installs to `%LOCALAPPDATA%\Progra
 a Start Menu shortcut). PRs build and guard-test on wm and win0. `bump-tag` mints
 `v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
-`GUI_WINDOW_CLASS_NAME` (guarded).
+`GUI_WINDOW_CLASS_NAME` (guarded), and on native Wayland its file name must equal the app_id
+`GUI_WAYLAND_APP_ID` (`misrc_gui.desktop`). Linux raylib is built with GLFW's Wayland AND X11
+backends plus `scripts/patches/raylib-5.5-window-class.patch` (app_id, logical-size
+framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (guarded).
 
 ## Testing
 
@@ -221,8 +224,12 @@ Fork-side:
   is a rollback mirror written on the old 75-300 grid and never read back; nothing may set
   `ui_scale_auto = false` on a zoom (guard "UI zoom is relative to the desktop"). Both windows
   call `SetMouseCursor(MOUSE_CURSOR_ARROW)` once, or XWayland shows its 1x root cursor.
-  Synthetic X events (XSendEvent) do not reach the GUI on wm; to see a dialog in a scratch
-  `--config` instance, open it at startup in a throwaway local edit and grab the window with
+  Native Wayland (the default on wm since 2026-10-02): the framebuffer stays logical-size and
+  the compositor scales it, so `gui_ui_detect_display_scale_percent` counts the content scale
+  as backing scale there and never calls `GetCurrentMonitor()` (a failed window-position
+  query, i.e. a GLFW warning every frame). Synthetic X events (XSendEvent) do not reach the
+  GUI on wm; to see a dialog in a scratch `--config` instance, open it at startup in a
+  throwaway local edit, launch with `MISRC_GUI_PLATFORM=x11` and grab the window with
   python-xlib `get_image`.
 - Headless modes that call `gui_settings_load`/`save` without `--config` hit the LIVE settings
   file of whoever runs them: `--auto-record` saves defaults before the override applies, and

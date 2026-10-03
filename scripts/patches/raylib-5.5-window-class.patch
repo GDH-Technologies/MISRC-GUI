@@ -1,0 +1,39 @@
+diff --git a/src/platforms/rcore_desktop_glfw.c b/src/platforms/rcore_desktop_glfw.c
+index baf2967..5ccff75 100644
+--- a/src/platforms/rcore_desktop_glfw.c
++++ b/src/platforms/rcore_desktop_glfw.c
+@@ -100,6 +100,24 @@ extern CoreData CORE;                   // Global CORE state context
+ 
+ static PlatformData platform = { 0 };   // Platform specific data
+ 
++// GDH-Technologies/MISRC-GUI patch (scripts/patches/raylib-5.5-window-class.patch):
++// window hints the application must set before InitWindow(), which InitPlatform()
++// would otherwise wipe with glfwDefaultWindowHints() before creating the window.
++static char gdhWaylandAppId[128] = { 0 };
++static int gdhScaleFramebuffer = 1;     // GLFW's own default
++
++// waylandAppId: the Wayland app_id (matched against the .desktop file name);
++// NULL or "" leaves GLFW's default. scaleFramebuffer: GLFW_SCALE_FRAMEBUFFER.
++void GdhSetWindowPlatformHints(const char *waylandAppId, int scaleFramebuffer)
++{
++    gdhWaylandAppId[0] = '\0';
++    if (waylandAppId != NULL) {
++        strncpy(gdhWaylandAppId, waylandAppId, sizeof(gdhWaylandAppId) - 1);
++        gdhWaylandAppId[sizeof(gdhWaylandAppId) - 1] = '\0';
++    }
++    gdhScaleFramebuffer = scaleFramebuffer ? 1 : 0;
++}
++
+ //----------------------------------------------------------------------------------
+ // Module Internal Functions Declaration
+ //----------------------------------------------------------------------------------
+@@ -1306,6 +1324,9 @@ int InitPlatform(void)
+     // Initialize graphic device: display/window and graphic context
+     //----------------------------------------------------------------------------
+     glfwDefaultWindowHints();                       // Set default windows hints
++    // GDH patch: re-apply the application's hints the reset above just cleared
++    if (gdhWaylandAppId[0] != '\0') glfwWindowHintString(GLFW_WAYLAND_APP_ID, gdhWaylandAppId);
++    glfwWindowHint(GLFW_SCALE_FRAMEBUFFER, gdhScaleFramebuffer ? GLFW_TRUE : GLFW_FALSE);
+     //glfwWindowHint(GLFW_RED_BITS, 8);             // Framebuffer red color component bits
+     //glfwWindowHint(GLFW_GREEN_BITS, 8);           // Framebuffer green color component bits
+     //glfwWindowHint(GLFW_BLUE_BITS, 8);            // Framebuffer blue color component bits

@@ -68,6 +68,22 @@ float gui_ui_get_scale_factor(void);
 // application zoom and any OS backing scale such as macOS Retina.
 Vector2 gui_ui_get_render_scale(void);
 
+// The Wayland app_id: GNOME matches it against the .desktop file name
+// (misrc_gui.desktop), as it matches WM_CLASS against StartupWMClass on X11.
+#define GUI_WAYLAND_APP_ID "misrc_gui"
+
+// Desktop Linux only (a no-op elsewhere); call before every InitWindow. Picks
+// the display backend -- MISRC_GUI_PLATFORM=x11|wayland forces one, otherwise
+// GLFW chooses (Wayland in a Wayland session, X11 elsewhere) -- and sets the
+// Wayland app_id. The framebuffer stays at logical size so the compositor
+// scales it, exactly as it scaled the Xwayland window before. Both hooks are
+// weak references: a build against a raylib without the fork's patch
+// (scripts/patches/raylib-5.5-window-class.patch) still links and runs on X11.
+void gui_ui_prepare_window_platform(void);
+// After InitWindow: "wayland", "x11", or "default" when GLFW cannot say.
+const char *gui_ui_display_backend_name(void);
+bool gui_ui_display_is_wayland(void);
+
 // Asks the platform what scale the current display wants, as a percent on the
 // supported steps. Wraps the pure policy in gui_ui_scale.h with the raylib
 // queries it must not depend on directly (that file is compiled standalone by

@@ -185,6 +185,66 @@ int gui_ui_get_layout_height(void)
     return (height > 0) ? height : 1;
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/* GLFW is compiled into libraylib.a and glfw3.h is not on this target's
+ * include path, so the hint values are spelled out (GLFW 3.4 glfw3.h). Weak:
+ * against a raylib without the fork's patch -- Fedora's shared libraylib, an
+ * AppImage container's -- they resolve to NULL and are skipped. */
+#define GUI_GLFW_PLATFORM          0x00050003
+#define GUI_GLFW_PLATFORM_WAYLAND  0x00060003
+#define GUI_GLFW_PLATFORM_X11      0x00060004
+extern void glfwInitHint(int hint, int value) __attribute__((weak));
+extern int glfwGetPlatform(void) __attribute__((weak));
+extern void GdhSetWindowPlatformHints(const char *wayland_app_id, int scale_framebuffer)
+    __attribute__((weak));
+#endif
+
+/* Set when the patched raylib took the unscaled-framebuffer hint: on Wayland
+ * the compositor then magnifies the window by its content scale. */
+static bool s_compositor_scales_window = false;
+
+void gui_ui_prepare_window_platform(void)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+    const char *want = getenv("MISRC_GUI_PLATFORM");
+    if (want && want[0]) {
+        if (!glfwInitHint) {
+            fprintf(stderr, "[GUI] MISRC_GUI_PLATFORM=%s ignored: this raylib does not expose GLFW\n", want);
+        } else if (strcmp(want, "x11") == 0) {
+            glfwInitHint(GUI_GLFW_PLATFORM, GUI_GLFW_PLATFORM_X11);
+        } else if (strcmp(want, "wayland") == 0) {
+            glfwInitHint(GUI_GLFW_PLATFORM, GUI_GLFW_PLATFORM_WAYLAND);
+        } else {
+            fprintf(stderr, "[GUI] MISRC_GUI_PLATFORM=%s ignored (x11 or wayland)\n", want);
+        }
+    }
+    /* Logical-size framebuffer: raylib 5.5 sizes its viewport from the window
+     * size, so GLFW's default scaled framebuffer would draw the UI into one
+     * corner of it, and the first resize would undo any fix applied at init. */
+    if (GdhSetWindowPlatformHints) {
+        GdhSetWindowPlatformHints(GUI_WAYLAND_APP_ID, 0);
+        s_compositor_scales_window = true;
+    }
+#endif
+}
+
+const char *gui_ui_display_backend_name(void)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (glfwGetPlatform) {
+        int platform = glfwGetPlatform();
+        if (platform == GUI_GLFW_PLATFORM_WAYLAND) return "wayland";
+        if (platform == GUI_GLFW_PLATFORM_X11) return "x11";
+    }
+#endif
+    return "default";
+}
+
+bool gui_ui_display_is_wayland(void)
+{
+    return strcmp(gui_ui_display_backend_name(), "wayland") == 0;
+}
+
 int gui_ui_detect_display_scale_percent(void)
 {
     // GLFW reports content scale from Xft.dpi under X11/XWayland and from the
@@ -195,10 +255,17 @@ int gui_ui_detect_display_scale_percent(void)
     // The per-monitor fallback. glfwGetWindowPos is unsupported on Wayland, so
     // GetCurrentMonitor is only trustworthy under X11 -- which is exactly where
     // content scale is a single global value and cannot distinguish displays.
-    // The two signals cover each other's blind spot.
-    int monitor = GetCurrentMonitor();
-    int monitor_px_w = GetMonitorWidth(monitor);
-    int monitor_mm_w = GetMonitorPhysicalWidth(monitor);
+    // The two signals cover each other's blind spot. Native Wayland has only
+    // the first: the compositor's content scale is per output and authoritative
+    // (1.0 means 1x), and asking for the window position there fails with a
+    // GLFW warning -- once per frame, since this runs every frame.
+    int monitor_px_w = 0;
+    int monitor_mm_w = 0;
+    if (!gui_ui_display_is_wayland()) {
+        int monitor = GetCurrentMonitor();
+        monitor_px_w = GetMonitorWidth(monitor);
+        monitor_mm_w = GetMonitorPhysicalWidth(monitor);
+    }
 
     // Whatever magnification raylib already applied to the framebuffer.
     float backing_scale = 1.0f;
@@ -206,6 +273,13 @@ int gui_ui_detect_display_scale_percent(void)
     int render_width = GetRenderWidth();
     if (screen_width > 0 && render_width > 0) {
         backing_scale = (float)render_width / (float)screen_width;
+    }
+    /* Native Wayland with a logical-size framebuffer: the compositor magnifies
+     * the whole window by the content scale, so that magnification is on
+     * screen already -- as Xwayland's was. Zooming for it again would draw the
+     * UI 1.25x too big on wm's 1.25x desktop. */
+    if (s_compositor_scales_window && gui_ui_display_is_wayland() && content_scale > 1.0f) {
+        backing_scale = content_scale;
     }
 
     return gui_ui_scale_from_display(content_scale, monitor_px_w,

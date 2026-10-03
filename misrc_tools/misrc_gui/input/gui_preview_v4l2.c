@@ -15,6 +15,7 @@
  * non-Linux stubs below instead of compiling this in. */
 #if defined(__linux__) && !defined(__ANDROID__)
 
+#include "../ui/gui_ui.h"   /* gui_ui_prepare_window_platform (the popout window) */
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1845,6 +1846,9 @@ int gui_preview_child_main(const char *device, const char *fmt_spec, int parent_
      * uses only raylib's built-in DrawText. */
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     SetTraceLogLevel(LOG_WARNING);
+    /* Same backend and app_id as the main window, so the popout groups under
+     * the MISRC launcher; MISRC_GUI_PLATFORM is inherited from the parent. */
+    gui_ui_prepare_window_platform();
     InitWindow(720, 576, title);
     /* The themed arrow at the desktop's cursor size, not the inherited 1x X11
      * root cursor -- see the matching call in misrc_gui.c. */
