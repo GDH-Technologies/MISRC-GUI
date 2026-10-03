@@ -95,7 +95,7 @@ Install the dependencies:
 ```sh
 sudo dnf install -y gcc meson ninja-build cmake pkgconf-pkg-config git nasm \
   flac-devel libusb1-devel raylib-devel fftw-devel soxr-devel alsa-lib-devel \
-  libX11-devel mesa-libGL-devel libuvc-devel
+  libX11-devel mesa-libGL-devel libuvc-devel wayland-devel libxkbcommon-devel
 ```
 
 Then build:
@@ -123,6 +123,11 @@ Notes on the Fedora-specific pieces:
 - **`libX11-devel` and `mesa-libGL-devel`** are required because the GUI link line appends a
   literal `-lX11 -lGL`, independent of what `raylib.pc` declares.
 - **`libuvc-devel`** is only needed to build vendored hsdaoh; Meson never looks for it.
+- **`wayland-devel` and `libxkbcommon-devel`** (which bring `wayland-scanner`) are needed to
+  build the vendored raylib's GLFW with its Wayland backend (GDH fork). GLFW loads the
+  Wayland and libdecor libraries at run time, so the GUI's link line does not change.
+  `raylib-devel` is only a fallback: a GUI linked against it instead of the vendored,
+  patched raylib still runs, but without the Wayland app_id.
 - `scripts/build-appimage-local.sh` is **not** usable natively on Fedora — it asserts a glibc
   2.35 ceiling for AppImage portability and Fedora 44 is glibc 2.43. Use its container mode
   if you need an AppImage.
@@ -245,6 +250,12 @@ desktop with Follow desktop ON. The old `ui_scale_percent` key is still written
 cannot tell your displays apart and moving the window will not change the
 scale. Use the zoom on the odd panel out. Per-monitor following works where
 the compositor reports a per-window content scale.
+
+*GDH fork:* the Linux build runs natively on Wayland (GNOME and other Wayland
+sessions), where the compositor scales the window per monitor; X11 is used
+everywhere else. `MISRC_GUI_PLATFORM=x11` forces the X11/XWayland path and
+`MISRC_GUI_PLATFORM=wayland` forces Wayland. `--debug-view` and stderr name
+the backend in use (`[GUI] Display backend: wayland`).
 
 Run with `--debug-view` to log what was detected:
 

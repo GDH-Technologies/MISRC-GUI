@@ -504,6 +504,21 @@ xprop WM_CLASS      # then click the window
 # => WM_CLASS(STRING) = "MISRC Capture", "MISRC Capture"
 ```
 
+That is the X11 half. On GNOME Wayland the Linux build runs natively (raylib's GLFW is built with
+both backends by `scripts/build-deps-unix.sh`) and GNOME matches the window by its Wayland
+**app_id** instead, against the `.desktop` *file name*: the app_id is `misrc_gui`
+(`GUI_WAYLAND_APP_ID`, set through `scripts/patches/raylib-5.5-window-class.patch`), so the
+launcher must stay `misrc_gui.desktop`. `StartupWMClass` still serves the X11 fallback
+(`MISRC_GUI_PLATFORM=x11`). Verify the Wayland side with:
+
+```bash
+WAYLAND_DEBUG=1 misrc_gui 2>&1 | grep -m1 set_app_id
+# => xdg_toplevel#NN.set_app_id("misrc_gui")
+```
+
+The deps stamp hashes the raylib patch and the GLFW backend flags, so a change to either rebuilds
+raylib on the next deploy instead of reusing the cached `libraylib.a`.
+
 The install step then **sweeps stale MISRC launchers** it did not write. A leftover `.desktop`
 naming an older, versioned `StartupWMClass` shows up as a second "MISRC GUI" in the app grid and
 matches no window, which looks identical to the bug the constant class name fixes. The sweep is

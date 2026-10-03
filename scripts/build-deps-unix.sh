@@ -30,6 +30,21 @@ case "$OS" in
   *) fail "Unsupported OS: $OS" ;;
 esac
 HOST_ARCH="${MACOS_ARCH:-$(uname -m)}"  # MACOS_ARCH overrides macOS build arch
+# Bounded: an unnumbered `cmake --build --parallel` is an unbounded `make -j`,
+# which froze a 31 GiB wm once already.
+BUILD_JOBS="${MISRC_BUILD_JOBS:-8}"
+
+# Linux builds raylib's bundled GLFW with BOTH display backends (raylib defaults
+# to X11 only, so under GNOME Wayland the GUI always ran through Xwayland) and
+# applies the fork's window-hint patch (Wayland app_id, framebuffer scaling).
+# macOS is untouched: GLFW has no Wayland backend there.
+RAYLIB_PATCH=""
+RAY_PLATFORM_ARGS=()
+if [[ "$HOST_SYSTEM" == "linux" ]]; then
+  RAYLIB_PATCH="$REPO_ROOT/scripts/patches/raylib-${RAYLIB_TAG}-window-class.patch"
+  [[ -f "$RAYLIB_PATCH" ]] || fail "No raylib patch for tag $RAYLIB_TAG: $RAYLIB_PATCH"
+  RAY_PLATFORM_ARGS=(-DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON)
+fi
 
 mkdir -p "$DEPS_PREFIX/lib/pkgconfig" "$DEPS_PREFIX/include" "$REPO_ROOT/.deps"
 
@@ -42,7 +57,7 @@ require_tools cmake pkg-config cc git
 
 # System deps hsdaoh/meson rely on (libuvc is hard-required by hsdaoh's CMake).
 for m in fftw3f flac libusb-1.0 soxr libuvc; do
-  pkg-config --exists "$m" || fail "Missing pkg-config module '$m'. Install the system dev package (apt: libuvc-dev libfftw3-dev libflac-dev libsoxr-dev libusb-1.0-0-dev; dnf: libuvc-devel fftw-devel flac-devel soxr-devel libusb1-devel libX11-devel mesa-libGL-devel; brew: fftw flac libusb libuvc libsoxr)."
+  pkg-config --exists "$m" || fail "Missing pkg-config module '$m'. Install the system dev package (apt: libuvc-dev libfftw3-dev libflac-dev libsoxr-dev libusb-1.0-0-dev; dnf: libuvc-devel fftw-devel flac-devel soxr-devel libusb1-devel libX11-devel mesa-libGL-devel wayland-devel libxkbcommon-devel; brew: fftw flac libusb libuvc libsoxr)."
 done
 # meson.build hard-requires libFLAC >= 1.5.0 for multithreaded encode.
 flac_ver="$(pkg-config --modversion flac)"
@@ -56,6 +71,9 @@ compute_stamp() {
   {
     echo "host=$HOST_SYSTEM arch=$HOST_ARCH"
     echo "raylib_tag=$RAYLIB_TAG"
+    # A new backend flag or patch must rebuild raylib on hosts with a warm stamp.
+    echo "raylib_platform_args=${RAY_PLATFORM_ARGS[*]:-}"
+    if [[ -n "$RAYLIB_PATCH" ]]; then sha256sum "$RAYLIB_PATCH" | awk '{print "raylib_patch=" $1}'; fi
     if [[ -d "$HSDAOH_SOURCE_DIR/.git" ]]; then
       git -C "$HSDAOH_SOURCE_DIR" rev-parse HEAD 2>/dev/null || true
     fi
@@ -92,7 +110,7 @@ git config --global --add safe.directory "$REPO_ROOT/.deps/raylib" 2>/dev/null |
 # libdir=${exec_prefix}/lib and the stamp gate below looks in lib/ as well.
 # Pinning the libdir keeps all three in agreement on every distro.
 HS_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DINSTALL_UDEV_RULES=OFF)
-RAY_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GAMES=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX")
+RAY_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GAMES=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" ${RAY_PLATFORM_ARGS[@]+"${RAY_PLATFORM_ARGS[@]}"})
 if [[ "$HOST_SYSTEM" == "darwin" ]]; then
   BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
   FLAC_PREFIX="$(brew --prefix flac 2>/dev/null || echo "$BREW_PREFIX/opt/flac")"
@@ -107,7 +125,7 @@ fi
 rm -rf "$REPO_ROOT/.deps/hsdaoh"
 cp -R "$HSDAOH_SOURCE_DIR" "$REPO_ROOT/.deps/hsdaoh"
 cmake -S "$REPO_ROOT/.deps/hsdaoh" -B "$REPO_ROOT/.deps/hsdaoh/build" "${HS_CMAKE_ARGS[@]}"
-cmake --build "$REPO_ROOT/.deps/hsdaoh/build" --parallel
+cmake --build "$REPO_ROOT/.deps/hsdaoh/build" --parallel "$BUILD_JOBS"
 cmake --install "$REPO_ROOT/.deps/hsdaoh/build"
 for PCDIR in "$DEPS_PREFIX/lib/pkgconfig" "$DEPS_PREFIX/lib64/pkgconfig"; do
   [[ -f "$PCDIR/libhsdaoh.pc" && ! -f "$PCDIR/hsdaoh.pc" ]] && cp "$PCDIR/libhsdaoh.pc" "$PCDIR/hsdaoh.pc"
@@ -122,8 +140,16 @@ else
   git -C "$REPO_ROOT/.deps/raylib" fetch --depth 1 origin "refs/tags/$RAYLIB_TAG:refs/tags/$RAYLIB_TAG" || true
   git -C "$REPO_ROOT/.deps/raylib" checkout --detach "$RAYLIB_TAG"
 fi
+if [[ -n "$RAYLIB_PATCH" ]]; then
+  # A build-only clone: back to the pristine tag first, so an updated patch never
+  # lands on top of an older one, then apply it or stop.
+  git -C "$REPO_ROOT/.deps/raylib" checkout --force --detach "$RAYLIB_TAG"
+  git -C "$REPO_ROOT/.deps/raylib" apply --whitespace=nowarn "$RAYLIB_PATCH" \
+    || fail "raylib patch does not apply to tag $RAYLIB_TAG: $RAYLIB_PATCH"
+  log "applied $(basename "$RAYLIB_PATCH")"
+fi
 cmake -S "$REPO_ROOT/.deps/raylib" -B "$REPO_ROOT/.deps/raylib/build" "${RAY_CMAKE_ARGS[@]}"
-cmake --build "$REPO_ROOT/.deps/raylib/build" --parallel
+cmake --build "$REPO_ROOT/.deps/raylib/build" --parallel "$BUILD_JOBS"
 cmake --install "$REPO_ROOT/.deps/raylib/build"
 
 # --- sanity -----------------------------------------------------------------

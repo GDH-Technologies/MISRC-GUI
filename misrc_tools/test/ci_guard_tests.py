@@ -996,6 +996,70 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path, gui_c_pa
     return 0
 
 
+def check_native_wayland_contract(repo_root: Path) -> int:
+    """The Linux GUI runs natively on Wayland instead of through Xwayland (on
+    2026-10-02 wm's Xwayland died mid-finalize and took the GNOME session with
+    it). raylib defaults its bundled GLFW to X11 only, so build-deps-unix.sh
+    must turn the Wayland backend on, apply the fork's raylib patch, and fold
+    both into the deps stamp -- or a warm host never rebuilds raylib. Every
+    window is created after gui_ui_prepare_window_platform() (backend choice,
+    app_id, logical-size framebuffer), the app_id matches the launcher's file
+    name, and the per-frame scale detection never asks Wayland for a window
+    position (a GLFW warning per frame)."""
+    deps = read_text(repo_root / "scripts/build-deps-unix.sh")
+    for snippet, why in (
+        ("-DGLFW_BUILD_WAYLAND=ON", "raylib's GLFW is built without its Wayland backend"),
+        ("-DGLFW_BUILD_X11=ON", "raylib's GLFW must keep X11 (cs0's Xvfb, MISRC_GUI_PLATFORM=x11)"),
+        ('raylib_platform_args=', "the deps stamp ignores the GLFW backend flags"),
+        ('raylib_patch=', "the deps stamp ignores the raylib patch"),
+        ('apply --whitespace=nowarn "$RAYLIB_PATCH"', "the raylib patch is never applied"),
+        ('checkout --force --detach "$RAYLIB_TAG"', "the raylib clone is not reset before patching"),
+    ):
+        if snippet not in deps:
+            return fail(f"build-deps-unix.sh: {why} (missing {snippet!r})")
+    if re.search(r"--parallel\s*$", deps, re.MULTILINE):
+        return fail("build-deps-unix.sh: an unnumbered `cmake --build --parallel` is an unbounded make -j")
+
+    patch_path = repo_root / "scripts/patches/raylib-5.5-window-class.patch"
+    if not patch_path.exists():
+        return fail(f"missing {patch_path.relative_to(repo_root)}")
+    patch = read_text(patch_path)
+    for snippet in ("void GdhSetWindowPlatformHints(", "GLFW_WAYLAND_APP_ID", "GLFW_SCALE_FRAMEBUFFER"):
+        if snippet not in patch:
+            return fail(f"raylib patch lost {snippet!r}")
+    reset = patch.find("glfwDefaultWindowHints();")
+    if reset < 0 or patch.find("glfwWindowHintString(GLFW_WAYLAND_APP_ID", reset) < 0:
+        return fail("raylib patch must set the app_id AFTER glfwDefaultWindowHints() resets the hints")
+
+    ui_h = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h"))
+    if '#define GUI_WAYLAND_APP_ID "misrc_gui"' not in ui_h:
+        return fail('gui_ui.h: GUI_WAYLAND_APP_ID must be "misrc_gui" (the launcher is misrc_gui.desktop)')
+    if "misrc_gui.desktop" not in read_text(repo_root / ".github/workflows/selfhosted-deploy.yml"):
+        return fail("selfhosted-deploy.yml no longer installs misrc_gui.desktop, which the app_id names")
+
+    ui_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    for snippet in ('getenv("MISRC_GUI_PLATFORM")', "__attribute__((weak))", "GdhSetWindowPlatformHints(GUI_WAYLAND_APP_ID, 0)"):
+        if snippet not in ui_c:
+            return fail(f"gui_ui.c: gui_ui_prepare_window_platform lost {snippet!r}")
+    try:
+        detect = extract_function_body(ui_c, "int gui_ui_detect_display_scale_percent(void)")
+    except RuntimeError as exc:
+        return fail(f"gui_ui.c: {exc}")
+    call = detect.find("GetCurrentMonitor()")
+    gate = detect.find("if (!gui_ui_display_is_wayland())")
+    if call >= 0 and not (0 <= gate < call):
+        return fail("gui_ui_detect_display_scale_percent calls GetCurrentMonitor() on Wayland "
+                    "(a failed window-position query and a GLFW warning every frame)")
+
+    for rel in ("misrc_tools/misrc_gui/core/misrc_gui.c", "misrc_tools/misrc_gui/input/gui_preview_v4l2.c"):
+        code = strip_c_comments(read_text(repo_root / rel))
+        init = code.find("InitWindow(")
+        prep = code.rfind("gui_ui_prepare_window_platform();", 0, init) if init >= 0 else -1
+        if init < 0 or prep < 0 or "InitWindow(" in code[prep:init]:
+            return fail(f"{rel}: InitWindow() must directly follow gui_ui_prepare_window_platform()")
+    return 0
+
+
 def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
     """WM_CLASS is what ties a running window back to its launcher. misrc_gui.c
     creates the window under GUI_WINDOW_CLASS_NAME, so every .desktop we write --
@@ -4798,6 +4862,7 @@ def main() -> int:
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
         ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path, gui_c_path)),
         ("WM_CLASS matches GUI window class", lambda: check_wm_class_consistency(gui_c_path, repo_root)),
+        ("native Wayland build and window platform", lambda: check_native_wayland_contract(repo_root)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_ui_c_path)),
         ("macOS startup admin elevation contract", lambda: check_macos_admin_elevation_contract(gui_c_path)),
         ("Windows meson subsystem contract", lambda: check_windows_meson_subsystem_contract(meson_path)),
