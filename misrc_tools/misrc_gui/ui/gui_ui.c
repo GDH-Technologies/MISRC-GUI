@@ -5954,12 +5954,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                            : gui_record_is_finalizing();
         bool record_pending = is_client ? gui_net_client_peer_record_pending(app)
                                         : gui_record_is_pending();
-        // Finalize no longer blocks a new recording; tint the idle button
-        // orange as the indicator, but recording state always wins.
+        // A start is refused until finalize completes, so the idle button
+        // reads as busy ("Saving...", orange, dimmed text) rather than as an
+        // action; it once said "Finalize", which invited the very click that
+        // started a new recording. Recording state always wins.
         Color record_color = rec ? COLOR_CLIP_RED
                              : (record_finalizing ? (Color){184, 118, 20, 255} : COLOR_BUTTON);
         const char *record_label = rec ? "Stop Rec"
-                                   : (record_finalizing ? "Finalize" : "Record");
+                                   : (record_finalizing ? "Saving..." : "Record");
         // A record start waiting on the server's overwrite prompt: yellow, so
         // the client operator knows the server needs an answer.
         if (!rec && record_pending) {
@@ -5980,10 +5982,10 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         }
         const char *record_display_label = record_label;
         if (!playback_mode && toolbar_very_narrow) {
-            if (record_finalizing) {
-                record_display_label = "Fin";
-            } else if (rec) {
+            if (rec) {
                 record_display_label = "Stop";
+            } else if (record_finalizing) {
+                record_display_label = "Wait";
             } else if (record_pending) {
                 record_display_label = "Pend";
             } else {
@@ -5999,7 +6001,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             .backgroundColor = to_clay_color(record_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            Color text_color = control_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
+            bool record_busy = !playback_mode && !rec && record_finalizing;
+            Color text_color = (control_capturing && !record_busy) ? COLOR_TEXT : COLOR_TEXT_DIM;
             CLAY_TEXT(make_string(record_display_label),
                 CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(text_color) }));
         }
@@ -10046,8 +10049,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 if (gui_app_effective_recording(app)) {
                     gui_app_stop_recording(app);
                 } else {
-                    // gui_record_start itself refuses on drain/path collision
-                    // with a status message; finalize no longer blocks here.
+                    // gui_record_start (or, on a client, the server's) refuses
+                    // while the previous recording finalizes, with a status.
                     gui_app_start_recording(app);
                 }
             } else if (gui_net_is_client(app)) {

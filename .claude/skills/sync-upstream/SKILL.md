@@ -79,6 +79,11 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 - **Recording locks.** Keep the ones from upstream v1.2.0; a fork change must not drop
   them: `gui_record_cleanup()` before `bufmgr_cleanup()`, and Disconnect, Space and the
   mode toggle refused while recording or finalizing.
+- **No record start while finalizing.** Since 2026-10-02 the fork matches upstream again:
+  `gui_record_start()` refuses while `gui_record_is_finalizing()`. Keep the fork's
+  decoupled finalize thread and its "Saving..." idle label; do not take upstream's
+  button-click gate as a second copy. `check_record_start_refuses_while_finalizing`
+  guards it.
 - **RAW sample encoding.** Keep the fork's `convert_i16_to_raw_bytes` (unsigned offset
   binary, `.u16` left-justified; 27c020f + the left-justify fix) until upstream carries an
   equivalent: its `.u8`/`.u16` names are only true with it, and with it a CX capture is
