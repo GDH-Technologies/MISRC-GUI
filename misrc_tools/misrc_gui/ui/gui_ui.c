@@ -898,20 +898,20 @@ static bool gui_ui_build_release_asset_filename_for_platform(const char *release
     if (!gui_ui_is_release_tag_safe(release_tag)) return false;
 
 #if defined(__ANDROID__)
-    const char *pattern = "Android_MISRC_%s_arm64.apk";
+    const char *pattern = "Android_MISRC_GUI_%s_arm64.apk";
 #elif defined(__APPLE__)
-    const char *pattern = "macOS_MISRC_%s_universal.dmg";
+    const char *pattern = "macOS_MISRC_GUI_%s_universal.dmg";
 #elif defined(_WIN32)
 #if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Windows_MISRC_%s_arm64.zip";
+    const char *pattern = "Windows_MISRC_GUI_%s_arm64.zip";
 #else
-    const char *pattern = "Windows_MISRC_%s_x86.zip";
+    const char *pattern = "Windows_MISRC_GUI_%s_x86.zip";
 #endif
 #elif defined(__linux__)
 #if defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Linux_MISRC_%s_arm64.zip";
+    const char *pattern = "Linux_MISRC_GUI_%s_arm64.zip";
 #else
-    const char *pattern = "Linux_MISRC_%s_x86.zip";
+    const char *pattern = "Linux_MISRC_GUI_%s_x86.zip";
 #endif
 #else
     return false;

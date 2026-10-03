@@ -72,6 +72,30 @@ jobs:
         if: matrix.guard_mode == 'runtime'
         run: |
           python misrc_tools/test/ci_guard_tests.py
+  release-link-check:
+    name: Release download link check
+    runs-on: ubuntu-24.04
+    needs:
+      - preflight-guard-tests
+      - preflight-cross-platform-guards
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # End-to-end check of the in-app updater's Download button: the test
+      # extracts the per-platform asset filename patterns from gui_ui.c (the
+      # strings actually compiled into the app), resolves the latest release
+      # via the releases/latest redirect (same as the app), and HEAD-checks
+      # every URL it builds. Regression it prevents (v1.2.4): the app mapped
+      # Windows_MISRC_%s_x86.zip while the workflow publishes
+      # Windows_MISRC_GUI_<tag>_x86.zip, so every platform's Download button
+      # 404'd. Runs on every trigger against the latest published release;
+      # the release job re-runs it with --tag against the tag it just published.
+      - name: Verify the app updater's download URLs against the latest release
+        run: |
+          set -eux
+          python3 misrc_tools/test/release_link_check.py
+
   linux-appimage:
     name: Linux AppImage build (${{ matrix.arch }})
     strategy:
@@ -1441,3 +1465,12 @@ jobs:
             release-assets/**/Windows_MISRC_GUI_*_arm64.zip
             release-assets/**/macOS_MISRC_GUI_*_universal.dmg
             release-assets/**/Android_MISRC_GUI_*_arm64.apk
+
+      # Same-run verification of what the in-app updater will build for this
+      # tag: HEAD-check every per-platform URL the app's Download button
+      # opens. Fails the release job if the app mapping or the published asset
+      # names drift (the v1.2.4 bug shipped 404 links on every platform).
+      - name: Verify release download links (app updater mapping)
+        run: |
+          set -eux
+          python3 misrc_tools/test/release_link_check.py --tag "${{ steps.tag.outputs.tag }}"

@@ -1486,6 +1486,72 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
     return 0
 
 
+def check_release_download_link_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert the in-app updater's asset filename mapping matches the release
+    artifact naming, and that the live link check is wired into CI.
+
+    Regression (user report, release v1.2.4): gui_ui.c built asset names
+    missing the "_GUI" infix (Windows_MISRC_%s_x86.zip) while the workflow
+    publishes Windows_MISRC_GUI_<tag>_x86.zip, so every platform's
+    update-check Download button 404'd for every release.
+    check_release_artifact_naming_contract only pinned the WORKFLOW side;
+    nothing cross-checked the APP side. This guard pins both sides to the
+    identical naming and requires the live release_link_check.py CI test
+    (HEAD-checks the exact URLs the app builds, against the latest
+    published release on every run and against the just-published tag in
+    the release job).
+    """
+    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
+    if not gui_c_path.exists():
+        return fail(f"Missing gui_ui.c: {gui_c_path}")
+    gui_text = read_text(gui_c_path)
+
+    required_patterns = [
+        "Android_MISRC_GUI_%s_arm64.apk",
+        "macOS_MISRC_GUI_%s_universal.dmg",
+        "Windows_MISRC_GUI_%s_arm64.zip",
+        "Windows_MISRC_GUI_%s_x86.zip",
+        "Linux_MISRC_GUI_%s_arm64.zip",
+        "Linux_MISRC_GUI_%s_x86.zip",
+    ]
+    for pattern in required_patterns:
+        if pattern not in gui_text:
+            return fail(
+                f"gui_ui.c release asset mapping is missing the exact pattern: {pattern} "
+                "(must match the workflow's <Platform>_MISRC_GUI_<tag>_<arch>.<ext> naming)"
+            )
+    for pattern in [p.replace("MISRC_GUI_", "MISRC_") for p in required_patterns]:
+        if pattern in gui_text:
+            return fail(
+                f"gui_ui.c still contains the broken asset mapping (missing the _GUI "
+                f"infix) that 404'd the updater's Download button on every platform: {pattern}"
+            )
+
+    link_check = repo_root / "misrc_tools" / "test" / "release_link_check.py"
+    if not link_check.exists():
+        return fail(f"Missing release link check CI test: {link_check}")
+    link_text = read_text(link_check)
+    for snippet in [
+        "releases/latest",
+        "releases/download",
+        "gui_ui.c",
+        "gui_ui_build_release_asset_filename_for_platform",
+        "--tag",
+    ]:
+        if snippet not in link_text:
+            return fail(f"release_link_check.py is missing required snippet: {snippet}")
+
+    workflow_text = read_text(workflow_path)
+    for snippet in [
+        "release-link-check:",
+        "python3 misrc_tools/test/release_link_check.py",
+        'release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+    ]:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing release download link check wiring: {snippet}")
+    return 0
+
+
 def check_release_version_resolution_contract(repo_root: Path, workflow_path: Path) -> int:
     """Assert release-context CI runs resolve the tag (never a dev string) and
     that a release can never ship a dev-named artifact under the tag.
@@ -2286,6 +2352,7 @@ def main() -> int:
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
+        ("release download link contract", lambda: check_release_download_link_contract(repo_root, workflow_path)),
         ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
