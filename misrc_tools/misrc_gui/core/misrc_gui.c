@@ -870,6 +870,12 @@ int main(int argc, char **argv) {
                  (int)((float)want_width / scale_factor),
                  (int)((float)want_height / scale_factor),
                  gui_ui_get_scale_percent());
+        // What raylib actually draws into. On Wayland render must already equal
+        // screen here -- smaller is the UI stuck in the bottom-left corner
+        // (2026-10-02). On X11 the resize lands with the next event poll, so
+        // render still shows the old size at this point; that is normal.
+        TraceLog(LOG_INFO, "DISPLAY: screen %dx%d, render %dx%d",
+                 GetScreenWidth(), GetScreenHeight(), GetRenderWidth(), GetRenderHeight());
     }
     SetTargetFPS(60);
     SetExitKey(0);  // Disable escape key auto-close

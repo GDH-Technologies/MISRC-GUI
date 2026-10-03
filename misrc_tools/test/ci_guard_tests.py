@@ -1030,6 +1030,11 @@ def check_native_wayland_contract(repo_root: Path) -> int:
     reset = patch.find("glfwDefaultWindowHints();")
     if reset < 0 or patch.find("glfwWindowHintString(GLFW_WAYLAND_APP_ID", reset) < 0:
         return fail("raylib patch must set the app_id AFTER glfwDefaultWindowHints() resets the hints")
+    # A Wayland client-side resize gets no configure event, so GLFW never calls
+    # raylib's WindowSizeCallback: without this the startup SetWindowSize left
+    # the UI drawn at the old size in the bottom-left corner (2026-10-02).
+    if "WindowSizeCallback(platform.handle, width, height)" not in patch:
+        return fail("raylib patch: SetWindowSize must run WindowSizeCallback itself on Wayland")
 
     ui_h = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.h"))
     if '#define GUI_WAYLAND_APP_ID "misrc_gui"' not in ui_h:
