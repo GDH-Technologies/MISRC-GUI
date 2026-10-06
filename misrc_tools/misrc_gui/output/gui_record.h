@@ -93,6 +93,21 @@ uint64_t gui_record_spill_backlog_bytes(int channel);
 // extraction thread's record-drop path.
 void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint32_t frame_index);
 
+// Iteration-scoped tap gate for multi-channel lockstep capture threads
+// (CXADC): latch the record decision once per iteration so a record
+// start/stop handshake landing between the per-channel pushes cannot split
+// the channels by one chunk. tap_channel_active() reports whether the
+// channel is a direct native RAW channel this record session; enter/leave
+// mark the channel's tap in-flight (covering the gated pushes for the
+// stopper's disable + wait-idle handshake); tap_push_latched honors the
+// iteration-latched decision.
+bool gui_record_direct_tap_channel_active(int channel);
+bool gui_record_tap_iteration_enter(int channel);
+void gui_record_tap_iteration_leave(int channel);
+void gui_record_direct_tap_push_latched(int channel, bool latched_on,
+                                         const uint8_t *bytes, size_t len,
+                                         uint32_t frame_index);
+
 // Proactive low-disk guard for active recording paths.
 // Returns true when free space drops below threshold and capture should be stopped safely.
 bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,

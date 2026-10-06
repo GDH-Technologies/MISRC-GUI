@@ -208,6 +208,76 @@ static void audio_update_peaks(gui_app_t *app, const uint8_t *buf, size_t len)
     }
 }
 
+/* --- F1: record-alignment helpers ---------------------------------------
+ *
+ * The clockgen capture path writes BUF_CAPTURE_AUDIO in 576 B blocks
+ * (48 frames x 12 B = ~1 ms @ 46,875 Hz, matching the ALSA readi period).
+ * Reading/discarding at that same granularity reaches the ring's current
+ * write position ("now") with at most one producer block of residual.
+ */
+#define AUDIO_SYNC_CHUNK_BYTES 576
+
+// Write one already-read audio block to the enabled output files using the
+// same conversion path as the main loop (4ch direct + 1ch/2ch conversions).
+static void audio_write_recorded_block(audio_ctx_t *a, const uint8_t *buf, size_t n)
+{
+    if (!a || !buf || n == 0) return;
+    if (a->f_4ch) fwrite(buf, 1, n, a->f_4ch);
+    if (a->convert_1ch) {
+        extract_audio_1ch_C((uint8_t *)buf, n,
+                            a->buffer_1ch[0], a->buffer_1ch[1],
+                            a->buffer_1ch[2], a->buffer_1ch[3]);
+        for (int i = 0; i < 4; i++) {
+            if (a->f_1ch[i]) fwrite(a->buffer_1ch[i], 1, n / 4, a->f_1ch[i]);
+        }
+    }
+    if (a->convert_2ch) {
+        extract_audio_2ch_C((uint16_t *)buf, n,
+                            (uint16_t *)a->buffer_2ch[0],
+                            (uint16_t *)a->buffer_2ch[1]);
+        for (int i = 0; i < 2; i++) {
+            if (a->f_2ch[i]) fwrite(a->buffer_2ch[i], 1, n / 2, a->f_2ch[i]);
+        }
+    }
+    a->total_bytes += n;
+}
+
+// Discard all currently-buffered capture audio (up to the ring's write
+// position = "now") so a recording session starts at the transition instant
+// instead of writing up to one full read block (~350 ms) of pre-record audio.
+static uint64_t audio_discard_ring_to_now(audio_ctx_t *a)
+{
+    uint64_t dropped = 0;
+    if (!a || !a->bufmgr) return 0;
+    for (;;) {
+        void *d = bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO,
+                                    AUDIO_SYNC_CHUNK_BYTES, 0);
+        if (!d) break;
+        bufmgr_read_end(a->bufmgr, BUF_CAPTURE_AUDIO, AUDIO_SYNC_CHUNK_BYTES);
+        dropped += AUDIO_SYNC_CHUNK_BYTES;
+    }
+    return dropped;
+}
+
+// Flush all currently-buffered capture audio (up to "now") to the open
+// output files so a recording session ends at the transition instant instead
+// of losing up to one full read block (~350 ms) of tail audio.
+static uint64_t audio_flush_ring_to_files(audio_ctx_t *a)
+{
+    uint64_t flushed = 0;
+    if (!a || !a->bufmgr) return 0;
+    for (;;) {
+        void *d = bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO,
+                                    AUDIO_SYNC_CHUNK_BYTES, 0);
+        if (!d) break;
+        audio_update_peaks(a->app, (const uint8_t *)d, AUDIO_SYNC_CHUNK_BYTES);
+        audio_write_recorded_block(a, (const uint8_t *)d, AUDIO_SYNC_CHUNK_BYTES);
+        bufmgr_read_end(a->bufmgr, BUF_CAPTURE_AUDIO, AUDIO_SYNC_CHUNK_BYTES);
+        flushed += AUDIO_SYNC_CHUNK_BYTES;
+    }
+    return flushed;
+}
+
 static int audio_thread_main(void *ctx)
 {
     audio_ctx_t *a = (audio_ctx_t *)ctx;
@@ -244,10 +314,61 @@ static int audio_thread_main(void *ctx)
     }
 
     size_t iter_count = 0;
-    bool was_recording = false;
+    // gui_audio_start may pre-open output files when a record is already
+    // active at thread start; begin in the recording state so the post-read
+    // open-files transition below does not double-open them.
+    bool was_recording = (a->f_4ch != NULL) || (a->f_2ch[0] != NULL) ||
+                         (a->f_2ch[1] != NULL) || (a->f_1ch[0] != NULL) ||
+                         (a->f_1ch[1] != NULL) || (a->f_1ch[2] != NULL) ||
+                         (a->f_1ch[3] != NULL);
+    bool rec_start_aligned = false;
     while (1) {
-        // Read from buffer manager with timeout
-        buf = bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 10);
+        /*
+         * F1 record-alignment transitions, handled at the TOP of every
+         * loop iteration. Each iteration is bounded by the 2 ms read
+         * timeout, so the record button is observed within ~2-4 ms.
+         * Previously the transitions were only observed after a full
+         * BUFFER_AUDIO_READ_SIZE (196,608 B ~= 350 ms of clockgen audio)
+         * block read succeeded, which wrote up to one full block of
+         * pre-record audio at record START (the WAV led the RF files by
+         * 0-350 ms). Now: START discards everything buffered before the
+         * transition (the ring's write position = "now", at the capture
+         * thread's 576 B write granularity = the ~1 ms USB delivery
+         * quantum) so the WAV files begin at the record instant. At record
+         * STOP the record-stop entry stops + restarts this thread within
+         * ~us of clearing is_recording, so the exit-drain path normally
+         * ends the files (draining the ring to "now", ~stop + 2-10 ms);
+         * the STOP flush here is the safety net for any path where the
+         * thread survives a record stop. The post-read open/close blocks
+         * below still own the file lifecycle.
+         */
+        {
+            bool rec_now = a->app && a->app->is_recording;
+            if (rec_now && !rec_start_aligned) {
+                rec_start_aligned = true;
+                uint64_t dropped = audio_discard_ring_to_now(a);
+                uint32_t rate_hz = gui_audio_capture_rate_hz(a->app);
+                if (rate_hz == 0) rate_hz = AUDIO_CXADC_DEFAULT_SAMPLE_RATE_HZ;
+                double dropped_ms = (double)dropped / 12.0 / (double)rate_hz * 1000.0;
+                fprintf(stderr,
+                        "[AUDIO] Record start aligned: discarded %llu B (~%.1f ms) of pre-record audio\n",
+                        (unsigned long long)dropped, dropped_ms);
+            } else if (!rec_now && rec_start_aligned) {
+                rec_start_aligned = false;
+                uint64_t flushed = audio_flush_ring_to_files(a);
+                uint32_t rate_hz = gui_audio_capture_rate_hz(a->app);
+                if (rate_hz == 0) rate_hz = AUDIO_CXADC_DEFAULT_SAMPLE_RATE_HZ;
+                double flushed_ms = (double)flushed / 12.0 / (double)rate_hz * 1000.0;
+                fprintf(stderr,
+                        "[AUDIO] Record stop aligned: flushed %llu B (~%.1f ms) of tail audio\n",
+                        (unsigned long long)flushed, flushed_ms);
+            }
+        }
+        // Read from buffer manager with timeout. The 2 ms timeout keeps the
+        // loop spinning at ~500 Hz so the record-state transition above is
+        // observed within ~2-4 ms of the record button (the old 10 ms timeout
+        // bounded it at ~10-20 ms).
+        buf = bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);
         if (!buf) {
             if (iter_count < 5) {
                 fprintf(stderr, "[AUDIO] No data in buffer (iter %zu), fill_level=%zu\n", 

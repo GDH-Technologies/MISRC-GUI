@@ -102,6 +102,23 @@ gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *
                                                         const uint8_t *bytes, size_t len,
                                                         uint32_t frame_index);
 
+// Iteration-scoped tap gate (multi-channel lockstep capture threads): the
+// CXADC capture thread must decide ONCE per iteration whether that
+// iteration's chunks are recorded, so a record start/stop handshake landing
+// between the per-channel pushes cannot split the channels by one chunk
+// (observed: a 64 KiB A/B count difference). enter() marks the channel's tap
+// in-flight and returns the latched enabled state; the caller pushes every
+// gated channel with push_latched(latched_on) or none, then leaves. The
+// in-flight marking makes the stopper's disable + wait-idle sequence wait
+// for the whole gated iteration (the leave is only reached after the gated
+// pushes completed), so no latched push can run after the writers' final
+// drain.
+bool gui_record_direct_tap_iteration_enter(gui_record_direct_ctx_t *ctx);
+void gui_record_direct_tap_iteration_leave(gui_record_direct_ctx_t *ctx);
+gui_record_direct_push_result_t gui_record_direct_push_latched(
+    gui_record_direct_ctx_t *ctx, bool latched_on,
+    const uint8_t *bytes, size_t len, uint32_t frame_index);
+
 // Writer thread (started by the record layer instead of the legacy RAW
 // writer for direct channels). fwrites the bytes unchanged; variable-length
 // reads; drains ring + spill remainder at stop including the final partial

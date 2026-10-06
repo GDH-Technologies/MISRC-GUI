@@ -2036,11 +2036,7 @@ static void gui_record_direct_log_cb(void *user, int channel, const char *level,
 // Capture-thread entry point (called from gui_cxadc.c after each card read).
 // Drop handling mirrors the extraction thread's record-drop path: capture
 // log entry + optional stop_on_dropout.
-void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint32_t frame_index) {
-    if (card != 0 && card != 1) return;
-    gui_record_direct_ctx_t *ctx = (card == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
-    gui_record_direct_push_result_t result = gui_record_direct_push(ctx, bytes, len, frame_index);
-    if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
+static void gui_record_direct_report_drop(int card, uint32_t frame_index, size_t len) {
     gui_app_t *app = s_recording_app;
     if (!app) return;
     char msg[320];
@@ -2053,6 +2049,42 @@ void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint
         atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
         atomic_store(&app->dropout_stop_requested, true);
     }
+}
+
+void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint32_t frame_index) {
+    if (card != 0 && card != 1) return;
+    gui_record_direct_ctx_t *ctx = (card == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_push_result_t result = gui_record_direct_push(ctx, bytes, len, frame_index);
+    if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
+    gui_record_direct_report_drop(card, frame_index, len);
+}
+
+bool gui_record_direct_tap_channel_active(int channel) {
+    if (channel != 0 && channel != 1) return false;
+    return (channel == 0) ? s_direct_channel_a_active : s_direct_channel_b_active;
+}
+
+bool gui_record_tap_iteration_enter(int channel) {
+    if (channel != 0 && channel != 1) return false;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    return gui_record_direct_tap_iteration_enter(ctx);
+}
+
+void gui_record_tap_iteration_leave(int channel) {
+    if (channel != 0 && channel != 1) return;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_tap_iteration_leave(ctx);
+}
+
+void gui_record_direct_tap_push_latched(int channel, bool latched_on,
+                                         const uint8_t *bytes, size_t len,
+                                         uint32_t frame_index) {
+    if (channel != 0 && channel != 1) return;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_push_result_t result =
+        gui_record_direct_push_latched(ctx, latched_on, bytes, len, frame_index);
+    if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
+    gui_record_direct_report_drop(channel, frame_index, len);
 }
 
 static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {

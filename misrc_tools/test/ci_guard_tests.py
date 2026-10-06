@@ -1835,8 +1835,15 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         (direct_c, "atomic_load(&ctx->tap_enabled)", "producer checks the enabled flag"),
         (direct_c, "bufmgr_fill_level(ctx->bufmgr, (buffer_id_t)ctx->buf_id)", "writer reads variable lengths"),
         (direct_c, "GUI_RECORD_DIRECT_MAX_BLOCK_BYTES", "writer read granularity cap"),
-        (cxadc_c, "gui_record_direct_tap_push(0, card_buf_a", "card A native tap"),
-        (cxadc_c, "gui_record_direct_tap_push(1, card_buf_b", "card B native tap"),
+        (cxadc_c, "gui_record_direct_tap_push_latched(0, true, card_buf_a", "card A latched native tap"),
+        (cxadc_c, "gui_record_direct_tap_push_latched(1, true, card_buf_b", "card B latched native tap"),
+        (cxadc_c, "gui_record_tap_iteration_enter(0)", "iteration gate enter (A)"),
+        (cxadc_c, "gui_record_tap_iteration_enter(1)", "iteration gate enter (B)"),
+        (cxadc_c, "gui_record_tap_iteration_leave(0)", "iteration gate leave (A)"),
+        (cxadc_c, "gui_record_tap_iteration_leave(1)", "iteration gate leave (B)"),
+        (cxadc_c, "bool tap_this_iter = a_on && b_on;", "per-iteration latched record decision (A/B chunk symmetry)"),
+        (record_h, "gui_record_direct_tap_push_latched", "latched tap wrapper declaration"),
+        (direct_c, "gui_record_direct_push_latched(", "latched push in the record-direct module"),
         (cxadc_h, "gui_cxadc_direct_record_available", "CXADC direct availability query"),
         (record_h, "gui_record_direct_tap_push", "tap entry point declaration"),
         (record_h, "gui_record_spill_read_block", "public spill read"),
@@ -1855,17 +1862,26 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         if snippet not in text:
             return fail(f"Direct RAW passthrough contract missing {label}: {snippet}")
 
-    # Tap placement: both taps must run before the A/B pairing truncation
-    # (output_samples = min(...)) so the direct bytes are the exact card
-    # reads, not truncated/paired samples.
-    tap_a = cxadc_c.find("gui_record_direct_tap_push(0, card_buf_a")
-    tap_b = cxadc_c.find("gui_record_direct_tap_push(1, card_buf_b")
-    pairing = cxadc_c.find("if (ctx->card_count > 1)")
+    # Tap placement: the lockstep tap gate must sit AFTER the A/B reads and
+    # pairing truncation (the pushed bytes are the exact card reads, never
+    # the paired/truncated samples) and BEFORE the display-ring write, with
+    # the per-iteration ordering: enter both channels' taps, latch the
+    # decision once, push both chunks with the same decision, then leave.
+    # A record start/stop handshake landing between the per-channel pushes
+    # then cannot split the channels by one chunk.
+    gate_enter_a = cxadc_c.find("gui_record_tap_iteration_enter(0)")
+    gate_latch = cxadc_c.find("bool tap_this_iter = a_on && b_on;")
+    tap_a = cxadc_c.find("gui_record_direct_tap_push_latched(0, true, card_buf_a")
+    tap_b = cxadc_c.find("gui_record_direct_tap_push_latched(1, true, card_buf_b")
+    gate_leave_a = cxadc_c.find("gui_record_tap_iteration_leave(0)")
     truncation = cxadc_c.find("output_samples_b < output_samples")
-    if min(tap_a, tap_b, pairing, truncation) < 0:
-        return fail("Direct RAW tap placement anchors not found in gui_cxadc.c")
-    if not (tap_a < pairing < tap_b < truncation):
-        return fail("Direct RAW taps must sit before the A/B pairing truncation in the capture loop")
+    display_write = cxadc_c.find("bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF")
+    if min(gate_enter_a, gate_latch, tap_a, tap_b, gate_leave_a, truncation, display_write) < 0:
+        return fail("Direct RAW tap gate placement anchors not found in gui_cxadc.c")
+    if not (truncation < gate_enter_a < gate_latch < tap_a < tap_b < gate_leave_a):
+        return fail("Direct RAW tap gate must sit after the A/B pairing, latching the decision once before both latched pushes")
+    if not (gate_leave_a < display_write):
+        return fail("Direct RAW tap gate must complete before the display-ring write")
 
     # Producer handshake: mark in-flight, THEN read enabled.
     push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push")
@@ -2289,6 +2305,123 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     return 0
 
 
+def check_audio_record_alignment_contract(repo_root: Path) -> int:
+    """Static contract for the F1 record-alignment transitions in the
+    audio thread: transitions detected at the top of the loop (bounded by
+    the 2 ms read timeout, so within ~2-4 ms of the record button), a
+    discard-to-now of buffered pre-record audio at record START at the
+    576 B producer granularity, and a flush-to-now of buffered tail audio
+    at record STOP (the old semantics wrote up to one full ~350 ms block
+    of pre-record audio at record START)."""
+    audio_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.c")
+    buffer_manager_c = read_text(repo_root / "misrc_tools/common/buffer_manager.c")
+
+    required_snippets = [
+        (audio_c, "#define AUDIO_SYNC_CHUNK_BYTES 576", "producer-granularity sync chunk (48 frames x 12 B)"),
+        (audio_c, "static uint64_t audio_discard_ring_to_now(", "discard-to-now helper"),
+        (audio_c, "static uint64_t audio_flush_ring_to_files(", "flush-to-now helper"),
+        (audio_c, "static void audio_write_recorded_block(", "shared block-write helper"),
+        (audio_c, "BUF_CAPTURE_AUDIO,\n                                    AUDIO_SYNC_CHUNK_BYTES, 0)", "sync helpers use no-wait full chunks"),
+        (audio_c, "[AUDIO] Record start aligned", "start-alignment log line"),
+        (audio_c, "[AUDIO] Record stop aligned", "stop-alignment log line"),
+        (audio_c, "bool was_recording = (a->f_4ch != NULL)", "pre-opened-files recording init"),
+        (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);", "2 ms read timeout keeps the transition observation at ~2-4 ms"),
+        (buffer_manager_c, "if (timeout_ms == 0) return NULL;", "timeout-0 read returns only full available chunks"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"Audio record alignment contract missing {label}: {snippet}")
+
+    # The transition handler must sit at the TOP of the audio loop, before
+    # the main full-block read, so transitions are observed within the
+    # 10 ms read-timeout spin instead of only at the next full ~350 ms block.
+    thread_body = func_body_from(audio_c, "static int audio_thread_main(void *ctx)")
+    loop_pos = thread_body.find("while (1) {")
+    transition_pos = thread_body.find("bool rec_now = a->app && a->app->is_recording;")
+    read_pos = thread_body.find("bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);")
+    if min(loop_pos, transition_pos, read_pos) < 0:
+        return fail("Audio record alignment anchors not found in audio_thread_main")
+    if not (loop_pos < transition_pos < read_pos):
+        return fail("Audio record transition handler must sit at the top of the audio loop, before the main full-block read")
+
+    # START discards, STOP flushes: both through the producer-granularity
+    # chunk (12,288 B = one clockgen capture-thread write) and both before
+    # the main full-block read path runs.
+    start_discard_pos = thread_body.find("audio_discard_ring_to_now(a);", transition_pos)
+    stop_flush_pos = thread_body.find("audio_flush_ring_to_files(a);", transition_pos)
+    if start_discard_pos < 0 or stop_flush_pos < 0:
+        return fail("Audio record transitions must call the discard/flush helpers")
+    if not (start_discard_pos < read_pos and stop_flush_pos < read_pos):
+        return fail("Audio record transition handlers must run before the main full-block read")
+
+    # The flush must write through the same conversion path (peaks + block
+    # writer) rather than dropping the tail.
+    flush_body = func_body_from(audio_c, "static uint64_t audio_flush_ring_to_files")
+    for snippet in ["audio_update_peaks", "audio_write_recorded_block", "bufmgr_read_end"]:
+        if snippet not in flush_body:
+            return fail(f"audio_flush_ring_to_files must use the shared write path: missing {snippet}")
+    return 0
+
+
+def check_cxadc_sync_start_contract(repo_root: Path) -> int:
+    """Static contract for the F1b synchronized card starts: after the
+    sequential capture-start rate probes (which leave card 0's stream ~one
+    probe duration behind card 1's in wall-clock content time), both cards
+    are drained to their current 2 MiB release boundary and skipped to a
+    common content instant T_ref BEFORE the RF lockstep thread starts, so
+    the recorded A/B content offset is bounded by read granularity and
+    measurement slop instead of the probe skew (~114 ms measured)."""
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+
+    required_snippets = [
+        (cxadc_c, "static void cxadc_sync_card_starts(", "synchronized-start routine"),
+        (cxadc_c, "#define CXADC_SYNC_CHUNK_BYTES", "sync chunk granularity"),
+        (cxadc_c, "#define CXADC_SYNC_LIVE_CHUNK_MIN_US", "live-detection threshold"),
+        (cxadc_c, "#define CXADC_SYNC_GRID_LIVE_MIN_US", "grid-read live-detection threshold"),
+        (cxadc_c, "#define CXADC_SYNC_TREF_MARGIN_US", "T_ref margin"),
+        (cxadc_c, "#define CXADC_SYNC_MAX_DRAIN_BYTES", "drain byte cap"),
+        (cxadc_c, "#define CXADC_SYNC_MAX_TOTAL_US", "total sync budget"),
+        (cxadc_c, "static size_t s_cxadc_probe_consumed_bytes[CXADC_MAX_CARDS];", "per-session consumed grid reference"),
+        (cxadc_c, "[CXADC] sync-start:", "sync-start log line"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"CXADC synchronized start contract missing {label}: {snippet}")
+
+    sync_body = func_body_from(cxadc_c, "static void cxadc_sync_card_starts")
+    for snippet in [
+        "CXADC_SYNC_LIVE_CHUNK_MIN_US",          # phase-1 drain live heuristic
+        "% CXADC_SYNC_RELEASE_BYTES",           # grid-align to the 2 MiB boundary grid
+        "rem - (size_t)got",                    # exact-remainder consumption (no overshoot)
+        "CXADC_SYNC_GRID_LIVE_MIN_US",          # grid-read full-period wait detection
+        "cxadc_sync_read_card(ctx, i, buf, 1)",  # 1-byte boundary-crossing probe
+        "probe_us >= 1000",                     # probe must truly block (crossing measured)
+        "t_ref += CXADC_SYNC_TREF_MARGIN_US",   # common target with margin
+        "delta_us * byte_rate",                 # skip bytes from content-time delta
+        "card_sample_rate_hz[i]",               # per-card measured rate
+        "tenbit_mode[i]",                       # per-card sample width
+        "s_cxadc_probe_consumed_bytes[i]",       # grid reference from the probe's consumed count
+    ]:
+        if snippet not in sync_body:
+            return fail(f"cxadc_sync_card_starts missing required logic: {snippet}")
+
+    # The sync must run AFTER the capture-start probe loop and BEFORE the RF
+    # capture thread is created, gated on two or more cards.
+    start_body = func_body_from(
+        cxadc_c, "int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)")
+    probe_pos = start_body.find("cxadc_probe_and_cache_card_rate(app, i, s_cxadc.tenbit_mode[i],")
+    sync_call_pos = start_body.find("cxadc_sync_card_starts(&s_cxadc, card_count);")
+    gate_pos = start_body.find("if (card_count > 1) {")
+    rf_thread_pos = start_body.find("thrd_create_with_priority(&s_cxadc.rf_thread,")
+    if min(probe_pos, sync_call_pos, gate_pos, rf_thread_pos) < 0:
+        return fail("CXADC sync-start ordering anchors not found in gui_cxadc_start")
+    if not (probe_pos < sync_call_pos < rf_thread_pos):
+        return fail("cxadc_sync_card_starts must run after the capture-start probes and before the RF thread starts")
+    if not (gate_pos < sync_call_pos):
+        return fail("cxadc_sync_card_starts must be gated on card_count > 1")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -2362,6 +2495,8 @@ def main() -> int:
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),
+        ("audio record alignment contract", lambda: check_audio_record_alignment_contract(repo_root)),
+        ("CXADC synchronized start contract", lambda: check_cxadc_sync_start_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

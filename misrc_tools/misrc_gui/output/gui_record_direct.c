@@ -74,21 +74,11 @@ void gui_record_direct_tap_wait_idle(gui_record_direct_ctx_t *ctx) {
     }
 }
 
-gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *ctx,
-                                                       const uint8_t *bytes, size_t len,
-                                                       uint32_t frame_index) {
-    if (!ctx || !bytes || len == 0) {
-        return GUI_RECORD_DIRECT_PUSH_IDLE;
-    }
-
-    // Handshake: mark in-flight, THEN check enabled, so the stopper's
-    // disable + wait-idle sequence can never miss an active push.
-    atomic_fetch_add(&ctx->tap_inflight, 1);
-    if (!atomic_load(&ctx->tap_enabled)) {
-        atomic_fetch_sub(&ctx->tap_inflight, 1);
-        return GUI_RECORD_DIRECT_PUSH_IDLE;
-    }
-
+// Push body shared by the live-checked push and the iteration-latched
+// push. No in-flight management here: the callers own the tap handshake.
+static gui_record_direct_push_result_t gui_record_direct_push_inner(
+    gui_record_direct_ctx_t *ctx, const uint8_t *bytes, size_t len,
+    uint32_t frame_index) {
     if (ctx->bytes_read_total) {
         atomic_fetch_add(ctx->bytes_read_total, len);
     }
@@ -110,7 +100,6 @@ gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *
             ctx->cb.spill_enqueue(ctx->cb.user, ctx->channel, bytes, len, frame_index)) {
             result = GUI_RECORD_DIRECT_PUSH_SPILL;
         }
-        atomic_fetch_sub(&ctx->tap_inflight, 1);
         return result;
     }
 
@@ -131,8 +120,57 @@ gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *
         result = GUI_RECORD_DIRECT_PUSH_SPILL;
     }
 
+    return result;
+}
+
+gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *ctx,
+                                                       const uint8_t *bytes, size_t len,
+                                                       uint32_t frame_index) {
+    if (!ctx || !bytes || len == 0) {
+        return GUI_RECORD_DIRECT_PUSH_IDLE;
+    }
+
+    // Handshake: mark in-flight, THEN check enabled, so the stopper's
+    // disable + wait-idle sequence can never miss an active push.
+    atomic_fetch_add(&ctx->tap_inflight, 1);
+    if (!atomic_load(&ctx->tap_enabled)) {
+        atomic_fetch_sub(&ctx->tap_inflight, 1);
+        return GUI_RECORD_DIRECT_PUSH_IDLE;
+    }
+
+    gui_record_direct_push_result_t result =
+        gui_record_direct_push_inner(ctx, bytes, len, frame_index);
     atomic_fetch_sub(&ctx->tap_inflight, 1);
     return result;
+}
+
+bool gui_record_direct_tap_iteration_enter(gui_record_direct_ctx_t *ctx) {
+    if (!ctx) return false;
+    // Handshake: mark in-flight, THEN check enabled, so the stopper's
+    // disable + wait-idle sequence waits for this whole gated iteration
+    // (tap_iteration_leave is only reached after the gated pushes have
+    // completed) and can never miss a latched push.
+    atomic_fetch_add(&ctx->tap_inflight, 1);
+    return atomic_load(&ctx->tap_enabled);
+}
+
+void gui_record_direct_tap_iteration_leave(gui_record_direct_ctx_t *ctx) {
+    if (!ctx) return;
+    atomic_fetch_sub(&ctx->tap_inflight, 1);
+}
+
+gui_record_direct_push_result_t gui_record_direct_push_latched(
+    gui_record_direct_ctx_t *ctx, bool latched_on,
+    const uint8_t *bytes, size_t len, uint32_t frame_index) {
+    if (!ctx || !bytes || len == 0 || !latched_on) {
+        return GUI_RECORD_DIRECT_PUSH_IDLE;
+    }
+    // The paired tap_iteration_enter already marked this channel in-flight
+    // (the stopper's wait-idle covers this push); honor the iteration-latched
+    // decision instead of the live tap_enabled flag so a record start/stop
+    // handshake landing between the per-channel pushes cannot split the
+    // channels by one chunk.
+    return gui_record_direct_push_inner(ctx, bytes, len, frame_index);
 }
 
 int gui_record_direct_writer_thread(void *ctx_ptr) {

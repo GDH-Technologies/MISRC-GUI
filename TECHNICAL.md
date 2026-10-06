@@ -436,6 +436,116 @@ rate stays — never a wrong override.
   unit test; a genuinely stale-sysfs card (the reporting user's machine)
   is the final end-to-end confirmation.
 
+## Multi-stream capture start alignment (CXADC cards + clockgen audio)
+
+Equal sample counts between capture streams do NOT mean aligned content.
+Two independent start-skew mechanisms were measured on the 2x CXADC +
+clockgen rig (2026-10-06, prompt log `cx-misrc-sync-investigation-2026-10-06`)
+and fixed:
+
+1. **RF A/B content offset (~105-155 ms per capture).** The capture-start
+   rate probes run sequentially (drain + 4 MiB timed live window per card),
+   so card 0's stream position is left ~one probe duration behind card 1's
+   in wall-clock content time. The RF thread then reads both cards in
+   lockstep (equal chunks per iteration), which preserves that content
+   offset for the whole capture — measured 114.076 ms (rfA/rfB were
+   byte-exact equal, yet misaligned by that much).
+2. **PCM1802 audio vs RF offset (0-350 ms).** The audio thread reads
+   BUF_CAPTURE_AUDIO in full 196,608 B blocks (~349.5 ms of 46,875 Hz x 12 B
+   clockgen audio) and only observed the record state after a full block
+   read — so at record START up to one full block of pre-record audio was
+   written (measured: WAV span exceeded the RF span by +275 ms).
+
+### Fix 1 — audio record transitions at the top of the loop (gui_audio.c)
+
+The record-state transitions are now handled at the TOP of every audio
+loop iteration. Each iteration is bounded by the 2 ms read timeout (the
+loop spins at ~500 Hz), so transitions are observed within ~2-4 ms of the
+record button:
+
+- START discards everything buffered before the transition, at the capture
+  thread's 576 B write granularity (`AUDIO_SYNC_CHUNK_BYTES` = 48 frames x
+  12 B, matching the ALSA readi period), so the WAV files begin at the record
+  instant within the ~1 ms USB audio delivery quantum.
+- STOP flushes everything buffered up to "now" through the same conversion
+  path (peaks + 4ch/2ch/1ch writes), so the WAV files end at the stop
+  instant. (The record-stop path stops + restarts the audio thread, whose
+  exit drain already flushes the tail; the stop-flush is the safety net for
+  any path where the thread survives a record stop.)
+
+Log lines:
+
+    [AUDIO] Record start aligned: discarded 147456 B (~262.1 ms) of pre-record audio
+    [AUDIO] Record stop aligned: flushed N B (~X.X ms) of tail audio
+
+Verified on the rig (same 15 s auto-record load test as the direct RAW
+section): WAV span excess vs the RF files went from **+275 ms (baseline)
+to +13 ms**; rfA/rfB remain byte-exact equal (599,785,472 B each).
+
+### Fix 2 — synchronized card starts, exact boundary grid (gui_cxadc.c)
+
+`cxadc_sync_card_starts()` runs after the sequential capture-start probes
+and before the RF thread starts (2+ cards only), using the driver's exact
+grid: `open()` latches `initial_page` = a 512-page-aligned boundary index,
+so a card's release boundaries recur at exactly 2,097,152-byte multiples of
+the fd's total consumed byte count (tracked across the capture-start probe
+via `s_cxadc_probe_consumed_bytes`, reset per card at the capture-start
+probe), and `lgpcnt` is always on the same grid — so a grid-aligned reader
+is always a whole number of 2 MiB releases behind lgpcnt. Per card:
+
+1. Drain to the current release boundary (bounded; efficiency only).
+2. Grid-align: consume the exact byte remainder to the next boundary.
+3. Measure a boundary crossing EXACTLY: whole 2 MiB grid reads until one
+   blocks a full release period (the stream is exactly at lgpcnt), then a
+   1-byte read that blocks until the NEXT boundary crossing and completes
+   within microseconds of it — that completion IS the content time of the
+   stream position (measured directly, no period arithmetic, no mid-release
+   ambiguity).
+4. Skip to T_ref = max(card crossing times) + 1 ms with EXACT byte counts
+   (64 KiB chunks + an exact-remainder final read; blocking reads fill
+   exactly the requested count).
+
+Residual: the 1-byte probe's IRQ/wakeup slop (tens of microseconds,
+near-identical per card) + the measured-rate error over the skip
+(microseconds) — byte-exact A/B content alignment. The clockgen audio path
+also runs the ALSA readi at 48-frame (~1 ms) granularity so the ring's
+"now" advances at the USB delivery quantum.
+
+Log line:
+
+    [CXADC] sync-start: exact boundary alignment to a common content instant;
+            card0: crossing@+157.123ms skip=4398.0KB total=12.34MB card1: ...
+            -> all streams at T_ref (byte-exact; residual ~tens of us)
+
+### Fix 3 — lockstep tap gate (gui_record_direct.c/.h, gui_record.c/.h, gui_cxadc.c)
+
+The record start/stop handshake flips the live `tap_enabled` flag
+asynchronously to the capture thread. With one live-checked push per
+channel, a flip landing between the A and B pushes of one lockstep
+iteration split the channels by one 64 KiB chunk (observed once in three
+runs before this gate). The CXADC capture thread now latches the record
+decision ONCE per iteration: enter both active channels' taps
+(`gui_record_tap_iteration_enter` — marks each channel's tap in-flight and
+returns the latched enabled state), combine into a single per-iteration
+decision, push both chunks with `gui_record_direct_tap_push_latched` (which
+honors the latched decision instead of the live flag) or neither, then
+leave. The in-flight marking makes the stop-side disable + wait-idle
+handshake wait for the whole gated iteration, so no latched push can run
+after the writers' final drain. A/B record counts are now chunk-atomic
+(verified: two consecutive 15 s runs byte-exact equal, read==written).
+
+Residual audio-vs-RF offset: the PCM1802 WAV begins ~3-7 ms after the
+record instant (~1 ms USB delivery quantum + ~2-4 ms observation) and ends
+~2-10 ms after the stop (the record-stop entry stops the audio thread,
+whose exit drain ends the files at "now"); measured span differences vs
+the RF files: +13 to +23 ms across runs (baseline: +275 ms). The RF A/B
+feeds are byte-exact in both counts and content; the audio boundary floor
+is the USB delivery quantum without hardware timestamping.
+
+Guard: `ci_guard_tests.py` `audio record alignment contract`,
+`CXADC synchronized start contract`, and the gated-tap ordering in
+`raw direct passthrough contract`.
+
 ## GUI Readout + Stats Breakdown
 
 This section documents what the GUI stats/readouts show, where each value comes

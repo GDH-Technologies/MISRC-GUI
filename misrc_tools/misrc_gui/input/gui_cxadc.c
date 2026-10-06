@@ -260,7 +260,11 @@ extern volatile atomic_int do_exit;
 #define CXADC_READ_CHUNK_BYTES 65536
 #define CXADC_AUDIO_SAMPLE_RATE_HZ 46875U
 #define CXADC_AUDIO_CHANNEL_COUNT 3
-#define CXADC_AUDIO_READ_FRAMES 1024
+// 48 frames (~1 ms @ 46,875 Hz) keeps the BUF_CAPTURE_AUDIO ring advancing
+// at ~1 ms granularity so the record-start alignment (the discard-to-now in
+// gui_audio.c) is bounded by the USB audio delivery quantum instead of the
+// old ~21.8 ms (1024-frame) period.
+#define CXADC_AUDIO_READ_FRAMES 48
 #define CXADC_AUDIO_PACKED_FRAME_BYTES 12
 
 typedef enum {
@@ -811,6 +815,14 @@ typedef enum {
                                     // cache so enumeration does not retry)
 } cxadc_rate_state_t;
 static cxadc_rate_state_t s_cxadc_measured_rate_state[CXADC_MAX_CARDS][2];
+// Total bytes consumed from each card's fd during the CURRENT capture
+// session (the capture-start probe + the synchronized-start reads). The
+// driver's initial_page is always 512-page aligned, so release boundaries
+// recur at exactly 2,097,152-byte multiples of this count - the exact-alignment
+// grid reference for cxadc_sync_card_starts(). Reset per card at the
+// capture-start probe; the startup-enumeration probe (a separate, closed fd
+// session) accumulates into it first and is cleared by that reset.
+static size_t s_cxadc_probe_consumed_bytes[CXADC_MAX_CARDS];
 
 // Time a blocking read window on the card and derive the feed rate
 // (samples/s = bytes read / elapsed / bytes-per-sample). Uses the capture
@@ -890,8 +902,8 @@ static bool cxadc_measure_card_rate_hz(int card_idx, bool tenbit, size_t probe_b
             fprintf(stderr,
                     "[CXADC] rate check: card %d could not reach the live stream while draining the backlog; using the sysfs-derived rate\n",
                     card_idx);
-            goto probe_done;
         }
+        s_cxadc_probe_consumed_bytes[card_idx] += drained_bytes;
     }
 
     // Phase 2: timed all-live window.
@@ -936,6 +948,7 @@ static bool cxadc_measure_card_rate_hz(int card_idx, bool tenbit, size_t probe_b
     }
 
 probe_done:
+    s_cxadc_probe_consumed_bytes[card_idx] += total_bytes;
     free(buf);
 #if defined(_WIN32)
     if (close_after && h != INVALID_HANDLE_VALUE) {
@@ -1177,7 +1190,9 @@ static int cxadc_configure_audio_pcm(snd_pcm_t *pcm,
     }
 
     snd_pcm_uframes_t period_frames = CXADC_AUDIO_READ_FRAMES;
-    snd_pcm_uframes_t buffer_frames = CXADC_AUDIO_READ_FRAMES * 8;
+    // With the small ~1 ms period, keep a proportionally larger ALSA buffer
+    // (64 periods ≈ 65 ms) so scheduling hiccups do not overrun the stream.
+    snd_pcm_uframes_t buffer_frames = CXADC_AUDIO_READ_FRAMES * 64;
     (void)snd_pcm_hw_params_set_period_size_near(pcm, params, &period_frames, &dir);
     (void)snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer_frames);
 
@@ -2002,22 +2017,17 @@ static int cxadc_capture_thread(void *ctx_ptr)
             continue;
         }
 
-        // Direct native RAW tap (card 0 -> channel A): the exact bytes just
-        // read, before the A/B pairing below (which truncates both reads to
-        // the shorter one and drops card A's data when card B returns 0).
-        // No-op unless channel A was set up as direct native at record start.
-        gui_record_direct_tap_push(0, card_buf_a, (size_t)read_a, tap_frame_index++);
-
         int output_samples = read_a / input_bytes_per_sample_a;
         if (output_samples <= 0) {
             thrd_sleep_ms(1);
             continue;
         }
+        int read_b = 0;
         if (ctx->card_count > 1) {
 #if defined(_WIN32)
-            int read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+            read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
 #else
-            int read_b = cxadc_read_card(ctx->card_fds[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+            read_b = cxadc_read_card(ctx->card_fds[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
 #endif
             if (read_b < 0) {
                 gui_app_set_status(app, "CXADC read error on card 1");
@@ -2027,12 +2037,42 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 thrd_sleep_ms(1);
                 continue;
             }
-            // Direct native RAW tap (card 1 -> channel B): exact bytes, before
-            // the pairing truncation below.
-            gui_record_direct_tap_push(1, card_buf_b, (size_t)read_b, tap_frame_index++);
             int output_samples_b = read_b / input_bytes_per_sample_b;
             if (output_samples_b < output_samples) {
                 output_samples = output_samples_b;
+            }
+        }
+
+        // Direct native RAW taps (cards 0/1 -> channels A/B): the exact bytes
+        // just read, before the A/B pairing truncation above (which truncates
+        // both reads to the shorter one and drops card A's data when card B
+        // returns 0). Gated per iteration: both channels' taps are entered
+        // (marked in-flight, so the record-stop handshake's wait-idle covers
+        // the whole iteration) and the record decision is latched ONCE, then
+        // both chunks are pushed with the same decision — a record start/stop
+        // handshake landing between the per-channel pushes can no longer
+        // split the channels by one chunk (observed a 64 KiB A/B count
+        // difference before this gate). No pushes unless the channels were
+        // set up as direct native at record start.
+        {
+            const bool tap_a_ch = gui_record_direct_tap_channel_active(0);
+            const bool tap_b_ch = (ctx->card_count > 1) &&
+                                  gui_record_direct_tap_channel_active(1);
+            if (tap_a_ch || tap_b_ch) {
+                bool a_on = tap_a_ch ? gui_record_tap_iteration_enter(0) : true;
+                bool b_on = tap_b_ch ? gui_record_tap_iteration_enter(1) : true;
+                bool tap_this_iter = a_on && b_on;
+                if (tap_a_ch && tap_this_iter) {
+                    gui_record_direct_tap_push_latched(0, true, card_buf_a,
+                                                       (size_t)read_a, tap_frame_index);
+                }
+                if (tap_b_ch && tap_this_iter) {
+                    gui_record_direct_tap_push_latched(1, true, card_buf_b,
+                                                       (size_t)read_b, tap_frame_index + 1);
+                }
+                if (tap_a_ch) gui_record_tap_iteration_leave(0);
+                if (tap_b_ch) gui_record_tap_iteration_leave(1);
+                tap_frame_index += 2;
             }
         }
 
@@ -2159,6 +2199,188 @@ bool gui_cxadc_detect_misrc_clockgen_audio(void)
 #else
     return false;
 #endif
+}
+
+/* --- F1b: synchronized card starts (exact boundary grid) ---------------
+ *
+ * The per-card capture-start rate probes (drain + timed 4 MiB live window,
+ * ~105-155 ms each) run sequentially, so card 0's stream position is left
+ * ~one probe duration behind card 1's in wall-clock content time. The RF
+ * capture thread then reads both cards in lockstep, which preserves that
+ * content offset for the whole capture (measured 114 ms on 2026-10-06).
+ *
+ * This routine re-aligns the streams to a single common content instant
+ * BEFORE the RF thread starts, using the driver's exact grid: open() latches
+ * initial_page = a 512-page-aligned boundary index, so a card's release
+ * boundaries recur at exactly 2,097,152-byte multiples of the fd's total
+ * consumed byte count, and lgpcnt is always on the same grid - so a
+ * grid-aligned reader is always a whole number of 2 MiB releases behind
+ * lgpcnt (never mid-release).
+ *
+ * Per card:
+ *   1. Drain to the current release boundary (bounded; efficiency only).
+ *   2. Grid-align: consume the exact byte remainder to the next boundary.
+ *   3. Measure a boundary crossing EXACTLY: consume whole 2 MiB grid reads
+ *      until one blocks a full release period (the stream is exactly at
+ *      lgpcnt: at a boundary with nothing readable), then a 1-byte read that
+ *      blocks until the NEXT boundary crossing and completes within
+ *      microseconds of it. That completion IS the content time of the
+ *      stream position - measured directly, not derived from period
+ *      arithmetic (no mid-release ambiguity, no chunk overshoot).
+ *   4. Skip to T_ref = max(card crossing times) + margin with EXACT byte
+ *      counts (64 KiB chunks + an exact-remainder final read; blocking
+ *      reads fill exactly the requested count).
+ *
+ * Residual: the 1-byte probe's IRQ/wakeup slop (tens of microseconds,
+ * near-identical per card on the same system) + the measured-rate error
+ * over the skip (microseconds) - byte-exact A/B content alignment.
+ */
+#define CXADC_SYNC_CHUNK_BYTES       ((size_t)64 * 1024)
+#define CXADC_SYNC_RELEASE_BYTES     (2u * 1024 * 1024) /* driver 512-page boundary grid */
+#define CXADC_SYNC_LIVE_CHUNK_MIN_US 4000
+#define CXADC_SYNC_GRID_LIVE_MIN_US  20000
+#define CXADC_SYNC_TREF_MARGIN_US    1000
+#define CXADC_SYNC_MAX_DRAIN_BYTES   ((size_t)64 * 1024 * 1024)
+#define CXADC_SYNC_MAX_TOTAL_US      (4000ULL * 1000ULL)
+#define CXADC_SYNC_MAX_GRID_READS    64
+
+static int cxadc_sync_read_card(cxadc_ctx_t *ctx, int i, uint8_t *buf, size_t n)
+{
+#if defined(_WIN32)
+    return cxadc_read_card(ctx->card_handles[i], buf, n);
+#else
+    return cxadc_read_card(ctx->card_fds[i], buf, n);
+#endif
+}
+
+static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
+{
+    if (!ctx || card_count < 2) return;
+
+    uint8_t *buf = (uint8_t *)malloc(CXADC_SYNC_RELEASE_BYTES);
+    if (!buf) {
+        fprintf(stderr, "[CXADC] sync-start: failed to allocate sync buffer; skipping sync\n");
+        return;
+    }
+
+    uint64_t sync_start_us = get_time_us();
+    uint64_t deadline_us = sync_start_us + CXADC_SYNC_MAX_TOTAL_US;
+    size_t consumed_total[CXADC_MAX_CARDS];
+    uint64_t crossing_us[CXADC_MAX_CARDS] = { 0 };
+    size_t skip_bytes[CXADC_MAX_CARDS] = { 0 };
+    bool measured[CXADC_MAX_CARDS] = { false };
+
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        consumed_total[i] = s_cxadc_probe_consumed_bytes[i];
+    }
+
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        // Phase 1: drain to the current release boundary (bounded; the
+        // exactness comes from phases 2-3, not this heuristic).
+        size_t drained_here = 0;
+        while (drained_here < CXADC_SYNC_MAX_DRAIN_BYTES &&
+               get_time_us() < deadline_us) {
+            uint64_t t0 = get_time_us();
+            int got = cxadc_sync_read_card(ctx, i, buf, CXADC_SYNC_CHUNK_BYTES);
+            uint64_t took_us = get_time_us() - t0;
+            if (got < 0) break;
+            if (got > 0) {
+                consumed_total[i] += (size_t)got;
+                drained_here += (size_t)got;
+            }
+            if (took_us >= CXADC_SYNC_LIVE_CHUNK_MIN_US) break; // caught up (approx)
+        }
+
+        // Phase 2: grid-align - consume the exact remainder to the next
+        // 2,097,152-byte boundary multiple of the fd's consumed count.
+        size_t rem = (size_t)(CXADC_SYNC_RELEASE_BYTES -
+                              (consumed_total[i] % CXADC_SYNC_RELEASE_BYTES)) %
+                     CXADC_SYNC_RELEASE_BYTES;
+        while (rem > 0 && get_time_us() < deadline_us) {
+            size_t want = (rem > CXADC_SYNC_CHUNK_BYTES) ? CXADC_SYNC_CHUNK_BYTES : rem;
+            int got = cxadc_sync_read_card(ctx, i, buf, want);
+            if (got < 0) { rem = 0; break; }
+            if (got == 0) continue; // interrupted; blocking reads fill exactly
+            consumed_total[i] += (size_t)got;
+            rem = ((size_t)got >= rem) ? 0 : (rem - (size_t)got);
+        }
+
+        // Phase 3: exact boundary-crossing measurement - whole 2 MiB grid
+        // reads until one blocks a full release period (the stream is
+        // exactly at lgpcnt), then a 1-byte probe whose completion IS the
+        // next boundary crossing (microsecond-level slop).
+        for (size_t g = 0; g < CXADC_SYNC_MAX_GRID_READS && get_time_us() < deadline_us; g++) {
+            uint64_t t0 = get_time_us();
+            int got = cxadc_sync_read_card(ctx, i, buf, CXADC_SYNC_RELEASE_BYTES);
+            uint64_t took_us = get_time_us() - t0;
+            if (got < 0) break;
+            if (got == 0) continue; // interrupted; retry the grid read
+            consumed_total[i] += (size_t)got;
+            if (took_us >= CXADC_SYNC_GRID_LIVE_MIN_US) {
+                // The stream was exactly at lgpcnt and this read waited a
+                // full release period. A 1-byte read now blocks until the
+                // next boundary crossing; accept the measurement only if
+                // it truly blocked (guards a phase-2 grid failure).
+                uint64_t p0 = get_time_us();
+                int one = cxadc_sync_read_card(ctx, i, buf, 1);
+                uint64_t probe_us = get_time_us() - p0;
+                if (one == 1) {
+                    consumed_total[i] += 1;
+                    if (probe_us >= 1000) {
+                        crossing_us[i] = get_time_us() - sync_start_us;
+                        measured[i] = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Phase 4: skip every measured card to T_ref with exact byte counts
+    // (64 KiB chunks + an exact-remainder final read).
+    uint64_t t_ref = 0;
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        if (measured[i] && crossing_us[i] > t_ref) t_ref = crossing_us[i];
+    }
+    if (t_ref == 0) {
+        fprintf(stderr, "[CXADC] sync-start: no boundary crossing measured within "
+                        "budget (caps or read errors); streams left at drain positions (unaligned)\n");
+        free(buf);
+        return;
+    }
+    t_ref += CXADC_SYNC_TREF_MARGIN_US;
+
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        if (!measured[i]) continue;
+        uint64_t bytes_per_sample = ctx->tenbit_mode[i] ? 2u : 1u;
+        uint64_t byte_rate = (uint64_t)ctx->card_sample_rate_hz[i] * bytes_per_sample;
+        if (byte_rate == 0) byte_rate = 40000000u;
+        uint64_t delta_us = (t_ref > crossing_us[i])
+                                ? (t_ref - crossing_us[i])
+                                : CXADC_SYNC_TREF_MARGIN_US;
+        skip_bytes[i] = (size_t)((delta_us * byte_rate + 500000ULL) / 1000000ULL);
+        size_t rem = skip_bytes[i];
+        while (rem > 0 && get_time_us() < deadline_us) {
+            size_t want = (rem > CXADC_SYNC_CHUNK_BYTES) ? CXADC_SYNC_CHUNK_BYTES : rem;
+            int got = cxadc_sync_read_card(ctx, i, buf, want);
+            if (got < 0) break;
+            if (got == 0) continue;
+            consumed_total[i] += (size_t)got;
+            rem = ((size_t)got >= rem) ? 0 : (rem - (size_t)got);
+        }
+    }
+
+    free(buf);
+
+    fprintf(stderr, "[CXADC] sync-start: exact boundary alignment to a common content instant;");
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        fprintf(stderr, " card%d%s: crossing@+%.3fms skip=%.1fKB total=%.2fMB",
+                i, measured[i] ? "" : "(unmeasured)",
+                (double)crossing_us[i] / 1000.0,
+                (double)skip_bytes[i] / 1024.0,
+                (double)consumed_total[i] / (1024.0 * 1024.0));
+    }
+    fprintf(stderr, " -> all streams at T_ref (byte-exact; residual ~tens of us)\n");
 }
 
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
@@ -2337,6 +2559,9 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // and the direct RAW availability check all use the measured truth.
     if (card_count > 0) {
         for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+            // Reset the per-session consumed counter before the capture-start
+            // probe so the exact-alignment grid references this fd session only.
+            s_cxadc_probe_consumed_bytes[i] = 0;
             cxadc_probe_and_cache_card_rate(app, i, s_cxadc.tenbit_mode[i],
                                              CXADC_RATE_PROBE_START_BYTES);
             int t = s_cxadc.tenbit_mode[i] ? 1 : 0;
@@ -2345,6 +2570,14 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             }
         }
         s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
+    }
+    // F1b: the sequential probes above leave card 0's stream position ~one
+    // probe duration (~105-155 ms) behind card 1's in wall-clock content
+    // time, and the RF thread's lockstep preserves that offset for the whole
+    // capture (measured 114 ms on 2026-10-06). Re-align both streams to a
+    // common content instant before the RF thread starts (2+ cards only).
+    if (card_count > 1) {
+        cxadc_sync_card_starts(&s_cxadc, card_count);
     }
     // The RF card-reading thread only applies when there are cxadcN cards.
     // In audio-only MISRC Clockgen mode (card_count == 0) the clockgen USB-audio
