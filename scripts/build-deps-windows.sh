@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build vendored deps into .deps/install for a local Windows (MSYS2 MINGW64) build.
+# Build vendored deps into .deps/install for a local Windows (MSYS2 UCRT64) build.
 # Mirrors the deps-build block of the .github/workflows/build.yml `windows-exe` job
 # so local == CI for hsdaoh + libuvc. raylib/fftw3f/flac/soxr/libusb are reused
-# from the pacman MINGW64 install (identical versions to CI's MSYS2 setup) to
+# from the pacman UCRT64 install (identical versions to CI's MSYS2 setup) to
 # avoid redundant recompiles.
 #
 # Idempotent: skips work whose stamp matches the current inputs, so repeated runs
@@ -19,11 +19,13 @@ HSDAOH_SOURCE_DIR="${HSDAOH_SOURCE_DIR:-$REPO_ROOT/third_party/hsdaoh}"
 LIBUVC_REF="${LIBUVC_REF:-v0.0.7}"
 RAYLIB_TAG="${RAYLIB_TAG:-5.5}"
 
-# MSYS2 MINGW64 must be on PATH (caller ensures this, but enforce for safety).
+# MSYS2 UCRT64 must be on PATH (caller ensures this, but enforce for safety).
+# MINGW64 is deprecated by MSYS2; UCRT64 is the CI toolchain since run
+# 37035393223's migration, so it is preferred. mingw64 stays as a fallback.
 if [[ -z "${MINGW_PREFIX:-}" ]]; then
-  if [[ -d /mingw64 ]]; then MINGW_PREFIX=/mingw64
-  elif [[ -d /ucrt64 ]]; then MINGW_PREFIX=/ucrt64
-  else echo "[build-deps-windows] ERROR: no MSYS2 mingw64/ucrt64 found" >&2; exit 1; fi
+  if [[ -d /ucrt64 ]]; then MINGW_PREFIX=/ucrt64
+  elif [[ -d /mingw64 ]]; then MINGW_PREFIX=/mingw64
+  else echo "[build-deps-windows] ERROR: no MSYS2 ucrt64/mingw64 found" >&2; exit 1; fi
 fi
 export PATH="$MINGW_PREFIX/bin:$PATH"
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:$MINGW_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -46,6 +48,10 @@ compute_stamp() {
   {
     echo "libuvc_ref=$LIBUVC_REF"
     echo "raylib_tag=$RAYLIB_TAG"
+    # Toolchain identity: switching MINGW64 <-> UCRT64 changes the CRT the
+    # static libs are built against, so the stamp must bust on a switch
+    # (mirrors the CI cache key naming the ucrt64 toolchain).
+    echo "msystem_prefix=${MINGW_PREFIX:-unknown}"
     # hsdaoh source tree (the thing that actually matters for MISRC builds).
     if [[ -d "$HSDAOH_SOURCE_DIR/.git" ]]; then
       git -C "$HSDAOH_SOURCE_DIR" rev-parse HEAD 2>/dev/null || true
@@ -74,7 +80,7 @@ fi
 require_tools() {
   local missing=0
   for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "[build-deps-windows] Missing: $t" >&2; missing=1; }; done
-  [[ $missing -eq 0 ]] || fail "Install missing MSYS2 MINGW64 tools and retry."
+  [[ $missing -eq 0 ]] || fail "Install missing MSYS2 UCRT64 tools and retry."
 }
 require_tools cmake ninja gcc pkg-config git sed
 
@@ -157,7 +163,7 @@ log "raylib: $(pkg-config --modversion raylib) (built vendored with internal GLF
 
 # --- sanity -----------------------------------------------------------------
 pkg-config --exists hsdaoh || fail "hsdaoh.pc not resolvable after build"
-pkg-config --exists fftw3f || fail "fftw3f not found; install mingw-w64-x86_64-fftw"
+pkg-config --exists fftw3f || fail "fftw3f not found; install mingw-w64-ucrt-x86_64-fftw"
 log "hsdaoh: $(pkg-config --modversion hsdaoh)"
 log "fftw3f: $(pkg-config --modversion fftw3f)"
 

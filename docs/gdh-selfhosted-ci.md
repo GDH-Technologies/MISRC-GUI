@@ -485,7 +485,7 @@ Exec=/home/rdodge/.local/bin/misrc_gui %U
 StartupWMClass=MISRC Capture
 ```
 
-`StartupWMClass` must equal `GUI_WINDOW_CLASS_NAME` in `misrc_tools/misrc_gui/core/misrc_gui.c`.
+`StartupWMClass` must equal `MISRC_WINDOW_CLASS_TITLE` in `misrc_tools/misrc_gui/core/misrc_gui.c`.
 The GUI passes that constant to `InitWindow` and only then applies the versioned title with
 `SetWindowTitle`, which touches `_NET_WM_NAME` and not `WM_CLASS` — so every build reports the same
 class and any launcher keeps matching the running window. `ci_guard_tests.py` enforces the

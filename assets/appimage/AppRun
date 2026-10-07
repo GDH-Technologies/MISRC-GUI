@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# AppRun - launches MISRC GUI / capture / extract and registers the GUI with
+# the desktop launcher.
+#
+# AppImages are not registered with the desktop automatically. Without a
+# matching user-level .desktop file, Cinnamon/Mint (and GNOME/KDE) cannot tie
+# the running window to a launcher: the taskbar shows a placeholder icon,
+# pinning does not stick and the shell generates a stray
+# "Misrc_Gui.cinnamon-generated.desktop".
+#
+# On plain GUI launches this installs ~/.local/share/applications/misrc_gui.desktop
+# (Exec = the AppImage file itself) and the hicolor icon. The window identity set
+# in misrc_tools/misrc_gui/core/misrc_gui.c (WM_CLASS instance "misrc_gui", class
+# "MISRC Capture") matches that file. The launcher is rewritten only when its
+# content changes, so it always follows the AppImage that was run last.
+#
+# A Desktop icon is NEVER created automatically. Earlier builds copied one to
+# ~/Desktop on every launch, so it came back after being deleted. Ask for one
+# explicitly with:   ./<MISRC AppImage> --create-shortcut
+#
+# Set MISRC_GUI_NO_INTEGRATION=1 to skip the automatic launcher install.
+#
+# Deliberately no "set -e": desktop integration must never block the app.
+
+self="$(readlink -f -- "$0")"
+HERE="${self%/*}"
+
+# X11 WM_CLASS instance name. The class comes from the stable window title
+# that misrc_gui.c creates the window with.
+export RESOURCE_NAME="misrc_gui"
+
+# Prints the user-level launcher for the AppImage file in $APPIMAGE.
+misrc_gui_launcher_text() {
+    # '%' is the field-code escape character in Exec.
+    local exec_path="${APPIMAGE//%/%%}"
+    cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=MISRC GUI
+Comment=MISRC capture GUI
+Exec="${exec_path}"
+TryExec=${APPIMAGE}
+Icon=misrc
+Categories=Utility;
+Terminal=false
+StartupNotify=true
+StartupWMClass=MISRC Capture
+EOF
+}
+
+# Mirror misrc_gui.c main(): the window opens only when every argument is a GUI
+# flag. Anything else is CLI capture mode, --version, --help or --smoke-test and
+# must not touch the user's desktop files.
+misrc_gui_is_gui_launch() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --debug-view | --auto-connect) shift ;;
+            --config) shift; [ "$#" -gt 0 ] && shift ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# Install/refresh the user-level launcher + icon. "force" (explicit
+# --create-shortcut) ignores the MISRC_GUI_NO_INTEGRATION opt-out.
+misrc_gui_integrate() {
+    # Only when running from a real AppImage file (APPIMAGE is the file path;
+    # $HERE is a temporary mount that must never end up in a .desktop file).
+    [ -n "${APPIMAGE:-}" ] && [ -f "${APPIMAGE}" ] || return 1
+    if [ "${1:-}" != "force" ]; then
+        [ -z "${MISRC_GUI_NO_INTEGRATION:-}" ] || return 0
+    fi
+
+    # Characters that would need multi-level .desktop escaping: skip rather
+    # than write a broken launcher.
+    case "${APPIMAGE}" in
+        *[\"\`\$\\]*) return 1 ;;
+    esac
+
+    local data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    local apps_dir="${data_home}/applications"
+    local icon_dir="${data_home}/icons/hicolor/512x512/apps"
+    local desktop="${apps_dir}/misrc_gui.desktop"
+    local icon_src="${HERE}/usr/share/icons/hicolor/512x512/apps/misrc.png"
+    local icon_dst="${icon_dir}/misrc.png"
+    local changed=0
+
+    mkdir -p "${apps_dir}" "${icon_dir}" 2>/dev/null || return 1
+
+    local desired
+    desired="$(misrc_gui_launcher_text)"
+
+    # Rewrite only when missing or when it points at a different AppImage or
+    # version, so the launcher follows whichever AppImage ran last.
+    if [ ! -f "${desktop}" ] || [ "$(cat "${desktop}" 2>/dev/null)" != "${desired}" ]; then
+        printf '%s\n' "${desired}" > "${desktop}.tmp.$$" 2>/dev/null \
+            && mv -f "${desktop}.tmp.$$" "${desktop}" 2>/dev/null \
+            && changed=1
+        rm -f "${desktop}.tmp.$$" 2>/dev/null
+    fi
+
+    if [ -f "${icon_src}" ] && { [ ! -f "${icon_dst}" ] || ! cmp -s "${icon_src}" "${icon_dst}"; }; then
+        cp -f "${icon_src}" "${icon_dst}" 2>/dev/null && changed=1
+    fi
+
+    if [ "${changed}" -eq 1 ]; then
+        update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+        gtk-update-icon-cache -f -t "${data_home}/icons/hicolor" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# Explicit, user-requested Desktop icon (--create-shortcut only).
+misrc_gui_create_desktop_icon() {
+    local data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    local launcher="${data_home}/applications/misrc_gui.desktop"
+    local desktop_dir=""
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    fi
+    # xdg-utils' xdg-user-dir answers $HOME when no user-dirs config exists.
+    if [ -z "${desktop_dir}" ] || [ "${desktop_dir}" = "${HOME}" ]; then
+        desktop_dir="${HOME}/Desktop"
+    fi
+    if [ ! -d "${desktop_dir}" ]; then
+        echo "MISRC GUI: Desktop folder not found: ${desktop_dir}" >&2
+        return 1
+    fi
+    [ -f "${launcher}" ] || return 1
+    cp -f "${launcher}" "${desktop_dir}/MISRC GUI.desktop" || return 1
+    chmod +x "${desktop_dir}/MISRC GUI.desktop" 2>/dev/null || true
+    echo "MISRC GUI: Desktop icon created: ${desktop_dir}/MISRC GUI.desktop"
+    return 0
+}
+
+if [ "${1:-}" = "--create-shortcut" ]; then
+    if ! misrc_gui_integrate force; then
+        echo "MISRC GUI: --create-shortcut needs to run from the AppImage file itself" >&2
+        echo "           (APPIMAGE must point at an existing file with a plain path)." >&2
+        exit 1
+    fi
+    misrc_gui_create_desktop_icon
+    exit $?
+fi
+
+case "${1:-}" in
+    capture)
+        shift
+        exec "${HERE}/usr/bin/misrc_capture" "$@"
+        ;;
+    extract)
+        shift
+        exec "${HERE}/usr/bin/misrc_extract" "$@"
+        ;;
+esac
+
+if misrc_gui_is_gui_launch "$@"; then
+    misrc_gui_integrate || true
+fi
+
+exec "${HERE}/usr/bin/misrc_gui" "$@"

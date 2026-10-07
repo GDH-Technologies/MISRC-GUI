@@ -2,9 +2,13 @@
 #define GUI_CXADC_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct gui_app gui_app_t;
+
+// Maximum CXADC cards the GUI drives (card 0 -> channel A, card 1 -> B).
+#define CXADC_MAX_CARDS 2
 // Marker serial values used by synthetic CXADC mode entries.
 #define CXADC_MARKER_SERIAL_1CARD "CXADC_1CARD"
 #define CXADC_MARKER_SERIAL_2CARD "CXADC_2CARD"
@@ -78,6 +82,26 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled);
 // callers fall back to the 40/20 MSPS clockgen baseline.
 bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out);
 
+// Measured (empirical) CXADC card feed rate. sysfs crystal/tenxfsc can be
+// stale on hardware-modded cards (e.g. a 40 MHz-modded card still reporting
+// the stock 28.636 MHz crystal), which caps the rate readout and the
+// resample options at 28.6 while the card actually feeds 40 MSPS. The
+// measured rate is timed from a real blocking read of /dev/cxadcN and
+// cached per (card, tenbit mode) for the session; refreshed at startup
+// enumeration (gui_cxadc_probe_card_rates) and at every capture start.
+// Falls back to the sysfs-derived rate when nothing was measured.
+bool gui_cxadc_get_effective_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out);
+
+// Probe the present cards now (startup/enumeration hook): time a short
+// blocking-read window per card in the given tenbit modes, snap to the
+// known rate tiers (common/cxadc_rate_tiers.h), cache the results, and log
+// any sysfs-vs-measured disagreement. No-op when a CXADC capture is already
+// running (the capture-start probe owns the cards then) or when
+// MISRC_GUI_NO_CXADC_RATE_PROBE=1 is set. Note: the probe briefly reads the
+// cards, so it must not run while another process is capturing on them.
+// Returns the number of newly measured (card, mode) entries.
+int gui_cxadc_probe_card_rates(int card_count, const bool tenbit_modes[CXADC_MAX_CARDS]);
+
 // Start CXADC capture mode (card_count: 1 or 2).
 // misrc_clockgen_mode selects MISRC v1.5 audio-device matching behavior.
 // Returns 0 on success, -1 on error.
@@ -88,6 +112,15 @@ void gui_cxadc_stop(gui_app_t *app);
 
 // Check whether CXADC capture mode is currently running.
 bool gui_cxadc_is_running(void);
+
+// Direct native RAW recording support (FLAC off + no resampling).
+// True when the running CXADC capture can feed channel `channel` (card
+// index == channel) byte-exact native samples of the requested RAW bit
+// width: rf_bits 8 requires the card in 8-bit mode (1 byte/sample),
+// rf_bits 16 requires tenbit mode (2 bytes/sample). bytes_per_sample_out
+// may be NULL. False for anything else (capture not running, no such
+// card, width mismatch).
+bool gui_cxadc_direct_record_available(int channel, uint8_t rf_bits, size_t *bytes_per_sample_out);
 
 // Start ONLY the clockgen audio capture thread (WASAPI/ALSA) feeding
 // BUF_CAPTURE_AUDIO + headswitch ingest, with no CXADC RF cards and no

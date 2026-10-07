@@ -16,6 +16,7 @@
 
 #include <signal.h>
 #include <spawn.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 

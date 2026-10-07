@@ -191,48 +191,17 @@ build_native() {
   cp "$REPO_ROOT/$BUILD_DIR/misrc_capture" "$appdir/usr/bin/"
   cp "$REPO_ROOT/$BUILD_DIR/misrc_extract" "$appdir/usr/bin/"
 
-  # Same pinned, checksummed mediamtx the CI AppImage gets. Without this a
-  # locally built AppImage would silently lack the streaming server.
+  # Pinned, checksummed mediamtx (fork-only: upstream's CI AppImage carries
+  # none). Without this a locally built AppImage would silently lack the
+  # streaming server.
   bash "$REPO_ROOT/scripts/fetch-mediamtx.sh" "$(uname -m)" \
     "$appdir/usr/bin" "$appdir/usr/share/doc/mediamtx"
 
-  cat > "$appdir/AppRun" <<'EOF'
-#!/usr/bin/env bash
-HERE="$(dirname "$(readlink -f "$0")")"
-if [[ "$#" -eq 0 ]]; then
-  exec "$HERE/usr/bin/misrc_gui"
-fi
-case "$1" in
-  capture)
-    shift
-    exec "$HERE/usr/bin/misrc_capture" "$@"
-    ;;
-  extract)
-    shift
-    exec "$HERE/usr/bin/misrc_extract" "$@"
-    ;;
-  *)
-    exec "$HERE/usr/bin/misrc_gui" "$@"
-    ;;
-esac
-EOF
-  chmod +x "$appdir/AppRun"
-
-  # StartupWMClass must match GUI_WINDOW_CLASS_NAME in
-  # misrc_tools/misrc_gui/core/misrc_gui.c, or the desktop shell cannot tie the
-  # running window back to this launcher and falls back to a generic icon.
-  cat > "$appdir/misrc.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=MISRC GUI
-Exec=misrc_gui
-Icon=misrc
-Categories=Utility;
-StartupWMClass=MISRC Capture
-X-GNOME-WMClass=MISRC Capture
-Terminal=false
-StartupNotify=true
-EOF
+  # AppRun and the desktop entry are shared with CI (.github/workflows/build.yml):
+  # real repo files, not inline heredocs. AppRun installs a launcher in
+  # ~/.local/share/applications only; it never writes ~/Desktop.
+  install -m 0755 "$REPO_ROOT/assets/appimage/AppRun" "$appdir/AppRun"
+  install -m 0644 "$REPO_ROOT/assets/appimage/misrc_gui.desktop" "$appdir/misrc_gui.desktop"
 
   local icon_src="$REPO_ROOT/assets/Icons/MISRC_Icon.png"
   [[ -f "$icon_src" ]] || fail "Icon not found: $icon_src"
@@ -252,7 +221,7 @@ EOF
     ARCH="$LINUXDEPLOY_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$linuxdeploy_bin" \
       --appdir "$appdir" \
       -e "$appdir/usr/bin/misrc_gui" \
-      -d "$appdir/misrc.desktop" \
+      -d "$appdir/misrc_gui.desktop" \
       -i "$appdir/misrc.png" \
       --output appimage
   )

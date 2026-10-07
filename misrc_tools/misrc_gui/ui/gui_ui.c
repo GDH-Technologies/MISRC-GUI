@@ -372,8 +372,10 @@ static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
     }
     // Stock: detect the card's 8-bit rate; fall back to 28.6 MHz. Never
     // return 14.3 (the 10-bit half) as the base — stock is always 28.6.
+    // Uses the measured (effective) rate when a probe has run, so a
+    // stale sysfs crystal parameter on a modded card cannot cap this.
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx, false, &detected_hz) &&
+    if (gui_cxadc_get_effective_rate_hz(card_idx, false, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }
@@ -391,7 +393,7 @@ static float gui_ui_cxadc_hw_rate_for_tenbit(const gui_app_t *app, int card_idx,
         return tenbit ? 20000.0f : 40000.0f;
     }
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &detected_hz) &&
+    if (gui_cxadc_get_effective_rate_hz(card_idx, tenbit, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }
@@ -1044,20 +1046,20 @@ static bool gui_ui_build_release_asset_filename_for_platform(const char *release
     if (!gui_ui_is_release_tag_safe(release_tag)) return false;
 
 #if defined(__ANDROID__)
-    const char *pattern = "Android_MISRC_%s_arm64.apk";
+    const char *pattern = "Android_MISRC_GUI_%s_arm64.apk";
 #elif defined(__APPLE__)
-    const char *pattern = "macOS_MISRC_%s_universal.dmg";
+    const char *pattern = "macOS_MISRC_GUI_%s_universal.dmg";
 #elif defined(_WIN32)
 #if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Windows_MISRC_%s_arm64.zip";
+    const char *pattern = "Windows_MISRC_GUI_%s_arm64.zip";
 #else
-    const char *pattern = "Windows_MISRC_%s_x86.zip";
+    const char *pattern = "Windows_MISRC_GUI_%s_x86.zip";
 #endif
 #elif defined(__linux__)
 #if defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Linux_MISRC_%s_arm64.zip";
+    const char *pattern = "Linux_MISRC_GUI_%s_arm64.zip";
 #else
-    const char *pattern = "Linux_MISRC_%s_x86.zip";
+    const char *pattern = "Linux_MISRC_GUI_%s_x86.zip";
 #endif
 #else
     return false;

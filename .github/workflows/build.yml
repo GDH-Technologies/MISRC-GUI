@@ -72,6 +72,30 @@ jobs:
         if: matrix.guard_mode == 'runtime'
         run: |
           python misrc_tools/test/ci_guard_tests.py
+  release-link-check:
+    name: Release download link check
+    runs-on: ubuntu-24.04
+    needs:
+      - preflight-guard-tests
+      - preflight-cross-platform-guards
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # End-to-end check of the in-app updater's Download button: the test
+      # extracts the per-platform asset filename patterns from gui_ui.c (the
+      # strings actually compiled into the app), resolves the latest release
+      # via the releases/latest redirect (same as the app), and HEAD-checks
+      # every URL it builds. Regression it prevents (v1.2.4): the app mapped
+      # Windows_MISRC_%s_x86.zip while the workflow publishes
+      # Windows_MISRC_GUI_<tag>_x86.zip, so every platform's Download button
+      # 404'd. Runs on every trigger against the latest published release;
+      # the release job re-runs it with --tag against the tag it just published.
+      - name: Verify the app updater's download URLs against the latest release
+        run: |
+          set -eux
+          python3 misrc_tools/test/release_link_check.py
+
   linux-appimage:
     name: Linux AppImage build (${{ matrix.arch }})
     strategy:
@@ -291,117 +315,11 @@ jobs:
           cp "$BUILD_DIR/misrc_capture" AppDir/usr/bin/
           cp "$BUILD_DIR/misrc_extract" AppDir/usr/bin/
 
-          # Bundle the RTSP server. Pinned and checksummed in the script, which
-          # scripts/build-appimage-local.sh calls too, so a locally built
-          # AppImage carries the same server as a released one.
-          # gui_mediamtx.c looks beside its own binary before PATH, so this copy
-          # is the one the app uses, and the feature works with nothing installed.
-          bash scripts/fetch-mediamtx.sh "$LINUXDEPLOY_ARCH" \
-            AppDir/usr/bin AppDir/usr/share/doc/mediamtx
-          test -x AppDir/usr/bin/mediamtx
-          test -s AppDir/usr/share/doc/mediamtx/LICENSE
-
-          cat > AppDir/AppRun <<'EOF'
-          #!/usr/bin/env bash
-          HERE="$(dirname "$(readlink -f "$0")")"
-          install_shortcuts() {
-            local appimage_path="${APPIMAGE:-}"
-            if [[ -z "$appimage_path" || ! -f "$appimage_path" ]]; then
-              return 0
-            fi
-            local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
-            local apps_dir="$data_home/applications"
-            local icons_dir="$data_home/icons/hicolor/512x512/apps"
-            local launcher="$apps_dir/misrc_gui.desktop"
-            local local_bin_dir="$HOME/.local/bin"
-            local stable_appimage="$local_bin_dir/misrc_gui.AppImage"
-            local launcher_exec_path="$appimage_path"
-
-            mkdir -p "$apps_dir" "$icons_dir" "$local_bin_dir"
-            if ln -sfn "$appimage_path" "$stable_appimage"; then
-              launcher_exec_path="$stable_appimage"
-              chmod +x "$stable_appimage" || true
-            fi
-            local escaped_launcher_exec_path="$launcher_exec_path"
-            escaped_launcher_exec_path="${escaped_launcher_exec_path//\\/\\\\}"
-            escaped_launcher_exec_path="${escaped_launcher_exec_path//\"/\\\"}"
-            # Must match GUI_WINDOW_CLASS_NAME in misrc_tools/misrc_gui/core/misrc_gui.c.
-            # Deliberately version-free: the GUI creates its window under this exact
-            # name so WM_CLASS is stable, which is what lets a launcher written by any
-            # build keep matching the running window (and keep its icon in the dock).
-            local startup_wm_class="MISRC Capture"
-            local escaped_startup_wm_class="$startup_wm_class"
-            escaped_startup_wm_class="${escaped_startup_wm_class//\\/\\\\}"
-            escaped_startup_wm_class="${escaped_startup_wm_class//\"/\\\"}"
-            if [[ -f "$HERE/misrc.png" ]]; then
-              cp -f "$HERE/misrc.png" "$icons_dir/misrc.png" || true
-            fi
-            {
-              printf '%s\n' \
-                "[Desktop Entry]" \
-                "Type=Application" \
-                "Name=MISRC GUI" \
-                "Exec=\"${escaped_launcher_exec_path}\" %U" \
-                "Icon=misrc" \
-                "Categories=Utility;" \
-                "StartupWMClass=${escaped_startup_wm_class}" \
-                "X-GNOME-WMClass=${escaped_startup_wm_class}" \
-                "Terminal=false" \
-                "StartupNotify=true"
-            } > "$launcher"
-            chmod +x "$launcher" || true
-
-            local desktop_dir=""
-            if command -v xdg-user-dir >/dev/null 2>&1; then
-              desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
-            fi
-            if [[ -z "$desktop_dir" ]]; then
-              desktop_dir="$HOME/Desktop"
-            fi
-            if [[ -d "$desktop_dir" ]]; then
-              cp -f "$launcher" "$desktop_dir/MISRC GUI.desktop" || true
-              chmod +x "$desktop_dir/MISRC GUI.desktop" || true
-            fi
-          }
-          if [[ "${1:-}" == "--create-shortcut" ]]; then
-            install_shortcuts
-            exit 0
-          fi
-          if [[ $# -eq 0 ]]; then
-            install_shortcuts
-            exec "$HERE/usr/bin/misrc_gui"
-          fi
-          case "$1" in
-            capture)
-              shift
-              exec "$HERE/usr/bin/misrc_capture" "$@"
-              ;;
-            extract)
-              shift
-              exec "$HERE/usr/bin/misrc_extract" "$@"
-              ;;
-            *)
-              if [[ "${1:-}" != "--smoke-test" ]]; then
-                install_shortcuts
-              fi
-              exec "$HERE/usr/bin/misrc_gui" "$@"
-              ;;
-          esac
-          EOF
-          chmod +x AppDir/AppRun
-
-          cat > AppDir/misrc.desktop <<EOF
-          [Desktop Entry]
-          Type=Application
-          Name=MISRC GUI
-          Exec=misrc_gui
-          Icon=misrc
-          Categories=Utility;
-          StartupWMClass=MISRC Capture
-          X-GNOME-WMClass=MISRC Capture
-          Terminal=false
-          StartupNotify=true
-          EOF
+          # AppRun and the desktop entry are real repo files (not inline heredocs:
+          # nested EOF / $ inside YAML broke earlier workflows). AppRun installs a
+          # launcher in ~/.local/share/applications only; it never writes ~/Desktop.
+          install -m 0755 assets/appimage/AppRun AppDir/AppRun
+          install -m 0644 assets/appimage/misrc_gui.desktop AppDir/misrc_gui.desktop
           ICON_SRC="assets/Icons/MISRC_Icon.png"
           test -f "$ICON_SRC"
           convert "$ICON_SRC" -resize 512x512\! AppDir/misrc.png
@@ -416,7 +334,7 @@ jobs:
           ARCH="$LINUXDEPLOY_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy \
             --appdir AppDir \
             -e AppDir/usr/bin/misrc_gui \
-            -d AppDir/misrc.desktop \
+            -d AppDir/misrc_gui.desktop \
             -i AppDir/misrc.png \
             --output appimage
 
@@ -568,50 +486,59 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .deps/install
-          key: deps-windows-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
+          # Key names the ucrt64 toolchain: MINGW64 is deprecated by MSYS2
+          # (run 37035393223 emitted the deprecation annotation) and this job
+          # migrated to UCRT64, so a stale MINGW64-built (msvcrt-based)
+          # .deps/install must never be reused by the UCRT64 job.
+          key: deps-windows-ucrt64-x86_64-raylib5.5-libuvc-v0.0.7-${{ hashFiles('third_party/hsdaoh/**') }}
 
+      # MINGW64 is deprecated by MSYS2 (run 37035393223 emitted the
+      # '[msystem-mingw64] MINGW64 is deprecated. Migrate to UCRT64 or
+      # CLANG64' annotation). UCRT64 keeps the gcc toolchain (same code path
+      # meson.build selects for gcc: -lgomp, no getopt shim) and statically
+      # links the UCRT via the existing -static ldflags.
       - name: Setup MSYS2 (cached)
         id: setup_msys2_cached
         continue-on-error: true
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           cache: true
           install: >-
             git
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-flac
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-libjpeg-turbo
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-libsoxr
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-flac
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           cache: false
           install: >-
             git
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-flac
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-libjpeg-turbo
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-libsoxr
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-flac
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Resolve build version
         id: version
@@ -790,6 +717,13 @@ jobs:
           msystem: CLANGARM64
           update: true
           cache: true
+          # libsoxr: resample parity with the x86_64 job (run 37035393223's
+          # arm64 log 'libsoxr not found, building without resample support'
+          # because the package was missing from this list).
+          # llvm-openmp: MSYS2's clang-built static libsoxr.a references the
+          # LLVM OpenMP runtime (libomp.a) and meson links -lomp for the
+          # -static build (run 37053411644: undefined __kmpc_fork_call /
+          # omp_init_lock from libsoxr.a).
           install: >-
             git
             mingw-w64-clang-aarch64-binutils
@@ -799,6 +733,8 @@ jobs:
             mingw-w64-clang-aarch64-flac
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
+            mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
@@ -819,6 +755,8 @@ jobs:
             mingw-w64-clang-aarch64-flac
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
+            mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
@@ -1527,3 +1465,12 @@ jobs:
             release-assets/**/Windows_MISRC_GUI_*_arm64.zip
             release-assets/**/macOS_MISRC_GUI_*_universal.dmg
             release-assets/**/Android_MISRC_GUI_*_arm64.apk
+
+      # Same-run verification of what the in-app updater will build for this
+      # tag: HEAD-check every per-platform URL the app's Download button
+      # opens. Fails the release job if the app mapping or the published asset
+      # names drift (the v1.2.4 bug shipped 404 links on every platform).
+      - name: Verify release download links (app updater mapping)
+        run: |
+          set -eux
+          python3 misrc_tools/test/release_link_check.py --tag "${{ steps.tag.outputs.tag }}"

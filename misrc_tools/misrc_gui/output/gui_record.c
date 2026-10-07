@@ -19,6 +19,7 @@
 #include "gui_audio.h"
 #include "../input/gui_capture.h"
 #include "../input/gui_cxadc.h"
+#include "gui_record_direct.h"
 
 #include "../../common/ringbuffer.h"
 #include "../../common/rb_event.h"
@@ -720,8 +721,10 @@ static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_byt
 
 #if defined(_WIN32) || defined(_WIN64)
 #define GUI_RECORD_FSEEK(stream, offset, whence) _fseeki64((stream), (__int64)(offset), (whence))
+#define GUI_RECORD_FTELL(stream) _ftelli64((stream))
 #else
 #define GUI_RECORD_FSEEK(stream, offset, whence) fseeko((stream), (off_t)(offset), (whence))
+#define GUI_RECORD_FTELL(stream) ftello((stream))
 #endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -990,8 +993,8 @@ static void gui_record_spill_recycle_if_drained(gui_record_session_t *ses, int c
     gui_record_spill_unlock(spill);
 }
 
-static bool gui_record_spill_read_block(gui_record_session_t *ses, int channel, int16_t *dst, size_t bytes) {
-    if (!gui_record_spill_valid_channel(channel) || !dst || bytes == 0) {
+static bool gui_record_spill_read_block_ses(gui_record_session_t *ses, int channel, void *dst, size_t bytes) {
+    if (!ses || !gui_record_spill_valid_channel(channel) || !dst || bytes == 0) {
         return false;
     }
 
@@ -1026,6 +1029,21 @@ static bool gui_record_spill_read_block(gui_record_session_t *ses, int channel, 
     return ok;
 }
 
+/* Public, byte-generic forms on the active session. The direct RAW writer
+ * does not use these: it keeps draining after stop, when s_active is already
+ * NULL, so its callbacks go through the _ses forms on its own session. */
+bool gui_record_spill_read_block(int channel, void *dst, size_t bytes) {
+    return gui_record_spill_read_block_ses(s_active, channel, dst, bytes);
+}
+
+uint64_t gui_record_spill_backlog_bytes(int channel) {
+    gui_record_session_t *ses = s_active;
+    if (!ses || !gui_record_spill_valid_channel(channel)) {
+        return 0;
+    }
+    return gui_record_spill_backlog_bytes_locked(ses, channel);
+}
+
 bool gui_record_spill_is_forced(int channel) {
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
@@ -1049,16 +1067,16 @@ void gui_record_spill_clear_forced(int channel) {
     }
 }
 
-bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *samples, size_t bytes,
-                              uint32_t frame_index, char *error_msg, size_t error_msg_size) {
-    if (!gui_record_spill_valid_channel(channel) || !samples || bytes == 0) {
+static bool gui_record_spill_enqueue_ses(gui_record_session_t *ses, gui_app_t *app, int channel,
+                                         const void *data, size_t bytes, uint32_t frame_index,
+                                         char *error_msg, size_t error_msg_size) {
+    if (!gui_record_spill_valid_channel(channel) || !data || bytes == 0) {
         if (error_msg && error_msg_size > 0) {
             snprintf(error_msg, error_msg_size, "Invalid spill enqueue request");
         }
         return false;
     }
 
-    gui_record_session_t *ses = s_active;
     if (!ses) {
         if (error_msg && error_msg_size > 0) {
             snprintf(error_msg, error_msg_size, "No active recording session for spill");
@@ -1084,7 +1102,7 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
     bool ok = false;
     gui_record_spill_lock(spill);
     if (GUI_RECORD_FSEEK(spill->fp, write_off, SEEK_SET) == 0) {
-        size_t nwritten = fwrite(samples, 1, bytes, spill->fp);
+        size_t nwritten = fwrite(data, 1, bytes, spill->fp);
         if (nwritten == bytes) {
             ok = true;
         } else {
@@ -1118,6 +1136,12 @@ bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *sample
     }
 
     return true;
+}
+
+bool gui_record_spill_enqueue(gui_app_t *app, int channel, const void *data, size_t bytes,
+                              uint32_t frame_index, char *error_msg, size_t error_msg_size) {
+    return gui_record_spill_enqueue_ses(s_active, app, channel, data, bytes, frame_index,
+                                        error_msg, error_msg_size);
 }
 
 /* writer_ctx_t is defined with gui_record_session_t near the top of the file. */
@@ -1270,7 +1294,7 @@ static bool gui_record_get_next_block(writer_ctx_t *wctx, size_t block_bytes, in
         return true;
     }
 
-    if (gui_record_spill_read_block(wctx->ses, wctx->channel, spill_block, block_bytes)) {
+    if (gui_record_spill_read_block_ses(wctx->ses, wctx->channel, spill_block, block_bytes)) {
         *out_samples = spill_block;
         *from_ringbuffer = false;
         return true;
@@ -1485,33 +1509,19 @@ static int flac_writer_thread(void *ctx) {
 }
 #endif
 
-// RAW files are unsigned (offset binary), the layout a CX card writes natively
-// and what ld-decode/vhs-decode load for .u8/.u16; a signed sample read as
-// unsigned wraps at zero and scrambles the waveform. .u8 is the signed 8-bit
-// sample +128. .u16 is the 12-bit sample left-justified (<<4, low nibble 0)
-// +32768, little-endian, full 16-bit scale like the 16-bit FLAC path: a CX
-// card's 16-bit mode is itself 12 significant bits left-justified, so a CX
-// capture comes out byte-identical to `cat /dev/cxadcN` in either mode.
 static void convert_i16_to_raw_bytes(uint8_t *dst, const int16_t *src, size_t n, uint8_t bits) {
     if (!dst || !src || n == 0) return;
 
     if (bits == 8) {
+        int8_t *d = (int8_t *)dst;
         for (size_t i = 0; i < n; i++) {
-            dst[i] = (uint8_t)((int)gui_record_sample_12bit_to_i8(src[i]) + 128);
+            d[i] = gui_record_sample_12bit_to_i8(src[i]);
         }
         return;
     }
 
-    for (size_t i = 0; i < n; i++) {
-        // The resampler can overshoot the 12-bit range; clamp after the shift
-        // as the 16-bit FLAC path does.
-        int32_t v = (int32_t)src[i] << 4;
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        uint16_t u = (uint16_t)(v + 32768);
-        dst[2 * i] = (uint8_t)(u & 0xFFu);
-        dst[2 * i + 1] = (uint8_t)(u >> 8);
-    }
+    // 16-bit raw: write int16 as-is
+    memcpy(dst, src, n * sizeof(int16_t));
 }
 
 // RAW file writer thread
@@ -1744,8 +1754,20 @@ static int raw_writer_thread(void *ctx) {
     return 0;
 }
 
+// Direct native RAW passthrough contexts (CXADC, FLAC off, no resampling;
+// see the eligibility/tap wiring below, after raw_ext_for_bits).
+static gui_record_direct_ctx_t s_direct_ctx_a;
+static gui_record_direct_ctx_t s_direct_ctx_b;
+static atomic_uint_fast64_t s_direct_bytes_read_a;
+static atomic_uint_fast64_t s_direct_bytes_read_b;
+// Latched at record start for the end-of-recording summary.
+static bool s_direct_channel_a_active = false;
+static bool s_direct_channel_b_active = false;
+
 // Initialize recording subsystem
 void gui_record_init(void) {
+    memset(&s_direct_ctx_a, 0, sizeof(s_direct_ctx_a));
+    memset(&s_direct_ctx_b, 0, sizeof(s_direct_ctx_b));
     atomic_store(&s_record_stop_finalizing, false);
     atomic_store(&s_record_stop_finalize_done, false);
     gui_record_reset_disk_guard_state();
@@ -1764,6 +1786,8 @@ void gui_record_cleanup(void) {
         free(s_finalizing);
         s_finalizing = NULL;
     }
+    memset(&s_direct_ctx_a, 0, sizeof(s_direct_ctx_a));
+    memset(&s_direct_ctx_b, 0, sizeof(s_direct_ctx_b));
     gui_record_reset_disk_guard_state();
     gui_record_close_session_log();
 }
@@ -2007,11 +2031,169 @@ static uint8_t rf_bits_for_raw(uint8_t requested) {
     return (requested == 8) ? 8 : 16;
 }
 
-// File extension for a RAW RF capture: unsigned 8-bit -> .u8, 16-bit -> .u16.
-// Matches the ld-decode/cxadc raw-sample convention so downstream tools pick
-// the right sample width from the extension without a sidecar.
-static const char *raw_ext_for_bits(uint8_t bits) {
-    return (bits == 8) ? "u8" : "u16";
+// RAW file extension, named by what the file contains (matches the
+// ld-decode/cxadc raw-sample convention so downstream tools pick the right
+// sample width and signedness from the extension without a sidecar):
+// - direct native passthrough (CXADC, FLAC off, no resample on the channel):
+//   the card's bytes unchanged -> unsigned .u8 (8-bit mode) / .u16 (tenbit)
+// - converted output (resampled channels, non-CXADC devices): the signed
+//   samples produced by the decode/resample writer -> .s8 / .s16
+static const char *raw_ext_for_bits(uint8_t bits, bool direct_native) {
+    if (direct_native) {
+        return (bits == 8) ? "u8" : "u16";
+    }
+    return (bits == 8) ? "s8" : "s16";
+}
+
+// --- Direct native RAW passthrough (CXADC, FLAC off, no resampling) ---
+// The CXADC capture thread pushes the exact bytes it reads from the card
+// straight into the channel's record ringbuffer (tap below), and the
+// byte-exact writer thread fwrites them unchanged, so the output file is
+// the card's native stream (unsigned .u8/.u16). All other RAW paths
+// (resampled channels, non-CXADC devices) keep the converting legacy writer
+// (signed .s8/.s16). Contexts + counters live above (gui_record_init /
+// gui_record_cleanup reset them before any session can start).
+
+// Shared eligibility: direct native passthrough applies when the selected
+// device is a running CXADC capture, FLAC compression is off, the channel's
+// resampler is off, and the card behind the channel actually delivers
+// samples of the requested width (8-bit mode -> native u8 bytes, tenbit
+// mode -> native u16 words). Otherwise the converted legacy RAW path runs.
+// Used by gui_record_apply_auto_names (file naming), gui_record_open_session_log
+// (capture log) and gui_record_start_confirmed (writer/tap selection) so all
+// three always agree with the on-disk content.
+static bool gui_record_direct_channel_eligible(const gui_app_t *app, int channel) {
+    if (!app || app->settings.use_flac) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    if (app->devices[app->selected_device].type != DEVICE_TYPE_CXADC) return false;
+    if (channel != 0 && channel != 1) return false;
+    if (!gui_cxadc_is_running()) return false;
+    bool channel_enabled = (channel == 0) ? app->settings.capture_a : app->settings.capture_b;
+    if (!channel_enabled) return false;
+    bool resample_on = (channel == 0) ? app->settings.enable_resample_a : app->settings.enable_resample_b;
+    if (resample_on) return false;
+    uint8_t raw_bits = rf_bits_for_raw((channel == 0) ? app->settings.rf_bits_a : app->settings.rf_bits_b);
+    size_t bytes_per_sample = 0;
+    if (!gui_cxadc_direct_record_available(channel, raw_bits, &bytes_per_sample)) return false;
+    return true;
+}
+
+// gui_record_direct callbacks: bridge the module's injectable interface to
+// this file's spill temp file, capture log and per-channel write-error flags.
+// `user` is the recording's gui_record_session_t, not s_active: the direct
+// writer keeps draining the ring and the spill after stop has handed the
+// session to finalize (s_active == NULL by then).
+static bool gui_record_direct_spill_enqueue_cb(void *user, int channel, const void *data,
+                                               size_t len, uint32_t frame_index) {
+    gui_record_session_t *ses = (gui_record_session_t *)user;
+    char err[256] = {0};
+    if (!gui_record_spill_enqueue_ses(ses, ses->app, channel, data, len,
+                                      frame_index, err, sizeof(err))) {
+        if (err[0]) {
+            gui_record_log_capture_event(ses->app, "ERROR", err, GUI_ERROR_CLASS_SYSTEM, 1);
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool gui_record_direct_spill_read_cb(void *user, int channel, void *dst, size_t len) {
+    return gui_record_spill_read_block_ses((gui_record_session_t *)user, channel, dst, len);
+}
+
+static uint64_t gui_record_direct_spill_backlog_cb(void *user, int channel) {
+    gui_record_session_t *ses = (gui_record_session_t *)user;
+    if (!ses || !gui_record_spill_valid_channel(channel)) return 0;
+    return gui_record_spill_backlog_bytes_locked(ses, channel);
+}
+
+static void gui_record_direct_set_write_error_cb(void *user, int channel, bool active) {
+    gui_record_session_t *ses = (gui_record_session_t *)user;
+    if (ses && gui_record_spill_valid_channel(channel)) {
+        atomic_store(&ses->write_error[channel], active);
+    }
+}
+
+static void gui_record_direct_log_cb(void *user, int channel, const char *level, const char *message) {
+    gui_record_session_t *ses = (gui_record_session_t *)user;
+    if (!ses || !message || !message[0]) return;
+    char prefixed[768];
+    snprintf(prefixed, sizeof(prefixed), "Direct RAW channel %c: %s",
+             channel == 0 ? 'A' : 'B', message);
+    if (gui_record_level_is_error(level)) {
+        gui_app_count_system_errors(ses->app, 1);
+    }
+    gui_record_log_write_line_ses(ses, level ? level : "INFO", prefixed);
+}
+
+// Capture-thread entry point (called from gui_cxadc.c after each card read).
+// Drop handling mirrors the extraction thread's record-drop path: capture
+// log entry + optional stop_on_dropout.
+static void gui_record_direct_report_drop(int card, uint32_t frame_index, size_t len) {
+    const gui_record_direct_ctx_t *ctx = (card == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    const gui_record_session_t *ses = (const gui_record_session_t *)ctx->cb.user;
+    gui_app_t *app = ses ? ses->app : NULL;
+    if (!app) return;
+    char msg[320];
+    snprintf(msg, sizeof(msg),
+             "Direct record data loss on channel %c at frame=%u (%zu bytes: record buffer full and spill enqueue failed)",
+             card == 0 ? 'A' : 'B', frame_index, len);
+    gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
+    fprintf(stderr, "[DIRECT] %s\n", msg);
+    if (app->settings.stop_on_dropout && !atomic_load(&app->dropout_stop_requested)) {
+        atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
+        atomic_store(&app->dropout_stop_requested, true);
+    }
+}
+
+void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint32_t frame_index) {
+    if (card != 0 && card != 1) return;
+    gui_record_direct_ctx_t *ctx = (card == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_push_result_t result = gui_record_direct_push(ctx, bytes, len, frame_index);
+    if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
+    gui_record_direct_report_drop(card, frame_index, len);
+}
+
+// Withdraw both channels from the capture thread's tap gate and wait until
+// no gated iteration still holds a context: for a record start that fails
+// after the channels were published, so the stale contexts (whose user is a
+// session about to be freed) are left alone, and the next start's memset
+// cannot race an enter/leave pair.
+static void gui_record_direct_unpublish(void) {
+    s_direct_channel_a_active = false;
+    s_direct_channel_b_active = false;
+    gui_record_direct_tap_disable(&s_direct_ctx_a);
+    gui_record_direct_tap_disable(&s_direct_ctx_b);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_a);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_b);
+}
+
+bool gui_record_direct_tap_channel_active(int channel) {
+    if (channel != 0 && channel != 1) return false;
+    return (channel == 0) ? s_direct_channel_a_active : s_direct_channel_b_active;
+}
+
+bool gui_record_tap_iteration_enter(int channel) {
+    if (channel != 0 && channel != 1) return false;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    return gui_record_direct_tap_iteration_enter(ctx);
+}
+
+void gui_record_tap_iteration_leave(int channel) {
+    if (channel != 0 && channel != 1) return;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_tap_iteration_leave(ctx);
+}
+
+void gui_record_direct_tap_push_latched(int channel, bool latched_on,
+                                         const uint8_t *bytes, size_t len,
+                                         uint32_t frame_index) {
+    if (channel != 0 && channel != 1) return;
+    gui_record_direct_ctx_t *ctx = (channel == 0) ? &s_direct_ctx_a : &s_direct_ctx_b;
+    gui_record_direct_push_result_t result =
+        gui_record_direct_push_latched(ctx, latched_on, bytes, len, frame_index);
+    if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
+    gui_record_direct_report_drop(channel, frame_index, len);
 }
 
 static void format_msps_from_khz(char *dst, size_t dst_len, float khz) {
@@ -2354,7 +2536,15 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "capture_device_type: %s", gui_record_device_type_name(app));
     gui_record_log_write_line_locked("INFO", msg);
-    snprintf(msg, sizeof(msg), "capture_format: %s", app->settings.use_flac ? "FLAC" : "RAW");
+    bool direct_raw_a = false;
+    bool direct_raw_b = false;
+    if (!app->settings.use_flac) {
+        direct_raw_a = gui_record_direct_channel_eligible(app, 0);
+        direct_raw_b = gui_record_direct_channel_eligible(app, 1);
+    }
+    snprintf(msg, sizeof(msg), "capture_format: %s",
+             app->settings.use_flac ? "FLAC"
+             : ((direct_raw_a || direct_raw_b) ? "RAW direct native passthrough" : "RAW converted"));
     gui_record_log_write_line_locked("INFO", msg);
 
     snprintf(msg, sizeof(msg), "Capture channels: A=%s B=%s", app->settings.capture_a ? "on" : "off", app->settings.capture_b ? "on" : "off");
@@ -2371,6 +2561,26 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
              app->settings.enable_resample_a ? "on" : "off", app->settings.resample_rate_a,
              app->settings.enable_resample_b ? "on" : "off", app->settings.resample_rate_b);
     gui_record_log_write_line_locked("INFO", msg);
+    if (!app->settings.use_flac) {
+        char raw_a[40];
+        char raw_b[40];
+        if (!app->settings.capture_a) {
+            snprintf(raw_a, sizeof(raw_a), "off");
+        } else {
+            snprintf(raw_a, sizeof(raw_a), "%s %s",
+                     direct_raw_a ? "direct native" : "converted",
+                     raw_ext_for_bits(bits_a, direct_raw_a));
+        }
+        if (!app->settings.capture_b) {
+            snprintf(raw_b, sizeof(raw_b), "off");
+        } else {
+            snprintf(raw_b, sizeof(raw_b), "%s %s",
+                     direct_raw_b ? "direct native" : "converted",
+                     raw_ext_for_bits(bits_b, direct_raw_b));
+        }
+        snprintf(msg, sizeof(msg), "RAW output: A=%s B=%s", raw_a, raw_b);
+        gui_record_log_write_line_locked("INFO", msg);
+    }
     snprintf(msg, sizeof(msg), "Capture limits: capture_limit_seconds=%u record_limit_seconds=%u (%s)",
              (unsigned)app->settings.capture_limit_seconds,
              (unsigned)app->settings.record_limit_seconds,
@@ -2520,12 +2730,17 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
             snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
         }
     } else {
-        // RAW: 8/16 only. Extension is per-channel (.u8 / .u16) so the
-        // filename advertises the on-disk sample width.
+        // RAW: 8/16 only. Extension is per-channel and named by content:
+        // direct native passthrough (CXADC + no resample on the channel)
+        // stores the card's unsigned bytes (.u8/.u16); everything else is
+        // the converting writer's signed samples (.s8/.s16). Same predicate
+        // as record start, so the name always matches the on-disk content.
+        bool direct_a = gui_record_direct_channel_eligible(app, 0);
+        bool direct_b = gui_record_direct_channel_eligible(app, 1);
         uint8_t bits_a = rf_bits_for_raw(app->settings.rf_bits_a);
         uint8_t bits_b = rf_bits_for_raw(app->settings.rf_bits_b);
-        const char *ext_a = raw_ext_for_bits(bits_a);
-        const char *ext_b = raw_ext_for_bits(bits_b);
+        const char *ext_a = raw_ext_for_bits(bits_a, direct_a);
+        const char *ext_b = raw_ext_for_bits(bits_b, direct_b);
         char rate_tag_a[32] = {0};
         char rate_tag_b[32] = {0};
         char rf_tag_a[40] = {0};
@@ -2886,7 +3101,7 @@ static void gui_record_flush_video_start_log(gui_app_t *app)
 }
 
 /* One headless recording from the simulated device straight to files, with
- * no window and no clicking: --auto-record and --capture-meta-selftest. The
+ * no window and no clicking: --headless-record and --capture-meta-selftest. The
  * settings are built from defaults (never loaded), so two runs are directly
  * comparable; the caller decides which settings file a save would reach. */
 typedef struct {
@@ -3424,7 +3639,9 @@ int gui_record_name_test_main(void)
     }
 
     /* Pass 3: RAW mode, timestamping off. The RAW extension is per-channel
-     * (.u8 for 8-bit, .u16 for 16-bit) and both namers must agree on it. */
+     * and both namers must agree on it. No CXADC capture runs here, so no
+     * channel is direct native: converted output, .s8 for 8-bit and .s16 for
+     * 16-bit (.u8/.u16 only for a CXADC direct passthrough channel). */
     app.settings.append_timestamp_on_capture_start = false;
     app.settings.use_flac = false;
     app.settings.rf_bits_a = 8;
@@ -3444,11 +3661,11 @@ int gui_record_name_test_main(void)
         printf("FAIL: RAW names diverge with timestamping off\n"); rc = 1;
     }
     size_t raw_a_len = strlen(s_raw_a), raw_b_len = strlen(s_raw_b);
-    if (raw_a_len < 3 || strcmp(s_raw_a + raw_a_len - 3, ".u8") != 0) {
-        printf("FAIL: 8-bit RAW name does not end in .u8 (%s)\n", s_raw_a); rc = 1;
+    if (raw_a_len < 3 || strcmp(s_raw_a + raw_a_len - 3, ".s8") != 0) {
+        printf("FAIL: 8-bit converted RAW name does not end in .s8 (%s)\n", s_raw_a); rc = 1;
     }
-    if (raw_b_len < 4 || strcmp(s_raw_b + raw_b_len - 4, ".u16") != 0) {
-        printf("FAIL: 16-bit RAW name does not end in .u16 (%s)\n", s_raw_b); rc = 1;
+    if (raw_b_len < 4 || strcmp(s_raw_b + raw_b_len - 4, ".s16") != 0) {
+        printf("FAIL: 16-bit converted RAW name does not end in .s16 (%s)\n", s_raw_b); rc = 1;
     }
 
     printf("%s\n", rc ? "NAME TEST FAILED" : "name test passed");
@@ -3539,7 +3756,12 @@ int gui_record_start(gui_app_t *app) {
         }
     }
 
-    if (file_a_exists || file_b_exists || file_v_exists || file_cc_exists) {
+    // The settings "Overwrite output files" toggle now means what it says:
+    // with it on, existing files are overwritten without the confirmation
+    // popup. Required for unattended automated runs (--auto-record), where
+    // the popup would stall the run forever.
+    if ((file_a_exists || file_b_exists || file_v_exists || file_cc_exists) &&
+        !app->settings.overwrite_files) {
         // Build detailed message with file info
         char message[512];
         char size_buf[32];
@@ -4132,7 +4354,8 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         thrd_sleep_ms(10);
 
         // Now enable recording in extraction thread - data will start flowing
-        gui_extract_set_recording(true, true, bits_a, bits_b);
+        // (FLAC mode has no direct channels)
+        gui_extract_set_recording(true, true, bits_a, bits_b, false, false);
 
         // Start audio output/monitoring (if enabled)
         gui_audio_start(app, &app->buffers);
@@ -4213,6 +4436,53 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         ses->ctx_b.resample_rate_khz = app->settings.resample_rate_b;
         ses->ctx_b.resample_quality = app->settings.resample_quality_b;
         ses->ctx_b.resample_gain_db = app->settings.resample_gain_b;
+
+        // Direct native passthrough decision (per channel). Computed once
+        // here and reused for the writer threads, the capture-side taps and
+        // the extraction skip mask, so a direct channel's record ringbuffer
+        // has exactly one producer (the CXADC tap) and one consumer.
+        bool direct_a = gui_record_direct_channel_eligible(app, 0);
+        bool direct_b = gui_record_direct_channel_eligible(app, 1);
+        memset(&s_direct_ctx_a, 0, sizeof(s_direct_ctx_a));
+        memset(&s_direct_ctx_b, 0, sizeof(s_direct_ctx_b));
+        atomic_store(&s_direct_bytes_read_a, 0);
+        atomic_store(&s_direct_bytes_read_b, 0);
+        s_direct_channel_a_active = direct_a;
+        s_direct_channel_b_active = direct_b;
+        if (direct_a) {
+            s_direct_ctx_a.bufmgr = &app->buffers;
+            s_direct_ctx_a.buf_id = BUF_RECORD_A;
+            s_direct_ctx_a.channel = 0;
+            s_direct_ctx_a.file = ses->file_a;
+            s_direct_ctx_a.recording_active = &app->is_recording;
+            s_direct_ctx_a.exit_flag = &do_exit;
+            s_direct_ctx_a.bytes_read_total = &s_direct_bytes_read_a;
+            s_direct_ctx_a.bytes_written_total = &app->recording_bytes;
+            s_direct_ctx_a.bytes_written_channel = &app->recording_raw_a;
+            s_direct_ctx_a.cb.user = ses;
+            s_direct_ctx_a.cb.spill_enqueue = gui_record_direct_spill_enqueue_cb;
+            s_direct_ctx_a.cb.spill_read = gui_record_direct_spill_read_cb;
+            s_direct_ctx_a.cb.spill_backlog = gui_record_direct_spill_backlog_cb;
+            s_direct_ctx_a.cb.set_write_error = gui_record_direct_set_write_error_cb;
+            s_direct_ctx_a.cb.log = gui_record_direct_log_cb;
+        }
+        if (direct_b) {
+            s_direct_ctx_b.bufmgr = &app->buffers;
+            s_direct_ctx_b.buf_id = BUF_RECORD_B;
+            s_direct_ctx_b.channel = 1;
+            s_direct_ctx_b.file = ses->file_b;
+            s_direct_ctx_b.recording_active = &app->is_recording;
+            s_direct_ctx_b.exit_flag = &do_exit;
+            s_direct_ctx_b.bytes_read_total = &s_direct_bytes_read_b;
+            s_direct_ctx_b.bytes_written_total = &app->recording_bytes;
+            s_direct_ctx_b.bytes_written_channel = &app->recording_raw_b;
+            s_direct_ctx_b.cb.user = ses;
+            s_direct_ctx_b.cb.spill_enqueue = gui_record_direct_spill_enqueue_cb;
+            s_direct_ctx_b.cb.spill_read = gui_record_direct_spill_read_cb;
+            s_direct_ctx_b.cb.spill_backlog = gui_record_direct_spill_backlog_cb;
+            s_direct_ctx_b.cb.set_write_error = gui_record_direct_set_write_error_cb;
+            s_direct_ctx_b.cb.log = gui_record_direct_log_cb;
+        }
 #if LIBSOXR_ENABLED
         ses->ctx_b.soxr = NULL;
         ses->ctx_b.soxr_rate_khz = 0.0f;
@@ -4238,12 +4508,18 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
         if (app->settings.capture_a) {
+            // Direct channels use the byte-exact direct writer instead of
+            // the converting raw_writer_thread.
+            int (*writer_a_fn)(void *) = direct_a ? gui_record_direct_writer_thread
+                                                  : raw_writer_thread;
+            void *writer_a_arg = direct_a ? (void *)&s_direct_ctx_a : (void *)&ses->ctx_a;
             if (thrd_create_with_priority(&ses->writer_thread_a,
-                                          raw_writer_thread,
-                                          &ses->ctx_a,
+                                          writer_a_fn,
+                                          writer_a_arg,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer A");
                 app->is_recording = false;
+                gui_record_direct_unpublish();
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (ses->file_a) fclose(ses->file_a);
                 if (ses->file_b) fclose(ses->file_b);
@@ -4255,12 +4531,16 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             started_a = true;
         }
         if (app->settings.capture_b) {
+            int (*writer_b_fn)(void *) = direct_b ? gui_record_direct_writer_thread
+                                                  : raw_writer_thread;
+            void *writer_b_arg = direct_b ? (void *)&s_direct_ctx_b : (void *)&ses->ctx_b;
             if (thrd_create_with_priority(&ses->writer_thread_b,
-                                          raw_writer_thread,
-                                          &ses->ctx_b,
+                                          writer_b_fn,
+                                          writer_b_arg,
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer B");
                 app->is_recording = false;
+                gui_record_direct_unpublish();
                 if (started_a) thrd_join(ses->writer_thread_a, NULL);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (ses->file_a) fclose(ses->file_a);
@@ -4287,8 +4567,13 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // Small delay to let writer threads initialize and start waiting on buffers
         thrd_sleep_ms(10);
 
-        // Now enable recording in extraction thread - data will start flowing
-        gui_extract_set_recording(true, false, bits_a, bits_b);
+        // Enable the capture-side native taps now that the writers are up,
+        // then enable extraction recording with the direct skip mask, so each
+        // record ringbuffer has exactly one producer (the tap for direct
+        // channels, extraction for converted channels).
+        if (direct_a) gui_record_direct_tap_enable(&s_direct_ctx_a);
+        if (direct_b) gui_record_direct_tap_enable(&s_direct_ctx_b);
+        gui_extract_set_recording(true, false, bits_a, bits_b, direct_a, direct_b);
 
         // Start audio output/monitoring (if enabled)
         gui_audio_start(app, &app->buffers);
@@ -4296,7 +4581,9 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         gui_record_flush_video_start_log(app);   /* RAW: log opens last */
         gui_record_flush_cc_start_log(app);
 
-        gui_app_set_status(app, "Recording (RAW)...");
+        gui_app_set_status(app, (direct_a || direct_b)
+                                 ? "Recording (RAW direct)..."
+                                 : "Recording (RAW)...");
     }
 
     /* The link is on disk before the first stop could ever be asked for. A
@@ -4315,6 +4602,20 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     if (ses->writer_threads_running) {
         if (ses->capture_a) thrd_join(ses->writer_thread_a, NULL);
         if (ses->capture_b) thrd_join(ses->writer_thread_b, NULL);
+    }
+    /* The direct writer counts only into the app-level atomics (its module
+     * has no session), and those are not the session's: a reconnect during
+     * this finalize zeroes them (cxadc_reset_stats). Its file holds exactly
+     * the bytes it wrote, from offset 0 with no header, so the position of
+     * the still-open file is the session's total for the summary and the
+     * sidecar. */
+    if (s_direct_channel_a_active && ses->file_a) {
+        int64_t pos = (int64_t)GUI_RECORD_FTELL(ses->file_a);
+        if (pos >= 0) atomic_store(&ses->acc_raw[0], (uint64_t)pos);
+    }
+    if (s_direct_channel_b_active && ses->file_b) {
+        int64_t pos = (int64_t)GUI_RECORD_FTELL(ses->file_b);
+        if (pos >= 0) atomic_store(&ses->acc_raw[1], (uint64_t)pos);
     }
     /* After the RF joins: the master reaches a consistent state first, and the
      * video finish can block for seconds flushing an FFV1 GOP. Keyed off the
@@ -4504,6 +4805,30 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     if (rec_drops > 0) {
         gui_record_log_writef("WARN", "Backpressure drops detected: %u frame blocks dropped", rec_drops);
     }
+    if (s_direct_channel_a_active) {
+        uint64_t read_bytes = atomic_load(&s_direct_bytes_read_a);
+        uint64_t written_bytes = atomic_load(&ses->acc_raw[0]);
+        char read_buf[64], written_buf[64];
+        format_log_data_size_u64(read_bytes, read_buf, sizeof(read_buf));
+        format_log_data_size_u64(written_bytes, written_buf, sizeof(written_buf));
+        fprintf(stderr, "[REC] Direct RAW channel A: read=%s written=%s\n", read_buf, written_buf);
+        gui_record_log_writef_ses(ses, "INFO", "Direct RAW channel A: bytes_read=%s bytes_written=%s%s",
+                              read_buf, written_buf,
+                              (read_bytes == written_bytes)
+                              ? "" : " (MISMATCH: data was dropped or left in the spill backlog)");
+    }
+    if (s_direct_channel_b_active) {
+        uint64_t read_bytes = atomic_load(&s_direct_bytes_read_b);
+        uint64_t written_bytes = atomic_load(&ses->acc_raw[1]);
+        char read_buf[64], written_buf[64];
+        format_log_data_size_u64(read_bytes, read_buf, sizeof(read_buf));
+        format_log_data_size_u64(written_bytes, written_buf, sizeof(written_buf));
+        fprintf(stderr, "[REC] Direct RAW channel B: read=%s written=%s\n", read_buf, written_buf);
+        gui_record_log_writef_ses(ses, "INFO", "Direct RAW channel B: bytes_read=%s bytes_written=%s%s",
+                              read_buf, written_buf,
+                              (read_bytes == written_bytes)
+                              ? "" : " (MISMATCH: data was dropped or left in the spill backlog)");
+    }
     {
         char end_iso[32];
         gui_record_build_iso8601_timestamp(end_iso, sizeof(end_iso));
@@ -4529,6 +4854,11 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     }
     gui_record_log_writef_ses(ses, "INFO", "Session complete");
     gui_record_close_session_log_ses(ses);
+    s_direct_channel_a_active = false;
+    s_direct_channel_b_active = false;
+    // Disarm the direct taps (the writer threads have drained and exited).
+    gui_record_direct_tap_disable(&s_direct_ctx_a);
+    gui_record_direct_tap_disable(&s_direct_ctx_b);
 }
 
 static int gui_record_finalize_thread(void *arg) {
@@ -4561,6 +4891,15 @@ void gui_record_stop(gui_app_t *app) {
             s_finalizing = NULL;
         }
     }
+    // Direct native taps first: disable them and wait for any in-flight
+    // card pushes to finish, so the writers' final drain (triggered by
+    // is_recording = false below) can never race a producer still pushing.
+    // Ahead of the no-session branch so the taps are disarmed on every path.
+    gui_record_direct_tap_disable(&s_direct_ctx_a);
+    gui_record_direct_tap_disable(&s_direct_ctx_b);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_a);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_b);
+
     gui_record_session_t *ses = s_active;
     if (!ses) {
         app->is_recording = false;
@@ -4579,7 +4918,7 @@ void gui_record_stop(gui_app_t *app) {
     ses->end_rec_b_drops = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
 
     // Disable recording in extraction thread first.
-    gui_extract_set_recording(false, false, 16, 16);
+    gui_extract_set_recording(false, false, 16, 16, false, false);
 
     // Signal threads to stop FIRST so the audio restart cannot reopen WAVs in
     // record mode. The session flag switches this session's writer threads to
