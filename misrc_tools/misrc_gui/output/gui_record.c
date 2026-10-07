@@ -721,8 +721,10 @@ static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_byt
 
 #if defined(_WIN32) || defined(_WIN64)
 #define GUI_RECORD_FSEEK(stream, offset, whence) _fseeki64((stream), (__int64)(offset), (whence))
+#define GUI_RECORD_FTELL(stream) _ftelli64((stream))
 #else
 #define GUI_RECORD_FSEEK(stream, offset, whence) fseeko((stream), (off_t)(offset), (whence))
+#define GUI_RECORD_FTELL(stream) ftello((stream))
 #endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -2150,6 +2152,20 @@ void gui_record_direct_tap_push(int card, const uint8_t *bytes, size_t len, uint
     gui_record_direct_push_result_t result = gui_record_direct_push(ctx, bytes, len, frame_index);
     if (result != GUI_RECORD_DIRECT_PUSH_DROPPED) return;
     gui_record_direct_report_drop(card, frame_index, len);
+}
+
+// Withdraw both channels from the capture thread's tap gate and wait until
+// no gated iteration still holds a context: for a record start that fails
+// after the channels were published, so the stale contexts (whose user is a
+// session about to be freed) are left alone, and the next start's memset
+// cannot race an enter/leave pair.
+static void gui_record_direct_unpublish(void) {
+    s_direct_channel_a_active = false;
+    s_direct_channel_b_active = false;
+    gui_record_direct_tap_disable(&s_direct_ctx_a);
+    gui_record_direct_tap_disable(&s_direct_ctx_b);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_a);
+    gui_record_direct_tap_wait_idle(&s_direct_ctx_b);
 }
 
 bool gui_record_direct_tap_channel_active(int channel) {
@@ -4503,6 +4519,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer A");
                 app->is_recording = false;
+                gui_record_direct_unpublish();
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (ses->file_a) fclose(ses->file_a);
                 if (ses->file_b) fclose(ses->file_b);
@@ -4523,6 +4540,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
                                           THRD_PRIORITY_CRITICAL) != thrd_success) {
                 gui_app_set_status(app, "Failed to start RAW writer B");
                 app->is_recording = false;
+                gui_record_direct_unpublish();
                 if (started_a) thrd_join(ses->writer_thread_a, NULL);
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 if (ses->file_a) fclose(ses->file_a);
@@ -4585,15 +4603,19 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         if (ses->capture_a) thrd_join(ses->writer_thread_a, NULL);
         if (ses->capture_b) thrd_join(ses->writer_thread_b, NULL);
     }
-    /* The direct writer counts into the app-level atomics only (its module
-     * has no session); carry its totals into the session's, which the summary
-     * and the sidecar read. Safe: a new recording, which would reset them,
-     * cannot start while this finalize runs. */
-    if (s_direct_channel_a_active) {
-        atomic_store(&ses->acc_raw[0], atomic_load(&app->recording_raw_a));
+    /* The direct writer counts only into the app-level atomics (its module
+     * has no session), and those are not the session's: a reconnect during
+     * this finalize zeroes them (cxadc_reset_stats). Its file holds exactly
+     * the bytes it wrote, from offset 0 with no header, so the position of
+     * the still-open file is the session's total for the summary and the
+     * sidecar. */
+    if (s_direct_channel_a_active && ses->file_a) {
+        int64_t pos = (int64_t)GUI_RECORD_FTELL(ses->file_a);
+        if (pos >= 0) atomic_store(&ses->acc_raw[0], (uint64_t)pos);
     }
-    if (s_direct_channel_b_active) {
-        atomic_store(&ses->acc_raw[1], atomic_load(&app->recording_raw_b));
+    if (s_direct_channel_b_active && ses->file_b) {
+        int64_t pos = (int64_t)GUI_RECORD_FTELL(ses->file_b);
+        if (pos >= 0) atomic_store(&ses->acc_raw[1], (uint64_t)pos);
     }
     /* After the RF joins: the master reaches a consistent state first, and the
      * video finish can block for seconds flushing an FFV1 GOP. Keyed off the
