@@ -58,7 +58,11 @@ static void gui_record_direct_account_write(gui_record_direct_ctx_t *ctx, size_t
 
 void gui_record_direct_tap_enable(gui_record_direct_ctx_t *ctx) {
     if (!ctx) return;
-    atomic_store(&ctx->tap_inflight, 0);
+    // Never reset tap_inflight here. The capture thread may already be
+    // inside an enter/leave pair (the record layer publishes the channel as
+    // direct before the writers start), and a store of 0 between its enter
+    // and leave leaves the count at -1, which tap_wait_idle then never sees
+    // return to 0. The context is zeroed before it is published.
     atomic_store(&ctx->tap_enabled, true);
 }
 
