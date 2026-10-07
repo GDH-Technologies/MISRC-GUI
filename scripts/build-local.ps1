@@ -169,7 +169,7 @@ function ConvertTo-MsysPath {
 
 function Invoke-DepsBuild {
     # Ensure vendored deps (.deps/install) exist and are fresh by delegating to
-    # scripts/build-deps-windows.sh under MSYS2 MINGW64. That script mirrors the
+    # scripts/build-deps-windows.sh under MSYS2 UCRT64. That script mirrors the
     # windows-exe CI deps block (static libuvc + hsdaoh + raylib) and self-skips
     # via a content-addressed stamp when inputs are unchanged, so this is cheap
     # (a stamp hash, no rebuild) on subsequent runs. This keeps local == CI and
@@ -181,11 +181,11 @@ function Invoke-DepsBuild {
     $envExe = "C:\msys64\usr\bin\env.exe"
     $bashExe = "C:\msys64\usr\bin\bash.exe"
     if (-not (Test-Path $envExe) -or -not (Test-Path $bashExe)) {
-        Fail "MSYS2 not found at C:\msys64. Install MSYS2 (mingw64 environment) to build deps locally, or set MISRC_DEPS_PREFIX to a prebuilt .deps/install."
+        Fail "MSYS2 not found at C:\msys64. Install MSYS2 (ucrt64 environment) to build deps locally, or set MISRC_DEPS_PREFIX to a prebuilt .deps/install."
     }
     $depsScriptMsys = ConvertTo-MsysPath $depsScript
-    Write-Log "Ensuring local deps via MSYS2 MINGW64 (skips instantly if already built): $depsScript"
-    & $envExe MSYSTEM=MINGW64 $bashExe -lc "bash '$depsScriptMsys'"
+    Write-Log "Ensuring local deps via MSYS2 UCRT64 (skips instantly if already built): $depsScript"
+    & $envExe MSYSTEM=UCRT64 $bashExe -lc "bash '$depsScriptMsys'"
     if ($LASTEXITCODE -ne 0) {
         Fail "Deps build script failed (see output above). Fix the reported error and rerun."
     }
@@ -215,9 +215,11 @@ function Add-PathEntryIfExists {
 }
 
 function Connect-MsysToolchainPaths {
+    # ucrt64 first: it is the CI toolchain (MINGW64 is deprecated by MSYS2);
+    # the others stay as fallbacks for machines that only have them installed.
     $candidateDirs = @(
-        "C:\msys64\mingw64\bin",
         "C:\msys64\ucrt64\bin",
+        "C:\msys64\mingw64\bin",
         "C:\msys64\clang64\bin",
         "C:\msys64\usr\bin"
     )
@@ -235,7 +237,7 @@ Connect-MsysToolchainPaths
 Ensure-MesonAndNinja -PythonExe $pythonExe
 
 # Force mingw-w64 GCC as the C/C++ compiler so Meson (like CMake) does not pick a
-# stray Clang from the inherited Windows PATH. The MSYS2 MINGW64 toolchain is
+# stray Clang from the inherited Windows PATH. The MSYS2 UCRT64 toolchain is
 # what CI's windows-exe job uses; matching it keeps local == CI.
 $env:CC = "gcc"
 $env:CXX = "g++"
@@ -269,10 +271,11 @@ $pkgPaths = @(
     (Join-Path $depsPrefix "lib/pkgconfig"),
     (Join-Path $depsPrefix "lib64/pkgconfig")
 )
-# Append the MSYS2 MINGW64/UCRT64 pkgconfig dirs so pacman-provided deps
+# Append the MSYS2 UCRT64/MINGW64 pkgconfig dirs so pacman-provided deps
 # (raylib, fftw3f, flac, libusb-1.0, soxr) are resolvable. Mirrors CI's
-# `...:${MINGW_PREFIX}/lib/pkgconfig` in the windows-exe job.
-foreach ($msys in @("C:\msys64\mingw64", "C:\msys64\ucrt64")) {
+# `...:${MINGW_PREFIX}/lib/pkgconfig` in the windows-exe job. ucrt64 first
+# (CI toolchain; MINGW64 is deprecated).
+foreach ($msys in @("C:\msys64\ucrt64", "C:\msys64\mingw64")) {
     $pcDir = Join-Path $msys "lib/pkgconfig"
     if (Test-Path $pcDir) {
         $pkgPaths += $pcDir

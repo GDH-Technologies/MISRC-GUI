@@ -31,7 +31,7 @@ def extract_function_body(source: str, signature: str) -> str:
     return match.group("body")
 
 
-GUI_WINDOW_CLASS_DEFINE = re.compile(r'^#define\s+GUI_WINDOW_CLASS_NAME\s+"([^"]+)"', re.M)
+GUI_WINDOW_CLASS_DEFINE = re.compile(r'^#define\s+MISRC_WINDOW_CLASS_TITLE\s+"([^"]+)"', re.M)
 
 # Tokens that would bake a build version back into WM_CLASS. This is the exact
 # regression that broke the dock icon: every build produced a different WM_CLASS,
@@ -99,7 +99,7 @@ def read_gui_window_class_name(gui_c_path: Path) -> str:
     this exact name, so every .desktop we generate must set StartupWMClass to it."""
     match = GUI_WINDOW_CLASS_DEFINE.search(read_text(gui_c_path))
     if not match:
-        raise RuntimeError("Could not find #define GUI_WINDOW_CLASS_NAME in misrc_gui.c")
+        raise RuntimeError("Could not find #define MISRC_WINDOW_CLASS_TITLE in misrc_gui.c")
     return match.group(1)
 
 
@@ -128,21 +128,6 @@ def extract_deploy_desktop_entry(deploy_text: str) -> str:
     if end < 0:
         raise RuntimeError("Unterminated .desktop heredoc in selfhosted-deploy.yml")
     return textwrap.dedent(deploy_text[start:end]).lstrip("\n")
-
-
-def extract_apprun_script(workflow_text: str) -> str:
-    marker = "cat > AppDir/AppRun <<'EOF'"
-    start = workflow_text.find(marker)
-    if start < 0:
-        raise RuntimeError("Could not find AppRun heredoc start marker in workflow")
-    start = workflow_text.find("\n", start)
-    if start < 0:
-        raise RuntimeError("Malformed AppRun heredoc in workflow")
-    start += 1
-    end = workflow_text.find("\n          EOF", start)
-    if end < 0:
-        raise RuntimeError("Could not find AppRun heredoc end marker in workflow")
-    return textwrap.dedent(workflow_text[start:end]).lstrip("\n")
 
 
 def run_checked(command: List[str], *, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
@@ -233,11 +218,57 @@ def check_macos_brew_install_policy(workflow_path: Path) -> int:
         if snippet not in workflow_text:
             return fail(f"Workflow is missing macOS conditional brew install snippet: {snippet}")
     return 0
+def check_msys2_toolchain_policy(workflow_path: Path) -> int:
+    """MSYS2 toolchain policy for the Windows CI jobs.
+
+    - MINGW64 is deprecated by MSYS2 (run 37035393223 emitted the
+      '[msystem-mingw64] MINGW64 is deprecated. Migrate to UCRT64 or CLANG64'
+      warning annotation); the x86_64 job must use UCRT64.
+    - Both Windows jobs must install libsoxr: run 37035393223's arm64 job
+      logged 'libsoxr not found, building without resample support' because
+      mingw-w64-clang-aarch64-libsoxr was missing from its install list, so
+      the ARM64 build silently shipped without resample support while
+      x86_64 had it.
+    - The arm64 job must install the LLVM OpenMP runtime: MSYS2's clang-built
+      static libsoxr.a references libomp (run 37053411644: ld.lld 'undefined
+      symbol: __kmpc_fork_call / omp_init_lock' referenced by
+      libsoxr.a(soxr.c.obj)/(filter.c.obj)); meson links -lomp for it.
+    - The Windows x86_64 deps cache key must name the ucrt64 toolchain so a
+      MINGW64-built .deps/install (msvcrt-based static libs) can never be
+      reused by the UCRT64 job.
+    """
+    workflow_text = read_text(workflow_path)
+    forbidden_snippets = [
+        "msystem: MINGW64",
+    ]
+    for snippet in forbidden_snippets:
+        if snippet in workflow_text:
+            return fail(f"Workflow uses the deprecated MSYS2 environment (migrate to UCRT64/CLANG64): {snippet}")
+    required_snippets = [
+        "msystem: UCRT64",
+        "msystem: CLANGARM64",
+        "mingw-w64-ucrt-x86_64-libsoxr",
+        "mingw-w64-clang-aarch64-libsoxr",
+        "mingw-w64-clang-aarch64-llvm-openmp",
+    ]
+    for snippet in required_snippets:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing required MSYS2 toolchain/resample parity snippet: {snippet}")
+    if "deps-windows-ucrt64-x86_64-" not in workflow_text:
+        return fail(
+            "Windows x86_64 deps cache key must name the ucrt64 toolchain "
+            "(deps-windows-ucrt64-x86_64-) so a MINGW64-built cache entry "
+            "(msvcrt-based static libs) can never be reused after the "
+            "UCRT64 migration"
+        )
+    return 0
+
+
 def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
         "libfftw3-dev",
-        "mingw-w64-x86_64-fftw",
+        "mingw-w64-ucrt-x86_64-fftw",
         "mingw-w64-clang-aarch64-fftw",
         "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
     ]
@@ -249,6 +280,192 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
     fft_probe_count = workflow_text.count(fft_probe)
     if fft_probe_count != 4:
         return fail(f"Workflow must probe fftw3f exactly 4 times (linux/windows x86/windows arm64/macos), found {fft_probe_count}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Libc direct-include contract (include-what-you-use, libc subset).
+#
+# Regression this prevents (Actions run 37035393223): gui_record_direct.c
+# called malloc/free with no <stdlib.h> of its own. common/threading.h
+# includes <stdlib.h> only in its POSIX branch, so glibc builds got malloc
+# declared transitively while the MSYS2 (Windows) builds did not -> implicit
+# declaration: a hard error on MSYS2 GCC/clang, only a warning on
+# ubuntu-22.04 gcc 11 / Apple clang / NDK clang. The bug class is invisible
+# on every platform except the one it breaks. This static guard makes the
+# 10-second preflight (any platform, before any deps build) fail instead:
+# a .c/.h whose TOP-LEVEL code (outside any platform-conditional #if, so
+# compiled on every platform) calls a libc function must include the libc
+# header itself, or get it from a project header that includes it OUTSIDE
+# any platform-conditional #if. Platform-conditional provision (threading.h's
+# POSIX-only <stdlib.h>) does NOT count - that is exactly the provision
+# that compiles on glibc and breaks on MinGW. Calls inside platform-gated
+# regions are exempt: by construction their includes live in the same branch
+# (the threading.h/posix-branch pattern), and each platform's CI build
+# verifies those branches compile with their own branch-local includes.
+# ---------------------------------------------------------------------------
+
+_PLATFORM_MACRO_RE = re.compile(
+    r"\b(_WIN32|_WIN64|__CYGWIN__|__MINGW32__|__MINGW64__|MSVC|_MSC_VER|"
+    r"__APPLE__|__MACH__|__ANDROID__|__linux__|__unix__|__FreeBSD__|"
+    r"__NetBSD__|__OpenBSD__|__sun|__EMSCRIPTEN__)\b"
+)
+
+_LIBC_HEADER_FAMILIES = {
+    "stdlib.h": (
+        "malloc", "calloc", "realloc", "free", "exit", "abort", "atexit",
+        "atoi", "atol", "strtol", "strtoul", "strtoll", "strtod", "strtof",
+        "qsort", "bsearch", "abs", "labs", "rand", "srand", "getenv",
+        "posix_memalign", "aligned_alloc",
+    ),
+    "stdio.h": (
+        "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+        "vsnprintf", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell",
+        "feof", "ferror", "clearerr", "fflush", "rewind", "remove", "rename",
+        "fputs", "fgets", "fgetc", "fputc", "putchar", "puts", "scanf",
+        "sscanf", "getline", "perror", "fileno", "setvbuf", "ungetc",
+    ),
+    "string.h": (
+        "memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp",
+        "strncmp", "strcpy", "strncpy", "strcat", "strncat", "strchr",
+        "strrchr", "strstr", "strdup", "strndup", "strtok", "strtok_r",
+        "strcasecmp", "strncasecmp", "strerror", "strcspn", "strspn",
+        "strnlen",
+    ),
+    "time.h": (
+        "clock_gettime", "nanosleep", "localtime", "gmtime", "strftime",
+        "mktime", "difftime",
+    ),
+    "math.h": (
+        "sin", "cos", "tan", "sqrt", "pow", "floor", "ceil", "fabs",
+        "fmod", "round", "lround", "atan2", "exp", "log10", "asin",
+        "acos", "atan", "hypot", "fmin", "fmax", "trunc", "rint",
+    ),
+}
+
+
+def _strip_c_lines(text: str) -> List[str]:
+    strip = _make_c_stripper()
+    return [strip(line) for line in text.splitlines()]
+
+
+def _parse_source(path: Path) -> Tuple[set, List[Path], str]:
+    """Parse one source file for the libc direct-include contract.
+
+    Returns (unconditional_system_includes, unconditional_project_include_paths,
+    top_level_text) where top_level_text is the comment/string-stripped text
+    of the lines OUTSIDE any platform-conditional #if region (code compiled on
+    every platform).
+
+    - Directive recognition uses comment/string-stripped lines (a directive
+      inside a comment strips to nothing and is skipped), but include names
+      are extracted from the RAW line: the stripper blanks string literals,
+      which would destroy `#include "header.h"` names.
+    - An #include counts as unconditional only if no enclosing #if/#ifdef/#elif
+      condition mentions a platform macro. Include guards (#ifndef X_H) do not
+      mention platform macros, so guarded headers still count. threading.h's
+      POSIX-only <stdlib.h> sits inside `#else` of a _WIN32 chain and does not
+      count. Unresolvable project includes (e.g. generated version.h) are
+      dropped.
+    """
+    text = read_text(path)
+    raw_lines = text.splitlines()
+    stripped_lines = _strip_c_lines(text)
+    system: set = set()
+    project: List[Path] = []
+    top_level_lines: List[str] = []
+    stack: List[bool] = []
+    for raw_line, stripped_line in zip(raw_lines, stripped_lines):
+        s = stripped_line.strip()
+        m = re.match(r"#\s*(\w+)", s)
+        m_raw = re.match(r"#\s*\w+\s*(.*)", raw_line.strip())
+        rest = m_raw.group(1).strip() if m_raw else ""
+        if not m:
+            if not any(stack):
+                top_level_lines.append(stripped_line)
+            continue
+        if not any(stack):
+            top_level_lines.append(s)
+        directive = m.group(1)
+        if directive in ("if", "ifdef", "ifndef"):
+            stack.append(bool(_PLATFORM_MACRO_RE.search(rest)))
+        elif directive == "elif" and stack:
+            stack[-1] = stack[-1] or bool(_PLATFORM_MACRO_RE.search(rest))
+        elif directive == "endif":
+            if stack:
+                stack.pop()
+        elif directive == "include" and not any(stack):
+            inc_sys = re.match(r"<([^>]+)>", rest)
+            inc_proj = re.match(r'"([^"]+)"', rest)
+            if inc_sys:
+                system.add(inc_sys.group(1))
+            elif inc_proj:
+                cand = path.parent / inc_proj.group(1)
+                if cand.exists():
+                    project.append(cand)
+    return system, project, "\n".join(top_level_lines)
+
+
+def check_libc_direct_include_contract(repo_root: Path) -> int:
+    root = repo_root / "misrc_tools"
+    if not root.exists():
+        return 0
+    parsed: Dict[Path, Tuple[set, List[Path], str]] = {}
+
+    def parse(path: Path) -> Tuple[set, List[Path], str]:
+        if path not in parsed:
+            parsed[path] = _parse_source(path)
+        return parsed[path]
+
+    def available_headers(entry: Path) -> set:
+        seen = {entry}
+        stack = [entry]
+        available = set()
+        while stack:
+            path = stack.pop()
+            system, project_paths, _ = parse(path)
+            available |= system
+            for q in project_paths:
+                if q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        return available
+
+    failures: List[str] = []
+    files = sorted(
+        p for p in root.rglob("*")
+        if p.suffix in (".c", ".h") and p.is_file()
+        and ".deps" not in p.parts and "build" not in p.parts
+    )
+    for path in files:
+        _, _, top_level_text = parse(path)
+        if not top_level_text:
+            continue
+        available = available_headers(path)
+        for header, funcs in _LIBC_HEADER_FAMILIES.items():
+            if header in available:
+                continue
+            called = [
+                fn for fn in funcs
+                if re.search(rf"(?<![\w.>]){re.escape(fn)}\s*\(", top_level_text)
+            ]
+            if called:
+                rel = path.relative_to(repo_root)
+                failures.append(
+                    f"{rel}: top-level code calls {', '.join(called)} without {header} "
+                    f"(direct or via a non-platform-conditional project header)"
+                )
+    if failures:
+        for line in failures:
+            print(f"ERROR: libc direct-include violation: {line}", file=sys.stderr)
+        return fail(
+            "libc direct-include contract violated in "
+            f"{len(failures)} file(s); add the missing #include(s). A libc call "
+            "satisfied only via a platform-conditional transitive include "
+            "(e.g. malloc via threading.h's POSIX-only <stdlib.h>) compiles on "
+            "glibc but is an implicit-declaration hard error on MSYS2 "
+            "(Windows) - run 37035393223."
+        )
     return 0
 
 
@@ -414,22 +631,105 @@ def check_built_gui_has_fx3_symbols(repo_root: Path, gui_path: Optional[Path] = 
     return 0
 
 
-def check_linux_desktop_metadata(workflow_path: Path, gui_c_path: Path) -> int:
+APPIMAGE_ASSET_DIR = Path("assets/appimage")
+APPIMAGE_DESKTOP_ID = "misrc_gui"
+# X11 WM_CLASS class the GUI window is created with; the launcher's
+# StartupWMClass must equal it and must NOT contain the version.
+APPIMAGE_WM_CLASS = "MISRC Capture"
+
+
+def read_desktop_key(text: str, key: str) -> Optional[str]:
+    for line in text.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def check_linux_desktop_metadata(repo_root: Path, workflow_path: Path) -> int:
+    """The AppDir desktop entry and AppRun are real repo files shared by the CI
+    workflow and scripts/build-appimage-local.sh (inline heredocs in YAML broke
+    before). The desktop entry carries a version-independent StartupWMClass."""
     workflow_text = read_text(workflow_path)
-    wm_class = read_gui_window_class_name(gui_c_path)
-    required_desktop_fields = [
-        "cat > AppDir/misrc.desktop <<EOF",
-        "Exec=misrc_gui",
-        "Icon=misrc",
-        f"StartupWMClass={wm_class}",
-        f"X-GNOME-WMClass={wm_class}",
-        "Terminal=false",
-        "StartupNotify=true",
+    required_workflow = [
+        "install -m 0755 assets/appimage/AppRun AppDir/AppRun",
+        "install -m 0644 assets/appimage/misrc_gui.desktop AppDir/misrc_gui.desktop",
+        "-d AppDir/misrc_gui.desktop",
         "ln -sf misrc.png AppDir/.DirIcon",
     ]
-    for field in required_desktop_fields:
-        if field not in workflow_text:
-            return fail(f"Missing Linux desktop integration field in workflow/AppRun: {field}")
+    for snippet in required_workflow:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing Linux desktop integration snippet: {snippet}")
+    forbidden_workflow = [
+        "cat > AppDir/AppRun",
+        "cat > AppDir/misrc.desktop",
+        "MISRC Capture ${BUILD_VERSION}",
+    ]
+    for snippet in forbidden_workflow:
+        if snippet in workflow_text:
+            return fail(
+                "Workflow still contains a forbidden inline/versioned AppImage desktop snippet "
+                f"(use assets/appimage/* and a version-independent StartupWMClass): {snippet}"
+            )
+
+    local_script = read_text(repo_root / "scripts" / "build-appimage-local.sh")
+    for snippet in ('assets/appimage/AppRun', 'assets/appimage/misrc_gui.desktop'):
+        if snippet not in local_script:
+            return fail(f"scripts/build-appimage-local.sh must use the shared file: {snippet}")
+    for snippet in ('cat > "$appdir/AppRun"', 'cat > "$appdir/misrc.desktop"'):
+        if snippet in local_script:
+            return fail(f"scripts/build-appimage-local.sh still has an inline copy: {snippet}")
+
+    desktop_path = repo_root / APPIMAGE_ASSET_DIR / "misrc_gui.desktop"
+    if not desktop_path.exists():
+        return fail(f"Missing AppDir desktop entry: {desktop_path}")
+    desktop_text = read_text(desktop_path)
+    expected = {
+        "Type": "Application",
+        "Exec": "misrc_gui",
+        "Icon": "misrc",
+        "Terminal": "false",
+        "StartupNotify": "true",
+        "StartupWMClass": APPIMAGE_WM_CLASS,
+    }
+    for key, value in expected.items():
+        actual = read_desktop_key(desktop_text, key)
+        if actual != value:
+            return fail(f"{desktop_path.name}: expected {key}={value!r}, found {actual!r}")
+    if not (repo_root / APPIMAGE_ASSET_DIR / "AppRun").exists():
+        return fail("Missing assets/appimage/AppRun")
+    return 0
+
+
+def check_window_identity_contract(repo_root: Path) -> int:
+    """GLFW (raylib) builds X11 WM_CLASS from the window title at creation, so
+    the window must be created with a fixed title (the versioned title changed
+    the class every release and left StartupWMClass stale). The fixed title,
+    the launcher StartupWMClass and AppRun's launcher text must all agree."""
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    define = f'#define MISRC_WINDOW_CLASS_TITLE "{APPIMAGE_WM_CLASS}"'
+    required = [
+        define,
+        f'setenv("RESOURCE_NAME", "{APPIMAGE_DESKTOP_ID}", 0);',
+        "InitWindow(default_window_width, default_window_height, MISRC_WINDOW_CLASS_TITLE);",
+        "SetWindowTitle(window_title);",
+    ]
+    for snippet in required:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c is missing window identity snippet: {snippet}")
+    if "InitWindow(default_window_width, default_window_height, window_title)" in gui_c:
+        return fail("misrc_gui.c must not create the window with the versioned title (unstable WM_CLASS)")
+    init_pos = gui_c.find("InitWindow(default_window_width")
+    title_pos = gui_c.find("SetWindowTitle(window_title);")
+    if init_pos < 0 or title_pos < init_pos:
+        return fail("SetWindowTitle(window_title) must come after InitWindow()")
+
+    apprun = read_text(repo_root / APPIMAGE_ASSET_DIR / "AppRun")
+    if f'export RESOURCE_NAME="{APPIMAGE_DESKTOP_ID}"' not in apprun:
+        return fail(f'AppRun must export RESOURCE_NAME="{APPIMAGE_DESKTOP_ID}"')
+    if f"StartupWMClass={APPIMAGE_WM_CLASS}" not in apprun:
+        return fail(f"AppRun launcher text must use StartupWMClass={APPIMAGE_WM_CLASS}")
+    if f'launcher="${{data_home}}/applications/{APPIMAGE_DESKTOP_ID}.desktop"' not in apprun:
+        return fail(f"AppRun must install the launcher as {APPIMAGE_DESKTOP_ID}.desktop")
     return 0
 
 
@@ -885,30 +1185,130 @@ def check_flac_large_file_offsets_contract(flac_writer_c_path: Path) -> int:
     return 0
 
 
-def check_apprun_static_contract(workflow_path: Path, gui_c_path: Path) -> int:
-    workflow_text = read_text(workflow_path)
-    apprun = extract_apprun_script(workflow_text)
-    wm_class = read_gui_window_class_name(gui_c_path)
+def check_apprun_static_contract(repo_root: Path) -> int:
+    apprun_path = repo_root / APPIMAGE_ASSET_DIR / "AppRun"
+    if not apprun_path.exists():
+        return fail(f"Missing AppRun: {apprun_path}")
+    apprun = read_text(apprun_path)
+    # Explanatory comments legitimately mention things the code must not do
+    # (e.g. "no set -e"), so scan code lines only.
+    code = "\n".join(line for line in apprun.splitlines()
+                     if not line.lstrip().startswith("#"))
     required_snippets = [
-        "install_shortcuts()",
+        "misrc_gui_integrate",
         "--create-shortcut",
-        "local stable_appimage=\"$local_bin_dir/misrc_gui.AppImage\"",
-        "ln -sfn \"$appimage_path\" \"$stable_appimage\"",
-        f"local startup_wm_class=\"{wm_class}\"",
+        "MISRC_GUI_NO_INTEGRATION",
+        "TryExec=${APPIMAGE}",
         "Icon=misrc",
-        "StartupWMClass=${escaped_startup_wm_class}",
-        "X-GNOME-WMClass=${escaped_startup_wm_class}",
         "StartupNotify=true",
+        "update-desktop-database",
+        "gtk-update-icon-cache",
     ]
     for snippet in required_snippets:
-        if snippet not in apprun:
+        if snippet not in code:
             return fail(f"AppRun shortcut contract is missing snippet: {snippet}")
-    if "Exec=\\\"${escaped_launcher_exec_path}\\\" %U" not in apprun and "Exec=\\\\\\\"${escaped_launcher_exec_path}\\\\\\\" %U" not in apprun:
-        return fail("AppRun shortcut contract is missing expected Exec launcher format")
+    forbidden_snippets = {
+        "set -e": "desktop integration must never be able to block launching the app",
+        ".local/bin": "no ~/.local/bin AppImage symlink side effect",
+        "%U": "the GUI takes no file arguments; a dropped file would route into CLI capture mode",
+        "X-GNOME-WMClass": "legacy key; StartupWMClass is the contract",
+        "--version": "launcher identity is version-independent; do not run the binary to build it",
+    }
+    for snippet, why in forbidden_snippets.items():
+        if snippet in code:
+            return fail(f"AppRun contains forbidden snippet {snippet!r}: {why}")
+
+    # The Desktop icon is user-requested only. Earlier builds copied one to
+    # ~/Desktop on every launch, so it reappeared after being deleted.
+    func_start = apprun.find("misrc_gui_create_desktop_icon() {")
+    if func_start < 0:
+        return fail("AppRun is missing misrc_gui_create_desktop_icon()")
+    func_end = apprun.find("\n}\n", func_start)
+    func_body = apprun[func_start:func_end]
+    outside = apprun[:func_start] + apprun[func_end:]
+    stray = [line for line in outside.splitlines()
+             if "MISRC GUI.desktop" in line and not line.lstrip().startswith("#")]
+    if stray:
+        return fail("AppRun writes 'MISRC GUI.desktop' outside misrc_gui_create_desktop_icon()")
+    if "MISRC GUI.desktop" not in func_body:
+        return fail("misrc_gui_create_desktop_icon() must be the only writer of the Desktop icon")
+    calls = [i for i in range(len(apprun)) if apprun.startswith("misrc_gui_create_desktop_icon", i)]
+    call_positions = [i for i in calls if i != func_start]
+    if len(call_positions) != 1:
+        return fail("misrc_gui_create_desktop_icon must be called exactly once (inside --create-shortcut)")
+    branch_start = apprun.find('if [ "${1:-}" = "--create-shortcut" ]; then')
+    branch_end = apprun.find("\nfi\n", branch_start)
+    if branch_start < 0 or not (branch_start < call_positions[0] < branch_end):
+        return fail("The Desktop icon may only be created inside the explicit --create-shortcut branch")
     return 0
 
 
-def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path, gui_c_path: Path) -> int:
+def _apprun_sandbox(root: Path, apprun_src: Path, icon_path: Path) -> Tuple[Path, Path]:
+    """AppDir with stub binaries that log their invocation. Returns (AppRun, calls log)."""
+    appdir = root / "AppDir"
+    (appdir / "usr/bin").mkdir(parents=True, exist_ok=True)
+    calls = root / "calls.log"
+    apprun = appdir / "AppRun"
+    apprun.write_text(read_text(apprun_src), encoding="utf-8")
+    apprun.chmod(apprun.stat().st_mode | stat.S_IXUSR)
+    for exe in ("misrc_gui", "misrc_capture", "misrc_extract"):
+        exe_path = appdir / "usr/bin" / exe
+        exe_path.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s RESOURCE_NAME=%s args=[%s]\\n' \"$(basename \"$0\")\" "
+            "\"${RESOURCE_NAME:-}\" \"$*\" >> \"${MISRC_TEST_CALLS}\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        exe_path.chmod(exe_path.stat().st_mode | stat.S_IXUSR)
+    icon_dir = appdir / "usr/share/icons/hicolor/512x512/apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    if icon_path.exists():
+        shutil.copy2(icon_path, icon_dir / "misrc.png")
+    else:
+        (icon_dir / "misrc.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    return apprun, calls
+
+
+def _apprun_home(root: Path, name: str) -> Path:
+    """Fresh HOME with a Desktop folder and a deterministic user-dirs config."""
+    home = root / name
+    (home / "Desktop").mkdir(parents=True, exist_ok=True)
+    (home / ".config").mkdir(parents=True, exist_ok=True)
+    (home / ".config/user-dirs.dirs").write_text(
+        'XDG_DESKTOP_DIR="$HOME/Desktop"\n', encoding="utf-8")
+    return home
+
+
+def _apprun_run(apprun: Path, calls: Path, home: Path, args: List[str],
+                appimage: Optional[Path] = None,
+                extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    # Environment is built from scratch so nothing can leak in from the real
+    # session (XDG_*, APPIMAGE) and xdg-user-dir can never resolve the real Desktop.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+           "LANG": "C", "MISRC_TEST_CALLS": str(calls)}
+    if appimage is not None:
+        env["APPIMAGE"] = str(appimage)
+    env.update(extra_env or {})
+    return subprocess.run(["bash", str(apprun), *args], env=env,
+                          capture_output=True, text=True)
+
+
+def _home_files(home: Path) -> List[str]:
+    baseline = {".config/user-dirs.dirs"}
+    # By-products of update-desktop-database / gtk-update-icon-cache when those
+    # tools exist on the host; benign and not something AppRun writes itself.
+    tool_cache_names = {"mimeinfo.cache", "icon-theme.cache"}
+    found = []
+    for path in sorted(home.rglob("*")):
+        if path.is_file() or path.is_symlink():
+            rel = path.relative_to(home).as_posix()
+            if rel not in baseline and path.name not in tool_cache_names:
+                found.append(rel)
+    return found
+
+
+def check_apprun_runtime_behavior(repo_root: Path, icon_path: Path) -> int:
     if not sys.platform.startswith("linux"):
         print("SKIP: AppRun runtime behavior (linux-only)")
         return 0
@@ -916,83 +1316,128 @@ def check_apprun_runtime_behavior(workflow_path: Path, icon_path: Path, gui_c_pa
         print("SKIP: AppRun runtime behavior (bash not available)")
         return 0
 
-    workflow_text = read_text(workflow_path)
-    script = extract_apprun_script(workflow_text)
-
+    apprun_src = repo_root / APPIMAGE_ASSET_DIR / "AppRun"
     with tempfile.TemporaryDirectory(prefix="misrc_ci_guard_") as temp_root:
         root = Path(temp_root)
-        appdir = root / "AppDir"
-        (appdir / "usr/bin").mkdir(parents=True, exist_ok=True)
+        apprun, calls = _apprun_sandbox(root, apprun_src, icon_path)
+        try:
+            run_checked(["bash", "-n", str(apprun)])
+        except subprocess.CalledProcessError as exc:
+            return fail(f"AppRun has a shell syntax error: {exc.stderr}")
 
-        apprun_path = appdir / "AppRun"
-        apprun_path.write_text(script, encoding="utf-8")
-        apprun_path.chmod(apprun_path.stat().st_mode | stat.S_IXUSR)
+        # A path with a space and a literal '%' exercises .desktop Exec escaping.
+        appimage = root / "MISRC 100% Test Build.AppImage"
+        appimage.write_text("fake", encoding="utf-8")
+        appimage.chmod(appimage.stat().st_mode | stat.S_IXUSR)
 
-        run_checked(["bash", "-n", str(apprun_path)])
+        # 1. Plain GUI launch installs the launcher + icon and nothing else.
+        home = _apprun_home(root, "home_plain")
+        res = _apprun_run(apprun, calls, home, [], appimage)
+        if res.returncode != 0:
+            return fail(f"AppRun plain launch failed (rc={res.returncode}): {res.stderr}")
+        launcher = home / ".local/share/applications/misrc_gui.desktop"
+        icon = home / ".local/share/icons/hicolor/512x512/apps/misrc.png"
+        if not launcher.exists() or not icon.exists():
+            return fail("AppRun plain launch did not install the launcher and icon")
+        text = read_text(launcher)
+        for required in (f'Exec="{str(appimage).replace("%", "%%")}"',
+                         f"TryExec={appimage}", "Icon=misrc", "Terminal=false",
+                         "StartupNotify=true", f"StartupWMClass={APPIMAGE_WM_CLASS}"):
+            if required not in text.splitlines():
+                return fail(f"Launcher is missing line: {required}\n{text}")
+        if "%U" in text or "X-GNOME-WMClass" in text:
+            return fail("Launcher must not contain %U or X-GNOME-WMClass")
+        if shutil.which("desktop-file-validate"):
+            check = subprocess.run(["desktop-file-validate", str(launcher)],
+                                   capture_output=True, text=True)
+            if check.returncode != 0:
+                return fail(f"Generated launcher failed desktop-file-validate: {check.stdout}{check.stderr}")
+        unexpected = [f for f in _home_files(home)
+                      if f not in (".local/share/applications/misrc_gui.desktop",
+                                   ".local/share/icons/hicolor/512x512/apps/misrc.png")]
+        if unexpected:
+            return fail(f"AppRun plain launch created unexpected files: {unexpected}")
+        if any((home / "Desktop").iterdir()):
+            return fail("AppRun plain launch must NEVER create a Desktop icon")
+        if "misrc_gui RESOURCE_NAME=misrc_gui args=[]" not in read_text(calls):
+            return fail("AppRun must exec misrc_gui with RESOURCE_NAME=misrc_gui exported")
 
-        for exe in ("misrc_gui", "misrc_capture", "misrc_extract"):
-            exe_path = appdir / "usr/bin" / exe
-            if exe == "misrc_gui":
-                exe_path.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "if [[ \"${1:-}\" == \"--version\" ]]; then\n"
-                    "  echo \"test-version\"\n"
-                    "  exit 0\n"
-                    "fi\n"
-                    "exit 0\n",
-                    encoding="utf-8",
-                )
-            else:
-                exe_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            exe_path.chmod(exe_path.stat().st_mode | stat.S_IXUSR)
+        # 2. Idempotent: a second launch must not rewrite anything.
+        before = (launcher.stat().st_mtime_ns, icon.stat().st_mtime_ns)
+        res = _apprun_run(apprun, calls, home, [], appimage)
+        after = (launcher.stat().st_mtime_ns, icon.stat().st_mtime_ns)
+        if res.returncode != 0 or before != after:
+            return fail("AppRun rewrote an unchanged launcher/icon on a repeat launch")
 
-        if icon_path.exists():
-            shutil.copy2(icon_path, appdir / "misrc.png")
-        else:
-            (appdir / "misrc.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        # 3. Re-pointing to a different AppImage rewrites Exec (follows the last-run copy).
+        other = root / "MISRC Other.AppImage"
+        other.write_text("fake", encoding="utf-8")
+        _apprun_run(apprun, calls, home, [], other)
+        if f'Exec="{other}"' not in read_text(launcher).splitlines():
+            return fail("AppRun did not re-point the launcher to the AppImage that ran last")
 
-        appimage_path = root / "MISRC Test Build.AppImage"
-        appimage_path.write_text("fake", encoding="utf-8")
-        appimage_path.chmod(appimage_path.stat().st_mode | stat.S_IXUSR)
+        # 4. GUI-only flags integrate too (mirrors misrc_gui.c main()).
+        for args in (["--debug-view"], ["--config", "/tmp/x.json"], ["--auto-connect", "--config", "/tmp/x.json"]):
+            fresh = _apprun_home(root, "home_flags_" + "_".join(a.strip("-/.") for a in args))
+            _apprun_run(apprun, calls, fresh, args, appimage)
+            if not (fresh / ".local/share/applications/misrc_gui.desktop").exists():
+                return fail(f"AppRun did not integrate for GUI launch args: {args}")
 
-        home = root / "home"
-        desktop_dir = home / "Desktop"
-        desktop_dir.mkdir(parents=True, exist_ok=True)
+        # 5. Non-GUI launches must not touch the desktop at all.
+        zero_touch = [
+            (["capture", "-h"], appimage, None, "misrc_capture"),
+            (["extract", "-h"], appimage, None, "misrc_extract"),
+            (["--smoke-test"], appimage, None, "misrc_gui"),
+            (["--version"], appimage, None, "misrc_gui"),
+            (["--help"], appimage, None, "misrc_gui"),
+            (["-a", "-r", "x"], appimage, None, "misrc_gui"),
+            ([], None, None, "misrc_gui"),
+            ([], appimage, {"MISRC_GUI_NO_INTEGRATION": "1"}, "misrc_gui"),
+            ([], root / "bad$name.AppImage", None, "misrc_gui"),
+            ([], root / 'bad"name.AppImage', None, "misrc_gui"),
+        ]
+        for idx, (args, image, extra, expected_exe) in enumerate(zero_touch):
+            if image is not None and not image.exists():
+                image.write_text("fake", encoding="utf-8")
+            fresh = _apprun_home(root, f"home_zero_{idx}")
+            calls.write_text("", encoding="utf-8")
+            res = _apprun_run(apprun, calls, fresh, args, image, extra)
+            if res.returncode != 0:
+                return fail(f"AppRun {args} failed (rc={res.returncode}): {res.stderr}")
+            touched = _home_files(fresh)
+            if touched or any((fresh / "Desktop").iterdir()):
+                return fail(f"AppRun {args} (extra={extra}) must not touch the desktop, but created: {touched}")
+            if not read_text(calls).startswith(expected_exe + " "):
+                return fail(f"AppRun {args} dispatched to the wrong binary; calls: {read_text(calls)!r}")
 
-        env = os.environ.copy()
-        env["HOME"] = str(home)
-        env["APPIMAGE"] = str(appimage_path)
-        env.pop("XDG_DATA_HOME", None)
+        # 6. Explicit --create-shortcut is the only way to get a Desktop icon,
+        #    and it does not start the GUI.
+        home = _apprun_home(root, "home_shortcut")
+        calls.write_text("", encoding="utf-8")
+        res = _apprun_run(apprun, calls, home, ["--create-shortcut"], appimage)
+        desktop_icon = home / "Desktop/MISRC GUI.desktop"
+        if res.returncode != 0 or not desktop_icon.exists():
+            return fail(f"--create-shortcut did not create the Desktop icon (rc={res.returncode}): {res.stderr}")
+        if read_text(desktop_icon) != read_text(home / ".local/share/applications/misrc_gui.desktop"):
+            return fail("Desktop icon must be a copy of the installed launcher")
+        if not os.access(desktop_icon, os.X_OK):
+            return fail("Desktop icon must be executable so the file manager will launch it")
+        if read_text(calls).strip():
+            return fail("--create-shortcut must not start the GUI")
+        res = _apprun_run(apprun, calls, _apprun_home(root, "home_shortcut_noimage"),
+                          ["--create-shortcut"], None)
+        if res.returncode == 0:
+            return fail("--create-shortcut without an AppImage file must fail instead of pretending")
 
-        run_checked(["bash", str(apprun_path), "--create-shortcut"], env=env)
-
-        launcher_path = home / ".local/share/applications/misrc_gui.desktop"
-        desktop_shortcut_path = home / "Desktop/MISRC GUI.desktop"
-        icon_install_path = home / ".local/share/icons/hicolor/512x512/apps/misrc.png"
-        stable_exec_path = home / ".local/bin/misrc_gui.AppImage"
-
-        if not launcher_path.exists():
-            return fail("AppRun --create-shortcut did not create launcher file")
-        if not desktop_shortcut_path.exists():
-            return fail("AppRun --create-shortcut did not create Desktop shortcut")
-        if not icon_install_path.exists():
-            return fail("AppRun --create-shortcut did not install icon")
-        if not stable_exec_path.exists():
-            return fail("AppRun --create-shortcut did not create stable AppImage launcher path")
-        if not os.path.samefile(stable_exec_path, appimage_path):
-            return fail("Stable AppImage launcher path does not resolve to current AppImage")
-
-        launcher = read_text(launcher_path)
-        expected_exec = f'Exec=\"{stable_exec_path}\" %U'
-        if expected_exec not in launcher:
-            return fail(f"Launcher Exec entry mismatch. Expected: {expected_exec}")
-        expected_wm_class = read_gui_window_class_name(gui_c_path)
-        for required in ("Icon=misrc", "Terminal=false", f"StartupWMClass={expected_wm_class}", f"X-GNOME-WMClass={expected_wm_class}", "StartupNotify=true"):
-            if required not in launcher:
-                return fail(f"Launcher is missing required key: {required}")
-
-        run_checked(["bash", str(apprun_path), "--smoke-test"], env=env)
-
+        # 7. Regression: a deleted Desktop icon must STAY deleted (it used to be
+        #    copied back on every launch).
+        desktop_icon.unlink()
+        for _ in range(2):
+            res = _apprun_run(apprun, calls, home, [], appimage)
+            if res.returncode != 0:
+                return fail(f"AppRun launch after deleting the Desktop icon failed: {res.stderr}")
+        if desktop_icon.exists() or any((home / "Desktop").iterdir()):
+            return fail("REGRESSION: AppRun re-created the deleted Desktop icon on launch")
     return 0
 
 
@@ -1067,24 +1512,23 @@ def check_native_wayland_contract(repo_root: Path) -> int:
 
 def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
     """WM_CLASS is what ties a running window back to its launcher. misrc_gui.c
-    creates the window under GUI_WINDOW_CLASS_NAME, so every .desktop we write --
-    release AppImage, local AppImage, and the self-hosted deploy that installs onto
+    creates the window under MISRC_WINDOW_CLASS_TITLE, so every .desktop we write --
+    the AppImage's (assets/appimage, shared by the release and the local build),
+    the one its AppRun installs, and the self-hosted deploy that installs onto
     workflow-master -- must set StartupWMClass to exactly that string, and must
     never decorate it with a build version, or a launcher written by one build
     stops matching the next build's window and the dock loses the app icon."""
     wm_class = read_gui_window_class_name(gui_c_path)
-    workflow_path = repo_root / ".github/workflows/build.yml"
     deploy_workflow_path = repo_root / ".github/workflows/selfhosted-deploy.yml"
-    local_appimage_script = repo_root / "scripts/build-appimage-local.sh"
     required_by_surface = {
-        workflow_path: (
+        repo_root / "assets/appimage/misrc_gui.desktop": (
             f"StartupWMClass={wm_class}",
-            f"X-GNOME-WMClass={wm_class}",
-            f'local startup_wm_class="{wm_class}"',
         ),
-        local_appimage_script: (
+        repo_root / "assets/appimage/AppRun": (
             f"StartupWMClass={wm_class}",
-            f"X-GNOME-WMClass={wm_class}",
+        ),
+        repo_root / "scripts/build-appimage-local.sh": (
+            '"$REPO_ROOT/assets/appimage/misrc_gui.desktop"',
         ),
     }
     for path, required in required_by_surface.items():
@@ -1094,7 +1538,7 @@ def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
         for snippet in required:
             if snippet not in text:
                 return fail(
-                    f"{path.name} does not match GUI_WINDOW_CLASS_NAME "
+                    f"{path.name} does not match MISRC_WINDOW_CLASS_TITLE "
                     f'("{wm_class}") in misrc_gui.c: missing {snippet!r}'
                 )
         offenders = find_versioned_wm_class(text)
@@ -1114,14 +1558,14 @@ def check_wm_class_consistency(gui_c_path: Path, repo_root: Path) -> int:
         if f"{key}={wm_class}\n" not in entry + "\n":
             return fail(
                 f"selfhosted-deploy.yml installs a .desktop whose {key} does not match "
-                f'GUI_WINDOW_CLASS_NAME ("{wm_class}") in misrc_gui.c'
+                f'MISRC_WINDOW_CLASS_TITLE ("{wm_class}") in misrc_gui.c'
             )
     offenders = find_versioned_wm_class(entry)
     if offenders:
         return fail(
             f"selfhosted-deploy.yml bakes a build version into WM_CLASS: {offenders}"
         )
-    # RESOURCE_NAME was the pre-GUI_WINDOW_CLASS_NAME shim. It pins only the instance
+    # RESOURCE_NAME was the pre-constant-class shim. It pins only the instance
     # half of WM_CLASS, and only for a process started through the Exec line that sets
     # it, so the dock icon silently depended on which launcher you clicked. The constant
     # class name replaces it -- reintroducing it re-splits the contract.
@@ -1799,9 +2243,9 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
     """A bundled binary is a supply-chain dependency of every release, so the
     version and hashes are pinned in the repo and the download is verified
     against them. Verifying against a checksums file fetched from the same
-    release proves only that the transfer worked. Both AppImage paths -- CI and
-    scripts/build-appimage-local.sh -- must go through the one script, or a
-    locally built AppImage ends up carrying a different server."""
+    release proves only that the transfer worked. The fork's AppImage is the
+    one scripts/build-appimage-local.sh builds; upstream's build.yml (never
+    edited here) packages its own release AppImage without a server."""
     fetch = repo_root / "scripts/fetch-mediamtx.sh"
     if not fetch.exists():
         return fail("scripts/fetch-mediamtx.sh is missing; the AppImage cannot bundle mediamtx")
@@ -1828,7 +2272,6 @@ def check_bundled_mediamtx_contract(repo_root: Path) -> int:
         )
 
     for consumer, label in (
-        (repo_root / ".github/workflows/build.yml", "the release AppImage"),
         (repo_root / "scripts/build-appimage-local.sh", "the local AppImage"),
     ):
         if "fetch-mediamtx.sh" not in read_text(consumer):
@@ -2708,7 +3151,9 @@ def check_net_settings_protocol(repo_root: Path) -> int:
         if flag not in usage:
             return fail(f"misrc_gui.c: print_usage() does not list {flag}")
         pos = main_c.find(f'strcmp(argv[i], "{flag}") == 0')
-        init = main_c.find("InitWindow(")
+        # The call, not a comment that names it (upstream's window-class
+        # define near the top says "See the InitWindow() call").
+        init = strip_c_comments(main_c).find("InitWindow(")
         if pos < 0 or init < 0 or pos > init:
             return fail(f"misrc_gui.c: {flag} must be dispatched before InitWindow")
     if "gui_net_client_view_begin(&app)" not in main_c or "gui_net_client_view_end(&app)" not in main_c:
@@ -3504,6 +3949,72 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
     return 0
 
 
+def check_release_download_link_contract(repo_root: Path, workflow_path: Path) -> int:
+    """Assert the in-app updater's asset filename mapping matches the release
+    artifact naming, and that the live link check is wired into CI.
+
+    Regression (user report, release v1.2.4): gui_ui.c built asset names
+    missing the "_GUI" infix (Windows_MISRC_%s_x86.zip) while the workflow
+    publishes Windows_MISRC_GUI_<tag>_x86.zip, so every platform's
+    update-check Download button 404'd for every release.
+    check_release_artifact_naming_contract only pinned the WORKFLOW side;
+    nothing cross-checked the APP side. This guard pins both sides to the
+    identical naming and requires the live release_link_check.py CI test
+    (HEAD-checks the exact URLs the app builds, against the latest
+    published release on every run and against the just-published tag in
+    the release job).
+    """
+    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
+    if not gui_c_path.exists():
+        return fail(f"Missing gui_ui.c: {gui_c_path}")
+    gui_text = read_text(gui_c_path)
+
+    required_patterns = [
+        "Android_MISRC_GUI_%s_arm64.apk",
+        "macOS_MISRC_GUI_%s_universal.dmg",
+        "Windows_MISRC_GUI_%s_arm64.zip",
+        "Windows_MISRC_GUI_%s_x86.zip",
+        "Linux_MISRC_GUI_%s_arm64.zip",
+        "Linux_MISRC_GUI_%s_x86.zip",
+    ]
+    for pattern in required_patterns:
+        if pattern not in gui_text:
+            return fail(
+                f"gui_ui.c release asset mapping is missing the exact pattern: {pattern} "
+                "(must match the workflow's <Platform>_MISRC_GUI_<tag>_<arch>.<ext> naming)"
+            )
+    for pattern in [p.replace("MISRC_GUI_", "MISRC_") for p in required_patterns]:
+        if pattern in gui_text:
+            return fail(
+                f"gui_ui.c still contains the broken asset mapping (missing the _GUI "
+                f"infix) that 404'd the updater's Download button on every platform: {pattern}"
+            )
+
+    link_check = repo_root / "misrc_tools" / "test" / "release_link_check.py"
+    if not link_check.exists():
+        return fail(f"Missing release link check CI test: {link_check}")
+    link_text = read_text(link_check)
+    for snippet in [
+        "releases/latest",
+        "releases/download",
+        "gui_ui.c",
+        "gui_ui_build_release_asset_filename_for_platform",
+        "--tag",
+    ]:
+        if snippet not in link_text:
+            return fail(f"release_link_check.py is missing required snippet: {snippet}")
+
+    workflow_text = read_text(workflow_path)
+    for snippet in [
+        "release-link-check:",
+        "python3 misrc_tools/test/release_link_check.py",
+        'release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+    ]:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing release download link check wiring: {snippet}")
+    return 0
+
+
 def check_release_version_resolution_contract(repo_root: Path, workflow_path: Path) -> int:
     """Assert release-context CI runs resolve the tag (never a dev string) and
     that a release can never ship a dev-named artifact under the tag.
@@ -3787,6 +4298,310 @@ def check_local_deps_cache_contract(repo_root: Path,
     for snippet in required_installation_snippets:
         if snippet not in installation_text:
             return fail(f"INSTALLATION.md is missing deps-cache contract snippet: {snippet}")
+    return 0
+
+
+def func_body_from(source: str, signature: str) -> str:
+    """Return the text of the function whose definition starts at
+    `signature`, from the signature up to the next column-0 closing brace.
+    All target functions keep nested braces indented, so this is exact."""
+    start = source.find(signature)
+    if start < 0:
+        raise RuntimeError(f"Function signature not found: {signature!r}")
+    end = source.find("\n}", start)
+    if end < 0:
+        raise RuntimeError(f"Function end not found for: {signature!r}")
+    return source[start:end]
+
+
+def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
+    """Static contract for the direct native RAW passthrough path (CXADC,
+    FLAC off, no resampling): tap placement before the A/B pairing
+    truncation, shared eligibility predicate, naming by content
+    (.u8/.u16 direct, .s8/.s16 converted), single producer per record
+    ring, and the start/stop tap handshakes."""
+    record_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
+    record_h = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.h")
+    direct_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c")
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+    cxadc_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.h")
+    extract_c = read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.c")
+    extract_h = read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.h")
+    settings_c = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+    harness_c = read_text(repo_root / "misrc_tools/test/gui_record_direct_harness.c")
+
+    required_snippets = [
+        (direct_c, "atomic_fetch_add(&ctx->tap_inflight, 1);", "producer marks in-flight"),
+        (direct_c, "atomic_load(&ctx->tap_enabled)", "producer checks the enabled flag"),
+        (direct_c, "bufmgr_fill_level(ctx->bufmgr, (buffer_id_t)ctx->buf_id)", "writer reads variable lengths"),
+        (direct_c, "GUI_RECORD_DIRECT_MAX_BLOCK_BYTES", "writer read granularity cap"),
+        (cxadc_c, "gui_record_direct_tap_push_latched(0, true, card_buf_a", "card A latched native tap"),
+        (cxadc_c, "gui_record_direct_tap_push_latched(1, true, card_buf_b", "card B latched native tap"),
+        (cxadc_c, "gui_record_tap_iteration_enter(0)", "iteration gate enter (A)"),
+        (cxadc_c, "gui_record_tap_iteration_enter(1)", "iteration gate enter (B)"),
+        (cxadc_c, "gui_record_tap_iteration_leave(0)", "iteration gate leave (A)"),
+        (cxadc_c, "gui_record_tap_iteration_leave(1)", "iteration gate leave (B)"),
+        (cxadc_c, "bool tap_this_iter = a_on && b_on;", "per-iteration latched record decision (A/B chunk symmetry)"),
+        (record_h, "gui_record_direct_tap_push_latched", "latched tap wrapper declaration"),
+        (direct_c, "gui_record_direct_push_latched(", "latched push in the record-direct module"),
+        (cxadc_h, "gui_cxadc_direct_record_available", "CXADC direct availability query"),
+        (record_h, "gui_record_direct_tap_push", "tap entry point declaration"),
+        (record_h, "gui_record_spill_read_block", "public spill read"),
+        (record_h, "gui_record_spill_backlog_bytes", "public spill backlog query"),
+        (record_c, '"Recording (RAW direct)..."', "direct status text"),
+        (record_c, "RAW direct native passthrough", "capture_format log line"),
+        (record_c, "gui_record_direct_channel_eligible", "shared eligibility predicate"),
+        (record_c, "Direct RAW channel A: bytes_read=", "end summary read vs written"),
+        (extract_h, "gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b,", "set_recording carries the direct mask"),
+        (meson, "'misrc_gui/output/gui_record_direct.c'", "module in the GUI build"),
+        (meson, "test('gui_record_direct'", "harness registered as a meson test"),
+        (harness_c, "gui_record_direct_push(", "harness drives the real push"),
+        (harness_c, "gui_record_direct_writer_thread", "harness drives the real writer"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"Direct RAW passthrough contract missing {label}: {snippet}")
+
+    # Tap placement: the lockstep tap gate must sit AFTER the A/B reads and
+    # pairing truncation (the pushed bytes are the exact card reads, never
+    # the paired/truncated samples) and BEFORE the display-ring write, with
+    # the per-iteration ordering: enter both channels' taps, latch the
+    # decision once, push both chunks with the same decision, then leave.
+    # A record start/stop handshake landing between the per-channel pushes
+    # then cannot split the channels by one chunk.
+    gate_enter_a = cxadc_c.find("gui_record_tap_iteration_enter(0)")
+    gate_latch = cxadc_c.find("bool tap_this_iter = a_on && b_on;")
+    tap_a = cxadc_c.find("gui_record_direct_tap_push_latched(0, true, card_buf_a")
+    tap_b = cxadc_c.find("gui_record_direct_tap_push_latched(1, true, card_buf_b")
+    gate_leave_a = cxadc_c.find("gui_record_tap_iteration_leave(0)")
+    truncation = cxadc_c.find("output_samples_b < output_samples")
+    display_write = cxadc_c.find("bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF")
+    if min(gate_enter_a, gate_latch, tap_a, tap_b, gate_leave_a, truncation, display_write) < 0:
+        return fail("Direct RAW tap gate placement anchors not found in gui_cxadc.c")
+    if not (truncation < gate_enter_a < gate_latch < tap_a < tap_b < gate_leave_a):
+        return fail("Direct RAW tap gate must sit after the A/B pairing, latching the decision once before both latched pushes")
+    if not (gate_leave_a < display_write):
+        return fail("Direct RAW tap gate must complete before the display-ring write")
+
+    # Producer handshake: mark in-flight, THEN read enabled.
+    push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push")
+    if push_body.find("atomic_fetch_add(&ctx->tap_inflight, 1);") > push_body.find("atomic_load(&ctx->tap_enabled)"):
+        return fail("Direct RAW push must mark in-flight before reading tap_enabled")
+
+    # Producer ordering rule: while the spill backlog is non-zero, pushes go
+    # to the spill (never into the ring ahead of older spill data).
+    if "backlog > 0" not in push_body:
+        return fail("Direct RAW push must key its spill-vs-ring decision on the spill backlog")
+
+    # Writer drain order: ringbuffer before spill (oldest data first).
+    writer_body = func_body_from(direct_c, "int gui_record_direct_writer_thread(void *ctx_ptr)")
+    if writer_body.find("bufmgr_read_begin") > writer_body.find("ctx->cb.spill_read"):
+        return fail("Direct RAW writer must drain the ringbuffer before the spill backlog")
+
+    # Naming by content: direct -> .u8/.u16, converted -> .s8/.s16.
+    ext_body = func_body_from(record_c, "static const char *raw_ext_for_bits")
+    for snippet in ['"u8"', '"u16"', '"s8"', '"s16"']:
+        if snippet not in ext_body:
+            return fail(f"gui_record.c raw_ext_for_bits must map direct/converted to u8/u16/s8/s16: missing {snippet}")
+    settings_ext_body = func_body_from(settings_c, "static const char *raw_ext_for_bits")
+    for snippet in ['"s8"', '"s16"']:
+        if snippet not in settings_ext_body:
+            return fail(f"gui_settings_table.c raw_ext_for_bits (converted preview) missing {snippet}")
+    for snippet in ['"u8"', '"u16"']:
+        if snippet in settings_ext_body:
+            return fail(f"gui_settings_table.c load-time preview must not claim native naming: {snippet}")
+
+    # Predicate gates on: CXADC device, FLAC off, per-channel resample off,
+    # running capture, live card sample-width match.
+    pred_body = func_body_from(record_c, "static bool gui_record_direct_channel_eligible")
+    for snippet in ["DEVICE_TYPE_CXADC", "app->settings.use_flac", "enable_resample_a", "enable_resample_b",
+                    "gui_cxadc_is_running", "gui_cxadc_direct_record_available"]:
+        if snippet not in pred_body:
+            return fail(f"Direct RAW eligibility predicate missing required condition: {snippet}")
+
+    # Single producer per record ring: extraction skips direct channels.
+    extract_body = func_body_from(extract_c, "static int extraction_thread(void *ctx)")
+    for snippet in ["!atomic_load(&s_direct_channel_a)", "!atomic_load(&s_direct_channel_b)"]:
+        if snippet not in extract_body:
+            return fail(f"Extraction must skip record writes for direct channels: {snippet}")
+    set_rec_body = func_body_from(extract_c, "void gui_extract_set_recording")
+    for snippet in ["s_direct_channel_a", "s_direct_channel_b"]:
+        if snippet not in set_rec_body:
+            return fail(f"gui_extract_set_recording must carry the direct mask: {snippet}")
+
+    # Stop handshake: taps disabled and idle BEFORE is_recording clears.
+    stop_body = func_body_from(record_c, "void gui_record_stop(gui_app_t *app)")
+    tap_disable_pos = stop_body.find("gui_record_direct_tap_disable")
+    tap_idle_pos = stop_body.find("gui_record_direct_tap_wait_idle")
+    is_recording_pos = stop_body.find("app->is_recording = false;")
+    if min(tap_disable_pos, tap_idle_pos, is_recording_pos) < 0:
+        return fail("Direct RAW stop handshake anchors not found in gui_record_stop")
+    if not (tap_disable_pos < tap_idle_pos < is_recording_pos):
+        return fail("gui_record_stop must disable+idle the taps before clearing is_recording")
+
+    # Start order: writers, then taps, then extraction recording (skip mask).
+    start_writer = record_c.find("gui_record_direct_writer_thread")
+    start_tap = record_c.find("gui_record_direct_tap_enable(&s_direct_ctx_a)")
+    start_extract = record_c.find("gui_extract_set_recording(true, false, bits_a, bits_b, direct_a, direct_b)")
+    if min(start_writer, start_tap, start_extract) < 0:
+        return fail("Direct RAW start-order anchors not found in gui_record.c")
+    if not (start_writer < start_tap < start_extract):
+        return fail("Record start must start writers, then enable taps, then extraction recording")
+    return 0
+
+
+def check_gui_auto_test_flags(repo_root: Path) -> int:
+    """Static contract for the unattended local test flags
+    (--select-device / --auto-capture / --auto-record) and the
+    overwrite_files popup bypass that unattended runs depend on."""
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    record_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
+
+    required_snippets = [
+        (gui_c, 'strcmp(a, "--select-device")', "--select-device parsed as a GUI flag"),
+        (gui_c, 'strcmp(a, "--auto-capture")', "--auto-capture parsed as a GUI flag"),
+        (gui_c, 'strcmp(a, "--auto-record")', "--auto-record parsed as a GUI flag"),
+        (gui_c, "[AUTO] --select-device: no device matches", "--select-device fails fast on no match"),
+        (gui_c, "gui_strcasestr_local", "portable case-insensitive device name match"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"GUI auto-test flags contract missing {label}: {snippet}")
+
+    # The unattended record cycle must report each phase and exit nonzero on failure.
+    for marker in ["[AUTO] auto-capture armed", "[AUTO] recording started", "[AUTO] recording stopped",
+                   "[AUTO] record cycle complete", "return auto_rec_failed ? 1 : 0;"]:
+        if marker not in gui_c:
+            return fail(f"GUI auto-record cycle missing required marker: {marker}")
+
+    # usage text documents all three flags
+    for flag in ["--select-device", "--auto-capture", "--auto-record <seconds>"]:
+        if flag not in gui_c:
+            return fail(f"GUI usage text missing auto-test flag: {flag}")
+
+    # overwrite_files must bypass the overwrite confirmation popup so
+    # unattended runs cannot stall on it.
+    start_body = func_body_from(record_c, "int gui_record_start(gui_app_t *app)")
+    if "!app->settings.overwrite_files" not in start_body:
+        return fail("gui_record_start must skip the overwrite popup when overwrite_files is on")
+    return 0
+
+
+def check_cxadc_rate_probe_contract(repo_root: Path) -> int:
+    """Static contract for the CXADC measured feed-rate check: probe at
+    startup enumeration and capture start, tier snapping via the shared
+    dependency-free header, effective rate preferred by the UI/settings
+    rate getters, and the env opt-out."""
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+    cxadc_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.h")
+    capture_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_capture.c")
+    ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    tiers_h = read_text(repo_root / "misrc_tools/common/cxadc_rate_tiers.h")
+    tiers_test_c = read_text(repo_root / "misrc_tools/test/cxadc_rate_tiers_test.c")
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+
+    required_snippets = [
+        (cxadc_c, "cxadc_measure_card_rate_hz", "timed blocking-read measurement"),
+        (cxadc_c, "cxadc_probe_and_cache_card_rate", "probe + cache + sysfs comparison"),
+        (cxadc_c, "MISRC_GUI_NO_CXADC_RATE_PROBE", "probe env opt-out"),
+        (cxadc_c, "CXADC_RATE_PROBE_START_BYTES", "capture-start probe window"),
+        (cxadc_c, "gui_cxadc_get_effective_rate_hz", "effective-rate API"),
+        (cxadc_c, "cxadc_snap_rate_tier_hz", "tier snapping from the shared header"),
+        (cxadc_c, "s_cxadc_measured_rate_state", "measured-rate cache"),
+        (cxadc_c, "CXADC_RATE_PROBE_DRAIN_CHUNK_MIN_US", "backlog drain phase before the timed window"),
+        (cxadc_h, "gui_cxadc_get_effective_rate_hz", "effective-rate declaration"),
+        (cxadc_h, "gui_cxadc_probe_card_rates", "probe entry point declaration"),
+        (capture_c, "gui_cxadc_probe_card_rates(cxadc_card_count", "startup enumeration probe"),
+        (capture_c, "gui_cxadc_get_effective_rate_hz(0, tenbit_mode_a", "CXADC profile sync uses the effective rate"),
+        (ui_c, "gui_cxadc_get_effective_rate_hz(card_idx, false", "UI base rate uses the effective rate"),
+        (ui_c, "gui_cxadc_get_effective_rate_hz(card_idx, tenbit", "UI hw rate uses the effective rate"),
+        (tiers_h, "cxadc_snap_rate_tier_hz", "tier snap helper"),
+        (tiers_h, "35795454", "upsampled 35.8 exclusion documented/absent as tier"),
+        (tiers_test_c, "cxadc_snap_rate_tier_hz", "tier snap unit test drives the real helper"),
+        (meson, "test('cxadc_rate_tiers'", "tier snap test registered"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"CXADC rate probe contract missing {label}: {snippet}")
+
+    # The tier table must NOT contain the upsampled 35.8 feed (35795454 /
+    # 35800000 must appear only in comments, never as a tier value).
+    tiers_body = tiers_h[tiers_h.find("CXADC_RATE_TIER_HZ[] = {"):tiers_h.find("};")]
+    for forbidden in ("35795454U,", "35800000U,"):
+        if forbidden in tiers_body:
+            return fail(f"35.8 MHz upsampled feed must not be a snap tier: {forbidden}")
+
+    # The measured rate must override the sysfs belief when they disagree
+    # (the reported stale-crystal case), at every capture start.
+    start_body = func_body_from(cxadc_c, "int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)")
+    probe_pos = start_body.find("cxadc_probe_and_cache_card_rate")
+    override_pos = start_body.find("s_cxadc.card_sample_rate_hz[i] = s_cxadc_measured_rate_hz[i][t]")
+    # rfind: the probe block's re-assignment is the LAST occurrence (the
+    # original sysfs-derived assignment earlier in the function stays).
+    rf_pos = start_body.rfind("s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0]")
+    if min(probe_pos, override_pos, rf_pos) < 0:
+        return fail("Capture-start rate-probe anchors not found in gui_cxadc_start")
+    if not (probe_pos < override_pos < rf_pos):
+        return fail("gui_cxadc_start must probe, apply the measured rate, then set rf_sample_rate_hz")
+    return 0
+
+
+def check_raw_direct_writer_runtime(repo_root: Path) -> int:
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: direct RAW writer runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for direct RAW writer runtime guard")
+        print("SKIP: direct RAW writer runtime guard (cc not available)")
+        return 0
+
+    sources = [
+        repo_root / "misrc_tools/test/gui_record_direct_harness.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c",
+        repo_root / "misrc_tools/common/buffer_manager.c",
+        repo_root / "misrc_tools/common/ringbuffer.c",
+        repo_root / "misrc_tools/common/rb_event.c",
+    ]
+    for path in sources:
+        if not path.exists():
+            return fail(f"Direct RAW writer runtime source is missing: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="misrc_direct_raw_guard_") as temp_root:
+        exe_name = "gui_record_direct_guard.exe" if os.name == "nt" else "gui_record_direct_guard"
+        exe_path = Path(temp_root) / exe_name
+        compile_cmd = [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-D_DEFAULT_SOURCE",
+        ]
+        if sys.platform == "darwin":
+            compile_cmd.insert(3, "-D_DARWIN_C_SOURCE")
+        compile_cmd += [str(p) for p in sources]
+        if sys.platform.startswith("linux"):
+            compile_cmd += ["-lpthread"]
+        compile_cmd += ["-o", str(exe_path)]
+        try:
+            run_checked(compile_cmd)
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "Failed to compile direct RAW writer runtime harness\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
+        try:
+            run_checked([str(exe_path)])
+        except subprocess.CalledProcessError as exc:
+            return fail(
+                "Direct RAW writer runtime harness failed\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            )
     return 0
 
 
@@ -4867,6 +5682,123 @@ def check_capture_metadata_post_build(gui_path: Path) -> int:
     return 0
 
 
+def check_audio_record_alignment_contract(repo_root: Path) -> int:
+    """Static contract for the F1 record-alignment transitions in the
+    audio thread: transitions detected at the top of the loop (bounded by
+    the 2 ms read timeout, so within ~2-4 ms of the record button), a
+    discard-to-now of buffered pre-record audio at record START at the
+    576 B producer granularity, and a flush-to-now of buffered tail audio
+    at record STOP (the old semantics wrote up to one full ~350 ms block
+    of pre-record audio at record START)."""
+    audio_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.c")
+    buffer_manager_c = read_text(repo_root / "misrc_tools/common/buffer_manager.c")
+
+    required_snippets = [
+        (audio_c, "#define AUDIO_SYNC_CHUNK_BYTES 576", "producer-granularity sync chunk (48 frames x 12 B)"),
+        (audio_c, "static uint64_t audio_discard_ring_to_now(", "discard-to-now helper"),
+        (audio_c, "static uint64_t audio_flush_ring_to_files(", "flush-to-now helper"),
+        (audio_c, "static void audio_write_recorded_block(", "shared block-write helper"),
+        (audio_c, "BUF_CAPTURE_AUDIO,\n                                    AUDIO_SYNC_CHUNK_BYTES, 0)", "sync helpers use no-wait full chunks"),
+        (audio_c, "[AUDIO] Record start aligned", "start-alignment log line"),
+        (audio_c, "[AUDIO] Record stop aligned", "stop-alignment log line"),
+        (audio_c, "bool was_recording = (a->f_4ch != NULL)", "pre-opened-files recording init"),
+        (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);", "2 ms read timeout keeps the transition observation at ~2-4 ms"),
+        (buffer_manager_c, "if (timeout_ms == 0) return NULL;", "timeout-0 read returns only full available chunks"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"Audio record alignment contract missing {label}: {snippet}")
+
+    # The transition handler must sit at the TOP of the audio loop, before
+    # the main full-block read, so transitions are observed within the
+    # 10 ms read-timeout spin instead of only at the next full ~350 ms block.
+    thread_body = func_body_from(audio_c, "static int audio_thread_main(void *ctx)")
+    loop_pos = thread_body.find("while (1) {")
+    transition_pos = thread_body.find("bool rec_now = a->app && a->app->is_recording;")
+    read_pos = thread_body.find("bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);")
+    if min(loop_pos, transition_pos, read_pos) < 0:
+        return fail("Audio record alignment anchors not found in audio_thread_main")
+    if not (loop_pos < transition_pos < read_pos):
+        return fail("Audio record transition handler must sit at the top of the audio loop, before the main full-block read")
+
+    # START discards, STOP flushes: both through the producer-granularity
+    # chunk (12,288 B = one clockgen capture-thread write) and both before
+    # the main full-block read path runs.
+    start_discard_pos = thread_body.find("audio_discard_ring_to_now(a);", transition_pos)
+    stop_flush_pos = thread_body.find("audio_flush_ring_to_files(a);", transition_pos)
+    if start_discard_pos < 0 or stop_flush_pos < 0:
+        return fail("Audio record transitions must call the discard/flush helpers")
+    if not (start_discard_pos < read_pos and stop_flush_pos < read_pos):
+        return fail("Audio record transition handlers must run before the main full-block read")
+
+    # The flush must write through the same conversion path (peaks + block
+    # writer) rather than dropping the tail.
+    flush_body = func_body_from(audio_c, "static uint64_t audio_flush_ring_to_files")
+    for snippet in ["audio_update_peaks", "audio_write_recorded_block", "bufmgr_read_end"]:
+        if snippet not in flush_body:
+            return fail(f"audio_flush_ring_to_files must use the shared write path: missing {snippet}")
+    return 0
+
+
+def check_cxadc_sync_start_contract(repo_root: Path) -> int:
+    """Static contract for the F1b synchronized card starts: after the
+    sequential capture-start rate probes (which leave card 0's stream ~one
+    probe duration behind card 1's in wall-clock content time), both cards
+    are drained to their current 2 MiB release boundary and skipped to a
+    common content instant T_ref BEFORE the RF lockstep thread starts, so
+    the recorded A/B content offset is bounded by read granularity and
+    measurement slop instead of the probe skew (~114 ms measured)."""
+    cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
+
+    required_snippets = [
+        (cxadc_c, "static void cxadc_sync_card_starts(", "synchronized-start routine"),
+        (cxadc_c, "#define CXADC_SYNC_CHUNK_BYTES", "sync chunk granularity"),
+        (cxadc_c, "#define CXADC_SYNC_LIVE_CHUNK_MIN_US", "live-detection threshold"),
+        (cxadc_c, "#define CXADC_SYNC_GRID_LIVE_MIN_US", "grid-read live-detection threshold"),
+        (cxadc_c, "#define CXADC_SYNC_TREF_MARGIN_US", "T_ref margin"),
+        (cxadc_c, "#define CXADC_SYNC_MAX_DRAIN_BYTES", "drain byte cap"),
+        (cxadc_c, "#define CXADC_SYNC_MAX_TOTAL_US", "total sync budget"),
+        (cxadc_c, "static size_t s_cxadc_probe_consumed_bytes[CXADC_MAX_CARDS];", "per-session consumed grid reference"),
+        (cxadc_c, "[CXADC] sync-start:", "sync-start log line"),
+    ]
+    for text, snippet, label in required_snippets:
+        if snippet not in text:
+            return fail(f"CXADC synchronized start contract missing {label}: {snippet}")
+
+    sync_body = func_body_from(cxadc_c, "static void cxadc_sync_card_starts")
+    for snippet in [
+        "CXADC_SYNC_LIVE_CHUNK_MIN_US",          # phase-1 drain live heuristic
+        "% CXADC_SYNC_RELEASE_BYTES",           # grid-align to the 2 MiB boundary grid
+        "rem - (size_t)got",                    # exact-remainder consumption (no overshoot)
+        "CXADC_SYNC_GRID_LIVE_MIN_US",          # grid-read full-period wait detection
+        "cxadc_sync_read_card(ctx, i, buf, 1)",  # 1-byte boundary-crossing probe
+        "probe_us >= 1000",                     # probe must truly block (crossing measured)
+        "t_ref += CXADC_SYNC_TREF_MARGIN_US",   # common target with margin
+        "delta_us * byte_rate",                 # skip bytes from content-time delta
+        "card_sample_rate_hz[i]",               # per-card measured rate
+        "tenbit_mode[i]",                       # per-card sample width
+        "s_cxadc_probe_consumed_bytes[i]",       # grid reference from the probe's consumed count
+    ]:
+        if snippet not in sync_body:
+            return fail(f"cxadc_sync_card_starts missing required logic: {snippet}")
+
+    # The sync must run AFTER the capture-start probe loop and BEFORE the RF
+    # capture thread is created, gated on two or more cards.
+    start_body = func_body_from(
+        cxadc_c, "int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)")
+    probe_pos = start_body.find("cxadc_probe_and_cache_card_rate(app, i, s_cxadc.tenbit_mode[i],")
+    sync_call_pos = start_body.find("cxadc_sync_card_starts(&s_cxadc, open_count);")
+    gate_pos = start_body.find("if (open_count > 1) {")
+    rf_thread_pos = start_body.find("thrd_create_with_priority(&s_cxadc.rf_thread,")
+    if min(probe_pos, sync_call_pos, gate_pos, rf_thread_pos) < 0:
+        return fail("CXADC sync-start ordering anchors not found in gui_cxadc_start")
+    if not (probe_pos < sync_call_pos < rf_thread_pos):
+        return fail("cxadc_sync_card_starts must run after the capture-start probes and before the RF thread starts")
+    if not (gate_pos < sync_call_pos):
+        return fail("cxadc_sync_card_starts must be gated on open_count > 1 (the cards this capture opened)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -4906,11 +5838,14 @@ def main() -> int:
         ("actions runtime policy", lambda: check_actions_runtime_policy(workflow_path)),
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
+        ("MSYS2 toolchain policy", lambda: check_msys2_toolchain_policy(workflow_path)),
+        ("libc direct-include contract", lambda: check_libc_direct_include_contract(repo_root)),
         ("meson FFT policy", lambda: check_meson_fft_policy(meson_path)),
         ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
-        ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path, gui_c_path)),
+        ("linux desktop metadata", lambda: check_linux_desktop_metadata(repo_root, workflow_path)),
+        ("window identity contract", lambda: check_window_identity_contract(repo_root)),
         ("WM_CLASS matches GUI window class", lambda: check_wm_class_consistency(gui_c_path, repo_root)),
         ("native Wayland build and window platform", lambda: check_native_wayland_contract(repo_root)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_ui_c_path)),
@@ -4951,10 +5886,11 @@ def main() -> int:
         ("every settings field is in the table", lambda: check_settings_table_covers_struct(repo_root)),
         ("net settings protocol contract", lambda: check_net_settings_protocol(repo_root)),
         ("record button follows the effective recording state", lambda: check_record_parity(repo_root)),
-        ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path, gui_c_path)),
+        ("AppRun static contract", lambda: check_apprun_static_contract(repo_root)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
+        ("release download link contract", lambda: check_release_download_link_contract(repo_root, workflow_path)),
         ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("CI-only tier contract",
@@ -4963,6 +5899,11 @@ def main() -> int:
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
+        ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
+        ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
+        ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),
+        ("audio record alignment contract", lambda: check_audio_record_alignment_contract(repo_root)),
+        ("CXADC synchronized start contract", lambda: check_cxadc_sync_start_contract(repo_root)),
         ("CXADC card B stays closed when RF B is off", lambda: check_cxadc_skips_card_b_when_rf_b_off(repo_root)),
         ("pane menu and per-pane source", lambda: check_pane_menu_contract(repo_root)),
         ("channel gear clears the panel labels", lambda: check_channel_gear_clearance(repo_root)),
@@ -4975,7 +5916,7 @@ def main() -> int:
         ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
     ]
     if not args.static_only:
-        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path, gui_c_path)))
+        checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
         checks.insert(9, ("ringbuffer mirror runtime", lambda: check_ringbuffer_mirror_runtime(repo_root)))
         checks.insert(10, ("net fanout runtime", lambda: check_net_fanout_runtime(repo_root)))
@@ -4992,7 +5933,8 @@ def main() -> int:
         checks.insert(15, ("priority clamp runtime", lambda: check_priority_clamp_runtime(repo_root)))
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
         checks.insert(17, ("SDTV preview geometry runtime", lambda: check_preview_sdtv_geometry_runtime(repo_root)))
-        checks.insert(10, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
+        checks.insert(10, ("direct RAW writer runtime", lambda: check_raw_direct_writer_runtime(repo_root)))
+        checks.insert(11, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
     # that catches vendored-dep shadowing and silent FX3-disable on every build.

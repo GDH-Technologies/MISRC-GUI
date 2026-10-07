@@ -5,8 +5,8 @@ End users should grab prebuilt binaries from the [releases page](https://github.
 ## Prerequisites
 
 ### Windows
-- [MSYS2](https://www.msys2.org/) with the `MINGW64` environment and these packages:
-  `mingw-w64-x86_64-cmake mingw-w64-x86_64-fftw mingw-w64-x86_64-flac mingw-w64-x86_64-gcc mingw-w64-x86_64-libusb mingw-w64-x86_64-libsoxr mingw-w64-x86_64-meson mingw-w64-x86_64-nasm mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf`
+- [MSYS2](https://www.msys2.org/) with the `UCRT64` environment (MINGW64 is deprecated by MSYS2; CI uses UCRT64) and these packages:
+  `mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-flac mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libusb mingw-w64-ucrt-x86_64-libsoxr mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf`
 - Python 3 (for Meson; the bootstrap script auto-installs user-level `meson` + `ninja` if missing)
 - `nasm` (provided by the MSYS2 package above)
 
@@ -48,7 +48,7 @@ Both entry points auto-build the vendored dependencies (see below) on first run 
 
 hsdaoh, libuvc, and raylib are not available as system packages on all platforms, so they are built from source into `.deps/install` (mirroring the CI `windows-exe` / `linux-appimage` / `macos-app-build` deps blocks). The deps build is stamp-gated: a content-addressed hash of the hsdaoh source tree + raylib tag + libuvc ref + system dep versions is stored in `.deps/install/.build-stamp`; the build skips instantly when the stamp matches, so new terminals and CI runs reuse until an input changes.
 
-- **Windows**: `scripts/build-local.ps1` auto-invokes `scripts/build-deps-windows.sh` (via MSYS2 MINGW64) on first run or when inputs change. No manual deps step needed.
+- **Windows**: `scripts/build-local.ps1` auto-invokes `scripts/build-deps-windows.sh` (via MSYS2 UCRT64) on first run or when inputs change. No manual deps step needed.
 - **Linux/macOS**: `scripts/build-local.sh` auto-invokes `scripts/build-deps-unix.sh` on first run or when inputs change.
 - **CI**: `actions/cache@v4` on `.deps/install` (keyed on `hashFiles(third_party/hsdaoh/**)` + raylib/libuvc versions) skips the rebuild on cache hit.
 - **Prebuilt publishing**: `scripts/publish-deps-cache.sh <platform> <arch>` packages `.deps/install` into a tar.xz + sha256 for upload to `harrypm/MISRC-ci-cache` (mirrors the existing libFLAC cache flow), so cold starts can download instead of compiling.

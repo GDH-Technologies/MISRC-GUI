@@ -735,7 +735,7 @@ jobs:
 
           # Desktop entry, rewritten idempotently.
           #
-          # StartupWMClass must equal GUI_WINDOW_CLASS_NAME in
+          # StartupWMClass must equal MISRC_WINDOW_CLASS_TITLE in
           # misrc_tools/misrc_gui/core/misrc_gui.c. The GUI creates its window under that
           # constant, so WM_CLASS is identical for every build and does not depend on how
           # the app was started.

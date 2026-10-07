@@ -95,7 +95,7 @@ build mirroring upstream's `windows-exe` job, installs to `%LOCALAPPDATA%\Progra
 a Start Menu shortcut). PRs build and guard-test on wm and win0. `bump-tag` mints
 `v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
-`GUI_WINDOW_CLASS_NAME` (guarded), and on native Wayland its file name must equal the app_id
+`MISRC_WINDOW_CLASS_TITLE` (guarded), and on native Wayland its file name must equal the app_id
 `GUI_WAYLAND_APP_ID` (`misrc_gui.desktop`). Linux raylib is built with GLFW's Wayland AND X11
 backends plus `scripts/patches/raylib-5.5-window-class.patch` (app_id, logical-size
 framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (guarded).

@@ -11,6 +11,18 @@ warnings = [
   '-Wall',
   '-Wextra',
   '-Wshadow',
+  # GCC >= 14 and clang >= 16 make these four hard errors by default (C99+),
+  # but the older toolchains still used on some CI runners (ubuntu-22.04
+  # gcc 11, Apple clang, NDK clang 14) only warn. A missing libc include
+  # (e.g. malloc/free without <stdlib.h>) then breaks ONLY the MSYS2 Windows
+  # jobs, after a full vendored-deps rebuild (run 37035393223: gui_record_direct.c
+  # failed there while Linux/macOS passed). Promoting them to -Werror here
+  # makes every platform fail at the first compile instead, and keeps old
+  # compilers at the same strictness the Windows toolchain already enforces.
+  '-Werror=implicit-function-declaration',
+  '-Werror=implicit-int',
+  '-Werror=int-conversion',
+  '-Werror=incompatible-pointer-types',
 ]
 
 cflags = warnings + [
@@ -345,6 +357,16 @@ if host_system == 'windows' or host_system == 'cygwin'
   ldflags += [ '-static', '-static-libgcc' ]
   if meson.get_compiler('c').get_id() == 'gcc'
     ldflags += [ '-lgomp' ]
+  elif soxr_dep.found()
+    # MSYS2's clang-built static libsoxr.a is compiled with OpenMP enabled
+    # (soxr.c uses #pragma omp; filter.c uses omp_* locks), so the -static
+    # link needs the LLVM OpenMP runtime -lomp (shipped by
+    # mingw-w64-clang-aarch64-llvm-openmp; libomp.a). The gcc environments
+    # get the equivalent from -lgomp above. Run 37053411644 (Windows arm64)
+    # failed with: ld.lld: error: undefined symbol: __kmpc_fork_call /
+    # omp_init_lock ... >>> referenced by libsoxr.a(soxr.c.obj) /
+    # libsoxr.a(filter.c.obj).
+    ldflags += [ '-lomp' ]
   endif
   ldflags_capture += [ '-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lonecore' ]
   sources_capture += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'
@@ -461,6 +483,7 @@ if raylib_dep.found()
     'misrc_gui/output/gui_capture_sidecar.c',
     'misrc_gui/output/gui_video_record.c',
     'misrc_gui/output/gui_cc_record.c',
+    'misrc_gui/output/gui_record_direct.c',
     'misrc_gui/output/gui_audio.c',
     'common/extract.c',
     'common/ringbuffer.c',
@@ -744,6 +767,28 @@ ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   c_args: cflags,
 )
 test('gui_ddd_async_policy', ddd_async_policy_test)
+
+# Byte-exact direct RAW record path: the real tap push + writer thread
+# against the real buffer manager/ringbuffer, with an in-memory spill stub
+# (no raylib/GUI dependency).
+gui_record_direct_test = executable('gui_record_direct_test',
+  ['test/gui_record_direct_harness.c',
+   'misrc_gui/output/gui_record_direct.c',
+   'common/buffer_manager.c',
+   'common/ringbuffer.c',
+   'common/rb_event.c'],
+  dependencies: [ meson.get_compiler('c').find_library('pthread', required: false) ],
+  c_args: cflags,
+)
+test('gui_record_direct', gui_record_direct_test)
+
+# CXADC measured feed-rate tier snapping (dependency-free header).
+cxadc_rate_tiers_test = executable('cxadc_rate_tiers_test',
+  'test/cxadc_rate_tiers_test.c',
+  dependencies: [],
+  c_args: cflags,
+)
+test('cxadc_rate_tiers', cxadc_rate_tiers_test)
 
 if ddd_enabled
   ddd_async_fault_test = executable('gui_ddd_async_fault_test',
