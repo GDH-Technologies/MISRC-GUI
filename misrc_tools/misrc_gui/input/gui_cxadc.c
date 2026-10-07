@@ -2492,6 +2492,29 @@ static int cxadc_sync_read_card(cxadc_ctx_t *ctx, int i, uint8_t *buf, size_t n)
 #endif
 }
 
+// Land every card on a whole sample. The 1-byte crossing probe leaves a
+// tenbit (2 bytes/sample) fd one byte into a sample, and the phase-4 skip is
+// even at the integer-MHz rates, so without this every word the RF thread
+// decodes pairs the high byte of one sample with the low byte of the next,
+// and a direct .u16 file starts mid-sample. No deadline: at most one byte per
+// card, and leaving it would be worse.
+static void cxadc_sync_land_on_sample(cxadc_ctx_t *ctx, int card_count, uint8_t *buf,
+                                      size_t consumed_total[CXADC_MAX_CARDS])
+{
+    for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+        size_t bytes_per_sample = ctx->tenbit_mode[i] ? 2u : 1u;
+        size_t misalign = consumed_total[i] % bytes_per_sample;
+        size_t rem = misalign ? (bytes_per_sample - misalign) : 0;
+        while (rem > 0) {
+            int got = cxadc_sync_read_card(ctx, i, buf, rem);
+            if (got < 0) break;
+            if (got == 0) continue;
+            consumed_total[i] += (size_t)got;
+            rem = ((size_t)got >= rem) ? 0 : (rem - (size_t)got);
+        }
+    }
+}
+
 static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
 {
     if (!ctx || card_count < 2) return;
@@ -2584,6 +2607,7 @@ static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
     if (t_ref == 0) {
         fprintf(stderr, "[CXADC] sync-start: no boundary crossing measured within "
                         "budget (caps or read errors); streams left at drain positions (unaligned)\n");
+        cxadc_sync_land_on_sample(ctx, card_count, buf, consumed_total);
         free(buf);
         return;
     }
@@ -2609,6 +2633,7 @@ static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
         }
     }
 
+    cxadc_sync_land_on_sample(ctx, card_count, buf, consumed_total);
     free(buf);
 
     fprintf(stderr, "[CXADC] sync-start: exact boundary alignment to a common content instant;");
