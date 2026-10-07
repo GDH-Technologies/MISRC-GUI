@@ -38,7 +38,9 @@ python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/m
 build-local/misrc_gui --rtsp-soak          # capture-path acceptance: RF throughput stream-off vs stream-on
 ```
 
-Windows host (MSYS2 MINGW64 at `C:\msys64`, packages per `build.yml`'s `windows-exe` job):
+Windows host (MSYS2 at `C:\msys64`, packages per `build.yml`'s `windows-exe` job; upstream moved
+that job and both scripts from MINGW64 to UCRT64 in v1.2.4, preferring `/ucrt64` and falling back
+to `/mingw64`):
 `pwsh -File scripts/build-local.ps1 [-All] [-Clean]` builds `.deps/install` via
 `scripts/build-deps-windows.sh` and then `build-local/misrc_gui.exe`, running `--smoke-test`
 itself; guards are `python misrc_tools/test/ci_guard_tests.py --static-only` and
@@ -91,7 +93,8 @@ source check; the vendored library is what links.
 `docs/gdh-selfhosted-ci.md`. `selfhosted-deploy.yml` runs on the org's own runners: `wm`
 (Linux, every event), `cs0` (Linux, `main` + tags only), `air0` (macOS ARM64, `main` + tags
 only, builds `~/Applications/MISRC.app`), `win0` (Windows x64, every event, MSYS2 MINGW64
-build mirroring upstream's `windows-exe` job, installs to `%LOCALAPPDATA%\Programs\MISRC` +
+build after upstream's `windows-exe` job, which itself moved to UCRT64 in v1.2.4 -- win0 not
+migrated yet; installs to `%LOCALAPPDATA%\Programs\MISRC` +
 a Start Menu shortcut). PRs build and guard-test on wm and win0. `bump-tag` mints
 `v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
@@ -102,14 +105,16 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 89
-  checks in a Linux `--post-build` run (capture metadata, 2026-10-02), several of which compile and run C
-  harnesses in `misrc_tools/test/*_harness.c`. Meson has thirteen `test()` targets
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 102
+  checks in a Linux `--post-build` run (v1.2.4 sync, 2026-10-07), several of which compile and run C
+  harnesses in `misrc_tools/test/*_harness.c`. Meson has fifteen `test()` targets
   (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
   must keep the fork's `"Preview"` entry.
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
   touches the capture path; run it and quote the numbers.
-- Headless modes for automation (`misrc_gui --help`): `--auto-record`,
+- Headless modes for automation (`misrc_gui --help`):
+  `--headless-record <dir> [secs] [video] [raw] [cc]` (the fork's Simulated-device recorder;
+  `--auto-record` until the v1.2.4 sync, renamed so upstream's flag of that name works),
   `--session-selftest`, `--capture-meta-selftest [keep_dir] [secs]` (both on scratch settings
   files), `--config <path>`
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
@@ -125,6 +130,11 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
   with no click — with a window. Upstream's `misrc_tools/test/cxadc_remote_capture_ci.sh`
   drives a server/client pair through it; that script is not wired into meson or CI and is
   unproven here.
+- Upstream's v1.2.4 local automation flags are windowed too: `--select-device <index|name>`
+  (exits 1 on no match), `--auto-capture` (Local mode, no `--config` needed) and
+  `--auto-record <secs>` (capture, settle 2 s, record, finalize, exit 0/1, `[AUTO]` lines on
+  stderr). Without `--config` they run on the LIVE settings file; give them a scratch config
+  with `overwrite_files` true, or the overwrite prompt stalls the cycle.
 - No formatter — there is no `.clang-format` upstream or here. Match the surrounding code.
 - Two hooks enforce this automatically (`.claude/settings.json`): `guards-on-edit.py` runs
   `--static-only` after any edit to a guard-matched file (the deploy workflow, `meson.build`,
@@ -156,6 +166,20 @@ callback-gating edits have silently broken GUI feeds before):
   (`#if !defined(_WIN32)`); on Windows a failed `Set-CxadcWinConfig` returns -1 and aborts
   the capture instead. Do not "fix" either by widening the Linux branch — upstream's own
   plan is to make the Windows baseline explicit and give it its own fallback.
+- One producer per record ring (v1.2.4, `dev/prompt_cxadc_direct_native_raw_stream_readme.md`):
+  a direct-RAW channel's `BUF_RECORD_A/B` is fed only by the CXADC capture-thread tap, and
+  extraction skips it (the direct mask in `gui_extract_set_recording`). The tap gate latches
+  the record decision once per RF iteration for both channels (c1b231b), and
+  `gui_record_stop` disables the taps and waits them idle before `is_recording` clears.
+  Guarded ("raw direct passthrough contract").
+- Every C file includes the header of each libc function it calls itself, never through a
+  platform-conditional transitive include: MSYS2 makes an implicit declaration a hard error,
+  and `meson.build` now passes `-Werror=implicit-function-declaration` (and friends) on every
+  platform. Guarded ("libc direct-include contract"), fork harnesses included.
+- CXADC rates are measured (v1.2.4): GUI device enumeration briefly reads each card once per
+  session (`MISRC_GUI_NO_CXADC_RATE_PROBE=1` opts out; a card another process holds is EBUSY
+  and skipped), and capture start probes, then aligns, the cards it opened (`[CXADC]
+  sync-start:` in the log) before the RF thread runs.
 
 Fork-side:
 
@@ -168,18 +192,19 @@ Fork-side:
   count, 0 past 2^36 (libFLAC wraps; ~28.6 min at 40 MSps). Upstream's finalize (9997eca)
   scales it to kHz, which truncates decodes in readers that trust it: on every sync keep the
   fork's `gui_record` finalize and resolve only `flac_writer.c` toward upstream.
-- RAW output is a CX card's native layout: unsigned offset binary, `.u8` = 8-bit sample +128,
-  `.u16` = the 12-bit sample left-justified (`<<4`, low nibble 0) +32768, LE, full 16-bit scale
-  like the 16-bit FLAC path. A CX card's 16-bit (`tenbit`) mode is itself 12 significant bits
-  left-justified (measured on wm's cxadc0, 2026-10-01: every one of 16.7M words a multiple
-  of 16), so the GUI's `(u16-32768)>>4` decode is lossless and a CX capture's `.u8`/`.u16`
-  is byte-identical to `cat /dev/cxadcN`. Upstream v1.2.3 (f693070) adopted the names but
-  still writes signed samples; the fork's `convert_i16_to_raw_bytes` (27c020f, then the
-  left-justify fix) makes them true and is owed upstream. Until harrypm takes it, keep the
-  fork's side of that function on every sync: signed data under a `.u8`/`.u16` name decodes
-  as a scrambled waveform, no error, and a 12-bit-scale `.u16` reads as 1/16 ADC occupancy
-  in the toolkit. v1.2.3-gdh.1 alone wrote that 12-bit-scale `.u16`. Both auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in
-  the table) must agree; `--video-name-test` checks it for FLAC and RAW.
+- RAW output follows upstream since the v1.2.4 sync (Reece's call, 2026-10-07): the name says
+  what the file holds. A CXADC channel with FLAC off and resample off records through the
+  direct tap, the card's own bytes: `.u8` (8-bit) / `.u16` (`tenbit`: 12 significant bits
+  left-justified, unsigned, LE), byte-identical to `cat /dev/cxadcN`. Every other RAW path
+  (MISRC, a resampled CX channel) is converted: signed `.s8` / `.s16`, and `.s16` is
+  12-bit scale (int16 as-is), not full scale. The predicate is
+  `gui_record_direct_channel_eligible`; it needs a running CXADC capture, so the load-time
+  preview in the table always says `.s8`/`.s16` and `gui_record_apply_auto_names` renames at
+  record start. The fork's unsigned converter (27c020f, 612c086) is retired; v1.2.3-gdh.2..9
+  wrote unsigned left-justified data under `.u8`/`.u16` for MISRC and resampled captures too,
+  and v1.2.3-gdh.1 a 12-bit-scale `.u16`. The toolkit reads only `.u8`/`.u16` today. Both
+  auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in the table)
+  must agree; `--video-name-test` checks it for FLAC and converted RAW.
 - Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
   channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
   `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate
@@ -232,7 +257,7 @@ Fork-side:
   throwaway local edit, launch with `MISRC_GUI_PLATFORM=x11` and grab the window with
   python-xlib `get_image`.
 - Headless modes that call `gui_settings_load`/`save` without `--config` hit the LIVE settings
-  file of whoever runs them: `--auto-record` saves defaults before the override applies, and
+  file of whoever runs them: `--headless-record` saves defaults before the override applies, and
   `--video-settings-test` rewrote it with probe values until it got a scratch path. On wm that
   file is the running server's; never run those bare on a host with a live GUI.
 - FLAC defaults are level 8 since the v1.2.1 sync (upstream's `c4bb577`) and threads
@@ -243,7 +268,7 @@ Fork-side:
   already saved `flac_threads` 0 keeps 0 — and upstream's startup popup then fires once per
   launch on an attended GUI until someone raises it (v1.2.2 adds a sibling popup for a saved
   level 1-3; since v1.2.3 neither fires while `use_flac` is off). Both popups live in the render loop, so no headless
-  mode can reach it: `--net-serve`, `--auto-record` and the preview/video/rtsp modes all
+  mode can reach it: `--net-serve`, `--headless-record` and the preview/video/rtsp modes all
   return before `InitWindow`, which is why cs0's `--config ... --net-serve` unit is unaffected.
 
 - Capture metadata (what a capture is OF: the toolkit's asset ids, client, title, label,
