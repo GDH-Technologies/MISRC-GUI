@@ -67,6 +67,8 @@ typedef struct {
     double real_sample_rate_hz;  // Resolved real sample rate in Hz (e.g. 20000000 for a
                                  // 20 MSPS RF capture, or 44100 for a true audio file)
     bool valid;                  // File was successfully opened/validated
+    bool length_provisional;     // Bounded tail endpoint; full reader still verifies it
+    bool length_verification_failed; // Full reader rejected/retracted that endpoint
 } playback_file_info_t;
 
 //-----------------------------------------------------------------------------
@@ -78,11 +80,37 @@ typedef struct {
 // Returns 0 on success, -1 on error
 int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b);
 
+// UI startup: file preparation is private to a joinable background loader.
+// Poll every render frame (also publishes background lengths):
+// 1 startup committed, -1 failed/cancelled, 0 no startup result.
+int gui_playback_start_async(gui_app_t *app, const char *file_a, const char *file_b);
+bool gui_playback_is_starting(gui_app_t *app);
+int gui_playback_poll_start(gui_app_t *app);
+void gui_playback_cancel_start(gui_app_t *app);
+// Shutdown only: cancel and join before releasing the app and its buffers.
+void gui_playback_finish_start(gui_app_t *app);
+
+
 // Stop playback and close files
 void gui_playback_stop(gui_app_t *app);
 
 // Check if playback is currently active
 bool gui_playback_is_running(gui_app_t *app);
+
+// A valid file may have zero/unknown length while the independent reader runs.
+// These getters, file-info getters and poll/stop belong to the render thread.
+bool gui_playback_is_indexing(gui_app_t *app, int channel); // 0=A, 1=B
+typedef struct {
+    uint64_t bytes_scanned;       // Audio bytes read, excluding FLAC metadata
+    uint64_t total_bytes;
+    bool active;                 // Includes a requested channel waiting its turn
+    bool queued;
+    bool waiting;                // Yielding to capture/record/playback pressure
+} playback_index_progress_t;
+// Render-thread snapshot; returns false and zeros out when no work is pending.
+bool gui_playback_get_index_progress(gui_app_t *app, int channel,
+                                     playback_index_progress_t *out);
+double gui_playback_get_channel_rate_hz(gui_app_t *app, int channel);
 
 // Get current playback state
 playback_state_t gui_playback_get_state(gui_app_t *app);
@@ -176,6 +204,8 @@ void gui_playback_request_analysis_window(gui_app_t *app, int channel,
 // slice_count x BINS float array (normalized 0-1 intensities, max-hold across
 // the slice's sub-windows — see the HARD DEV NOTE in gui_playback.c). The
 // render thread only resamples + LUT-maps these (no FFTs on the render path).
+// The array is pinned until the next successful poll on this channel or stop;
+// do not retain it across disconnect/reconnect.
 bool gui_playback_poll_analysis_window(gui_app_t *app, int channel,
                                         uint64_t *io_seq,
                                         const float **out_magnitudes,

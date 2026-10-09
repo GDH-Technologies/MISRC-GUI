@@ -27,7 +27,10 @@
 
 // ---- Framework stubs (not under test) ----
 void gui_app_set_status(gui_app_t *app, const char *message) { (void)app; (void)message; }
-int gui_extract_start(gui_app_t *app) { (void)app; return 0; }
+void gui_extract_prepare_stream(gui_app_t *app) { (void)app; }
+int gui_extract_start_tagged(gui_app_t *app) { (void)app; return 0; }
+bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2])
+{ (void)info; (void)counts; return true; }
 void gui_extract_stop(void) {}
 int gui_display_thread_start(display_thread_t *dt,
                              struct gui_app *app,
@@ -40,6 +43,8 @@ void *bufmgr_write_begin(buffer_manager_t *mgr, buffer_id_t id,
 { (void)id; (void)bytes; (void)policy; return mgr ? NULL : NULL; }
 void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes)
 { (void)mgr; (void)id; (void)bytes; }
+void bufmgr_signal_data(buffer_manager_t *mgr, buffer_id_t id)
+{ (void)mgr; (void)id; }
 double GetTime(void) { return 0.0; }  /* raylib, not linked */
 
 static int failures;
@@ -253,12 +258,11 @@ static void test_io_layer_patch_and_seek(const char *path)
 {
     test_case = "io_layer_patch_and_seek";
 
-    playback_probe_t probe = {0};
-    bool have_probe = gui_playback_probe_file(path, &probe);
-    expect_true(have_probe, "probe must read the header");
-    expect_true(probe.have_true_total, "probe must find the true total");
-    expect_u64(probe.true_total_samples, TEST_SAMPLES, "probe true total");
-    expect_u64(probe.header_total_samples, ((uint64_t)TEST_SAMPLES + 500u) / 1000u,
+    playback_file_info_t info = {0};
+    bool have_info = gui_playback_validate_file(path, &info);
+    expect_true(have_info, "validation must read the header and RF tags");
+    expect_u64(info.total_samples, TEST_SAMPLES, "resolved true total");
+    expect_u64(info.header_total_samples, ((uint64_t)TEST_SAMPLES + 500u) / 1000u,
                "header total is the kHz-domain value");
 
     FILE *f = fopen(path, "rb");
@@ -266,7 +270,7 @@ static void test_io_layer_patch_and_seek(const char *path)
     if (!f) return;
 
     playback_io_t io;
-    gui_playback_io_reset(&io, f, NULL, probe.true_total_samples);
+    gui_playback_io_reset(&io, f, NULL, info.total_samples);
     expect_true(io.stage == PLAYBACK_IO_STAGE_SERVING, "patch staging armed");
 
     FLAC__StreamDecoder *dec = FLAC__stream_decoder_new();
@@ -312,10 +316,25 @@ int main(void)
 {
     char path_old[256];
     char path_new[256];
-    snprintf(path_old, sizeof(path_old), "/tmp/misrc_pb_%d_test_rf_8-bit_20msps.flac",
-             (int)getpid());
-    snprintf(path_new, sizeof(path_new), "/tmp/misrc_pb_%d_test_fin_8-bit_20msps.flac",
-             (int)getpid());
+    const char *temp_dir = getenv("TMPDIR");
+#if defined(_WIN32) || defined(_WIN64)
+    if (!temp_dir || !temp_dir[0]) temp_dir = getenv("TEMP");
+    if (!temp_dir || !temp_dir[0]) temp_dir = getenv("TMP");
+    if (!temp_dir || !temp_dir[0]) temp_dir = ".";
+#else
+    if (!temp_dir || !temp_dir[0]) temp_dir = "/tmp";
+#endif
+    int old_len = snprintf(path_old, sizeof(path_old),
+                           "%s/misrc_pb_%d_test_rf_8-bit_20msps.flac",
+                           temp_dir, (int)getpid());
+    int new_len = snprintf(path_new, sizeof(path_new),
+                           "%s/misrc_pb_%d_test_fin_8-bit_20msps.flac",
+                           temp_dir, (int)getpid());
+    if (old_len < 0 || (size_t)old_len >= sizeof(path_old) ||
+        new_len < 0 || (size_t)new_len >= sizeof(path_new)) {
+        fprintf(stderr, "temporary fixture path is too long\n");
+        return 1;
+    }
 
     test_case = "generate";
     expect_true(write_test_flac(path_old, TEST_SAMPLES), "write OLD-convention flac");

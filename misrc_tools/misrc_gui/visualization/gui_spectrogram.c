@@ -102,12 +102,6 @@ typedef struct spectro_engine {
     uint64_t analysis_playhead;      // Playhead sample of the last request
     double analysis_span_seconds;    // Requested span (wheel adjustable)
     uint64_t analysis_seq;          // Last consumed analysis result seq
-    // Snapshot of the last consumed analysis result: the published magnitude
-    // buffer stays valid until the next publish, so a palette change can
-    // instantly re-map the SAME spectra through the new LUT (true reload).
-    const float *analysis_last_mags;
-    size_t analysis_last_count;
-    size_t analysis_last_bins;
 
     // Palette dropdown (top-right): Phosphor / Heat. Changing the palette
     // reloads the view (paused: instant re-map of the last result + re-request;
@@ -430,35 +424,42 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
             e->frame_valid = true;
             spectro_write_slice_index(e, (int)i);
         }
-        // Keep the snapshot for an instant palette-change re-map.
-        e->analysis_last_mags = mags;
-        e->analysis_last_count = slice_count;
-        e->analysis_last_bins = bins;
     }
 }
 
 // Reload the view after a palette change (same spectra, new LUT):
-// - Paused analysis: instantly re-map the last result snapshot through the
+// - Paused analysis: instantly re-map the current publication through the
 //   new LUT AND re-request the window (guarantees a fully-correct render
 //   even if a new publish raced the snapshot).
 // - Rolling: the history pixels are already LUT-mapped, so re-rendering is
 //   not possible — clear it and let it refill in the new palette.
-static void spectro_palette_reload(spectro_engine_t *e) {
+static void spectro_palette_reload(spectro_engine_t *e, gui_app_t *app, int channel) {
     if (!e) return;
-    if (e->analysis_active && e->analysis_last_mags && e->analysis_last_bins > 0) {
-        size_t limit = (e->analysis_last_count < (size_t)e->time_bins)
-            ? e->analysis_last_count : (size_t)e->time_bins;
+    const float *mags = NULL;
+    size_t slice_count = 0;
+    size_t bins = 0;
+    uint64_t seq = 0;
+    // Fetch only the current session's publication. The playback-owned
+    // buffers are released on stop, so never retain their aliases across
+    // frames for a later palette click.
+    bool remap = e->analysis_active &&
+        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED &&
+        gui_playback_poll_analysis_window(app, channel, &seq,
+                                          &mags, &slice_count, &bins) &&
+        mags && bins > 0;
+    if (remap) {
+        size_t limit = (slice_count < (size_t)e->time_bins)
+            ? slice_count : (size_t)e->time_bins;
         for (size_t i = 0; i < limit; i++) {
-            resample_magnitude(e->analysis_last_mags + i * e->analysis_last_bins,
-                               (int)e->analysis_last_bins, e->frame, e->freq_bins);
+            resample_magnitude(mags + i * bins, (int)bins, e->frame, e->freq_bins);
             e->frame_valid = true;
             spectro_write_slice_index(e, (int)i);
         }
-        e->analysis_rerequest = true;
     } else if (e->pixels) {
         memset(e->pixels, 0, (size_t)e->tex_w * e->tex_h * 4);
         e->frame_valid = false;
     }
+    if (e->analysis_active) e->analysis_rerequest = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -830,8 +831,6 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 // refilled in the new palette).
 static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
                                         Vector2 click, Rectangle bounds) {
-    (void)app;
-    (void)channel;
     spectro_engine_t *e = (spectro_engine_t *)state_ptr;
     if (!e) return false;
     if (!CheckCollisionPointRec(click, bounds)) return false;
@@ -842,7 +841,7 @@ static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int cha
                 if ((int)s_spec_palette != i) {
                     s_spec_palette = (i == (int)SPEC_PALETTE_HEAT)
                         ? SPEC_PALETTE_HEAT : SPEC_PALETTE_PHOSPHOR;
-                    spectro_palette_reload(e);
+                    spectro_palette_reload(e, app, channel);
                 }
                 e->palette_dropdown_open = false;
                 return true;

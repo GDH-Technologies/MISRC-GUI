@@ -29,6 +29,14 @@ void gui_extract_cleanup(void);
 // Uses app->buffers (buffer_manager) for reading BUF_CAPTURE_RF
 // Returns 0 on success, -1 on error
 int gui_extract_start(gui_app_t *app);
+// Start a new stopped session: clear old RF/display tails and reset sideband.
+// Call before any capture producer starts. Recording buffers are not touched.
+void gui_extract_prepare_stream(gui_app_t *app);
+// Playback publishes one stamp for each committed 65536-sample pair block,
+// before advancing the RF FIFO. Positions refer to source files, excluding padding.
+#include "gui_rf_preview_worker.h"
+int gui_extract_start_tagged(gui_app_t *app);
+bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2]);
 
 // Stop the extraction thread (call before capture stops)
 void gui_extract_stop(void);

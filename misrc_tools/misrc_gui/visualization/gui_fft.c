@@ -12,6 +12,7 @@
 #include "../core/gui_app.h"
 #include "gui_phosphor_rt.h"
 #include "../ui/gui_ui.h"
+#include "../../common/threading.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,68 @@
 #if LIBFFTW_ENABLED
 #include <fftw3.h>
 #endif
+
+// FFTW shares planner state across all channels and display workers. Keep
+// every non-execute operation serialized; distinct plans still execute in parallel.
+#if LIBFFTW_ENABLED
+static atomic_flag s_fftw_lock = ATOMIC_FLAG_INIT;
+
+static void gui_fft_library_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&s_fftw_lock, memory_order_acquire)) {
+        thrd_sleep_ms(1);
+    }
+}
+
+static void gui_fft_library_unlock(void) {
+    atomic_flag_clear_explicit(&s_fftw_lock, memory_order_release);
+}
+#endif
+
+void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags) {
+#if LIBFFTW_ENABLED
+    if (size <= 0 || !input || !output) return NULL;
+    gui_fft_library_lock();
+    fftwf_plan plan = fftwf_plan_dft_r2c_1d(size, input, (fftwf_complex *)output, flags);
+    gui_fft_library_unlock();
+    return plan;
+#else
+    (void)size; (void)input; (void)output; (void)flags;
+    return NULL;
+#endif
+}
+
+void gui_fft_plan_destroy(void *plan) {
+#if LIBFFTW_ENABLED
+    if (!plan) return;
+    gui_fft_library_lock();
+    fftwf_destroy_plan((fftwf_plan)plan);
+    gui_fft_library_unlock();
+#else
+    (void)plan;
+#endif
+}
+
+void *gui_fft_alloc(size_t bytes) {
+#if LIBFFTW_ENABLED
+    gui_fft_library_lock();
+    void *memory = fftwf_malloc(bytes);
+    gui_fft_library_unlock();
+    return memory;
+#else
+    return malloc(bytes);
+#endif
+}
+
+void gui_fft_free(void *memory) {
+#if LIBFFTW_ENABLED
+    if (!memory) return;
+    gui_fft_library_lock();
+    fftwf_free(memory);
+    gui_fft_library_unlock();
+#else
+    free(memory);
+#endif
+}
 
 //-----------------------------------------------------------------------------
 // Availability Check
@@ -75,15 +138,15 @@ static bool fft_resize(fft_state_t *state, int new_size) {
 
     // Free old resources
     if (state->fftw_plan) {
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
+        gui_fft_plan_destroy(state->fftw_plan);
         state->fftw_plan = NULL;
     }
     if (state->fftw_input) {
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
     }
     if (state->fftw_output) {
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_output);
         state->fftw_output = NULL;
     }
     if (state->window) {
@@ -106,28 +169,27 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     }
 
     // Allocate new buffers
-    state->fftw_input = (float *)fftwf_malloc(sizeof(float) * new_size);
+    state->fftw_input = (float *)gui_fft_alloc(sizeof(float) * new_size);
     if (!state->fftw_input) {
         fprintf(stderr, "[FFT] Failed to allocate FFTW input buffer (%d)\n", new_size);
         return false;
     }
 
-    state->fftw_output = fftwf_malloc(sizeof(fftwf_complex) * new_bins);
+    state->fftw_output = gui_fft_alloc(sizeof(fftwf_complex) * new_bins);
     if (!state->fftw_output) {
         fprintf(stderr, "[FFT] Failed to allocate FFTW output buffer (%d bins)\n", new_bins);
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
         return false;
     }
 
     // Create new FFTW plan
-    state->fftw_plan = fftwf_plan_dft_r2c_1d(new_size, state->fftw_input,
-                                              (fftwf_complex *)state->fftw_output,
-                                              FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
+    state->fftw_plan = gui_fft_plan_create_r2c(new_size, state->fftw_input,
+                                               state->fftw_output, FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
     if (!state->fftw_plan) {
         fprintf(stderr, "[FFT] Failed to create FFTW plan for size %d\n", new_size);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         state->fftw_input = NULL;
         state->fftw_output = NULL;
         return false;
@@ -137,9 +199,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->window = (float *)malloc(sizeof(float) * new_size);
     if (!state->window) {
         fprintf(stderr, "[FFT] Failed to allocate window buffer (%d)\n", new_size);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         state->fftw_plan = NULL;
         state->fftw_input = NULL;
         state->fftw_output = NULL;
@@ -156,9 +218,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->magnitude_back = (float *)malloc(sizeof(float) * new_bins);
     if (!state->magnitude_front || !state->magnitude_back) {
         fprintf(stderr, "[FFT] Failed to allocate magnitude buffers (%d bins)\n", new_bins);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         free(state->window);
         free(state->magnitude_front);
         free(state->magnitude_back);
@@ -178,9 +240,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->peak_hold = (float *)malloc(sizeof(float) * new_bins);
     if (!state->peak_hold) {
         fprintf(stderr, "[FFT] Failed to allocate peak_hold buffer (%d bins)\n", new_bins);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         free(state->window);
         free(state->magnitude_front);
         free(state->magnitude_back);
@@ -293,17 +355,17 @@ void gui_fft_cleanup(fft_state_t *state) {
 
 #if LIBFFTW_ENABLED
     if (state->fftw_plan) {
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
+        gui_fft_plan_destroy(state->fftw_plan);
         state->fftw_plan = NULL;
     }
 
     if (state->fftw_input) {
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
     }
 
     if (state->fftw_output) {
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_output);
         state->fftw_output = NULL;
     }
 

@@ -2579,6 +2579,12 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     if (card_count > 1) {
         cxadc_sync_card_starts(&s_cxadc, card_count);
     }
+    // Publish the final measured rates before any RF write reaches the
+    // extraction sideband; initial sysfs rates may have been corrected above.
+    atomic_store(&app->rf_source_rate_hz[0], s_cxadc.card_sample_rate_hz[0]);
+    atomic_store(&app->rf_source_rate_hz[1], s_cxadc.card_sample_rate_hz[1]);
+    atomic_store(&app->rf_preview_input_supported,
+                  card_count < 2 || s_cxadc.card_sample_rate_hz[0] == s_cxadc.card_sample_rate_hz[1]);
     // The RF card-reading thread only applies when there are cxadcN cards.
     // In audio-only MISRC Clockgen mode (card_count == 0) the clockgen USB-audio
     // feed is the sole source, so skip the RF thread and run audio-only.
