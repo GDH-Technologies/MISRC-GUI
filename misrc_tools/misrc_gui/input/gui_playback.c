@@ -7,6 +7,11 @@
 
 #include "gui_playback.h"
 #include "../core/gui_app.h"
+#if LIBFLAC_ENABLED == 1
+#if LIBFFTW_ENABLED
+#include <fftw3.h>
+#endif
+#endif
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../../common/buffer_manager.h"
@@ -47,11 +52,27 @@ typedef struct {
     uint32_t channels;
 } playback_streaminfo_aux_t;
 
-typedef struct {
+// Decoder IO layer state for libFLAC init_stream callbacks (see the LIBFLAC
+// section for the callbacks and the STREAMINFO patch rationale). Deliberately
+// FLAC-type-free so it can be embedded in the shared playback context.
+typedef struct playback_io_ctx {
+    FILE *file;
+    void *owner;                // playback_ctx_t* — decoder client_data
+    // Staged first-bytes serving with in-memory STREAMINFO total patch
+    int stage;                  // 0=off (plain fread), 1=serving staged head, 2=seek file to head_len first
+    uint64_t bytes_served;      // Sequential bytes served since decoder init (valid pre-seek)
+    uint64_t patch_total;       // TRUE stream total written into the STREAMINFO field
+    uint8_t head[26];           // Patched file bytes 0..25 (fLaC + block header + SI up to total field)
+    size_t head_len;
+} playback_io_t;
+
+typedef struct playback_ctx {
     // File handles and decoders
 #if LIBFLAC_ENABLED == 1
     FLAC__StreamDecoder *decoder_a;
     FLAC__StreamDecoder *decoder_b;
+    playback_io_t io_a;         // Per-channel IO layer (callbacks + patch state)
+    playback_io_t io_b;
 #endif
     FILE *file_a;
     FILE *file_b;
@@ -75,6 +96,16 @@ typedef struct {
     atomic_int state;              // playback_state_t
     atomic_int speed;              // playback_speed_t
     atomic_bool loop_enabled;
+    // Seek-while-paused backfill: decode the window ENDING at the seek target
+    // and push it through the pipeline so the panels show the real timeline at
+    // the playhead (DAW-style non-linear scrub), then hold. The spectrogram
+    // clears its rolling history on the position jump (gui_spectrogram.c).
+    bool backfill_active_a;
+    uint64_t backfill_target_a;
+    bool backfill_active_b;
+    uint64_t backfill_target_b;
+    atomic_uint_fast64_t seek_seq_a;  // Incremented on every successful CH A seek
+    atomic_uint_fast64_t seek_seq_b;  // Incremented on every successful CH B seek
     atomic_bool seek_requested_a;
     atomic_bool seek_requested_b;
     atomic_uint_fast64_t seek_target_a;
@@ -176,7 +207,8 @@ typedef enum {
     PLAYBACK_TOTAL_SOURCE_STREAMINFO_WRAP_CORRECTED,
     PLAYBACK_TOTAL_SOURCE_STREAMINFO_WRAP_ESTIMATED,
     PLAYBACK_TOTAL_SOURCE_COMPANION,
-    PLAYBACK_TOTAL_SOURCE_FRAME_SCAN
+    PLAYBACK_TOTAL_SOURCE_FRAME_SCAN,
+    PLAYBACK_TOTAL_SOURCE_TAIL_DECODE
 } playback_total_source_t;
 
 typedef struct {
@@ -216,6 +248,7 @@ static const char *gui_playback_total_source_name(playback_total_source_t source
         case PLAYBACK_TOTAL_SOURCE_STREAMINFO_WRAP_ESTIMATED: return "STREAMINFO_WRAP_ESTIMATED";
         case PLAYBACK_TOTAL_SOURCE_COMPANION: return "COMPANION_LOG_OR_WAV";
         case PLAYBACK_TOTAL_SOURCE_FRAME_SCAN: return "FRAME_HEADER_SCAN";
+        case PLAYBACK_TOTAL_SOURCE_TAIL_DECODE: return "TAIL_FRAME_DECODE";
         default: return "UNRESOLVED";
     }
 }
@@ -445,6 +478,408 @@ static bool gui_playback_file_tell(FILE *file, uint64_t *out_offset) {
     if (pos < 0) return false;
     *out_offset = (uint64_t)pos;
     return true;
+}
+
+ //-----------------------------------------------------------------------------
+// Decoder IO Layer (libFLAC init_stream callbacks + STREAMINFO patch)
+ //-----------------------------------------------------------------------------
+ /* The recorder stores the RF sample rate in the FLAC header as a kHz-domain
+ * value (20 MSPS -> 20000 Hz) and, on finalized files, scales STREAMINFO
+ * total_samples to RF/1000 so the header duration matches real time. The
+ * audio stream still contains one FLAC sample per RF sample, so finalized
+ * files hold ~1000x more samples than their header claims. libFLAC
+ * refuses seeks to any sample >= STREAMINFO total_samples and ignores
+ * seektable points beyond it, which silently broke timeline scrubbing on
+ * finalized captures (seek_absolute returned false; the old code ignored
+ * the return value and desynced the position tracker).
+ *
+ * Feeding the decoder through our own read callback lets us serve a PATCHED
+ * copy of the first 26 file bytes (the STREAMINFO total_samples field, file
+ * offsets 18..25, low 36 bits) with the probe-resolved TRUE stream total —
+ * the file on disk is never modified. Seeking, the seektable and EOF
+ * handling then all operate on real stream positions. */
+
+#define PLAYBACK_IO_HEAD_LEN 26u
+#define PLAYBACK_IO_SI_TOTAL_OFF 18u
+#define PLAYBACK_IO_SI_TOTAL_END 25u /* inclusive */
+#define PLAYBACK_IO_SI_TOTAL_MASK 0xFFFFFFFFFULL
+#define PLAYBACK_IO_SI_TOTAL_MOD (1ULL << 36)   /* STREAMINFO total_samples field width */
+#define PLAYBACK_IO_STAGE_OFF 0
+#define PLAYBACK_IO_STAGE_SERVING 1
+#define PLAYBACK_IO_STAGE_SEEK_FILE 2
+
+static void gui_playback_io_reset(playback_io_t *io, FILE *file, void *owner,
+                                  uint64_t patch_total) {
+    if (!io) return;
+    memset(io, 0, sizeof(*io));
+    io->file = file;
+    io->owner = owner;
+    io->patch_total = patch_total;
+    io->stage = PLAYBACK_IO_STAGE_OFF;
+    io->head_len = 0;
+
+    if (!io->file || patch_total == 0) {
+        return;
+    }
+
+    /* Stage + patch the STREAMINFO header region. The file is expected at
+     * offset 0 (fresh open); rewind defensively before reading. */
+    if (PLAYBACK_FSEEK(io->file, 0, SEEK_SET) != 0) {
+        return;
+    }
+    io->head_len = fread(io->head, 1, PLAYBACK_IO_HEAD_LEN, io->file);
+    if (PLAYBACK_FSEEK(io->file, 0, SEEK_SET) != 0) {
+        io->head_len = 0;
+        return;
+    }
+    if (io->head_len != PLAYBACK_IO_HEAD_LEN) {
+        io->head_len = 0;
+        return;
+    }
+    /* Sanity: "fLaC" magic and first metadata block must be STREAMINFO. */
+    if (memcmp(io->head, "fLaC", 4) != 0 || (io->head[4] & 0x7Fu) != 0x00u) {
+        io->head_len = 0;
+        return;
+    }
+
+    /* The STREAMINFO total_samples field is only 36 bits (max ~68.7G
+     * samples). Long captures exceed it (~28 min at 40 MSPS, ~57 min at
+     * 20 MSPS, ~3h49m at 5 MSPS), so the TRUE stream total cannot always be
+     * represented. When it cannot, write 0 ("unknown") instead: libFLAC
+     * then applies NO seek clamp (seek_absolute rejects targets >= the
+     * claimed total only when a total is claimed) and resolves seeks via
+     * the seektable / binary search over the real stream. Verified against
+     * a 130 GB / 225G-sample capture where patching the true count truncated
+     * to total % 2^36 and rejected every seek past that point. */
+    uint64_t field_total = (patch_total >= PLAYBACK_IO_SI_TOTAL_MOD) ? 0 : patch_total;
+
+    uint64_t v = 0;
+    for (size_t k = 0; k < 8; k++) {
+        v = (v << 8) | (uint64_t)io->head[PLAYBACK_IO_SI_TOTAL_OFF + k];
+    }
+    v = (v & ~PLAYBACK_IO_SI_TOTAL_MASK) | (field_total & PLAYBACK_IO_SI_TOTAL_MASK);
+    for (size_t k = 0; k < 8; k++) {
+        io->head[PLAYBACK_IO_SI_TOTAL_OFF + k] =
+            (uint8_t)(v >> (56u - 8u * (unsigned)k));
+    }
+    io->stage = PLAYBACK_IO_STAGE_SERVING;
+}
+
+static FLAC__StreamDecoderReadStatus gui_playback_io_read_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], size_t *bytes, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    if (!io || !io->file || !buffer || !bytes || *bytes == 0) {
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    size_t want = *bytes;
+    size_t n = 0;
+
+    if (io->stage == PLAYBACK_IO_STAGE_SERVING && io->bytes_served < (uint64_t)io->head_len) {
+        size_t staged_left = (size_t)((uint64_t)io->head_len - io->bytes_served);
+        n = (want < staged_left) ? want : staged_left;
+        if (n > 0) {
+            memcpy(buffer, io->head + (size_t)io->bytes_served, n);
+        }
+        if (io->bytes_served + (uint64_t)n >= (uint64_t)io->head_len) {
+            io->stage = PLAYBACK_IO_STAGE_SEEK_FILE;
+        }
+    } else {
+        if (io->stage == PLAYBACK_IO_STAGE_SEEK_FILE) {
+            /* Staged head fully served: resume real reads after the staged
+             * region (the underlying file handle is still at offset 0). */
+            if (PLAYBACK_FSEEK(io->file, (playback_file_off_t)io->head_len, SEEK_SET) != 0) {
+                return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+            }
+            io->stage = PLAYBACK_IO_STAGE_OFF;
+        }
+        n = fread(buffer, 1, want, io->file);
+    }
+
+    *bytes = n;
+    if (n == 0) {
+        return feof(io->file) ? FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM
+                              : FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+    io->bytes_served += (uint64_t)n;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+}
+
+static FLAC__StreamDecoderSeekStatus gui_playback_io_seek_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 absolute_byte_offset, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    if (!io || !io->file) return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
+    if (absolute_byte_offset > (FLAC__uint64)INT64_MAX) {
+        return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
+    }
+    if (PLAYBACK_FSEEK(io->file, (playback_file_off_t)absolute_byte_offset, SEEK_SET) != 0) {
+        return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
+    }
+    /* Any seek ends staged-head serving semantics (none occur before the
+     * initial metadata pass completes, but be safe). */
+    if (io->stage != PLAYBACK_IO_STAGE_OFF) {
+        io->stage = PLAYBACK_IO_STAGE_OFF;
+    }
+    return FLAC__STREAM_DECODER_SEEK_STATUS_OK;
+}
+
+static FLAC__StreamDecoderTellStatus gui_playback_io_tell_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *absolute_byte_offset, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    if (!io || !io->file || !absolute_byte_offset) {
+        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
+    }
+    if (io->stage == PLAYBACK_IO_STAGE_SERVING) {
+        /* While serving the staged head, the reported stream position is the
+         * logical position, not the underlying handle position. */
+        *absolute_byte_offset = io->bytes_served;
+        return FLAC__STREAM_DECODER_TELL_STATUS_OK;
+    }
+    uint64_t off = 0;
+    if (!gui_playback_file_tell(io->file, &off)) {
+        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
+    }
+    *absolute_byte_offset = off;
+    return FLAC__STREAM_DECODER_TELL_STATUS_OK;
+}
+
+static FLAC__StreamDecoderLengthStatus gui_playback_io_length_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *stream_length, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    if (!io || !io->file || !stream_length) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    uint64_t cur = 0;
+    if (!gui_playback_file_tell(io->file, &cur)) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    uint64_t size = 0;
+    if (PLAYBACK_FSEEK(io->file, 0, SEEK_END) != 0 ||
+        !gui_playback_file_tell(io->file, &size) ||
+        !gui_playback_file_seek_abs(io->file, cur)) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    *stream_length = size;
+    return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
+}
+
+static FLAC__bool gui_playback_io_eof_cb(const FLAC__StreamDecoder *decoder, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    return (io && io->file) ? (feof(io->file) != 0) : true;
+}
+
+//-----------------------------------------------------------------------------
+// DAW-style paused analysis window — state types (implementation at the end)
+//-----------------------------------------------------------------------------
+// A dedicated analysis decoder pool per channel renders windows straight from
+// the FLAC file while paused (the rolling pipeline only carries one
+// 65,536-sample display frame — see the full notes at the end of this file).
+// The window decode is split across seek-aligned segment decoders so span
+// changes render in a fraction of the sequential decode time.
+#define PLAYBACK_ANALYSIS_DECODE_SEGMENTS 8
+
+// One parallel decode segment: its own FILE handle + IO layer + decoder
+// (libFLAC decoders are single-threaded), plus its own FFTW plan/scratch.
+typedef struct playback_analysis_segment {
+    // Persistent segment decoder (created once, reused across windows)
+    FILE *file;
+    playback_io_t io;
+    FLAC__StreamDecoder *decoder;
+    bool valid;
+    // FFTW engine (worker side): plans created/re-created in the WORKER
+    // thread sequentially (FFTW plan creation is not thread-safe; executing
+    // distinct plans IS thread-safe). One true FFT per column over the
+    // column's full contiguous samples — the render thread never FFTs.
+    fftwf_plan fft_plan;
+    int fft_plan_size;            // Padded FFT size of the current plan (0 = none)
+    float *fft_in;                 // Column scratch: PLAYBACK_ANALYSIS_HOP_MAX floats
+    fftwf_complex *fft_out;        // (HOP_MAX/2+1) complex
+    float *frame_buf;              // Magnitude scratch: (HOP_MAX/2+1) floats (NEVER
+                                   // a stack array: hop_bins reaches 131073 and a
+                                   // 2049-float stack buffer caused a stack-smashing
+                                   // segfault on the first flush at 3s/20MSPS)
+    // Per-request decode state (worker/segment thread only)
+    uint64_t seg_start;          // Absolute sample position of the segment
+    uint64_t seg_span;           // Samples this segment decodes
+    size_t slice_first;          // First global slice index it captures
+    size_t slice_count;          // Slices this segment captures
+    size_t hop;                   // Contiguous samples per column (shared)
+    uint64_t decoded;           // Samples decoded since seg_start
+    size_t slices_done;         // Columns completed so far (local, 0-based)
+    size_t col_pos;              // Samples accumulated in the current column
+    int64_t col_dc_sum;          // DC accumulator for the current column
+    float *dst;                  // Target magnitude buffer (unpublished)
+    uint32_t errors_logged;
+} playback_analysis_segment_t;
+
+typedef struct {
+    bool inited;                 // Decoders + worker ready
+    bool failed;                 // Could not be created (logged once)
+    uint64_t total_samples;      // TRUE stream total (from playback info)
+
+    // Request (render thread writes params, then bumps req_seq)
+    uint64_t req_center;
+    uint64_t req_span;           // Span in SAMPLES (computed from duration)
+    atomic_uint_fast64_t req_seq;
+
+    // Worker + results (worker fills the unpublished buffer, publishes the
+    // index, then bumps done_seq; the render thread reads the published one)
+    atomic_bool worker_stop;
+    thrd_t worker;
+    bool worker_valid;
+    atomic_uint_fast64_t done_seq;
+    atomic_int publish_idx;      // 0/1: magnitude buffer index visible to render
+    float *mag_buf[2];          // SLICES x BINS float magnitude frames
+    // Per-request bookkeeping (worker only)
+    uint64_t win_start;
+    uint64_t win_span;
+    size_t hop;                   // Contiguous samples per column
+    // Parallel decode segments (persistent decoders, dispatched per request)
+    playback_analysis_segment_t segs[PLAYBACK_ANALYSIS_DECODE_SEGMENTS];
+    size_t seg_count;            // Segments successfully initialized
+} playback_analysis_t;
+
+static playback_analysis_t s_analysis[2] = {0};
+
+static void gui_playback_analysis_shutdown(playback_analysis_t *a);
+
+ //-----------------------------------------------------------------------------
+// File Probe (header STREAMINFO + TRUE stream total from tail decode)
+ //-----------------------------------------------------------------------------
+
+typedef struct {
+    bool ok;                    // STREAMINFO was read
+    bool have_true_total;       // find_total_samples() succeeded
+    uint32_t sample_rate;
+    uint8_t bits_per_sample;
+    uint32_t channels;
+    uint16_t min_block_size;
+    uint16_t max_block_size;
+    uint32_t min_frame_size;
+    uint32_t max_frame_size;
+    uint64_t header_total_samples;  // Raw STREAMINFO value (kHz-domain lie on finalized files)
+    uint64_t true_total_samples;    // Actual samples in the stream
+} playback_probe_t;
+
+typedef struct {
+    playback_probe_t *out;
+    playback_io_t io;           // No patch: the probe must see the RAW header
+    uint32_t errors_logged;
+} playback_probe_ctx_t;
+
+static FLAC__StreamDecoderWriteStatus gui_playback_probe_write_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
+    const FLAC__int32 *const buffer[], void *client_data)
+{
+    (void)decoder; (void)frame; (void)buffer; (void)client_data;
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+// Probe callbacks share the IO layer's client_data convention: the decoder
+// gets the playback_io_t* and the probe context hangs off io->owner.
+static void gui_playback_probe_meta_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_probe_ctx_t *pctx = io ? (playback_probe_ctx_t *)io->owner : NULL;
+    if (!pctx || !pctx->out || !metadata) return;
+    if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
+        const FLAC__StreamMetadata_StreamInfo *si = &metadata->data.stream_info;
+        pctx->out->ok = true;
+        pctx->out->sample_rate = si->sample_rate;
+        pctx->out->bits_per_sample = si->bits_per_sample;
+        pctx->out->channels = si->channels;
+        pctx->out->min_block_size = si->min_blocksize;
+        pctx->out->max_block_size = si->max_blocksize;
+        pctx->out->min_frame_size = si->min_framesize;
+        pctx->out->max_frame_size = si->max_framesize;
+        pctx->out->header_total_samples = si->total_samples;
+    }
+}
+
+static void gui_playback_probe_error_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_probe_ctx_t *pctx = io ? (playback_probe_ctx_t *)io->owner : NULL;
+    if (pctx && pctx->errors_logged < 5) {
+        pctx->errors_logged++;
+        fprintf(stderr, "[PLAYBACK] Probe decoder error: %s\n",
+                FLAC__StreamDecoderErrorStatusString[status]);
+    }
+}
+
+/* Probe a FLAC file with a throwaway decoder: reads the header STREAMINFO and
+ * the TRUE stream sample count (FLAC__stream_decoder_find_total_samples
+ * decodes backward from EOF, so this is cheap even for multi-GB files and
+ * authoritative regardless of which total_samples convention the header
+ * uses). Returns true when the header was read; true_total_samples may still
+ * be 0 when the tail decode failed. */
+static bool gui_playback_probe_file(const char *filepath, playback_probe_t *out) {
+    if (!filepath || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    FILE *file = fopen(filepath, "rb");
+    if (!file) return false;
+
+    playback_probe_ctx_t pctx = {0};
+    pctx.out = out;
+    /* The IO layer's owner pointer is the probe context (the callbacks'
+     * client_data is the embedded playback_io_t). No STREAMINFO patch. */
+    gui_playback_io_reset(&pctx.io, file, &pctx, 0);
+
+    bool ok = false;
+    FLAC__StreamDecoder *dec = FLAC__stream_decoder_new();
+    if (dec) {
+        FLAC__stream_decoder_set_md5_checking(dec, false);
+        FLAC__StreamDecoderInitStatus st = FLAC__stream_decoder_init_stream(
+            dec,
+            gui_playback_io_read_cb,
+            gui_playback_io_seek_cb,
+            gui_playback_io_tell_cb,
+            gui_playback_io_length_cb,
+            gui_playback_io_eof_cb,
+            gui_playback_probe_write_cb,
+            gui_playback_probe_meta_cb,
+            gui_playback_probe_error_cb,
+            &pctx.io);
+        if (st != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+            fprintf(stderr, "[PLAYBACK] Probe init failed: %s\n",
+                    FLAC__StreamDecoderInitStatusString[st]);
+        } else if (!FLAC__stream_decoder_process_until_end_of_metadata(dec)) {
+            fprintf(stderr, "[PLAYBACK] Probe metadata pass failed: %s\n", filepath);
+        } else {
+            uint64_t true_total = FLAC__stream_decoder_find_total_samples(dec);
+            if (true_total > 0) {
+                out->true_total_samples = true_total;
+                out->have_true_total = true;
+            } else {
+                fprintf(stderr,
+                        "[PLAYBACK] Probe could not determine true total for %s (tail decode failed)\n",
+                        filepath);
+            }
+            ok = out->ok;
+        }
+        /* find_total_samples leaves the decoder state undefined; we only
+         * finish+delete (no further decoding on this instance). */
+        FLAC__stream_decoder_finish(dec);
+        FLAC__stream_decoder_delete(dec);
+    }
+
+    fclose(file);
+    return ok;
 }
 
 static bool gui_playback_find_audio_offset_and_size(const char *filepath, uint64_t *out_audio_offset, uint64_t *out_file_size) {
@@ -1027,6 +1462,7 @@ static uint64_t gui_playback_resolve_total_samples(const char *filepath,
                                                    uint32_t header_sample_rate,
                                                    uint8_t bits_per_sample,
                                                    uint64_t declared_total_samples,
+                                                   uint64_t probe_true_total,
                                                    const playback_streaminfo_aux_t *aux,
                                                    playback_total_source_t *out_source,
                                                    double *out_real_rate_hz) {
@@ -1039,7 +1475,7 @@ static uint64_t gui_playback_resolve_total_samples(const char *filepath,
         *out_real_rate_hz = gui_playback_resolve_real_rate_hz(filepath, header_sample_rate, NULL);
     }
     if (!filepath || !aux) {
-        return declared_total_samples;
+        return (probe_true_total > 0) ? probe_true_total : declared_total_samples;
     }
 
     playback_vorbis_rf_tags_t tags = {0};
@@ -1048,6 +1484,23 @@ static uint64_t gui_playback_resolve_total_samples(const char *filepath,
     if (out_real_rate_hz) {
         *out_real_rate_hz = real_rate_hz;
     }
+
+    // 1. Probe truth: the actual sample count in the stream, obtained by
+    //    decoding the file tail. Authoritative for seek bounds and duration
+    //    regardless of which total_samples convention the header uses
+    //    (raw RF-domain count on pre-finalize files, RF/1000 kHz-domain on
+    //    finalized files).
+    if (probe_true_total > 0) {
+        if (out_source) *out_source = PLAYBACK_TOTAL_SOURCE_TAIL_DECODE;
+        if (tags.has_rf_total_samples && tags.rf_total_samples != probe_true_total) {
+            fprintf(stderr,
+                    "[PLAYBACK] Tag/probe total mismatch for %s: RF_TOTAL_SAMPLES=%" PRIu64
+                    " vs stream count=%" PRIu64 " (using stream count)\n",
+                    filepath, tags.rf_total_samples, probe_true_total);
+        }
+        return probe_true_total;
+    }
+
     if (tags.has_rf_total_samples || tags.has_rf_sample_rate || tags.has_duration_seconds) {
         if (tags.has_rf_total_samples) {
             if (tags.rf_total_samples > 0) {
@@ -1130,15 +1583,24 @@ static uint64_t gui_playback_resolve_total_samples(const char *filepath,
 
 static void gui_playback_apply_resolved_file_info(playback_file_info_t *info,
                                                    const playback_streaminfo_aux_t *aux,
+                                                   const playback_probe_t *probe,
                                                    const char *channel_label) {
     if (!info || !aux) return;
     playback_total_source_t source = PLAYBACK_TOTAL_SOURCE_UNRESOLVED;
     double real_rate_hz = 0.0;
+    uint64_t probe_total = (probe && probe->have_true_total) ? probe->true_total_samples : 0;
+    // The "declared" value feeding the legacy fallback chain must be the RAW
+    // header total (kHz-domain on finalized files), not the patched value the
+    // decoder metadata callback reported.
+    uint64_t declared = (info->header_total_samples > 0)
+        ? info->header_total_samples
+        : info->total_samples;
     uint64_t resolved_total = gui_playback_resolve_total_samples(
         info->filepath,
         info->sample_rate,
         info->bits_per_sample,
-        info->total_samples,
+        declared,
+        probe_total,
         aux,
         &source,
         &real_rate_hz);
@@ -1149,6 +1611,12 @@ static void gui_playback_apply_resolved_file_info(playback_file_info_t *info,
     if (real_rate_hz <= 0.0) {
         real_rate_hz = gui_playback_resolve_real_rate_hz(info->filepath, info->sample_rate, NULL);
     }
+    if (real_rate_hz > 0.0 && isfinite(real_rate_hz)) {
+        info->real_sample_rate_hz = real_rate_hz;
+    } else {
+        info->real_sample_rate_hz = 0.0;
+        real_rate_hz = 0.0;
+    }
     if (real_rate_hz > 0.0 && info->total_samples > 0) {
         info->duration_seconds = (double)info->total_samples / real_rate_hz;
     } else {
@@ -1156,8 +1624,10 @@ static void gui_playback_apply_resolved_file_info(playback_file_info_t *info,
     }
 
     fprintf(stderr,
-            "[PLAYBACK] %s resolved total=%" PRIu64 " (source=%s, real_rate=%.0fHz, %.2f sec)\n",
+            "[PLAYBACK] %s header total=%" PRIu64 " resolved total=%" PRIu64
+            " (source=%s, real_rate=%.0fHz, %.2f sec)\n",
             channel_label ? channel_label : "File",
+            info->header_total_samples,
             info->total_samples,
             gui_playback_total_source_name(source),
             real_rate_hz,
@@ -1166,6 +1636,9 @@ static void gui_playback_apply_resolved_file_info(playback_file_info_t *info,
 
 static double gui_playback_real_rate_from_info(const playback_file_info_t *info) {
     if (!info) return 0.0;
+    if (info->real_sample_rate_hz > 0.0 && isfinite(info->real_sample_rate_hz)) {
+        return info->real_sample_rate_hz;
+    }
     if (info->total_samples > 0 && info->duration_seconds > 0.0 && isfinite(info->duration_seconds)) {
         return (double)info->total_samples / info->duration_seconds;
     }
@@ -1188,7 +1661,11 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
     void *client_data)
 {
     (void)decoder;
-    playback_ctx_t *ctx = (playback_ctx_t *)client_data;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_ctx_t *ctx = io ? (playback_ctx_t *)io->owner : NULL;
+    if (!ctx) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
 
     uint32_t samples = frame->header.blocksize;
     uint8_t bps = frame->header.bits_per_sample;
@@ -1217,12 +1694,15 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
         debug_count_a++;
     }
 
-    // FLAC returns samples as int32 with the full bit depth
-    // MISRC recording format:
-    //   16-bit FLAC: 12-bit ADC samples shifted left 4 bits (range -32768 to 32752)
-    //   12-bit FLAC: 12-bit ADC samples as-is (range -2048 to 2047)
-    //   8-bit FLAC: samples clamped to 8-bit (range -128 to 127)
-    // Display expects 12-bit range values (like simulated mode uses ~1024 scale)
+    // FLAC returns samples as int32 with the full bit depth.
+    // Recorder conventions (gui_record.c):
+    //   16-bit FLAC: 12-bit ADC container << 4 (range -32768 to 32752)
+    //   12-bit FLAC: 12-bit ADC container as-is (range -2048 to 2047)
+    //   8-bit FLAC:  12-bit ADC container >> 4 (range -128 to 127)
+    // Playback restores the 12-bit container for EVERY depth so the raw
+    // packing, extraction ((2047 - field) << 4 into the 16-bit display
+    // container), VU meters, peaks and clipping all match the live capture
+    // preview 1:1 (verified against the recorder's own scaling code).
     if (bps == 16) {
         // 16-bit FLAC: shift right 4 to get back to 12-bit range
         for (uint32_t i = 0; i < samples; i++) {
@@ -1234,10 +1714,10 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
             out[i] = (int16_t)in[i];
         }
     } else if (bps == 8) {
-        // 8-bit FLAC: keep in 8-bit range (-128 to 127), don't scale up
-        // This will show reduced amplitude on display, reflecting the lower bit depth
+        // 8-bit FLAC: shift left 4 to restore the 12-bit container the live
+        // capture pipeline used (8-bit was stored as container >> 4)
         for (uint32_t i = 0; i < samples; i++) {
-            out[i] = (int16_t)in[i];
+            out[i] = (int16_t)(in[i] << 4);
         }
     } else {
         // Unknown bit depth - just cast
@@ -1258,7 +1738,11 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
     void *client_data)
 {
     (void)decoder;
-    playback_ctx_t *ctx = (playback_ctx_t *)client_data;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_ctx_t *ctx = io ? (playback_ctx_t *)io->owner : NULL;
+    if (!ctx) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
 
     uint32_t samples = frame->header.blocksize;
     uint8_t bps = frame->header.bits_per_sample;
@@ -1284,7 +1768,8 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
         debug_count_b++;
     }
 
-    // Same conversion as Channel A - normalize to 12-bit range for display
+    // Same conversion as Channel A - restore the 12-bit container for every
+    // depth so the display matches the live capture preview 1:1.
     if (bps == 16) {
         // 16-bit FLAC: shift right 4 to get back to 12-bit range
         for (uint32_t i = 0; i < samples; i++) {
@@ -1296,9 +1781,9 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
             out[i] = (int16_t)in[i];
         }
     } else if (bps == 8) {
-        // 8-bit FLAC: keep in 8-bit range, don't scale up
+        // 8-bit FLAC: shift left 4 to restore the 12-bit container
         for (uint32_t i = 0; i < samples; i++) {
-            out[i] = (int16_t)in[i];
+            out[i] = (int16_t)(in[i] << 4);
         }
     } else {
         // Unknown bit depth - just cast
@@ -1318,7 +1803,9 @@ static void decoder_metadata_cb_a(
     void *client_data)
 {
     (void)decoder;
-    playback_ctx_t *ctx = (playback_ctx_t *)client_data;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_ctx_t *ctx = io ? (playback_ctx_t *)io->owner : NULL;
+    if (!ctx) return;
 
     if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
         ctx->info_a.sample_rate = metadata->data.stream_info.sample_rate;
@@ -1345,7 +1832,9 @@ static void decoder_metadata_cb_b(
     void *client_data)
 {
     (void)decoder;
-    playback_ctx_t *ctx = (playback_ctx_t *)client_data;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_ctx_t *ctx = io ? (playback_ctx_t *)io->owner : NULL;
+    if (!ctx) return;
 
     if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
         ctx->info_b.sample_rate = metadata->data.stream_info.sample_rate;
@@ -1391,34 +1880,55 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
     strncpy(info->filepath, filepath, sizeof(info->filepath) - 1);
 
 #if LIBFLAC_ENABLED == 1
-    // Use FLAC metadata API to read stream info without full decode
-    // FLAC__metadata_get_streaminfo fills in an existing struct
-    FLAC__StreamMetadata metadata;
+    // Probe with a throwaway decoder: header STREAMINFO plus the TRUE stream
+    // sample count from a tail decode (cheap, works for multi-GB files and
+    // both header total_samples conventions). Fall back to the plain
+    // metadata API when the probe cannot run.
+    playback_probe_t probe = {0};
+    bool have_probe = gui_playback_probe_file(filepath, &probe);
+    playback_streaminfo_aux_t stream = {0};
 
-    if (!FLAC__metadata_get_streaminfo(filepath, &metadata)) {
-        fprintf(stderr, "[PLAYBACK] Failed to read FLAC metadata from: %s\n", filepath);
-        return false;
+    if (have_probe) {
+        info->sample_rate = probe.sample_rate;
+        info->bits_per_sample = probe.bits_per_sample;
+        info->header_total_samples = probe.header_total_samples;
+        info->total_samples = probe.true_total_samples;
+        stream.min_block_size = probe.min_block_size;
+        stream.max_block_size = probe.max_block_size;
+        stream.min_frame_size = probe.min_frame_size;
+        stream.max_frame_size = probe.max_frame_size;
+        stream.channels = probe.channels;
+    } else {
+        // Use FLAC metadata API to read stream info without full decode
+        // FLAC__metadata_get_streaminfo fills in an existing struct
+        FLAC__StreamMetadata metadata;
+
+        if (!FLAC__metadata_get_streaminfo(filepath, &metadata)) {
+            fprintf(stderr, "[PLAYBACK] Failed to read FLAC metadata from: %s\n", filepath);
+            return false;
+        }
+
+        FLAC__StreamMetadata_StreamInfo *si = &metadata.data.stream_info;
+        stream.min_block_size = si->min_blocksize;
+        stream.max_block_size = si->max_blocksize;
+        stream.min_frame_size = si->min_framesize;
+        stream.max_frame_size = si->max_framesize;
+        stream.channels = si->channels;
+
+        info->sample_rate = si->sample_rate;
+        info->bits_per_sample = si->bits_per_sample;
+        info->header_total_samples = si->total_samples;
+        info->total_samples = si->total_samples;
     }
 
-    FLAC__StreamMetadata_StreamInfo *si = &metadata.data.stream_info;
-    playback_streaminfo_aux_t stream = {
-        .min_block_size = si->min_blocksize,
-        .max_block_size = si->max_blocksize,
-        .min_frame_size = si->min_framesize,
-        .max_frame_size = si->max_framesize,
-        .channels = si->channels
-    };
-
-    info->sample_rate = si->sample_rate;
-    info->bits_per_sample = si->bits_per_sample;
-    info->total_samples = si->total_samples;
     playback_total_source_t source = PLAYBACK_TOTAL_SOURCE_UNRESOLVED;
     double real_rate_hz = 0.0;
     uint64_t resolved_total = gui_playback_resolve_total_samples(
         filepath,
         info->sample_rate,
         info->bits_per_sample,
-        info->total_samples,
+        info->header_total_samples,
+        (have_probe && probe.have_true_total) ? probe.true_total_samples : 0,
         &stream,
         &source,
         &real_rate_hz);
@@ -1429,20 +1939,28 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
     if (real_rate_hz <= 0.0) {
         real_rate_hz = gui_playback_resolve_real_rate_hz(filepath, info->sample_rate, NULL);
     }
+    if (real_rate_hz > 0.0 && isfinite(real_rate_hz)) {
+        info->real_sample_rate_hz = real_rate_hz;
+    } else {
+        info->real_sample_rate_hz = 0.0;
+        real_rate_hz = 0.0;
+    }
     if (real_rate_hz > 0.0 && info->total_samples > 0) {
         info->duration_seconds = (double)info->total_samples / real_rate_hz;
     } else {
         info->duration_seconds = 0.0;
     }
     fprintf(stderr,
-            "[PLAYBACK] Validate: resolved total=%" PRIu64 " (source=%s, real_rate=%.0fHz, %.2f sec)\n",
+            "[PLAYBACK] Validate: header total=%" PRIu64 " resolved total=%" PRIu64
+            " (source=%s, real_rate=%.0fHz, %.2f sec)\n",
+            info->header_total_samples,
             info->total_samples,
             gui_playback_total_source_name(source),
             real_rate_hz,
             info->duration_seconds);
 
     // Validate compatibility with MISRC format
-    // Expected: 40kHz, 8/12/16-bit, mono
+    // Expected: 40kHz header (kHz-domain RF rate), 8/12/16-bit, mono
     bool compatible = true;
 
     if (info->sample_rate != 40000) {
@@ -1476,6 +1994,13 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
 // Raw buffer write size (must match extraction thread's expected read size)
 #define RAW_BUFFER_SAMPLES 65536
 #define RAW_BUFFER_BYTES (RAW_BUFFER_SAMPLES * sizeof(uint32_t))
+// Paused-scrub backfill window. DURATION-based (sample rates vary across
+// files: 5/10/20/40 MSPS): converted to samples via the channel's resolved
+// real rate, capped by the spectrogram panel's slice capacity (one display
+// frame per batch = one history slice, 256 slices = SPEC_TIME_BINS in
+// gui_spectrogram.c; keep in sync) and floored at one batch.
+#define PLAYBACK_PREVIEW_WINDOW_SECONDS 3.0
+#define PLAYBACK_PREVIEW_WINDOW_BATCHES 256
 
 static int playback_thread_func(void *ctx_ptr) {
     playback_ctx_t *ctx = (playback_ctx_t *)ctx_ptr;
@@ -1514,17 +2039,62 @@ static int playback_thread_func(void *ctx_ptr) {
             }
             atomic_store(&ctx->seek_requested_a, false);
 
-        // 08.2024 - Windows no flac output issue fix     
+        // 08.2024 - Windows no flac output issue fix
 #if LIBFLAC_ENABLED == 1
             if (ctx->decoder_a) {
-                FLAC__stream_decoder_seek_absolute(ctx->decoder_a, target);
+                // Drop buffered audio BEFORE the seek so the frame containing
+                // the seek target (delivered during seek_absolute) is kept.
                 ctx->decode_available_a = 0;
                 ctx->decode_pos_a = 0;
-            }
+                uint64_t seek_target = target;
+                bool paused = (atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED);
+                if (paused) {
+                    // Paused scrub is non-linear: seek to the window START so
+                    // the following batches refill the timeline ending at the
+                    // playhead (the spectrogram clears on the seek-seq jump).
+                    uint64_t window =
+                        (uint64_t)(PLAYBACK_PREVIEW_WINDOW_SECONDS * ctx->info_a.real_sample_rate_hz);
+                    uint64_t cap =
+                        (uint64_t)PLAYBACK_PREVIEW_WINDOW_BATCHES * (uint64_t)RAW_BUFFER_SAMPLES;
+                    if (window > cap) window = cap;
+                    if (window < (uint64_t)RAW_BUFFER_SAMPLES) window = RAW_BUFFER_SAMPLES;
+                    seek_target = (target > window) ? (target - window) : 0;
+                }
+                if (FLAC__stream_decoder_seek_absolute(ctx->decoder_a, seek_target)) {
+                    atomic_store(&ctx->current_sample_a, seek_target);
+                    if (!ctx->file_b) {
+                        atomic_store(&ctx->current_sample, seek_target);
+                    }
+                    atomic_fetch_add(&ctx->seek_seq_a, 1);
+                    if (paused) {
+                        ctx->backfill_active_a = true;
+                        ctx->backfill_target_a = target;
+                        fprintf(stderr,
+                                "[PLAYBACK] Paused scrub CH A -> %" PRIu64
+                                " (backfill window from %" PRIu64 ")\n",
+                                target, seek_target);
+                    }
+                } else {
+                    // Seek failed (IO error / decoder state): audio continues
+                    // from its previous position — keep the position tracker
+                    // in sync with it instead of silently desyncing the UI.
+                    uint64_t pos = atomic_load(&ctx->current_sample_a);
+                    atomic_store(&ctx->current_sample_a, pos);
+                    if (!ctx->file_b) {
+                        atomic_store(&ctx->current_sample, pos);
+                    }
+                    fprintf(stderr,
+                            "[PLAYBACK] Channel A seek to %" PRIu64 " failed (state=%s)\n",
+                            target,
+                            FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(ctx->decoder_a)]);
+                }
+            } else
 #endif
-            atomic_store(&ctx->current_sample_a, target);
-            if (!ctx->file_b) {
-                atomic_store(&ctx->current_sample, target);
+            {
+                atomic_store(&ctx->current_sample_a, target);
+                if (!ctx->file_b) {
+                    atomic_store(&ctx->current_sample, target);
+                }
             }
             continue;
         }
@@ -1539,22 +2109,80 @@ static int playback_thread_func(void *ctx_ptr) {
 
 #if LIBFLAC_ENABLED == 1
             if (ctx->decoder_b) {
-                FLAC__stream_decoder_seek_absolute(ctx->decoder_b, target);
                 ctx->decode_available_b = 0;
                 ctx->decode_pos_b = 0;
-            }
+                uint64_t seek_target_b = target;
+                bool paused_b = (atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED);
+                if (paused_b) {
+                    uint64_t window_b =
+                        (uint64_t)(PLAYBACK_PREVIEW_WINDOW_SECONDS * ctx->info_b.real_sample_rate_hz);
+                    uint64_t cap_b =
+                        (uint64_t)PLAYBACK_PREVIEW_WINDOW_BATCHES * (uint64_t)RAW_BUFFER_SAMPLES;
+                    if (window_b > cap_b) window_b = cap_b;
+                    if (window_b < (uint64_t)RAW_BUFFER_SAMPLES) window_b = RAW_BUFFER_SAMPLES;
+                    seek_target_b = (target > window_b) ? (target - window_b) : 0;
+                }
+                if (FLAC__stream_decoder_seek_absolute(ctx->decoder_b, seek_target_b)) {
+                    atomic_store(&ctx->current_sample_b, seek_target_b);
+                    if (!ctx->file_a) {
+                        atomic_store(&ctx->current_sample, seek_target_b);
+                    }
+                    atomic_fetch_add(&ctx->seek_seq_b, 1);
+                    if (paused_b) {
+                        ctx->backfill_active_b = true;
+                        ctx->backfill_target_b = target;
+                        fprintf(stderr,
+                                "[PLAYBACK] Paused scrub CH B -> %" PRIu64
+                                " (backfill window from %" PRIu64 ")\n",
+                                target, seek_target_b);
+                    }
+                } else {
+                    uint64_t pos = atomic_load(&ctx->current_sample_b);
+                    atomic_store(&ctx->current_sample_b, pos);
+                    if (!ctx->file_a) {
+                        atomic_store(&ctx->current_sample, pos);
+                    }
+                    fprintf(stderr,
+                            "[PLAYBACK] Channel B seek to %" PRIu64 " failed (state=%s)\n",
+                            target,
+                            FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(ctx->decoder_b)]);
+                }
+            } else
 #endif
-            atomic_store(&ctx->current_sample_b, target);
-            if (!ctx->file_a) {
-                atomic_store(&ctx->current_sample, target);
+            {
+                atomic_store(&ctx->current_sample_b, target);
+                if (!ctx->file_a) {
+                    atomic_store(&ctx->current_sample, target);
+                }
             }
             continue;
         }
 
-        // Check for pause state
+        // Check for pause state. While holding (no batches written), keep
+        // the no-data watchdog fed: gui_capture_device_timeout (2 s) would
+        // otherwise fire auto-reconnect "Connection lost" and tear the
+        // playback session down — seen as playback "crashing" and resetting
+        // a couple of seconds after pausing.
+        // A paused scrub keeps the backfill running (window -> playhead),
+        // falling through the hold until the position passes the target.
         if (atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED) {
-            thrd_sleep_ms(10);
-            continue;
+            if (ctx->backfill_active_a && ctx->file_a &&
+                atomic_load(&ctx->current_sample_a) > ctx->backfill_target_a) {
+                ctx->backfill_active_a = false;
+                fprintf(stderr, "[PLAYBACK] CH A backfill complete at %" PRIu64 "\n",
+                        atomic_load(&ctx->current_sample_a));
+            }
+            if (ctx->backfill_active_b && ctx->file_b &&
+                atomic_load(&ctx->current_sample_b) > ctx->backfill_target_b) {
+                ctx->backfill_active_b = false;
+                fprintf(stderr, "[PLAYBACK] CH B backfill complete at %" PRIu64 "\n",
+                        atomic_load(&ctx->current_sample_b));
+            }
+            if (!ctx->backfill_active_a && !ctx->backfill_active_b) {
+                atomic_store(&app->last_callback_time_ms, get_time_ms());
+                thrd_sleep_ms(10);
+                continue;
+            }
         }
 
         // Decode more samples if needed
@@ -1594,22 +2222,44 @@ static int playback_thread_func(void *ctx_ptr) {
         bool eof_b = (ctx->decoder_b != NULL) && (avail_b == 0 &&
                       FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM);
 
-        // Loop channel A independently
+        // Loop channel A independently (a paused backfill that reaches the
+        // file end just stops the backfill instead of looping).
         if (eof_a) {
-            fprintf(stderr, "[PLAYBACK] Channel A EOF, looping\n");
-            FLAC__stream_decoder_seek_absolute(ctx->decoder_a, 0);
-            ctx->decode_available_a = 0;
-            ctx->decode_pos_a = 0;
-            atomic_store(&ctx->current_sample_a, 0);
+            if (ctx->backfill_active_a) {
+                ctx->backfill_active_a = false;
+                fprintf(stderr, "[PLAYBACK] CH A backfill reached file end\n");
+            } else if (FLAC__stream_decoder_seek_absolute(ctx->decoder_a, 0)) {
+                fprintf(stderr, "[PLAYBACK] Channel A EOF, looping\n");
+                ctx->decode_available_a = 0;
+                ctx->decode_pos_a = 0;
+                atomic_store(&ctx->current_sample_a, 0);
+            } else {
+                // Loop-seek failed (corrupt tail / IO error): throttle so the
+                // thread cannot spin at full speed on a persistent failure.
+                fprintf(stderr,
+                        "[PLAYBACK] Channel A loop-seek failed (state=%s), retrying\n",
+                        FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(ctx->decoder_a)]);
+                thrd_sleep_ms(100);
+            }
         }
 
-        // Loop channel B independently
+        // Loop channel B independently (a paused backfill that reaches the
+        // file end just stops the backfill instead of looping).
         if (eof_b) {
-            fprintf(stderr, "[PLAYBACK] Channel B EOF, looping\n");
-            FLAC__stream_decoder_seek_absolute(ctx->decoder_b, 0);
-            ctx->decode_available_b = 0;
-            ctx->decode_pos_b = 0;
-            atomic_store(&ctx->current_sample_b, 0);
+            if (ctx->backfill_active_b) {
+                ctx->backfill_active_b = false;
+                fprintf(stderr, "[PLAYBACK] CH B backfill reached file end\n");
+            } else if (FLAC__stream_decoder_seek_absolute(ctx->decoder_b, 0)) {
+                fprintf(stderr, "[PLAYBACK] Channel B EOF, looping\n");
+                ctx->decode_available_b = 0;
+                ctx->decode_pos_b = 0;
+                atomic_store(&ctx->current_sample_b, 0);
+            } else {
+                fprintf(stderr,
+                        "[PLAYBACK] Channel B loop-seek failed (state=%s), retrying\n",
+                        FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(ctx->decoder_b)]);
+                thrd_sleep_ms(100);
+            }
         }
 
         // If either channel just looped, continue to refill buffers
@@ -1722,9 +2372,13 @@ static int playback_thread_func(void *ctx_ptr) {
 
         batch_count++;
 
-        // Throttle based on playback speed
+        // Throttle based on playback speed. A paused-scrub backfill runs at
+        // full pipeline speed (like MAX) so the playhead window refills in a
+        // fraction of a second instead of taking a full window of wall time.
+        bool backfilling = (atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED) &&
+                           (ctx->backfill_active_a || ctx->backfill_active_b);
         playback_speed_t speed = atomic_load(&ctx->speed);
-        if (speed != PLAYBACK_SPEED_MAX) {
+        if (speed != PLAYBACK_SPEED_MAX && !backfilling) {
             float multiplier = speed_multipliers[speed];
             if (multiplier > 0) {
                 // Real-time pacing at the resolved true sample rate.
@@ -1796,11 +2450,25 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
     if (file_a) {
         strncpy(s_playback.info_a.filepath, file_a, sizeof(s_playback.info_a.filepath) - 1);
 
+        // Probe first: header STREAMINFO + TRUE stream total (tail decode).
+        playback_probe_t probe_a = {0};
+        bool have_probe_a = gui_playback_probe_file(file_a, &probe_a);
+
         s_playback.file_a = fopen(file_a, "rb");
         if (!s_playback.file_a) {
             fprintf(stderr, "[PLAYBACK] Failed to open file A: %s\n", file_a);
             goto error_cleanup;
         }
+
+        // When the header total disagrees with the true stream total, serve a
+        // PATCHED STREAMINFO to the decoder so libFLAC accepts seeks across
+        // the whole real stream (see the IO layer notes above).
+        uint64_t patch_total_a = 0;
+        if (have_probe_a && probe_a.have_true_total &&
+            probe_a.true_total_samples != probe_a.header_total_samples) {
+            patch_total_a = probe_a.true_total_samples;
+        }
+        gui_playback_io_reset(&s_playback.io_a, s_playback.file_a, &s_playback, patch_total_a);
 
         s_playback.decoder_a = FLAC__stream_decoder_new();
         if (!s_playback.decoder_a) {
@@ -1810,13 +2478,17 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
 
         FLAC__stream_decoder_set_md5_checking(s_playback.decoder_a, false);
 
-        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_FILE(
+        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_stream(
             s_playback.decoder_a,
-            s_playback.file_a,
+            gui_playback_io_read_cb,
+            gui_playback_io_seek_cb,
+            gui_playback_io_tell_cb,
+            gui_playback_io_length_cb,
+            gui_playback_io_eof_cb,
             decoder_write_cb_a,
             decoder_metadata_cb_a,
             decoder_error_cb,
-            &s_playback
+            &s_playback.io_a
         );
 
         if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
@@ -1825,19 +2497,38 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
             goto error_cleanup;
         }
 
-        // Process metadata to get file info
-        FLAC__stream_decoder_process_until_end_of_metadata(s_playback.decoder_a);
-        gui_playback_apply_resolved_file_info(&s_playback.info_a, &s_playback.stream_a, "File A");
+        // Process metadata to get file info (patched STREAMINFO when armed:
+        // info_a.total_samples then already reflects the TRUE stream total)
+        if (!FLAC__stream_decoder_process_until_end_of_metadata(s_playback.decoder_a)) {
+            fprintf(stderr, "[PLAYBACK] Failed to read metadata from file A\n");
+            goto error_cleanup;
+        }
+        // Keep the RAW header total for diagnostics + legacy fallbacks.
+        s_playback.info_a.header_total_samples = have_probe_a
+            ? probe_a.header_total_samples
+            : s_playback.info_a.total_samples;
+        gui_playback_apply_resolved_file_info(&s_playback.info_a, &s_playback.stream_a,
+                                               have_probe_a ? &probe_a : NULL, "File A");
     }
 
     if (file_b) {
         strncpy(s_playback.info_b.filepath, file_b, sizeof(s_playback.info_b.filepath) - 1);
+
+        playback_probe_t probe_b = {0};
+        bool have_probe_b = gui_playback_probe_file(file_b, &probe_b);
 
         s_playback.file_b = fopen(file_b, "rb");
         if (!s_playback.file_b) {
             fprintf(stderr, "[PLAYBACK] Failed to open file B: %s\n", file_b);
             goto error_cleanup;
         }
+
+        uint64_t patch_total_b = 0;
+        if (have_probe_b && probe_b.have_true_total &&
+            probe_b.true_total_samples != probe_b.header_total_samples) {
+            patch_total_b = probe_b.true_total_samples;
+        }
+        gui_playback_io_reset(&s_playback.io_b, s_playback.file_b, &s_playback, patch_total_b);
 
         s_playback.decoder_b = FLAC__stream_decoder_new();
         if (!s_playback.decoder_b) {
@@ -1847,13 +2538,17 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
 
         FLAC__stream_decoder_set_md5_checking(s_playback.decoder_b, false);
 
-        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_FILE(
+        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_stream(
             s_playback.decoder_b,
-            s_playback.file_b,
+            gui_playback_io_read_cb,
+            gui_playback_io_seek_cb,
+            gui_playback_io_tell_cb,
+            gui_playback_io_length_cb,
+            gui_playback_io_eof_cb,
             decoder_write_cb_b,
             decoder_metadata_cb_b,
             decoder_error_cb,
-            &s_playback
+            &s_playback.io_b
         );
 
         if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
@@ -1862,8 +2557,15 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
             goto error_cleanup;
         }
 
-        FLAC__stream_decoder_process_until_end_of_metadata(s_playback.decoder_b);
-        gui_playback_apply_resolved_file_info(&s_playback.info_b, &s_playback.stream_b, "File B");
+        if (!FLAC__stream_decoder_process_until_end_of_metadata(s_playback.decoder_b)) {
+            fprintf(stderr, "[PLAYBACK] Failed to read metadata from file B\n");
+            goto error_cleanup;
+        }
+        s_playback.info_b.header_total_samples = have_probe_b
+            ? probe_b.header_total_samples
+            : s_playback.info_b.total_samples;
+        gui_playback_apply_resolved_file_info(&s_playback.info_b, &s_playback.stream_b,
+                                               have_probe_b ? &probe_b : NULL, "File B");
     }
 
     // Calculate total samples (max of both channels)
@@ -2008,6 +2710,10 @@ error_cleanup:
         FLAC__stream_decoder_delete(s_playback.decoder_b);
         s_playback.decoder_b = NULL;
     }
+    // Clear the IO layer state so it holds no handle aliases into the files
+    // being closed below (init_stream: we own the FILE handles).
+    gui_playback_io_reset(&s_playback.io_a, NULL, NULL, 0);
+    gui_playback_io_reset(&s_playback.io_b, NULL, NULL, 0);
     if (s_playback.file_a) {
         fclose(s_playback.file_a);
         s_playback.file_a = NULL;
@@ -2058,6 +2764,12 @@ void gui_playback_stop(gui_app_t *app) {
     // Stop extraction thread (reads BUF_CAPTURE_RF, writes BUF_DISPLAY)
     gui_extract_stop();
 
+    // Shut down the paused-analysis decoders/workers (isolated FILE handles).
+#if LIBFLAC_ENABLED == 1
+    gui_playback_analysis_shutdown(&s_analysis[0]);
+    gui_playback_analysis_shutdown(&s_analysis[1]);
+#endif
+
 #if LIBFLAC_ENABLED == 1
     if (s_playback.decoder_a) {
         FLAC__stream_decoder_finish(s_playback.decoder_a);
@@ -2069,11 +2781,20 @@ void gui_playback_stop(gui_app_t *app) {
         FLAC__stream_decoder_delete(s_playback.decoder_b);
         s_playback.decoder_b = NULL;
     }
+    // The IO layer owns the FILE handles (init_stream): close them after the
+    // decoders are gone and clear the patch state.
+    gui_playback_io_reset(&s_playback.io_a, NULL, NULL, 0);
+    gui_playback_io_reset(&s_playback.io_b, NULL, NULL, 0);
 #endif
 
-    // Note: FILE handles are managed by FLAC decoder after init_FILE
-    s_playback.file_a = NULL;
-    s_playback.file_b = NULL;
+    if (s_playback.file_a) {
+        fclose(s_playback.file_a);
+        s_playback.file_a = NULL;
+    }
+    if (s_playback.file_b) {
+        fclose(s_playback.file_b);
+        s_playback.file_b = NULL;
+    }
 
     free(s_playback.decode_buf_a);
     free(s_playback.decode_buf_b);
@@ -2102,6 +2823,7 @@ void gui_playback_pause(gui_app_t *app) {
     (void)app;
     if (atomic_load(&s_playback.state) == PLAYBACK_STATE_PLAYING) {
         atomic_store(&s_playback.state, PLAYBACK_STATE_PAUSED);
+        fprintf(stderr, "[PLAYBACK] Paused\n");
     }
 }
 
@@ -2109,6 +2831,7 @@ void gui_playback_resume(gui_app_t *app) {
     (void)app;
     if (atomic_load(&s_playback.state) == PLAYBACK_STATE_PAUSED) {
         atomic_store(&s_playback.state, PLAYBACK_STATE_PLAYING);
+        fprintf(stderr, "[PLAYBACK] Resumed\n");
     }
 }
 
@@ -2181,6 +2904,14 @@ uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel) 
         return atomic_load(&s_playback.current_sample_b);
     }
     return atomic_load(&s_playback.current_sample_a);
+}
+
+uint64_t gui_playback_get_seek_seq_channel(gui_app_t *app, int channel) {
+    (void)app;
+    if (channel == 1) {
+        return atomic_load(&s_playback.seek_seq_b);
+    }
+    return atomic_load(&s_playback.seek_seq_a);
 }
 
 uint64_t gui_playback_get_position_samples(gui_app_t *app) {
@@ -2261,6 +2992,55 @@ bool gui_playback_get_file_info_b(gui_app_t *app, playback_file_info_t *info) {
     return s_playback.info_b.valid;
 }
 
+// --- Selected playback file info (idle readout support) ---
+// While playback runs, the live file info is authoritative. When idle, the
+// file selected in settings is validated once per path change and cached, so
+// per-frame UI readout calls stay cheap. The cache does not watch for on-disk
+// changes to the same path; re-selecting the file refreshes it.
+typedef struct {
+    char path[512];
+    playback_file_info_t info;
+    bool cached;
+} playback_selected_cache_t;
+
+static playback_selected_cache_t s_selected_cache[2] = {0};
+
+bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_file_info_t *info) {
+    if (!app || !info) return false;
+    if (channel != 0 && channel != 1) return false;
+    memset(info, 0, sizeof(*info));
+
+    // Live playback info when this channel is actually playing.
+    if (gui_playback_is_running(app)) {
+        playback_file_info_t live = {0};
+        bool ok = (channel == 0)
+            ? gui_playback_get_file_info_a(app, &live)
+            : gui_playback_get_file_info_b(app, &live);
+        if (ok && live.valid) {
+            *info = live;
+            return true;
+        }
+    }
+
+    const char *path = (channel == 0) ? app->settings.playback_file_a
+                                      : app->settings.playback_file_b;
+    if (!path || path[0] == '\0') {
+        return false;
+    }
+
+    playback_selected_cache_t *cache = &s_selected_cache[channel];
+    if (!cache->cached || strncmp(cache->path, path, sizeof(cache->path)) != 0) {
+        snprintf(cache->path, sizeof(cache->path), "%s", path);
+        // validate_file fills info even when it returns false (e.g. wrong
+        // channel count), so the readout can still show bit depth / rate.
+        (void)gui_playback_validate_file(path, &cache->info);
+        cache->cached = true;
+    }
+
+    *info = cache->info;
+    return cache->info.valid;
+}
+
 void gui_playback_set_loop(gui_app_t *app, bool loop) {
     (void)app;
     atomic_store(&s_playback.loop_enabled, loop);
@@ -2269,4 +3049,568 @@ void gui_playback_set_loop(gui_app_t *app, bool loop) {
 bool gui_playback_get_loop(gui_app_t *app) {
     (void)app;
     return atomic_load(&s_playback.loop_enabled);
+}
+
+//-----------------------------------------------------------------------------
+// DAW-Style Paused Analysis Window (direct file random access)
+//-----------------------------------------------------------------------------
+/* While PAUSED the display panels render analysis windows straight from the
+ * FLAC file: the rolling live pipeline only carries one 65,536-sample display
+ * frame (3.3 ms at 20 MSPS) — 1:1-correct for playing, far too small for
+ * paused analysis. Each channel gets a dedicated analysis decoder (own FILE
+ * handle + IO layer + STREAMINFO patch, fully isolated from the playback
+ * thread's decoders) plus a background worker:
+ *   - request (render thread): stores center + span (duration-based; sample
+ *     rates vary across files 5/10/20/40 MSPS) and bumps req_seq (release).
+ *   - worker: one seek to the window start, sequential decode across the
+ *     span (per-slice seeks would re-decode seektable gaps), capturing one
+ *     FFT-sized slice at each strided boundary; publishes the double-
+ *     buffered slices, bumps done_seq (release).
+ *   - poll (render thread): takes the newest completed result via the
+ *     seq-ordered acquire chain, or returns false.
+ */
+#if LIBFLAC_ENABLED == 1
+
+#define PLAYBACK_ANALYSIS_SPAN_MIN_SECONDS 0.1
+#define PLAYBACK_ANALYSIS_SPAN_MAX_SECONDS 60.0
+
+// Segment seektable gap (the recorder's seektable point spacing — see
+// flac_writer.c seektable spacing; keep in sync). Each parallel segment pays
+// one gap of forward decode after its seek; parallel decoding only wins when
+// the window span amortizes that cost across segments.
+#define PLAYBACK_ANALYSIS_SEEK_GAP_SAMPLES (8388608ULL)
+
+// playback_analysis_t, s_analysis and the shutdown forward declaration
+// live at the IO layer section above (gui_playback_stop calls the shutdown).
+
+#if LIBFFTW_ENABLED
+static void gui_playback_analysis_flush_column(playback_analysis_segment_t *s);
+#endif
+static bool gui_playback_analysis_init(playback_analysis_t *a, int channel);
+
+// Linear resample of a magnitude frame (src -> dst bins), same math as the
+// spectrogram panel's resample_magnitude so analysis spectra render 1:1.
+static void gui_playback_analysis_resample(const float *src, int n_src, float *dst, int n_dst) {
+    if (!dst || n_dst <= 0) return;
+    if (!src || n_src <= 0) {
+        for (int i = 0; i < n_dst; i++) dst[i] = 0.0f;
+        return;
+    }
+    if (n_src == 1) {
+        for (int i = 0; i < n_dst; i++) dst[i] = src[0];
+        return;
+    }
+    if (n_dst == 1) {
+        dst[0] = src[n_src / 2];
+        return;
+    }
+    for (int i = 0; i < n_dst; i++) {
+        float pos = (float)i * (float)(n_src - 1) / (float)(n_dst - 1);
+        if (pos < 0.0f) pos = 0.0f;
+        int i0 = (int)pos;
+        if (i0 >= n_src - 1) { dst[i] = src[n_src - 1]; continue; }
+        float frac = pos - (float)i0;
+        dst[i] = src[i0] * (1.0f - frac) + src[i0 + 1] * frac;
+    }
+}
+
+// Segment write callback: accumulate EVERY decoded sample contiguously into
+// the current column's scratch; when the column's hop is full, flush it (one
+// true FFT over the column's full contiguous samples). No sub-window
+// sampling, no averaging, no max-hold — the result is a true full-resolution
+// spectrogram column, exactly like an FFT-size setting in a DAW (the span
+// trades time vs frequency resolution, never detail).
+static FLAC__StreamDecoderWriteStatus gui_playback_analysis_write_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
+    const FLAC__int32 *const buffer[], void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_analysis_segment_t *s = io ? (playback_analysis_segment_t *)io->owner : NULL;
+    if (!s || !frame || !buffer || !buffer[0] || !s->dst) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+#if LIBFFTW_ENABLED
+    uint32_t samples = frame->header.blocksize;
+    if (samples == 0) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    }
+    const FLAC__int32 *in = buffer[0];
+    for (uint32_t i = 0; i < samples; i++) {
+        if (s->slices_done >= s->slice_count) break;
+        if (s->col_pos < s->hop) {
+            s->fft_in[s->col_pos] = (float)in[i];
+            s->col_dc_sum += (int64_t)in[i];
+            s->col_pos++;
+            if (s->col_pos == s->hop) {
+                gui_playback_analysis_flush_column(s);
+            }
+        } else {
+            // Defensive: hop already filled (flush pending); skip.
+            s->col_pos++;
+        }
+    }
+#endif
+    s->decoded += samples;
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void gui_playback_analysis_meta_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data)
+{
+    (void)decoder; (void)metadata; (void)client_data;
+}
+
+static void gui_playback_analysis_error_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_analysis_segment_t *s = io ? (playback_analysis_segment_t *)io->owner : NULL;
+    if (s && s->errors_logged < 5) {
+        s->errors_logged++;
+        fprintf(stderr, "[PLAYBACK] Analysis decoder error: %s\n",
+                FLAC__StreamDecoderErrorStatusString[status]);
+    }
+}
+
+// Decode one segment: seek to its start, decode its span. The final
+// PARTIAL column (EOF or segment end) is flushed zero-padded so no sample
+// is dropped; columns an EOF cut short stay zero (buffer pre-zeroed).
+static void gui_playback_analysis_segment_decode(playback_analysis_segment_t *s) {
+    if (!s || !s->valid || !s->decoder || s->slice_count == 0) return;
+    if (!FLAC__stream_decoder_seek_absolute(s->decoder, s->seg_start)) {
+        return;
+    }
+    while (s->decoded < s->seg_span &&
+           FLAC__stream_decoder_get_state(s->decoder) !=
+                FLAC__STREAM_DECODER_END_OF_STREAM) {
+        if (!FLAC__stream_decoder_process_single(s->decoder)) break;
+    }
+#if LIBFFTW_ENABLED
+    if (s->col_pos > 0 && s->slices_done < s->slice_count) {
+        gui_playback_analysis_flush_column(s);
+    }
+#endif
+}
+
+#if LIBFFTW_ENABLED
+// Flush the current column: DC-remove + Hanning-window the accumulated
+// contiguous samples, zero-pad to the plan size, execute ONE true FFT,
+// normalize to 0-1 intensity (same dB scale as gui_fft), and resample the
+// hop/2+1 meaningful bins into the fixed-width result frame. This is the
+// full-resolution core: one FFT per column covering the column's entire
+// contiguous sample span.
+static void gui_playback_analysis_flush_column(playback_analysis_segment_t *s) {
+    if (!s || !s->dst || !s->fft_plan || !s->fft_in || !s->fft_out || !s->frame_buf) return;
+    size_t n = s->col_pos;
+    if (n > s->hop) n = s->hop;
+    if (n == 0) return;
+    int pad = s->fft_plan_size;
+
+    // DC removal over the ACTUAL samples.
+    float dc = (float)s->col_dc_sum / (float)n;
+    const float scale = 1.0f / 2048.0f;   // matches gui_fft int16 normalization
+    // Hanning window + normalize (same shape as gui_fft: hann(i) = 0.5*(1-cos)).
+    for (size_t i = 0; i < n; i++) {
+        float w = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(n - 1)));
+        s->fft_in[i] = (s->fft_in[i] - dc) * scale * w;
+    }
+    // Zero-pad to the plan size.
+    for (int i = (int)n; i < pad; i++) {
+        s->fft_in[i] = 0.0f;
+    }
+
+    fftwf_execute(s->fft_plan);
+
+    // Magnitude in dB -> 0-1 intensity (same normalization as gui_fft).
+    // hop_bins scales with the span (up to HOP_MAX/2+1 = 131073): use the
+    // per-segment HEAP frame_buf — a fixed 2049-float stack buffer here
+    // overflowed the thread stack on large spans (verified segfault).
+    const int db_min = -120;
+    const int db_max = 0;
+    int hop_bins = (int)(s->hop / 2) + 1;
+    if (hop_bins > pad / 2 + 1) hop_bins = pad / 2 + 1;
+    if (hop_bins > (int)(PLAYBACK_ANALYSIS_HOP_MAX / 2 + 1)) {
+        hop_bins = (int)(PLAYBACK_ANALYSIS_HOP_MAX / 2 + 1);
+    }
+    for (int j = 0; j < hop_bins; j++) {
+        float re = s->fft_out[j][0];
+        float im = s->fft_out[j][1];
+        float mag = sqrtf(re * re + im * im);
+        mag /= (float)n;       // normalize by actual sample count
+        mag *= 2.0f;          // Hanning coherent gain correction
+        float db = 20.0f * log10f(mag + 1e-10f);
+        if (db < (float)db_min) db = (float)db_min;
+        if (db > (float)db_max) db = (float)db_max;
+        s->frame_buf[j] = (db - (float)db_min) / (float)(db_max - db_min);
+    }
+    float *cell = s->dst +
+        (size_t)(s->slice_first + s->slices_done) * (size_t)PLAYBACK_ANALYSIS_BINS;
+    gui_playback_analysis_resample(s->frame_buf, hop_bins, cell, PLAYBACK_ANALYSIS_BINS);
+
+    s->slices_done++;
+    s->col_pos = 0;
+    s->col_dc_sum = 0;
+}
+#endif
+
+static int gui_playback_analysis_segment_thread(void *arg) {
+    gui_playback_analysis_segment_decode((playback_analysis_segment_t *)arg);
+    return 0;
+}
+
+static int gui_playback_analysis_worker(void *arg) {
+    playback_analysis_t *a = (playback_analysis_t *)arg;
+    int channel = (a == &s_analysis[0]) ? 0 : 1;
+    while (!atomic_load(&a->worker_stop)) {
+        uint64_t req = atomic_load(&a->req_seq);
+        if (req == 0 || req == atomic_load(&a->done_seq)) {
+            thrd_sleep_ms(10);
+            continue;
+        }
+        // Lazy RESOURCE init runs HERE (worker thread), never on the render
+        // thread: the init opens the file 8x + parses metadata per handle,
+        // which is file IO the render loop must never block on. (The worker
+        // thread itself is created separately — init creates no threads.)
+        if (!a->inited && !a->failed) {
+            if (!gui_playback_analysis_init(a, channel)) {
+                atomic_store(&a->done_seq, req);
+                continue;
+            }
+        }
+        if (!a->inited) {
+            atomic_store(&a->done_seq, req);
+            continue;
+        }
+        // Request params were published before req_seq was bumped.
+        uint64_t total = a->total_samples;
+        uint64_t span = a->req_span;
+        if (span > total) span = total;
+        if (span == 0) span = 1;
+        uint64_t center = a->req_center;
+        if (center >= total) center = total - 1;
+        uint64_t half = span / 2;
+        uint64_t start = (center > half) ? (center - half) : 0;
+        if (start + span > total) {
+            start = (total > span) ? (total - span) : 0;
+        }
+        a->win_start = start;
+        a->win_span = span;
+        // Full-resolution contiguous hop: each column = ONE FFT over the
+        // column's entire contiguous samples. hop caps at HOP_MAX (per-column
+        // FFT budget); spans beyond the cap clamp to hop = HOP_MAX coverage.
+        size_t hop = (size_t)((span + PLAYBACK_ANALYSIS_SLICES - 1) /
+                            (uint64_t)PLAYBACK_ANALYSIS_SLICES);
+        if (hop == 0) hop = 1;
+        if (hop > PLAYBACK_ANALYSIS_HOP_MAX) hop = PLAYBACK_ANALYSIS_HOP_MAX;
+        a->hop = hop;
+
+        // Pre-zero the unpublished magnitude buffer.
+        float *dst = a->mag_buf[1 - atomic_load(&a->publish_idx)];
+        memset(dst, 0, (size_t)PLAYBACK_ANALYSIS_SLICES *
+                              (size_t)PLAYBACK_ANALYSIS_BINS * sizeof(float));
+
+        // Padded FFT size (next power of two >= hop).
+        int pad = 1;
+        while (pad < (int)hop) pad <<= 1;
+
+        // Column-aligned segment layout (segments never share columns).
+        size_t segs = (a->seg_count > 0) ? a->seg_count : 1;
+        size_t per = (PLAYBACK_ANALYSIS_SLICES + segs - 1) / segs;
+        size_t active = 0;
+        for (size_t i = 0; i < a->seg_count; i++) {
+            playback_analysis_segment_t *s = &a->segs[i];
+            size_t first = i * per;
+            if (first >= PLAYBACK_ANALYSIS_SLICES || !s->valid) {
+                s->slice_count = 0;
+                continue;
+            }
+            size_t count = per;
+            if (first + count > PLAYBACK_ANALYSIS_SLICES) {
+                count = PLAYBACK_ANALYSIS_SLICES - first;
+            }
+            s->slice_first = first;
+            s->slice_count = count;
+            s->hop = hop;
+#if LIBFFTW_ENABLED
+            // (Re)create this segment's FFTW plan for the padded size — in
+            // THIS worker thread, sequentially (plan creation is not
+            // thread-safe; executing distinct plans is).
+            if (s->fft_plan_size != pad) {
+                if (s->fft_plan) {
+                    fftwf_destroy_plan(s->fft_plan);
+                    s->fft_plan = NULL;
+                }
+                s->fft_plan = fftwf_plan_dft_r2c_1d(pad, s->fft_in, s->fft_out,
+                                                    FFTW_ESTIMATE | FFTW_DESTROY_INPUT);
+                s->fft_plan_size = s->fft_plan ? pad : 0;
+            }
+#endif
+            s->seg_start = start + (uint64_t)first * (uint64_t)hop;
+            s->seg_span = (uint64_t)count * (uint64_t)hop;
+            active++;
+        }
+        // Extend the FINAL active segment to the window end so the last
+        // slice's FFT data is complete even when stride < slice samples.
+        if (active > 0) {
+            for (size_t i = a->seg_count; i > 0; i--) {
+                playback_analysis_segment_t *s = &a->segs[i - 1];
+                if (s->slice_count == 0) continue;
+                uint64_t seg_end = s->seg_start + s->seg_span;
+                uint64_t win_end = start + span;
+                if (seg_end < win_end) s->seg_span += win_end - seg_end;
+                break;
+            }
+        }
+        for (size_t i = 0; i < a->seg_count; i++) {
+            playback_analysis_segment_t *s = &a->segs[i];
+            if (s->slice_count == 0) continue;
+            s->decoded = 0;
+            s->slices_done = 0;
+            s->col_pos = 0;
+            s->col_dc_sum = 0;
+            s->dst = dst;
+        }
+
+        if (active == 0) {
+            atomic_store(&a->publish_idx, 1 - atomic_load(&a->publish_idx));
+            atomic_store(&a->done_seq, req);
+            continue;
+        }
+
+        // Parallel decode when the window is large enough to amortize each
+        // segment's seektable-gap forward decode; sequential for small
+        // windows (the per-segment gap cost would exceed the window itself).
+        bool parallel =
+            span > (2 * PLAYBACK_ANALYSIS_SEEK_GAP_SAMPLES) && active > 1;
+        thrd_t tids[PLAYBACK_ANALYSIS_DECODE_SEGMENTS];
+        size_t spawned = 0;
+        for (size_t i = 0; i < a->seg_count; i++) {
+            playback_analysis_segment_t *s = &a->segs[i];
+            if (s->slice_count == 0) continue;
+            if (parallel &&
+                thrd_create_with_priority(&tids[spawned],
+                                          gui_playback_analysis_segment_thread,
+                                          s, THRD_PRIORITY_NORMAL) == thrd_success) {
+                spawned++;
+            } else {
+                gui_playback_analysis_segment_decode(s);
+            }
+        }
+        for (size_t i = 0; i < spawned; i++) {
+            thrd_join(tids[i], NULL);
+        }
+        atomic_store(&a->publish_idx, 1 - atomic_load(&a->publish_idx));
+        atomic_store(&a->done_seq, req);
+    }
+    return 0;
+}
+
+static void gui_playback_analysis_shutdown(playback_analysis_t *a) {
+    if (!a) return;
+    if (a->worker_valid) {
+        atomic_store(&a->worker_stop, true);
+        thrd_join(a->worker, NULL);
+        a->worker_valid = false;
+    }
+    for (size_t i = 0; i < PLAYBACK_ANALYSIS_DECODE_SEGMENTS; i++) {
+        playback_analysis_segment_t *s = &a->segs[i];
+        if (s->decoder) {
+            FLAC__stream_decoder_finish(s->decoder);
+            FLAC__stream_decoder_delete(s->decoder);
+            s->decoder = NULL;
+        }
+        if (s->file) {
+            fclose(s->file);
+            s->file = NULL;
+        }
+#if LIBFFTW_ENABLED
+        if (s->fft_plan) {
+            fftwf_destroy_plan(s->fft_plan);
+            s->fft_plan = NULL;
+        }
+        if (s->fft_in) {
+            fftwf_free(s->fft_in);
+            s->fft_in = NULL;
+        }
+        if (s->fft_out) {
+            fftwf_free(s->fft_out);
+            s->fft_out = NULL;
+        }
+        free(s->frame_buf);
+        s->frame_buf = NULL;
+        s->fft_plan_size = 0;
+#endif
+        s->valid = false;
+    }
+    free(a->mag_buf[0]);
+    free(a->mag_buf[1]);
+    a->mag_buf[0] = NULL;
+    a->mag_buf[1] = NULL;
+    a->seg_count = 0;
+    memset(a, 0, sizeof(*a));
+}
+
+static bool gui_playback_analysis_init(playback_analysis_t *a, int channel) {
+    const char *path = (channel == 0) ? s_playback.info_a.filepath
+                                      : s_playback.info_b.filepath;
+    uint64_t total = (channel == 0) ? s_playback.info_a.total_samples
+                                    : s_playback.info_b.total_samples;
+    if (!path || !path[0] || total == 0) {
+        a->failed = true;
+        return false;
+    }
+    a->mag_buf[0] = (float *)calloc(
+        (size_t)PLAYBACK_ANALYSIS_SLICES * PLAYBACK_ANALYSIS_BINS, sizeof(float));
+    a->mag_buf[1] = (float *)calloc(
+        (size_t)PLAYBACK_ANALYSIS_SLICES * PLAYBACK_ANALYSIS_BINS, sizeof(float));
+    if (!a->mag_buf[0] || !a->mag_buf[1]) {
+        fprintf(stderr, "[PLAYBACK] Analysis: failed to allocate magnitude buffers\n");
+        gui_playback_analysis_shutdown(a);
+        a->failed = true;
+        return false;
+    }
+    a->total_samples = total;
+
+    // One decoder + FILE handle per parallel segment (libFLAC decoders are
+    // single-threaded; segments decode disjoint slice ranges concurrently).
+    // Partial pools work: fewer segments = less parallelism, same result.
+    for (size_t i = 0; i < PLAYBACK_ANALYSIS_DECODE_SEGMENTS; i++) {
+        playback_analysis_segment_t *s = &a->segs[i];
+        s->file = fopen(path, "rb");
+        if (!s->file) break;
+        // The IO layer patches the STREAMINFO total with the TRUE stream
+        // total (writing 0 when it exceeds the 36-bit field) so seeks work
+        // across the real stream — same rules as the playback decoders.
+        gui_playback_io_reset(&s->io, s->file, s, total);
+        s->decoder = FLAC__stream_decoder_new();
+        if (!s->decoder) break;
+        FLAC__stream_decoder_set_md5_checking(s->decoder, false);
+        FLAC__StreamDecoderInitStatus st = FLAC__stream_decoder_init_stream(
+            s->decoder,
+            gui_playback_io_read_cb,
+            gui_playback_io_seek_cb,
+            gui_playback_io_tell_cb,
+            gui_playback_io_length_cb,
+            gui_playback_io_eof_cb,
+            gui_playback_analysis_write_cb,
+            gui_playback_analysis_meta_cb,
+            gui_playback_analysis_error_cb,
+            &s->io);
+        if (st != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+            fprintf(stderr, "[PLAYBACK] Analysis: segment init failed: %s\n",
+                    FLAC__StreamDecoderInitStatusString[st]);
+            break;
+        }
+        if (!FLAC__stream_decoder_process_until_end_of_metadata(s->decoder)) {
+            fprintf(stderr, "[PLAYBACK] Analysis: segment metadata pass failed\n");
+            break;
+        }
+#if LIBFFTW_ENABLED
+        // Per-segment FFTW scratch (max-hop sized once; plans are created
+        // per-request in the worker thread where creation is sequential).
+        s->fft_in = (float *)fftwf_malloc(sizeof(float) * (size_t)PLAYBACK_ANALYSIS_HOP_MAX);
+        s->fft_out = (fftwf_complex *)fftwf_malloc(
+            sizeof(fftwf_complex) * (size_t)(PLAYBACK_ANALYSIS_HOP_MAX / 2 + 1));
+        s->frame_buf = (float *)malloc(
+            sizeof(float) * (size_t)(PLAYBACK_ANALYSIS_HOP_MAX / 2 + 1));
+        if (!s->fft_in || !s->fft_out || !s->frame_buf) {
+            fprintf(stderr, "[PLAYBACK] Analysis: segment FFT scratch alloc failed\n");
+            break;
+        }
+        s->fft_plan = NULL;
+        s->fft_plan_size = 0;
+#endif
+        s->hop = 1;
+        s->col_pos = 0;
+        s->col_dc_sum = 0;
+        s->valid = true;
+        a->seg_count++;
+    }
+    if (a->seg_count == 0) {
+        fprintf(stderr, "[PLAYBACK] Analysis: no segment decoders (%s)\n", path);
+        gui_playback_analysis_shutdown(a);
+        a->failed = true;
+        return false;
+    }
+    // Resources ready. The WORKER thread is created separately (cheap, no
+    // file IO) by the request path; this init creates no threads.
+    a->inited = true;
+    return true;
+}
+
+#endif // LIBFLAC_ENABLED
+
+void gui_playback_request_analysis_window(gui_app_t *app, int channel,
+                                           uint64_t center_sample,
+                                           double span_seconds) {
+    (void)app;
+    if (channel != 0 && channel != 1) return;
+#if LIBFLAC_ENABLED == 1
+    playback_analysis_t *a = &s_analysis[channel];
+    if (a->failed) return;
+    // Worker thread creation is cheap (no file IO): safe on the render
+    // thread. The worker lazily does the file-IO init on the first request.
+    if (!a->worker_valid) {
+        atomic_store(&a->worker_stop, false);
+        if (thrd_create_with_priority(&a->worker, gui_playback_analysis_worker, a,
+                                      THRD_PRIORITY_NORMAL) != thrd_success) {
+            fprintf(stderr, "[PLAYBACK] Analysis: worker create failed\n");
+            a->failed = true;
+            return;
+        }
+        a->worker_valid = true;
+    }
+
+    if (!(span_seconds >= PLAYBACK_ANALYSIS_SPAN_MIN_SECONDS)) {
+        span_seconds = PLAYBACK_ANALYSIS_SPAN_MIN_SECONDS;
+    }
+    double rate = (channel == 0) ? (double)s_playback.info_a.real_sample_rate_hz
+                                  : (double)s_playback.info_b.real_sample_rate_hz;
+    uint64_t total = (channel == 0) ? s_playback.info_a.total_samples
+                                    : s_playback.info_b.total_samples;
+    if (!(rate > 0.0) || total == 0) return;
+    // Full-resolution span cap: the contiguous model needs hop = span/SLICES
+    // <= HOP_MAX samples per column FFT, so the span caps at
+    // SLICES x HOP_MAX / rate (duration-based: rate-dependent, e.g. ~6.7 s
+    // at 20 MSPS, ~13.4 s at 10 MSPS, ~26.8 s at 5 MSPS).
+    double span_max =
+        (double)PLAYBACK_ANALYSIS_SLICES * (double)PLAYBACK_ANALYSIS_HOP_MAX / rate;
+    if (span_seconds > span_max) {
+        span_seconds = span_max;
+    }
+    if (center_sample >= total) center_sample = total - 1;
+    a->req_center = center_sample;
+    a->req_span = (uint64_t)(span_seconds * rate);
+    if (a->req_span == 0) a->req_span = 1;
+    atomic_fetch_add(&a->req_seq, 1);
+#else
+    (void)center_sample;
+    (void)span_seconds;
+#endif
+}
+
+bool gui_playback_poll_analysis_window(gui_app_t *app, int channel,
+                                        uint64_t *io_seq,
+                                        const float **out_magnitudes,
+                                        size_t *out_slice_count,
+                                        size_t *out_bins) {
+    (void)app;
+    if (channel != 0 && channel != 1) return false;
+#if LIBFLAC_ENABLED == 1
+    playback_analysis_t *a = &s_analysis[channel];
+    if (!a->inited) return false;
+    uint64_t done = atomic_load(&a->done_seq);
+    uint64_t seen = (io_seq ? *io_seq : 0);
+    if (done == 0 || done <= seen) return false;
+    if (io_seq) *io_seq = done;
+    if (out_magnitudes) *out_magnitudes = a->mag_buf[atomic_load(&a->publish_idx)];
+    if (out_slice_count) *out_slice_count = PLAYBACK_ANALYSIS_SLICES;
+    if (out_bins) *out_bins = (size_t)PLAYBACK_ANALYSIS_BINS;
+    return true;
+#else
+    (void)io_seq; (void)out_magnitudes; (void)out_slice_count; (void)out_bins;
+    return false;
+#endif
 }

@@ -26,6 +26,7 @@
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
 #include "../ui/gui_ui.h"
+#include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
@@ -969,13 +970,22 @@ int main(int argc, char **argv) {
             }
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
-                if (app.is_capturing) {
-                    // Refuse to disconnect via space-bar while recording:
-                    // tearing capture down mid-recording races the async record
-                    // finalize thread and can corrupt/truncate the capture file.
-                    // Force the user to stop recording first (mirrors the
-                    // Disconnect-button guard and the "settings locked while
-                    // recording" pattern).
+                // Space = play/pause (DAW-style). In playback mode it toggles
+                // pause; for live capture devices (no pause concept for a
+                // live feed) it starts/stops the capture as before, still
+                // refusing to disconnect mid-recording (tearing capture down
+                // races the async record finalize and can corrupt the file).
+                bool playback_dev =
+                    app.selected_device >= 0 &&
+                    app.selected_device < app.device_count &&
+                    app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK;
+                if (playback_dev && app.is_capturing && gui_playback_is_running(&app)) {
+                    gui_playback_toggle_pause(&app);
+                    gui_app_set_status(&app,
+                        gui_playback_get_state(&app) == PLAYBACK_STATE_PAUSED
+                            ? "Playback paused (space)"
+                            : "Playback playing (space)");
+                } else if (app.is_capturing) {
                     if (app.is_recording) {
                         gui_app_set_status(&app, "Stop recording before disconnecting (protects the capture file)");
                     } else {

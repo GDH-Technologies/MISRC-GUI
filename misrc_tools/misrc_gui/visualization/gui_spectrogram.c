@@ -26,6 +26,7 @@
 #include "gui_fft.h"
 #include "gui_text.h"
 #include "../core/gui_app.h"
+#include "../input/gui_playback.h"
 #include "../ui/gui_ui.h"
 
 #include <stdlib.h>
@@ -39,7 +40,17 @@
 //-----------------------------------------------------------------------------
 
 #define SPEC_FREQ_BINS   1024   // Fixed frequency resolution of the history texture
-#define SPEC_TIME_BINS   256    // History depth (time slices)
+#define SPEC_TIME_BINS   512    // History depth (time slices); keep in sync with
+                                // PLAYBACK_ANALYSIS_SLICES (gui_playback.h) — the
+                                // paused analysis window renders one column per slice
+
+// DAW-style paused analysis window: while playback is PAUSED the panel renders
+// a duration-based window of the FILE around the playhead (gui_playback.c
+// analysis decoder — async, direct random access) across the full history
+// width, instead of the rolling live feed (which is 1:1-correct for playing
+// but only carries the last 65,536-sample display frames). Wheel over the
+// panel while paused adjusts the span (1 s .. 60 s).
+#define SPEC_PAUSED_WINDOW_SECONDS 3.0
 
 #define SPEC_LABEL_H     16     // Waterfall: bottom strip reserved for freq labels (px)
 #define SPEC_LABEL_W     34     // Spectrograph: left strip reserved for freq labels (px)
@@ -71,6 +82,24 @@ typedef struct spectro_engine {
 
     bool frame_valid;                // True once at least one FFT frame has been consumed
     uint32_t last_sample_rate;       // Sample rate snapshot for axis labels
+    // Playback non-linear-move detection: a rolling history is only valid
+    // while the playhead advances linearly. On a seek (gui_playback.c bumps a
+    // per-channel seek sequence) the history is cleared and refills with the
+    // real timeline at the new playhead. (A fixed sample-count threshold
+    // CANNOT detect jumps: the per-slice playhead advance scales with the
+    // playback speed and the file's sample rate — a 3-frame threshold even
+    // cleared the history on every tick during 1x playback.)
+    uint64_t last_seek_seq;          // Channel seek sequence at the last append
+    bool last_seek_seq_valid;
+
+    // DAW-style paused analysis window (playback): rendered directly from
+    // the file via the gui_playback analysis decoder.
+    bool analysis_active;           // Paused-window mode engaged this session
+    bool analysis_requested;        // A window request is in flight
+    bool analysis_rerequest;         // Span changed; re-request on next render
+    uint64_t analysis_playhead;      // Playhead sample of the last request
+    double analysis_span_seconds;    // Requested span (wheel adjustable)
+    uint64_t analysis_seq;          // Last consumed analysis result seq
 } spectro_engine_t;
 
 //-----------------------------------------------------------------------------
@@ -278,6 +307,72 @@ static void spectro_append_frame(spectro_engine_t *e) {
 }
 
 //-----------------------------------------------------------------------------
+// Paused analysis window: write one slice at a fixed history index
+//-----------------------------------------------------------------------------
+
+// Write the current e->frame as time slice `index` (0 = window start).
+// Spectrograph: slice 0 at the LEFT edge, newest (window end) at the right.
+// Waterfall: slice 0 at the BOTTOM, newest at the top (matches live flow).
+static void spectro_write_slice_index(spectro_engine_t *e, int index) {
+    if (!e || !e->frame_valid || index < 0) return;
+
+    if (!e->time_on_x) {
+        // Waterfall: freq on X (cols), time on Y (rows). Oldest at bottom.
+        int row = e->time_bins - 1 - index;
+        if (row < 0 || row >= e->tex_h) return;
+        for (int f = 0; f < e->freq_bins && f < e->tex_w; f++) {
+            const unsigned char *c = lut_lookup(e, e->frame[f]);
+            unsigned char *p = &e->pixels[((size_t)row * e->tex_w + (size_t)f) * 4];
+            p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = c[3];
+        }
+    } else {
+        // Spectrograph: time on X (cols), freq on Y (rows). Oldest at left.
+        int col = index;
+        if (col >= e->tex_w) return;
+        for (int f = 0; f < e->freq_bins; f++) {
+            int row = e->freq_bins - 1 - f;   // high freq -> row 0 (top)
+            if (row < 0 || row >= e->tex_h) continue;
+            const unsigned char *c = lut_lookup(e, e->frame[f]);
+            put_pixel(e, col, row, c);
+        }
+    }
+}
+
+// Request/poll/render the paused analysis window into the history texture.
+// Fills the FULL history width with the window's slices (async: keeps the
+// last completed window until the worker publishes the new one).
+static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, int channel) {
+    uint64_t playhead = gui_playback_get_position_samples_channel(app, channel);
+    if (!e->analysis_requested || e->analysis_rerequest ||
+        playhead != e->analysis_playhead) {
+        gui_playback_request_analysis_window(app, channel, playhead,
+                                              e->analysis_span_seconds);
+        e->analysis_requested = true;
+        e->analysis_rerequest = false;
+        e->analysis_playhead = playhead;
+    }
+
+    const float *mags = NULL;
+    size_t slice_count = 0;
+    size_t bins = 0;
+    if (gui_playback_poll_analysis_window(app, channel, &e->analysis_seq,
+                                           &mags, &slice_count, &bins) &&
+        mags && bins > 0) {
+        // The worker already FFT'd + max-held each cell (gui_playback.c):
+        // the render only resamples each magnitude frame to the panel's
+        // frequency resolution and writes the column — no render-thread
+        // FFTs (512 columns render in ~ms, no frame stalls).
+        size_t limit = (slice_count < (size_t)e->time_bins)
+            ? slice_count : (size_t)e->time_bins;
+        for (size_t i = 0; i < limit; i++) {
+            resample_magnitude(mags + i * bins, (int)bins, e->frame, e->freq_bins);
+            e->frame_valid = true;
+            spectro_write_slice_index(e, (int)i);
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
 // Overlay: frequency axis grid + labels + "now" edge marker
 //-----------------------------------------------------------------------------
 
@@ -348,7 +443,6 @@ static void spectro_draw_overlay(spectro_engine_t *e, Rectangle bounds, Rectangl
 
 static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                                    Rectangle bounds, Color channel_color) {
-    (void)channel;
     (void)channel_color;
     if (!state_ptr || !app) return;
 
@@ -385,25 +479,81 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         e->needs_full_upload = true;
     }
 
-    // Consume the latest FFT frame from the display thread (no EMA: each time
-    // slice is a distinct, crisp spectrum).
-    if (atomic_exchange(&e->fft.magnitude_ready, 0)) {
-        int bins = e->fft.fft_bins;
-        if (bins > 0 && e->fft.magnitude_back) {
-            resample_magnitude(e->fft.magnitude_back, bins, e->frame, e->freq_bins);
+    // DAW-style mode select (the selected-device check mirrors gui_ui.c's
+    // gui_ui_selected_device_is_playback, which is file-static; the device
+    // fields come from gui_app.h).
+    bool playback_selected =
+        app && app->selected_device >= 0 &&
+        app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+    bool playback_paused =
+        playback_selected &&
+        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED;
+
+    if (playback_paused) {
+        // --- DAW-style paused analysis window (direct file render) ---
+        // Playing stays the 1:1 live rolling feed; paused renders a real
+        // window of the FILE around the playhead across the full history
+        // width (duration-based span, async worker — keeps the previous
+        // window until the new one is published).
+        if (!e->analysis_active) {
+            e->analysis_active = true;
+            e->analysis_requested = false;
+            e->analysis_rerequest = false;
+            e->analysis_playhead = 0;
+            e->analysis_seq = 0;
+            e->analysis_span_seconds = SPEC_PAUSED_WINDOW_SECONDS;
         }
-        e->last_sample_rate = atomic_load(&e->fft.sample_rate);
-        e->frame_valid = true;
+        spectro_update_paused_window(e, app, channel);
+        UpdateTexture(e->tex, e->pixels);
+        e->needs_full_upload = false;
+    } else {
+        if (e->analysis_active) {
+            // Paused -> playing/live transition: restart the rolling feed.
+            e->analysis_active = false;
+            e->analysis_requested = false;
+            e->last_seek_seq_valid = false;
+            if (e->pixels) {
+                memset(e->pixels, 0, (size_t)e->tex_w * e->tex_h * 4);
+            }
+            e->frame_valid = false;
+            e->needs_full_upload = true;
+        }
+
+        // Consume the latest FFT frame from the display thread (no EMA: each
+        // time slice is a distinct, crisp spectrum).
+        bool got_new_frame = atomic_exchange(&e->fft.magnitude_ready, 0) != 0;
+        if (got_new_frame) {
+            int bins = e->fft.fft_bins;
+            if (bins > 0 && e->fft.magnitude_back) {
+                resample_magnitude(e->fft.magnitude_back, bins, e->frame, e->freq_bins);
+            }
+            e->last_sample_rate = atomic_load(&e->fft.sample_rate);
+            e->frame_valid = true;
+        }
+
+        // Non-linear move detection (playback only): the playback thread bumps
+        // the channel's seek sequence on every successful seek — clear the
+        // rolling history on a change so it refills with the real timeline at
+        // the new playhead (a paused scrub backfills the window ending at the
+        // playhead; see gui_playback.c PLAYBACK_PREVIEW_WINDOW_SECONDS).
+        if (playback_selected) {
+            uint64_t seq = gui_playback_get_seek_seq_channel(app, channel);
+            if (e->last_seek_seq_valid && seq != e->last_seek_seq && e->pixels) {
+                memset(e->pixels, 0, (size_t)e->tex_w * e->tex_h * 4);
+            }
+            e->last_seek_seq = seq;
+            e->last_seek_seq_valid = true;
+        }
+        // Scroll one slice and write the latest frame (repeats the last frame
+        // if no new data arrived this render tick -> smooth 60 fps scroll).
+        spectro_append_frame(e);
+
+        // Upload the whole history buffer (no-flip; the draw uses negative
+        // source height so buffer row 0 lands at the top of the screen).
+        UpdateTexture(e->tex, e->pixels);
+        e->needs_full_upload = false;
     }
-
-    // Scroll one slice and write the latest frame (repeats the last frame if no
-    // new data arrived this render tick -> smooth 60 fps scroll).
-    spectro_append_frame(e);
-
-    // Upload the whole history buffer (no-flip; the draw uses negative source
-    // height so buffer row 0 lands at the top of the screen).
-    UpdateTexture(e->tex, e->pixels);
-    e->needs_full_upload = false;
 
     // Plot fills the whole bounds now; labels are drawn inside it on top of
     // the spectrogram (no reserved strip), so they read as part of the window.
@@ -417,11 +567,43 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                    (Vector2){0, 0}, 0.0f, WHITE);
 
     spectro_draw_overlay(e, bounds, plot);
+
+    // Paused analysis indicator: window span + pending state. Every column
+    // of the paused window is ONE true FFT over that column's full contiguous
+    // samples (full resolution; see gui_playback.c).
+    if (e->analysis_active) {
+        char win_buf[64];
+        snprintf(win_buf, sizeof(win_buf), "PAUSED  %.2fs window%s",
+                 e->analysis_span_seconds,
+                 e->analysis_requested ? "" : "  (rendering...)");
+        gui_text_draw(win_buf, bounds.x + 38.0f, bounds.y + 3.0f,
+                     FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+    }
 }
 
 //-----------------------------------------------------------------------------
 // Vtables + Registration
 //-----------------------------------------------------------------------------
+
+// Wheel over the panel while the paused analysis window is active adjusts the
+// window span (x1.25 / :1.25 steps, 0.1 s .. 60 s; longer spans are also capped
+// by the full-resolution hop budget inside gui_playback.c — the span trades
+// time vs frequency resolution exactly like an FFT-size setting, never detail).
+static bool spectro_vtable_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
+    if (!state_ptr || delta == 0.0f) return false;
+    spectro_engine_t *e = (spectro_engine_t *)state_ptr;
+    if (!e->analysis_active) return false;
+    Vector2 mouse = gui_ui_get_mouse_position();
+    if (!CheckCollisionPointRec(mouse, bounds)) return false;
+    double span = e->analysis_span_seconds;
+    if (delta > 0.0f) span /= 1.25;
+    else span *= 1.25;
+    if (span < 0.1) span = 0.1;
+    if (span > 60.0) span = 60.0;
+    e->analysis_span_seconds = span;
+    e->analysis_rerequest = true;
+    return true;
+}
 
 static const panel_vtable_t s_waterfall_vtable = {
     .name = "Waterfall",
@@ -432,7 +614,7 @@ static const panel_vtable_t s_waterfall_vtable = {
     .render = spectro_vtable_render,
     .render_overlay = NULL,
     .handle_click = NULL,
-    .handle_scroll = NULL,
+    .handle_scroll = spectro_vtable_handle_scroll,
     .get_menu_count = NULL,
     .get_menu = NULL,
 };
@@ -446,7 +628,7 @@ static const panel_vtable_t s_spectrograph_vtable = {
     .render = spectro_vtable_render,
     .render_overlay = NULL,
     .handle_click = NULL,
-    .handle_scroll = NULL,
+    .handle_scroll = spectro_vtable_handle_scroll,
     .get_menu_count = NULL,
     .get_menu = NULL,
 };

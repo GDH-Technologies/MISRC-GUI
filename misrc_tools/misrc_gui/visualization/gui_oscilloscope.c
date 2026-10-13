@@ -16,6 +16,7 @@
 #include "gui_panel.h"
 #include "../ui/gui_dropdown.h"
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
+#include "../input/gui_playback.h" // DAW-style pause: re-process on config change
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,14 @@ typedef struct {
 
     // Drag state for trigger level
     bool dragging;
+
+    // Config-changed flag (guarded by data_lock): set when zoom / trigger
+    // settings change (scroll, dropdowns, level drag). Cleared when the
+    // config is applied to a frame in waveform_vtable_process. While
+    // playback is PAUSED no new display frames arrive, so waveform_render
+    // re-processes the last frame on this flag (DAW-style: zoom/trigger
+    // adjustments keep rendering while paused).
+    bool config_dirty;
 
     // CVBS detected levels (updated when CVBS trigger mode active)
     int16_t cvbs_sync_level;    // Sync tip level (lowest peak)
@@ -1079,6 +1088,9 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
         state->display_samples_available = new_available;
         state->trigger_display_pos = new_trigger_display_pos;
     }
+    // The current config has been applied to this frame: a pending
+    // zoom/trigger change no longer needs a paused re-process.
+    state->config_dirty = false;
     waveform_state_unlock(state);
 }
 
@@ -1592,6 +1604,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         if (CheckCollisionPointRec(click, off_rect)) {
             waveform_state_lock(state);
             state->trigger_enabled = false;
+            state->config_dirty = true;
             waveform_state_unlock(state);
             state->trigger_dropdown_open = false;
             return true;
@@ -1608,6 +1621,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
                     state->trigger_source = waveform_default_trigger_source_for_channel(channel);
                 }
                 state->trigger_mode = (trigger_mode_t)i;
+                state->config_dirty = true;
                 waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
@@ -1620,6 +1634,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
             if (CheckCollisionPointRec(click, src_rect)) {
                 waveform_state_lock(state);
                 state->trigger_source = (trigger_source_t)i;
+                state->config_dirty = true;
                 waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
@@ -1667,6 +1682,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 
         waveform_state_lock(state);
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        state->config_dirty = true;
         waveform_state_unlock(state);
 
         return true;
@@ -1699,6 +1715,7 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
         waveform_state_lock(state);
 
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        state->config_dirty = true;
         waveform_state_unlock(state);
     } else {
         // Mouse released - stop dragging
@@ -1730,6 +1747,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
         if (state->zoom_scale < ZOOM_SCALE_MIN) {
             state->zoom_scale = ZOOM_SCALE_MIN;
         }
+        state->config_dirty = true;
         waveform_state_unlock(state);
     } else {
         // Scroll down = zoom out (more samples per pixel)
@@ -1738,6 +1756,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
         if (state->zoom_scale > ZOOM_SCALE_MAX) {
             state->zoom_scale = ZOOM_SCALE_MAX;
         }
+        state->config_dirty = true;
         waveform_state_unlock(state);
     }
 
@@ -1759,7 +1778,30 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
 
+    // DAW-style pause hold (playback only): while PAUSED no new display
+    // frames arrive, so zoom / trigger-level changes would not render until
+    // resume (config is applied per frame in waveform_vtable_process).
+    // Re-process the LAST display frame — the trigger source buffers still
+    // reference it — whenever the config changed while holding, so zoom,
+    // trigger level and trigger mode keep rendering live while paused.
+    if (app->selected_device >= 0 &&
+        app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK &&
+        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED) {
+        bool dirty = false;
+        waveform_state_lock(state);
+        dirty = state->config_dirty;
+        waveform_state_unlock(state);
+        if (dirty) {
+            const int16_t *src = (channel == 1) ? s_trigger_src_ch2 : s_trigger_src_ch1;
+            if (src && s_trigger_src_count > 0) {
+                waveform_vtable_process(state, src, s_trigger_src_count,
+                                        atomic_load(&app->sample_rate));
+            }
+        }
+    }
 
+    // Dispatch based on render mode
     // Dispatch based on render mode
     if (state->render_mode == WAVEFORM_MODE_PHOSPHOR) {
         render_waveform_phosphor_internal(state, app, channel, bounds, channel_color);

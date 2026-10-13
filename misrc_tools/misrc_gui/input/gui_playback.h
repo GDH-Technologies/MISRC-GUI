@@ -17,6 +17,7 @@
 #define GUI_PLAYBACK_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Forward declaration
@@ -55,10 +56,16 @@ typedef enum {
 
 typedef struct {
     char filepath[512];          // Full path to FLAC file
-    uint32_t sample_rate;        // Sample rate from FLAC metadata
+    uint32_t sample_rate;        // Sample rate from FLAC STREAMINFO header
+                                 // (kHz-domain value for RF captures, e.g. 20000 = 20 MSPS)
     uint8_t bits_per_sample;     // Bits per sample (8, 12, 16)
-    uint64_t total_samples;      // Total samples in file
-    double duration_seconds;     // Total duration
+    uint64_t total_samples;      // TRUE total samples in the stream (probe/tag resolved,
+                                 // NOT the raw header value on finalized files)
+    uint64_t header_total_samples; // Raw STREAMINFO total_samples value (diagnostics:
+                                 // kHz-domain RF/1000 on finalized files, may be 0)
+    double duration_seconds;     // TRUE total duration (total_samples / real_sample_rate_hz)
+    double real_sample_rate_hz;  // Resolved real sample rate in Hz (e.g. 20000000 for a
+                                 // 20 MSPS RF capture, or 44100 for a true audio file)
     bool valid;                  // File was successfully opened/validated
 } playback_file_info_t;
 
@@ -98,6 +105,13 @@ uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel);
 double gui_playback_get_position_normalized(gui_app_t *app);
 double gui_playback_get_position_seconds(gui_app_t *app);
 
+// Per-channel seek sequence: increments on every successful seek of that
+// channel (scrub / wheel / paused backfill). Display panels use it to detect
+// NON-LINEAR playhead moves exactly (a fixed sample-count threshold cannot
+// work: the per-slice position advance scales with the playback speed and
+// the file's sample rate) and clear rolling history on a jump.
+uint64_t gui_playback_get_seek_seq_channel(gui_app_t *app, int channel); // channel: 0=A, 1=B
+
 // Get total duration
 uint64_t gui_playback_get_total_samples(gui_app_t *app);
 double gui_playback_get_duration_seconds(gui_app_t *app);
@@ -111,6 +125,13 @@ const char* gui_playback_speed_name(playback_speed_t speed);
 bool gui_playback_get_file_info_a(gui_app_t *app, playback_file_info_t *info);
 bool gui_playback_get_file_info_b(gui_app_t *app, playback_file_info_t *info);
 
+// Get file info for the playback file selected in settings (channel: 0=A, 1=B).
+// Returns the live playback file info while playback is running; otherwise
+// validates the settings-selected file (cached by path, so it is cheap to
+// call per frame) so the UI can show bit depth / sample rate / duration
+// readouts before playback starts. Returns true when the info is valid.
+bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_file_info_t *info);
+
 // Validate a FLAC file before playback (check format compatibility)
 // Returns true if file is compatible with MISRC playback
 bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info);
@@ -118,5 +139,47 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
 // Loop mode: restart from beginning when EOF reached
 void gui_playback_set_loop(gui_app_t *app, bool loop);
 bool gui_playback_get_loop(gui_app_t *app);
+
+//-----------------------------------------------------------------------------
+// DAW-Style Paused Analysis Window (direct file random access)
+//-----------------------------------------------------------------------------
+// While PAUSED the display panels render analysis windows straight from the
+// FLAC file (the rolling live pipeline only carries one 65,536-sample display
+// frame — 3.3 ms at 20 MSPS — which is 1:1-correct for playing, but far too
+// small for paused analysis). A dedicated analysis decoder per channel
+// (own FILE handle + IO layer + STREAMINFO patch, isolated from the playback
+// thread's decoders) decodes the requested window asynchronously:
+//   gui_playback_request_analysis_window: center/span -> worker (non-blocking)
+//   gui_playback_poll_analysis_window:    newest completed result (or false)
+// The span is DURATION-based (sample rates vary across files: 5/10/20/40
+// MSPS) and centered on the playhead. Results are SLICE_COUNT FFT-sized
+// sample slices strided across the window; the spectrogram panel FFTs and
+// renders them across its full history width.
+
+#define PLAYBACK_ANALYSIS_SLICES 512        // == SPEC_TIME_BINS (gui_spectrogram.c); keep in sync
+#define PLAYBACK_ANALYSIS_SLICE_SAMPLES 4096
+#define PLAYBACK_ANALYSIS_BINS (PLAYBACK_ANALYSIS_SLICE_SAMPLES / 2 + 1)  // 2049
+
+// FULL-RESOLUTION contiguous model: each column of the result is ONE true
+// FFT over that column's entire contiguous sample span (hop = span/SLICES,
+// zero-padded to the next power of two for FFTW). No sub-window sampling,
+// no averaging, no max-hold — the span simply trades time vs frequency
+// resolution exactly like an FFT-size setting in a DAW. Longer spans are
+// capped by the per-column FFT budget (rate-dependent, duration-based).
+#define PLAYBACK_ANALYSIS_HOP_MAX 262144   // Max samples per column FFT (2^18)
+
+void gui_playback_request_analysis_window(gui_app_t *app, int channel,
+                                           uint64_t center_sample,
+                                           double span_seconds);
+// Returns true when a result newer than *io_seq is available; updates *io_seq
+// and points the outputs at the published per-slice magnitude frames: a
+// slice_count x BINS float array (normalized 0-1 intensities, max-hold across
+// the slice's sub-windows — see the HARD DEV NOTE in gui_playback.c). The
+// render thread only resamples + LUT-maps these (no FFTs on the render path).
+bool gui_playback_poll_analysis_window(gui_app_t *app, int channel,
+                                        uint64_t *io_seq,
+                                        const float **out_magnitudes,
+                                        size_t *out_slice_count,
+                                        size_t *out_bins);
 
 #endif // GUI_PLAYBACK_H

@@ -2677,10 +2677,9 @@ static device_type_t gui_capture_active_device_type(const gui_app_t *app)
 //   all normalize peaks into the 12-bit signed container (max magnitude 2048).
 // - DdD stores native 10-bit magnitude (max 512) directly into the peak
 //   atomics (gui_ddd.c), so its full scale is 512.
-// - 8-bit FLAC playback stays in the 8-bit range (max 128); 12/16-bit playback
-//   normalizes to the 12-bit container (2048). The bps is read from the FLAC
-//   STREAMINFO via gui_playback_get_file_info_a(); if unavailable (e.g. no
-//   file loaded yet / LIBFLAC disabled), fall back to 2048.
+// - playback normalizes EVERY FLAC bit depth (8/12/16-bit) back into the
+//   12-bit container on decode (see gui_playback.c write callbacks), so its
+//   full scale is 2048 like the live MISRC paths.
 uint16_t gui_app_level_autostop_full_scale(const gui_app_t *app)
 {
     if (!app) return 2048;
@@ -2688,13 +2687,7 @@ uint16_t gui_app_level_autostop_full_scale(const gui_app_t *app)
 #ifdef ENABLE_DDD
     if (t == DEVICE_TYPE_DDD) return 512;
 #endif
-    if (t == DEVICE_TYPE_PLAYBACK) {
-        playback_file_info_t info;
-        if (gui_playback_get_file_info_a((gui_app_t *)app, &info) && info.valid) {
-            if (info.bits_per_sample == 8) return 128;
-        }
-        return 2048;
-    }
+    (void)t;
     return 2048;
 }
 

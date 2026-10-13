@@ -724,3 +724,116 @@ Key constraints to preserve when touching capture/parser/audio paths:
   - Audio monitor: `Audio Mon` audible and `BUF_CAPTURE_AUDIO` no longer pinned at 0%.
 - Prefer minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`,
   and `gui_audio`; avoid unrelated UI/settings churn during capture debugging.
+
+## HARD DEV NOTE — Playback data pipeline (2026-10-12)
+
+Playback must behave 1:1 with the live capture preview. The constraints below
+are verified against real captures (VHS_Tape_08: 130 GB / 225,155,481,120-sample
+20 MSPS video RF + 18.4 GB / 56,288,870,044-sample 5 MSPS hifi RF).
+
+### FLAC header conventions (both exist on disk)
+
+- OLD (pre-finalize): STREAMINFO `total_samples` = raw RF sample count (TRUE),
+  header `sample_rate` = kHz-domain value (20000 = 20 MSPS). Header DURATION
+  is 1000x too long — this is the lie external audio programs show.
+- NEW (finalized): STREAMINFO `total_samples` = RF/1000 (kHz domain, so header
+  duration is truthful), RF truth in Vorbis tags (`RF_TOTAL_SAMPLES`,
+  `RF_SAMPLE_RATE`, `RF_SAMPLE_RATE_KHZ`, `DURATION_SECONDS`).
+- `FLAC__stream_decoder_seek_absolute` rejects any seek >= the STREAMINFO
+  total and ignores seektable points beyond it, so the header lie breaks
+  scrubbing on finalized files.
+
+### Resolution rules (gui_playback.c)
+
+- TRUE stream total: throwaway probe decoder +
+  `FLAC__stream_decoder_find_total_samples()` (tail decode — cheap for
+  multi-GB files, authoritative for both conventions). Order: probe truth >
+  RF tags > legacy wrap/companion/frame-scan fallbacks.
+- Real rate: `RF_SAMPLE_RATE` tag > kHz-domain header x1000 > filename
+  `<N>msps` hint. Genuine audio-rate files stay in kHz.
+- STREAMINFO patch: decoders feed through the owned IO layer
+  (`init_stream` callbacks). The first 26 file bytes are served from memory
+  with the total_samples field patched — file on disk never modified.
+  **The field is only 36 bits (~68.7G samples)**; long captures exceed it, so
+  when the true total cannot be represented the patch writes 0 ("unknown"):
+  libFLAC then applies NO seek clamp and resolves seeks via the seektable /
+  binary search over the real stream. (Patching the true count on a 225G-sample
+  file truncated to `total % 2^36` and rejected every seek past that point.)
+
+### Sample scaling (1:1 with live preview)
+
+Recorder conventions (gui_record.c): 16-bit FLAC = 12-bit container `<< 4`;
+12-bit = container as-is; 8-bit = container `>> 4`. Playback write callbacks
+restore the 12-bit container for EVERY depth (8-bit `<< 4`), so the raw
+packing (`2047 - sample`), extraction (`(2047 - field) << 4` into the 16-bit
+display container), VU meters, peaks and clipping all match live capture.
+
+### Pause (DAW-style) + watchdog
+
+- While PAUSED the playback thread keeps `last_callback_time_ms` fresh:
+  `gui_capture_device_timeout` (2 s) would otherwise fire auto-reconnect and
+tear the session down ("playback crashes and resets").
+- Seeks while paused push exactly ONE preview batch (`preview_pending`) so
+  the waveform/spectrogram render the new position, then hold.
+- The spectrogram/waterfall freeze while paused (`gui_spectrogram.c`):
+no scroll, new (preview) frames still land. Live capture scroll behavior is
+unchanged.
+
+### Timeline UI (gui_ui.c)
+
+- Right-side file info next to each scrub slider (all from the actual
+  selected/playing file, cached per path — never guessed): basename,
+  `8-bit 20.0 MSPS`, `RAW 838.8GiB FLAC 121.5GiB 6.9x` (RAW = per-channel
+  packed u32 stream = total_samples x 4, matching the capture log's raw
+  accounting; FLAC = on-disk size). Fixed representative widths per tier
+  (full -> compact -> hidden) so value changes never reflow the row.
+- Mouse wheel over a timeline row scrubs that channel with 1-10 s
+  acceleration: notches within 400 ms ramp the step (+0.75 s/notch, cap 10 s);
+  idle resets to 1 s. Wheel-up = back, wheel-down = forward.
+
+### Container limitation — external tools (ocenaudio) show "data < duration"
+
+FLAC's fields cannot represent RF captures:
+- `sample_rate` field: 20 bits, max 655,350 Hz — RF rates (5-40 MSPS) cannot
+  be stored; the recorder stores the kHz-domain value (20 MSPS -> 20000 Hz).
+- `total_samples` field: 36 bits, max 68,719,476,735 — this 3h07m capture has
+  225,155,481,120 samples; the recorder stores total/1000 so the header
+  DURATION (total/rate) is truthful.
+
+Consequence (verified): the full data IS in the file — real signal decodes at
+-ss 11000s and -ss 11230s of the 11257.77s total (ffmpeg volumedetect), and
+decoding to EOF yields every sample. But tools that decode a SAMPLE COUNT
+from STREAMINFO instead of decoding to EOF (ocenaudio's preview is one) stop
+after 225,155,481 "samples" — 0.1% of the data — while still showing the
+correct duration. No FLAC encoding can avoid this for >655 kHz captures; the
+GUI playback resolves the truth via the probe + tags and decodes to EOF.
+
+### DAW-style paused analysis window (2026-10-12 additions)
+
+- Playing = live 1:1 rolling feed; PAUSED renders analysis windows straight
+  from the file: `gui_playback_request_analysis_window` (duration-based span,
+  default exactly 3 s, wheel-over-panel 1-60 s) -> async worker ->
+  `gui_playback_poll_analysis_window` (512 slices x 4096 samples strided
+  across the span; the spectrogram FFTs + renders them across its full
+  history width).
+- Window decode runs on 8 seek-aligned parallel segment decoders (own FILE
+  handles + IO layer + STREAMINFO patch, isolated from the playback thread).
+  Benchmarked on the 130 GB capture (3 s @ 20 MSPS): sequential 621 ms ->
+  8 segments 82 ms (7.6x). Parallel only when span > 2x the seektable gap
+  (8,388,608 samples); small windows decode sequentially.
+- Seek while paused: backfills the 3 s pipeline window (waveform) AND
+  re-centers the analysis window on the new playhead.
+- Space bar = play/pause in playback mode (live capture devices keep
+  start/stop; still refuses to disconnect mid-recording).
+- Waveform zoom/trigger changes while paused re-process the last display
+  frame (config_dirty) so they render live; ZOOM_SCALE_MIN = 1.0 = full
+  resolution (1 sample/pixel).
+
+### Verification
+
+- `gui_playback_resolve` meson test (30 checks): synthesizes both header
+  conventions + asserts true-total resolution, patched decoder-visible total,
+  and seeks past the lying header total.
+- Real-file checks: `/tmp/flac_probe_test.c`, `/tmp/flac_seek_verify.c`,
+  `/tmp/flac_loop_verify.c`, `/tmp/flac_seg_bench.c` (probe/patch/seek/
+  EOF-loop/parallel-segment decode on the actual captures).

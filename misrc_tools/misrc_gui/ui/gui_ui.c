@@ -1289,9 +1289,9 @@ static bool gui_ui_playback_channel_timeline_info(gui_app_t *app, int channel_in
     if (!app) return false;
 
     playback_file_info_t info = {0};
-    (void)((channel_index == 0)
-        ? gui_playback_get_file_info_a(app, &info)
-        : gui_playback_get_file_info_b(app, &info));
+    // Live playback info while running; otherwise the file selected in
+    // settings (validated + cached per path) so timecodes show at idle too.
+    (void)gui_playback_get_selected_file_info(app, channel_index, &info);
 
     if (info.total_samples == 0) return false;
     double duration_seconds = info.duration_seconds;
@@ -1332,6 +1332,164 @@ static void gui_ui_format_playback_timeline(char *dst, size_t dst_len, int *out_
     if (fill_w < 0) fill_w = 0;
     if (fill_w > track_width_px) fill_w = track_width_px;
     if (out_fill_w) *out_fill_w = fill_w;
+}
+// Format the per-channel playback file readout shown in-line with the scrub
+// slider bar: the ACTUAL bit depth and the resolved real sample rate of the
+// selected/playing FLAC file ("8-bit 20.0 MSPS", "16-bit 44.1 kHz"; compact
+// tier "8b 20.0M" on narrow layouts). RF captures resolve to their true RF
+// rate; genuine audio-rate files stay in kHz.
+static void gui_ui_format_playback_readout(gui_app_t *app, int channel,
+                                           char *dst, size_t dst_len, bool compact)
+{
+    if (!dst || dst_len == 0) return;
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.bits_per_sample == 0 ||
+        !(info.real_sample_rate_hz > 0.0) || !isfinite(info.real_sample_rate_hz)) {
+        snprintf(dst, dst_len, "--");
+        return;
+    }
+    double hz = info.real_sample_rate_hz;
+    if (hz >= 1.0e6) {
+        snprintf(dst, dst_len, compact ? "%u-bit %.1fM" : "%u-bit %.1f MSPS",
+                 (unsigned)info.bits_per_sample, hz / 1.0e6);
+    } else {
+        snprintf(dst, dst_len, compact ? "%u-bit %.1fk" : "%u-bit %.1f kHz",
+                 (unsigned)info.bits_per_sample, hz / 1.0e3);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Playback timeline: right-side FILE INFO (HARD DEV NOTE)
+//-----------------------------------------------------------------------------
+/* HARD DEV NOTE — playback timeline file info + wheel scrub (2026-10-12)
+ *
+ * Next to each playback scrub slider the row shows, from the ACTUAL selected
+ * /playing FLAC file (gui_playback_get_selected_file_info: live info while
+ * playing, else path-cached validation — never a guess):
+ *   1. basename (ellipsized slot),
+ *   2. "8-bit 20.0 MSPS" — actual bit depth + resolved real RF rate
+ *      (RF_SAMPLE_RATE tag > kHz-domain header x1000 > filename msps hint),
+ *   3. "RAW 838.8GiB FLAC 121.5GiB 6.9x" — RAW is the per-channel packed
+ *      u32 raw stream (total_samples x 4 bytes — the same accounting the
+ *      capture log's rawA/rawB uses); FLAC is the on-disk size (64-bit size
+ *      read, cached per path); ratio = raw / compressed.
+ * Slots use fixed representative widths per tier (full -> compact -> hidden)
+ * so value changes never reflow the row; stacked rows put the whole info line
+ * under the track. Data is cached per path — re-select the file to refresh
+ * sizes after it changes on disk.
+ *
+ * Mouse wheel over a playback timeline row scrubs that channel with 1-10 s
+ * acceleration: notches within 400 ms ramp the step (+0.75 s/notch, capped at
+ * 10 s); an idle gap resets to the 1 s base step. Wheel-up steps backward,
+ * wheel-down steps forward (swap the sign in gui_handle_interactions to
+ * flip). Seeks while paused push ONE preview batch (gui_playback.c
+ * preview_pending) so the waveform/spectrogram render the new position, then
+ * hold — the spectrogram freezes while paused (gui_spectrogram.c) like a DAW.
+ *---------------------------------------------------------------------------*/
+
+// 64-bit file size, portable across the POSIX/Win32 builds.
+static uint64_t gui_ui_file_size_64(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint64_t size = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        __int64 end = _ftelli64(f);
+        if (end >= 0) size = (uint64_t)end;
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t end = ftello(f);
+        if (end >= 0) size = (uint64_t)end;
+    }
+#endif
+    fclose(f);
+    return size;
+}
+
+// Binary-unit size text ("838.8GiB"; compact tier "838.8G").
+static void gui_ui_format_size_u64(uint64_t bytes, char *dst, size_t dst_len, bool compact) {
+    if (!dst || dst_len == 0) return;
+    static const char *units_full[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    static const char *units_compact[] = {"B", "K", "M", "G", "T"};
+    double v = (double)bytes;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) {
+        v /= 1024.0;
+        u++;
+    }
+    if (bytes == 0) {
+        snprintf(dst, dst_len, "0B");
+        return;
+    }
+    if (u == 0) {
+        snprintf(dst, dst_len, "%uB", (unsigned)bytes);
+        return;
+    }
+    snprintf(dst, dst_len, compact ? "%.1f%s" : "%.1f%s", v,
+             compact ? units_compact[u] : units_full[u]);
+}
+
+// File info text: "RAW 838.8GiB FLAC 121.5GiB 6.9x" (compact "838.8G/121.5G").
+static void gui_ui_format_playback_fileinfo(gui_app_t *app, int channel,
+                                            char *dst, size_t dst_len, bool compact)
+{
+    if (!dst || dst_len == 0) return;
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.total_samples == 0 || info.filepath[0] == '\0') {
+        snprintf(dst, dst_len, "--");
+        return;
+    }
+    typedef struct {
+        char path[512];
+        uint64_t raw;
+        uint64_t flac;
+        bool valid;
+    } fileinfo_cache_t;
+    static fileinfo_cache_t s_fileinfo_cache[2];
+    fileinfo_cache_t *c = &s_fileinfo_cache[channel];
+    if (!c->valid || strncmp(c->path, info.filepath, sizeof(c->path)) != 0) {
+        snprintf(c->path, sizeof(c->path), "%s", info.filepath);
+        c->raw = info.total_samples * 4ULL;   // per-channel packed u32 stream
+        c->flac = gui_ui_file_size_64(c->path);
+        c->valid = true;
+    }
+    char raw_buf[20];
+    char flac_buf[20];
+    gui_ui_format_size_u64(c->raw, raw_buf, sizeof(raw_buf), compact);
+    gui_ui_format_size_u64(c->flac, flac_buf, sizeof(flac_buf), compact);
+    if (c->flac > 0) {
+        double ratio = (double)c->raw / (double)c->flac;
+        if (compact) {
+            snprintf(dst, dst_len, "%s/%s", raw_buf, flac_buf);
+        } else {
+            snprintf(dst, dst_len, "RAW %s FLAC %s %.1fx", raw_buf, flac_buf, ratio);
+        }
+    } else if (compact) {
+        snprintf(dst, dst_len, "%s", raw_buf);
+    } else {
+        snprintf(dst, dst_len, "RAW %s", raw_buf);
+    }
+}
+
+// File basename for the info line ("Tape_08_..._video_rf_8-bit_20msps.flac").
+static void gui_ui_playback_file_basename(gui_app_t *app, int channel,
+                                          char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.filepath[0] == '\0') return;
+    const char *slash = strrchr(info.filepath, '/');
+    const char *bslash = strrchr(info.filepath, '\\');
+    const char *sep = (slash && bslash) ? (slash > bslash ? slash : bslash)
+                                       : (slash ? slash : bslash);
+    const char *base = sep ? (sep + 1) : info.filepath;
+    snprintf(dst, dst_len, "%s", base);
 }
 static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, float mouse_x)
 {
@@ -1378,6 +1536,12 @@ static char playback_file_a_display[64];
 static char playback_file_b_display[64];
 static char playback_timeline_display_a[48];
 static char playback_timeline_display_b[48];
+static char playback_readout_display_a[32];
+static char playback_readout_display_b[32];
+static char playback_name_display_a[64];
+static char playback_name_display_b[64];
+static char playback_fileinfo_display_a[48];
+static char playback_fileinfo_display_b[48];
 static bool s_playback_scrub_active = false;
 static int s_playback_scrub_track_index = 0;
 
@@ -6362,6 +6526,11 @@ static void render_channel_stats(gui_app_t *app, int channel,
 
 typedef struct {
     int left_padding, right_padding, label_width, track_width;
+    int readout_width;      // "8-bit 20.0 MSPS" slot; 0 = no horizontal room
+    int fileinfo_width;     // "RAW x FLAC y" slot; 0 = hidden
+    int name_width;         // filename slot; 0 = hidden
+    bool readout_compact;   // Compact text tier chosen for the readout
+    bool fileinfo_compact;  // Compact text tier chosen for the fileinfo
     bool stacked;
 } gui_playback_timeline_layout_t;
 
@@ -6382,26 +6551,80 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     if (available < 1) available = 1;
     int track_width = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
     bool stacked = available - label_width - 8 < 64;
-    int track_available = stacked ? available : available - label_width - 8;
+    // Right-side file info slots (see the HARD DEV NOTE above the helpers):
+    // fixed representative widths per tier so value changes never reflow the
+    // row; tiers degrade full -> compact-fileinfo -> name+readout -> readout
+    // only. Stacked rows put the whole info line under the track (full tier).
+    int readout_full = gui_ui_measure_text_width(app, "16-bit 999.9 MSPS", FONT_SIZE_STATUS, 1);
+    int readout_compact_w = gui_ui_measure_text_width(app, "16-bit 999M", FONT_SIZE_STATUS, 1);
+    int fileinfo_full = gui_ui_measure_text_width(app, "RAW 9999.9GiB FLAC 9999.9GiB 99.9x", FONT_SIZE_STATUS, 1);
+    int fileinfo_compact_w = gui_ui_measure_text_width(app, "9999.9G/999.9G", FONT_SIZE_STATUS, 1);
+    int name_slot = gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
+    int readout_width = 0;
+    int fileinfo_width = 0;
+    int name_width = 0;
+    bool readout_compact = false;
+    bool fileinfo_compact = false;
+    if (stacked) {
+        name_width = name_slot;
+        readout_width = readout_full;
+        fileinfo_width = fileinfo_full;
+    } else {
+        int room = available - label_width - 8 - 64;  // keep a minimum track
+        int full_all = name_slot + 8 + readout_full + 8 + fileinfo_full;
+        int mid_all = name_slot + 8 + readout_full + 8 + fileinfo_compact_w;
+        int name_readout = name_slot + 8 + readout_full;
+        if (room >= full_all) {
+            name_width = name_slot;
+            readout_width = readout_full;
+            fileinfo_width = fileinfo_full;
+        } else if (room >= mid_all) {
+            name_width = name_slot;
+            readout_width = readout_full;
+            fileinfo_width = fileinfo_compact_w;
+            fileinfo_compact = true;
+        } else if (room >= name_readout) {
+            name_width = name_slot;
+            readout_width = readout_full;
+        } else if (room >= readout_compact_w) {
+            readout_width = readout_compact_w;
+            readout_compact = true;
+        }
+    }
+    int info_width = 0;
+    if (name_width > 0) info_width += name_width;
+    if (readout_width > 0) info_width += (info_width > 0 ? 8 : 0) + readout_width;
+    if (fileinfo_width > 0) info_width += (info_width > 0 ? 8 : 0) + fileinfo_width;
+    int track_available = stacked
+        ? available
+        : available - label_width - 8 - ((info_width > 0) ? info_width + 8 : 0);
     if (track_width > track_available) track_width = track_available;
     if (label_width > available) label_width = available;
     return (gui_playback_timeline_layout_t){left_padding, right_padding,
-                                           label_width, track_width, stacked};
+                                           label_width, track_width,
+                                           readout_width, fileinfo_width, name_width,
+                                           readout_compact, fileinfo_compact, stacked};
 }
 
 // Render one playback timeline row (used for Channel A and Channel B in playback mode).
+// name_text / readout_text / fileinfo_text form the right-side file info line
+// (basename, "8-bit 20.0 MSPS", "RAW x FLAC y"); pass NULL / empty strings to
+// skip slots the layout hid. See the HARD DEV NOTE above the helpers.
 static void render_playback_timeline_row(gui_app_t *app, int channel_index, char *timeline_text,
                                          int fill_w, bool enabled, gui_ui_channel_spacing_t spacing,
-                                         const gui_playback_timeline_layout_t *layout)
+                                         const gui_playback_timeline_layout_t *layout,
+                                         const char *name_text, const char *readout_text,
+                                         const char *fileinfo_text)
 {
     Color timeline_text_color = enabled ? COLOR_TEXT : COLOR_TEXT_DIM;
     Color timeline_track_color = enabled ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = enabled ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM;
+    Color readout_color = enabled ? COLOR_TEXT_DIM : ui_disabled_color(COLOR_TEXT_DIM);
     gui_ui_ellipsize_text(app, timeline_text, sizeof(playback_timeline_display_a),
                           FONT_SIZE_STATUS, 1, layout->label_width);
     CLAY(CLAY_IDI("PlaybackTimelineRow", channel_index), {
         .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 40 : 24) },
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 54 : 24) },
             .layoutDirection = CLAY_LEFT_TO_RIGHT,
             .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
             .childGap = spacing.horizontal_gap
@@ -6413,7 +6636,7 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
 
         CLAY(CLAY_IDI("PlaybackTimeline", channel_index), {
             .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 38 : 22) },
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 52 : 22) },
                 .layoutDirection = layout->stacked ? CLAY_TOP_TO_BOTTOM : CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
                 .childGap = layout->stacked ? 4 : 8
@@ -6440,6 +6663,67 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                         .backgroundColor = to_clay_color(timeline_fill_color),
                         .cornerRadius = CLAY_CORNER_RADIUS(5)
                     }) {}
+                }
+            }
+
+            // Right-side file info line: [basename][bit-depth + rate][RAW/FLAC]
+            // — flows after the scrub track horizontally / its own line stacked.
+            if (layout->name_width > 0 || layout->readout_width > 0 || layout->fileinfo_width > 0) {
+                CLAY(CLAY_IDI("PlaybackTimelineInfo", channel_index), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                        .childGap = 8
+                    }
+                }) {
+                    if (layout->name_width > 0 && name_text && name_text[0]) {
+                        char name_buf[64];
+                        snprintf(name_buf, sizeof(name_buf), "%s", name_text);
+                        gui_ui_ellipsize_text(app, name_buf, sizeof(name_buf),
+                                              FONT_SIZE_STATUS, 1, layout->name_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineName", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->name_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(name_buf),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(timeline_text_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+
+                    if (layout->readout_width > 0 && readout_text && readout_text[0]) {
+                        char readout_buf[32];
+                        snprintf(readout_buf, sizeof(readout_buf), "%s", readout_text);
+                        gui_ui_ellipsize_text(app, readout_buf, sizeof(readout_buf),
+                                              FONT_SIZE_STATUS, 1, layout->readout_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineReadout", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->readout_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(readout_buf),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(readout_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+
+                    if (layout->fileinfo_width > 0 && fileinfo_text && fileinfo_text[0]) {
+                        char fileinfo_buf[48];
+                        snprintf(fileinfo_buf, sizeof(fileinfo_buf), "%s", fileinfo_text);
+                        gui_ui_ellipsize_text(app, fileinfo_buf, sizeof(fileinfo_buf),
+                                              FONT_SIZE_STATUS, 1, layout->fileinfo_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineFileInfo", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->fileinfo_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(fileinfo_buf),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(readout_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
                 }
             }
         }
@@ -6587,9 +6871,31 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
                                             &playback_fill_w_b, &playback_has_file_b,
                                             current_sample_b, total_samples_b, duration_seconds_b, playback_track_width_px);
 
+            // Right-side file info per channel (HARD DEV NOTE above the
+            // helpers): basename + actual bit depth/resolved real rate +
+            // RAW/FLAC sizes, next to the scrub track on the same row.
+            gui_ui_playback_file_basename(app, 0, playback_name_display_a,
+                                          sizeof(playback_name_display_a));
+            gui_ui_playback_file_basename(app, 1, playback_name_display_b,
+                                          sizeof(playback_name_display_b));
+            gui_ui_format_playback_readout(app, 0, playback_readout_display_a,
+                                           sizeof(playback_readout_display_a),
+                                           timeline_layout.readout_compact);
+            gui_ui_format_playback_readout(app, 1, playback_readout_display_b,
+                                           sizeof(playback_readout_display_b),
+                                           timeline_layout.readout_compact);
+            gui_ui_format_playback_fileinfo(app, 0, playback_fileinfo_display_a,
+                                            sizeof(playback_fileinfo_display_a),
+                                            timeline_layout.fileinfo_compact);
+            gui_ui_format_playback_fileinfo(app, 1, playback_fileinfo_display_b,
+                                            sizeof(playback_fileinfo_display_b),
+                                            timeline_layout.fileinfo_compact);
+
             // Playback scrub row aligned with Channel A preview.
             render_playback_timeline_row(app, 0, playback_timeline_display_a, playback_fill_w_a,
-                                         playback_has_file_a, spacing, &timeline_layout);
+                                         playback_has_file_a, spacing, &timeline_layout,
+                                         playback_name_display_a, playback_readout_display_a,
+                                         playback_fileinfo_display_a);
         }
         // Channel A row: VU meter + waveform + stats
         CLAY(CLAY_ID("ChannelARow"), {
@@ -6621,7 +6927,9 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             if (playback_mode) {
                 // Second playback scrub row aligned with Channel B preview.
                 render_playback_timeline_row(app, 1, playback_timeline_display_b, playback_fill_w_b,
-                                             playback_has_file_b, spacing, &timeline_layout);
+                                             playback_has_file_b, spacing, &timeline_layout,
+                                             playback_name_display_b, playback_readout_display_b,
+                                             playback_fileinfo_display_b);
             }
             CLAY(CLAY_ID("ChannelBRow"), {
                 .layout = {
@@ -7963,6 +8271,60 @@ void gui_handle_interactions(gui_app_t *app) {
         if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
                                              gui_ui_get_mouse_position().x)) {
             s_playback_scrub_active = false;
+        }
+    }
+
+    // Playback timeline mouse-wheel scrubbing (HARD DEV NOTE above the file
+    // info helpers): wheel over a playback timeline row seeks that channel
+    // by 1-10 s of stream time with burst acceleration. Wheel-up steps back,
+    // wheel-down steps forward.
+    {
+        static double s_wheel_step_s = 1.0;
+        static double s_wheel_last_time = -1000.0;
+        if (playback_mode && app->is_capturing &&
+            !s_record_limit_window_open && !s_version_info_window_open &&
+            !s_metadata_window_open && !app->settings_panel_open) {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f) {
+                int wheel_channel = -1;
+                for (int ch = 0; ch < 2; ch++) {
+                    if (Clay_PointerOver(CLAY_IDI("PlaybackTimelineRow", ch))) {
+                        wheel_channel = ch;
+                        break;
+                    }
+                }
+                if (wheel_channel >= 0) {
+                    double now = GetTime();
+                    double gap = now - s_wheel_last_time;
+                    s_wheel_last_time = now;
+                    // Acceleration: notches within 400 ms ramp the step
+                    // (+0.75 s per notch, 1 s .. 10 s); an idle gap resets to
+                    // the 1 s base step.
+                    if (gap > 0.4 || gap < 0.0) {
+                        s_wheel_step_s = 1.0;
+                    } else {
+                        s_wheel_step_s += fabs((double)wheel) * 0.75;
+                        if (s_wheel_step_s > 10.0) s_wheel_step_s = 10.0;
+                    }
+                    uint64_t total = 0;
+                    double duration = 0.0;
+                    if (gui_ui_playback_channel_timeline_info(app, wheel_channel,
+                                                               &total, &duration) &&
+                        total > 1 && duration > 0.0) {
+                        double rate_hz = (double)total / duration;
+                        uint64_t step = (uint64_t)(s_wheel_step_s * rate_hz);
+                        if (step == 0) step = 1;
+                        uint64_t pos = gui_playback_get_position_samples_channel(app, wheel_channel);
+                        uint64_t target;
+                        if (wheel > 0.0f) {
+                            target = (pos > step) ? (pos - step) : 0;
+                        } else {
+                            target = (total - 1 > pos + step) ? (pos + step) : (total - 1);
+                        }
+                        gui_playback_seek_sample_channel(app, wheel_channel, target);
+                    }
+                }
+            }
         }
     }
 

@@ -640,6 +640,23 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_viewport_layout', viewport_layout_test)
+
+    # Playback file-info resolution + decoder IO layer (STREAMINFO patch)
+    # coverage. Synthesizes both FLAC header conventions with libFLAC, so it
+    # needs the FLAC dependency at link time (not just compile args). The
+    # paused-analysis path also FFTs on worker threads (gui_fft.c), so FFTW
+    # is linked as well.
+    if flac_dep.found() and fftw3f_dep.found()
+      playback_resolve_test = executable('gui_playback_resolve_test',
+        ['test/gui_playback_resolve_harness.c',
+         'misrc_gui/visualization/gui_fft.c'],
+        dependencies: overlay_test_deps + [flac_dep, fftw3f_dep],
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_playback_resolve', playback_resolve_test)
+    endif
   endif
 
   message('raylib found, building GUI application')
