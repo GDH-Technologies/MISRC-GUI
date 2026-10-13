@@ -28,6 +28,7 @@
 #include "../core/gui_app.h"
 #include "../input/gui_playback.h"
 #include "../ui/gui_ui.h"
+#include "../ui/gui_dropdown.h"  // gui_dropdown_option_color for the palette dropdown
 
 #include <stdlib.h>
 #include <string.h>
@@ -74,7 +75,8 @@ typedef struct spectro_engine {
     unsigned char *pixels;           // CPU RGBA8 history buffer: tex_w * tex_h * 4 bytes
     float         *frame;            // Latest resampled magnitude frame (freq_bins floats, render thread)
 
-    unsigned char  lut[256][4];      // Heatmap color LUT (matches phosphor intensityToHeatmap)
+    unsigned char  lut_phosphor[256][4];  // Phosphor LUT (matches phosphor intensityToHeatmap)
+    unsigned char  lut_heat[256][4];      // Inferno-style red/purple contrasting heat LUT
 
     Texture2D tex;                   // GPU texture (created lazily in render thread)
     bool tex_valid;
@@ -96,10 +98,23 @@ typedef struct spectro_engine {
     // the file via the gui_playback analysis decoder.
     bool analysis_active;           // Paused-window mode engaged this session
     bool analysis_requested;        // A window request is in flight
-    bool analysis_rerequest;         // Span changed; re-request on next render
+    bool analysis_rerequest;         // Span/palette changed; re-request on next render
     uint64_t analysis_playhead;      // Playhead sample of the last request
     double analysis_span_seconds;    // Requested span (wheel adjustable)
     uint64_t analysis_seq;          // Last consumed analysis result seq
+    // Snapshot of the last consumed analysis result: the published magnitude
+    // buffer stays valid until the next publish, so a palette change can
+    // instantly re-map the SAME spectra through the new LUT (true reload).
+    const float *analysis_last_mags;
+    size_t analysis_last_count;
+    size_t analysis_last_bins;
+
+    // Palette dropdown (top-right): Phosphor / Heat. Changing the palette
+    // reloads the view (paused: instant re-map of the last result + re-request;
+    // rolling: history clears and refills in the new palette).
+    Rectangle palette_btn_rect;
+    Rectangle palette_opts_rect[2];
+    bool palette_dropdown_open;
 } spectro_engine_t;
 
 //-----------------------------------------------------------------------------
@@ -145,13 +160,58 @@ static void build_lut(unsigned char lut[256][4]) {
     }
 }
 
+//-----------------------------------------------------------------------------
+// Heat map palettes (click the panel to toggle; shared by all spectro panels)
+//-----------------------------------------------------------------------------
+
+typedef enum {
+    SPEC_PALETTE_PHOSPHOR = 0,   // Original blue->cyan->green->yellow->red ramp
+    SPEC_PALETTE_HEAT               // Inferno-style red/purple contrasting heat map
+} spec_palette_t;
+
+static int s_spec_palette = SPEC_PALETTE_PHOSPHOR;
+
+// Inferno-style red/purple contrasting heat map (matplotlib "inferno"
+// control points): near-black -> deep purple -> magenta/red -> orange ->
+// pale yellow. The standard spectrogram palette in SDR/analysis tools.
+static void build_heat_lut(unsigned char lut[256][4]) {
+    static const float stops[][4] = {
+        { 0.00f,   0.0f,   0.0f,   4.0f },
+        { 0.13f,  31.0f,  12.0f,  72.0f },
+        { 0.25f,  85.0f,  15.0f, 109.0f },
+        { 0.38f, 136.0f,  34.0f, 106.0f },
+        { 0.50f, 186.0f,  54.0f,  85.0f },
+        { 0.63f, 227.0f,  89.0f,  51.0f },
+        { 0.75f, 249.0f, 140.0f,  10.0f },
+        { 0.88f, 249.0f, 201.0f,  50.0f },
+        { 1.00f, 252.0f, 255.0f, 164.0f },
+    };
+    const int n = (int)(sizeof(stops) / sizeof(stops[0]));
+    for (int i = 0; i < 256; i++) {
+        float t = (float)i / 255.0f;
+        int s = 0;
+        while (s + 1 < n - 1 && t > stops[s + 1][0]) s++;
+        float f = (t - stops[s][0]) / (stops[s + 1][0] - stops[s][0]);
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        for (int c = 0; c < 3; c++) {
+            float v = stops[s][1 + c] + f * (stops[s + 1][1 + c] - stops[s][1 + c]);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            lut[i][c] = (unsigned char)(v + 0.5f);
+        }
+        lut[i][3] = 255;
+    }
+}
+
 static inline const unsigned char *lut_lookup(spectro_engine_t *e, float m) {
     if (m < 0.0f) m = 0.0f;
     if (m > 1.0f) m = 1.0f;
     int idx = (int)(m * 255.0f + 0.5f);
     if (idx < 0) idx = 0;
     if (idx > 255) idx = 255;
-    return e->lut[idx];
+    return (s_spec_palette == SPEC_PALETTE_HEAT) ? e->lut_heat[idx]
+                                                 : e->lut_phosphor[idx];
 }
 
 //-----------------------------------------------------------------------------
@@ -207,7 +267,8 @@ static void *spectro_create(bool time_on_x) {
         return NULL;
     }
 
-    build_lut(e->lut);
+    build_lut(e->lut_phosphor);
+    build_heat_lut(e->lut_heat);
 
     if (!gui_fft_init(&e->fft)) {
         free(e->pixels);
@@ -358,7 +419,7 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
     if (gui_playback_poll_analysis_window(app, channel, &e->analysis_seq,
                                            &mags, &slice_count, &bins) &&
         mags && bins > 0) {
-        // The worker already FFT'd + max-held each cell (gui_playback.c):
+        // The worker already FFT'd the full contiguous columns (gui_playback.c):
         // the render only resamples each magnitude frame to the panel's
         // frequency resolution and writes the column — no render-thread
         // FFTs (512 columns render in ~ms, no frame stalls).
@@ -369,6 +430,34 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
             e->frame_valid = true;
             spectro_write_slice_index(e, (int)i);
         }
+        // Keep the snapshot for an instant palette-change re-map.
+        e->analysis_last_mags = mags;
+        e->analysis_last_count = slice_count;
+        e->analysis_last_bins = bins;
+    }
+}
+
+// Reload the view after a palette change (same spectra, new LUT):
+// - Paused analysis: instantly re-map the last result snapshot through the
+//   new LUT AND re-request the window (guarantees a fully-correct render
+//   even if a new publish raced the snapshot).
+// - Rolling: the history pixels are already LUT-mapped, so re-rendering is
+//   not possible — clear it and let it refill in the new palette.
+static void spectro_palette_reload(spectro_engine_t *e) {
+    if (!e) return;
+    if (e->analysis_active && e->analysis_last_mags && e->analysis_last_bins > 0) {
+        size_t limit = (e->analysis_last_count < (size_t)e->time_bins)
+            ? e->analysis_last_count : (size_t)e->time_bins;
+        for (size_t i = 0; i < limit; i++) {
+            resample_magnitude(e->analysis_last_mags + i * e->analysis_last_bins,
+                               (int)e->analysis_last_bins, e->frame, e->freq_bins);
+            e->frame_valid = true;
+            spectro_write_slice_index(e, (int)i);
+        }
+        e->analysis_rerequest = true;
+    } else if (e->pixels) {
+        memset(e->pixels, 0, (size_t)e->tex_w * e->tex_h * 4);
+        e->frame_valid = false;
     }
 }
 
@@ -382,7 +471,18 @@ static void format_freq(char *buf, size_t bufsz, double hz) {
     else                  snprintf(buf, bufsz, "%.0f", hz);
 }
 
-static void spectro_draw_overlay(spectro_engine_t *e, Rectangle bounds, Rectangle plot) {
+// DAW-style absolute timecode: h:mm:ss.s / m:ss.s
+static void format_abs_timecode(char *buf, size_t bufsz, double secs) {
+    if (!(secs >= 0.0) || !isfinite(secs)) secs = 0.0;
+    int h = (int)(secs / 3600.0);
+    int m = (int)(secs / 60.0) % 60;
+    double s = secs - (double)(h * 3600 + m * 60);
+    if (h > 0) snprintf(buf, bufsz, "%d:%02d:%04.1f", h, m, s);
+    else       snprintf(buf, bufsz, "%d:%04.1f", m, s);
+}
+
+static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
+                                 Rectangle bounds, Rectangle plot) {
     (void)plot;  // Labels are drawn inside bounds, so plot == bounds.
     uint32_t sr = e->last_sample_rate;
     double nyq = (double)sr * 0.5;
@@ -391,6 +491,20 @@ static void spectro_draw_overlay(spectro_engine_t *e, Rectangle bounds, Rectangl
     const int divs = SPEC_AXIS_DIVS;
     const float pad = 3.0f;      // Inset from the border so labels sit inside the window
     const float label_h = (float)FONT_SIZE_OSC_SCALE;
+
+    // DAW-style time axis. The rolling history covers time_bins display
+    // frames (65536 samples each); the paused analysis window covers
+    // analysis_span_seconds centered on the playhead (absolute timecodes).
+    double time_window_s = 0.0;
+    bool time_absolute = e->analysis_active;
+    double time_center_s = 0.0;
+    if (real_rate_hz > 0.0) {
+        time_window_s = (double)e->time_bins * 65536.0 / real_rate_hz;
+        if (time_absolute) {
+            time_window_s = e->analysis_span_seconds;
+            time_center_s = (double)e->analysis_playhead / real_rate_hz;
+        }
+    }
 
     if (!e->time_on_x) {
         // Waterfall: frequency on X (0 at left, Nyquist at right).
@@ -408,6 +522,28 @@ static void spectro_draw_overlay(spectro_engine_t *e, Rectangle bounds, Rectangl
             if (lx < bounds.x + pad) lx = bounds.x + pad;
             if (lx + tw > bounds.x + bounds.width - pad) lx = bounds.x + bounds.width - tw - pad;
             gui_text_draw_mono(buf, lx, label_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+        }
+        // Time axis (left inside edge, top = now): seconds back from now.
+        if (real_rate_hz > 0.0) {
+            const int t_divs = 2;
+            float tx = bounds.x + pad;
+            for (int d = 0; d <= t_divs; d++) {
+                float frac = (float)d / (float)t_divs;          // 0 = top (newest)
+                float py = bounds.y + bounds.height * frac;
+                double t = -time_window_s * (double)frac;
+                char tb[24];
+                if (time_absolute) {
+                    format_abs_timecode(tb, sizeof(tb), time_center_s - time_window_s / 2.0 + (double)(t_divs - d) / (double)t_divs * time_window_s);
+                } else {
+                    snprintf(tb, sizeof(tb), "%.2fs", t);
+                }
+                float ly = py - label_h / 2.0f;
+                if (ly < bounds.y + pad) ly = bounds.y + pad;
+                if (ly + label_h > bounds.y + bounds.height - pad) {
+                    ly = bounds.y + bounds.height - label_h - pad;
+                }
+                gui_text_draw_mono(tb, tx, ly, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            }
         }
         // "Now" marker at the top edge (newest slice).
         DrawLineEx((Vector2){bounds.x, bounds.y}, (Vector2){bounds.x + bounds.width, bounds.y},
@@ -427,6 +563,35 @@ static void spectro_draw_overlay(spectro_engine_t *e, Rectangle bounds, Rectangl
             if (ly < bounds.y + pad) ly = bounds.y + pad;
             if (ly + label_h > bounds.y + bounds.height - pad) ly = bounds.y + bounds.height - label_h - pad;
             gui_text_draw_mono(buf, label_x, ly, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+        }
+        // Time axis (bottom inside edge): DAW-style. Paused analysis shows
+        // ABSOLUTE timecodes across the window; rolling shows seconds back
+        // from "now" (right edge = 0).
+        if (real_rate_hz > 0.0) {
+            const int t_divs = 4;
+            float ty = bounds.y + bounds.height - label_h - pad;
+            for (int d = 0; d <= t_divs; d++) {
+                float frac = (float)d / (float)t_divs;          // 0 = left (oldest)
+                float px = bounds.x + bounds.width * frac;
+                DrawLineEx((Vector2){px, bounds.y}, (Vector2){px, bounds.y + bounds.height},
+                           1.0f, COLOR_GRID);
+                char tb[24];
+                double t;
+                if (time_absolute) {
+                    t = time_center_s - time_window_s / 2.0 + (double)frac * time_window_s;
+                    format_abs_timecode(tb, sizeof(tb), t);
+                } else {
+                    t = -time_window_s * (1.0 - (double)frac);
+                    snprintf(tb, sizeof(tb), "%.2fs", t);
+                }
+                int tw = gui_text_measure_mono(tb, FONT_SIZE_OSC_SCALE);
+                float lx = px - tw / 2.0f;
+                if (lx < bounds.x + pad) lx = bounds.x + pad;
+                if (lx + tw > bounds.x + bounds.width - pad) {
+                    lx = bounds.x + bounds.width - tw - pad;
+                }
+                gui_text_draw_mono(tb, lx, ty, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            }
         }
         // "Now" marker at the right edge (newest slice).
         DrawLineEx((Vector2){bounds.x + bounds.width, bounds.y},
@@ -566,7 +731,19 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                    (Rectangle){plot.x, plot.y, plot.width, plot.height},
                    (Vector2){0, 0}, 0.0f, WHITE);
 
-    spectro_draw_overlay(e, bounds, plot);
+    // Real rate for the time axis: playback resolves the file's TRUE rate;
+    // live capture's display rate is kHz-domain, so x1000.
+    double real_rate_hz = 0.0;
+    if (playback_selected) {
+        playback_file_info_t info = {0};
+        (void)gui_playback_get_selected_file_info(app, channel, &info);
+        if (info.real_sample_rate_hz > 0.0) real_rate_hz = info.real_sample_rate_hz;
+    }
+    if (real_rate_hz <= 0.0 && e->last_sample_rate > 0) {
+        real_rate_hz = (double)e->last_sample_rate * 1000.0;
+    }
+
+    spectro_draw_overlay(e, real_rate_hz, bounds, plot);
 
     // Paused analysis indicator: window span + pending state. Every column
     // of the paused window is ONE true FFT over that column's full contiguous
@@ -579,11 +756,108 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         gui_text_draw(win_buf, bounds.x + 38.0f, bounds.y + 3.0f,
                      FONT_SIZE_OSC_SCALE, COLOR_TEXT);
     }
+
+    // Palette dropdown (top-right): Phosphor / Heat. Selecting a palette
+    // RELOADS the view through the new LUT (see spectro_palette_reload).
+    {
+        static const char *pal_names[2] = { "Phosphor", "Heat" };
+        float btn_h = 18;
+        float pad = 8;
+        float text_scale = gui_ui_get_scale_factor();
+        float to_logical_w = 1.0f / text_scale;
+        float btn_w = 0;
+        for (int i = 0; i < 2; i++) {
+            float w = (float)((int)(gui_text_measure(pal_names[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w)) + 26;
+            if (w > btn_w) btn_w = w;
+        }
+        e->palette_btn_rect = (Rectangle){
+            bounds.x + bounds.width - btn_w - pad, bounds.y + 6, btn_w, btn_h
+        };
+        Color btn_bg = e->palette_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+        DrawRectangleRounded(e->palette_btn_rect, 0.15f, 4, btn_bg);
+        {
+            const char *lbl = pal_names[s_spec_palette];
+            int text_w = (int)((float)gui_text_measure(lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+            float total_w = (float)text_w + 12;
+            float text_x = e->palette_btn_rect.x + (e->palette_btn_rect.width - total_w) / 2;
+            float text_y = e->palette_btn_rect.y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2;
+            gui_text_draw(lbl, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+            float as = 5.0f;
+            float ax = text_x + (float)text_w + 6;
+            float acy = e->palette_btn_rect.y + btn_h / 2;
+            if (e->palette_dropdown_open) {
+                Vector2 top = { ax + as / 2, acy - as / 2 };
+                Vector2 left = { ax, acy + as / 2 };
+                Vector2 right = { ax + as, acy + as / 2 };
+                DrawTriangle(top, left, right, COLOR_TEXT);
+            } else {
+                Vector2 bottom = { ax + as / 2, acy + as / 2 };
+                Vector2 left = { ax, acy - as / 2 };
+                Vector2 right = { ax + as, acy - as / 2 };
+                DrawTriangle(bottom, right, left, COLOR_TEXT);
+            }
+        }
+        if (e->palette_dropdown_open) {
+            float opt_h = 20;
+            for (int i = 0; i < 2; i++) {
+                Rectangle opt = {
+                    e->palette_btn_rect.x,
+                    e->palette_btn_rect.y + btn_h + (float)i * opt_h,
+                    e->palette_btn_rect.width,
+                    opt_h
+                };
+                e->palette_opts_rect[i] = opt;
+                bool selected = ((int)s_spec_palette == i);
+                bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
+                DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
+                const char *lbl = pal_names[i];
+                int lw = (int)((float)gui_text_measure(lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+                float lx = opt.x + (opt.width - (float)lw) / 2;
+                float ly = opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2;
+                gui_text_draw(lbl, lx, ly, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+            }
+        }
+    }
 }
 
 //-----------------------------------------------------------------------------
 // Vtables + Registration
 //-----------------------------------------------------------------------------
+
+// Palette dropdown clicks (top-right): open/select/close. Selecting a
+// palette RELOADS the view through the new LUT (paused: the same spectra
+// re-mapped instantly + a fresh request; rolling: history cleared and
+// refilled in the new palette).
+static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
+                                        Vector2 click, Rectangle bounds) {
+    (void)app;
+    (void)channel;
+    spectro_engine_t *e = (spectro_engine_t *)state_ptr;
+    if (!e) return false;
+    if (!CheckCollisionPointRec(click, bounds)) return false;
+
+    if (e->palette_dropdown_open) {
+        for (int i = 0; i < 2; i++) {
+            if (CheckCollisionPointRec(click, e->palette_opts_rect[i])) {
+                if ((int)s_spec_palette != i) {
+                    s_spec_palette = (i == (int)SPEC_PALETTE_HEAT)
+                        ? SPEC_PALETTE_HEAT : SPEC_PALETTE_PHOSPHOR;
+                    spectro_palette_reload(e);
+                }
+                e->palette_dropdown_open = false;
+                return true;
+            }
+        }
+        // Button or outside click closes the dropdown.
+        e->palette_dropdown_open = false;
+        return true;
+    }
+    if (CheckCollisionPointRec(click, e->palette_btn_rect)) {
+        e->palette_dropdown_open = true;
+        return true;
+    }
+    return false;
+}
 
 // Wheel over the panel while the paused analysis window is active adjusts the
 // window span (x1.25 / :1.25 steps, 0.1 s .. 60 s; longer spans are also capped
@@ -613,7 +887,7 @@ static const panel_vtable_t s_waterfall_vtable = {
     .process = spectro_vtable_process,
     .render = spectro_vtable_render,
     .render_overlay = NULL,
-    .handle_click = NULL,
+    .handle_click = spectro_vtable_handle_click,
     .handle_scroll = spectro_vtable_handle_scroll,
     .get_menu_count = NULL,
     .get_menu = NULL,
@@ -627,7 +901,7 @@ static const panel_vtable_t s_spectrograph_vtable = {
     .process = spectro_vtable_process,
     .render = spectro_vtable_render,
     .render_overlay = NULL,
-    .handle_click = NULL,
+    .handle_click = spectro_vtable_handle_click,
     .handle_scroll = spectro_vtable_handle_scroll,
     .get_menu_count = NULL,
     .get_menu = NULL,
