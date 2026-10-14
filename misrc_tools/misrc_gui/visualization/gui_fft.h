@@ -113,6 +113,14 @@ typedef struct fft_state {
 // Returns true if FFT support is compiled in (FFTW available)
 bool gui_fft_available(void);
 
+// FFTW non-execute operations share one process-wide lock. Callers retain
+// ownership and must stop users of a plan or buffer before destroying it.
+// Without FFTW, plan creation returns NULL and allocation uses malloc/free.
+void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags);
+void gui_fft_plan_destroy(void *plan);
+void *gui_fft_alloc(size_t bytes);
+void gui_fft_free(void *memory);
+
 //-----------------------------------------------------------------------------
 // FFT Lifecycle Management
 //-----------------------------------------------------------------------------

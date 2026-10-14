@@ -351,4 +351,11 @@ cvbs_format_t gui_cvbs_get_format(cvbs_decoder_t *decoder);
 // Get format name string
 const char *gui_cvbs_get_format_name(cvbs_decoder_t *decoder);
 
+// UI publishes active routes once per frame. Extraction does not use the display DSP lock.
+void gui_video_update_rf_routes(gui_app_t *app);
+// Continuous RF input from extraction; samples are copied into bounded workers.
+#include "../processing/gui_rf_preview_worker.h"
+void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
+                          size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
+                          bool input_supported);
 #endif // GUI_CVBS_H

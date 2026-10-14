@@ -83,19 +83,35 @@ int main(void)
                         "timeline text and scrub track retain a positive width");
             int required = layout.stacked ? (layout.label_width > layout.track_width ? layout.label_width : layout.track_width)
                                           : layout.label_width + 8 + layout.track_width;
+            int info_width = 0;
+            const int slots[] = {layout.name_width, layout.readout_width, layout.fileinfo_width};
+            for (unsigned int slot = 0; slot < sizeof(slots) / sizeof(slots[0]); slot++) {
+                if (slots[slot] > 0) info_width += (info_width ? 8 : 0) + slots[slot];
+            }
+            if (layout.stacked) {
+                if (info_width > required) required = info_width;
+            } else if (info_width) {
+                required += 8 + info_width;
+            }
             expect_true(required <= available, "the timeline cannot push its parent wider than the window");
             saw_stacked |= layout.stacked;
             saw_inline |= !layout.stacked;
             if (width >= 960) {
                 expect_true(!layout.stacked, "ordinary wide windows retain a single timeline row");
-                expect_true(layout.track_width == (width < 1150 ? 240 : 300),
-                            "wide windows retain the original track width");
+                expect_true(layout.track_width >= 64 && layout.track_width <= (width < 1150 ? 240 : 300),
+                            "inline file details leave a usable bounded scrub track");
+                if (width >= 1920) {
+                    expect_true(layout.track_width == 300,
+                                "wide windows retain the preferred full track width");
+                }
             }
             for (int zoom = 75; zoom <= 200; zoom += 5) {
                 s_ui_scale_percent = zoom;
                 gui_playback_timeline_layout_t same = gui_ui_playback_timeline_layout(NULL, width, spacing);
                 expect_true(same.label_width == layout.label_width && same.track_width == layout.track_width &&
                             same.left_padding == layout.left_padding && same.right_padding == layout.right_padding &&
+                            same.name_width == layout.name_width && same.readout_width == layout.readout_width &&
+                            same.fileinfo_width == layout.fileinfo_width &&
                             same.stacked == layout.stacked,
                             "a fixed logical viewport and font determine the entire timeline geometry");
             }

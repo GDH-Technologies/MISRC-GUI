@@ -203,6 +203,7 @@ typedef struct {
 
     // RF bit depth selection (per-channel)
     // FLAC supports 8/12/16; RAW supports 8/16 (12 is disabled in RAW UI).
+    int rf_preview_budget_percent;            // Shared preview budget: 50/75/100% of one logical core.
     uint8_t rf_bits_a;
     uint8_t rf_bits_b;
     // CXADC capture mode per card: false=8-bit @ base 40 MSPS,
@@ -450,6 +451,11 @@ typedef struct gui_app {
     atomic_uint_fast32_t clip_count_b_neg;
     atomic_bool stream_synced;
     atomic_uint_fast32_t sample_rate;
+    // Zero per-channel rate falls back to the live shared rate; explicit rates
+    // describe independent hardware/file clocks even when preview is gated.
+    atomic_uint_fast32_t rf_source_rate_hz[2];
+    atomic_bool rf_preview_input_supported;
+    atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
 
     // Audio monitoring peaks (24-bit audio magnitude, per channel 1..4)
@@ -598,9 +604,11 @@ void gui_app_cleanup(gui_app_t *app);
 // Device management
 void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
+/* Commit a prepared FLAC playback start on the UI thread. Call every frame. */
+void gui_app_poll_capture_start(gui_app_t *app);
 /* Android-only: run gui_app_start_capture() on a worker thread so the render
  * loop stays responsive during hsdaoh_open + stream start. On non-Android
- * builds this is not declared/defined. */
+ * builds this is not declared/defined. FLAC uses its own preparation worker. */
 #if defined(__ANDROID__)
 void gui_app_start_capture_async(gui_app_t *app);
 void gui_app_stop_capture_async(gui_app_t *app);

@@ -30,6 +30,7 @@
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
+#include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
 #include "../ui/gui_popup.h"
@@ -828,6 +829,7 @@ int main(int argc, char **argv) {
     // Main loop
     while (!WindowShouldClose() && !atomic_load(&do_exit)) {
         bool was_capturing = app.is_capturing;
+        gui_app_poll_capture_start(&app);
         if (app.is_recording) {
             if (!recording_fps_throttle) {
                 SetTargetFPS(30);
@@ -979,7 +981,9 @@ int main(int argc, char **argv) {
                     app.selected_device >= 0 &&
                     app.selected_device < app.device_count &&
                     app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK;
-                if (playback_dev && app.is_capturing && gui_playback_is_running(&app)) {
+                if (gui_playback_is_starting(&app)) {
+                    gui_app_stop_capture(&app);
+                } else if (playback_dev && app.is_capturing && gui_playback_is_running(&app)) {
                     gui_playback_toggle_pause(&app);
                     gui_app_set_status(&app,
                         gui_playback_get_state(&app) == PLAYBACK_STATE_PAUSED
@@ -1202,7 +1206,8 @@ int main(int argc, char **argv) {
             }
 
             // Attempt reconnection if pending
-            if (app.reconnect_pending && !app.is_capturing) {
+            if (app.reconnect_pending && !app.is_capturing &&
+                !gui_playback_is_starting(&app)) {
 #if defined(__ANDROID__)
                 /* If a USB permission request is mid-flight, the per-frame
                  * poll in gui_handle_interactions completes the connect; just
@@ -1254,7 +1259,10 @@ int main(int argc, char **argv) {
                          * the render loop stays responsive; otherwise request
                          * async permission and let the per-frame poll complete
                          * the connect. */
-                        if (android_usb_has_fd()) {
+                        if (app.selected_device >= 0 && app.selected_device < app.device_count &&
+                            app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
+                            (void)gui_app_start_capture(&app);
+                        } else if (android_usb_has_fd()) {
                             gui_app_start_capture_async(&app);
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;
@@ -1267,7 +1275,7 @@ int main(int argc, char **argv) {
                         }
 #else
                         int reconnect_rc = gui_app_start_capture(&app);
-                        if (reconnect_rc == 0) {
+                        if (reconnect_rc == 0 && !gui_playback_is_starting(&app)) {
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;
                             app.reconnect_attempts = 0;
@@ -1297,6 +1305,7 @@ int main(int argc, char **argv) {
 
         // Build UI layout
         Clay_BeginLayout();
+        gui_video_update_rf_routes(&app);
         gui_render_layout(&app);
         Clay_RenderCommandArray render_commands = Clay_EndLayout();
 

@@ -424,6 +424,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
 
     // RF bit depth defaults (per-channel)
+    settings->rf_preview_budget_percent = 100;
     settings->rf_bits_a = 16;
     settings->rf_bits_b = 16;
     settings->cxadc_tenbit_mode_card[0] = false;
@@ -600,6 +601,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"auto_names_enabled\": %s,\n", settings->auto_names_enabled ? "true" : "false");
     fprintf(f, "  \"output_base_name\": \"%s\",\n", settings->output_base_name);
     fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
+    fprintf(f, "  \"rf_preview_budget_percent\": %d,\n", settings->rf_preview_budget_percent);
     fprintf(f, "  \"rf_bits_a\": %u,\n", (unsigned)settings->rf_bits_a);
     fprintf(f, "  \"rf_bits_b\": %u,\n", (unsigned)settings->rf_bits_b);
     fprintf(f, "  \"cxadc_tenbit_mode_a\": %s,\n", settings->cxadc_tenbit_mode_card[0] ? "true" : "false");
@@ -1038,6 +1040,10 @@ void gui_settings_load(gui_settings_t *settings) {
     // Duration limits: feature removed, ignore saved values and force to 0
     settings->capture_limit_seconds = 0;
     settings->record_limit_seconds = 0;
+    if ((value = find_value(content, "rf_preview_budget_percent")) != NULL) {
+        int budget = atoi(value);
+        settings->rf_preview_budget_percent = budget == 50 || budget == 75 ? budget : 100;
+    }
     if ((value = find_value(content, "rf_bits_a")) != NULL) {
         settings->rf_bits_a = (uint8_t)atoi(value);
     }

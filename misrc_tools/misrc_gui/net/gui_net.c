@@ -4,6 +4,7 @@
  */
 
 #include "gui_net.h"
+#include "../input/gui_playback.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
@@ -1200,6 +1201,9 @@ static int client_pump_thread(void *arg) {
         if (in_have > sizeof(inbuf)) in_have = sizeof(inbuf);
         memcpy(inbuf, hbuf + body_off, in_have);
 
+        // A reconnect loses RF continuity even if the mirrored capture state
+        // never became idle. Bind the new stream's first write to a new epoch.
+        if (!pc->is_audio) atomic_fetch_add(&app->rf_stream_epoch, 1);
         fprintf(stderr, "[NET] client pump %s streaming (frame=%d)\n", path, frame);
         /* Body loop: read until the stream closes, then reconnect. */
         while (!atomic_load(&cli->pump_stop)) {
@@ -1268,7 +1272,7 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF);
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO);
     (void)bufmgr_ensure_init(&app->buffers, BUF_DISPLAY);
-    bufmgr_reset(&app->buffers, BUF_CAPTURE_RF);
+    gui_extract_prepare_stream(app);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_AUDIO);
     bufmgr_reset(&app->buffers, BUF_DISPLAY);
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
@@ -1869,7 +1873,7 @@ void gui_net_poll_commands(gui_app_t *app) {
             }
         }
         if (atomic_exchange(&app->net_cmd_stop, false)) {
-            if (app->is_capturing) {
+            if (app->is_capturing || gui_playback_is_starting(app)) {
                 fprintf(stderr, "[NET] server: executing /stop\n");
                 gui_app_stop_capture(app);
             }
@@ -1888,7 +1892,8 @@ void gui_net_poll_commands(gui_app_t *app) {
         }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
-            if (!app->is_capturing && n >= 0 && n < app->device_count) {
+            if (!app->is_capturing && !gui_playback_is_starting(app) &&
+                n >= 0 && n < app->device_count) {
                 fprintf(stderr, "[NET] server: executing /device %d\n", n);
                 app->selected_device = n;
             }

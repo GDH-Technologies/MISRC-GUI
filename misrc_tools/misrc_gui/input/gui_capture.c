@@ -751,6 +751,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
 
     switch (result) {
         case FRAME_SYNC_LOST:
+            atomic_fetch_add(&app->rf_stream_epoch, 1);
             if (was_synced && misrc_debug_enabled()) {
                 fprintf(stderr, "[CB] Lost sync to HDMI input stream\n");
             }
@@ -763,6 +764,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
             s_capture_missed_burst_reported = false;
             break;
         case FRAME_SYNC_MISSED:
+            atomic_fetch_add(&app->rf_stream_epoch, 1);
             if (misrc_debug_enabled()) {
                 // Match CLI usefulness: include framecounter. Note expected counter isn't directly
                 // available here because frame_process() already updated last_frame_cnt.
@@ -1118,6 +1120,9 @@ void gui_app_init(gui_app_t *app) {
 
     // Initialize sample rate to default (will be updated when device connects)
     atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    atomic_store(&app->rf_source_rate_hz[0], 0);
+    atomic_store(&app->rf_source_rate_hz[1], 0);
+    atomic_store(&app->rf_preview_input_supported, true);
     atomic_store(&app->audio_sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
     atomic_store(&app->dropout_stop_requested, false);
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
@@ -1196,6 +1201,8 @@ void gui_app_init(gui_app_t *app) {
                 (unsigned)app->settings.memory_budget_gb);
     }
 
+    gui_extract_prepare_stream(app);
+
     // Initialize display thread (allocated, started on capture start)
     app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
@@ -1245,6 +1252,10 @@ void gui_app_init(gui_app_t *app) {
 
 // Cleanup application
 void gui_app_cleanup(gui_app_t *app) {
+    // A pending FLAC preparation owns file resources until its worker exits.
+    // Join it before releasing any application, buffer or panel state.
+    gui_playback_finish_start(app);
+
     // Stop any active server/client networking first (joins worker/pump threads).
     gui_net_stop(app);
     gui_net_cleanup_globals();
@@ -1330,6 +1341,7 @@ void gui_app_cleanup(gui_app_t *app) {
 
 // Enumerate available capture devices
 void gui_app_enumerate_devices(gui_app_t *app) {
+    if (!app || gui_playback_is_starting(app)) return;
     app->device_count = 0;
     fprintf(stderr, "[GUI] enumerate_devices: count=%d\n", app->device_count); //debugging
     // Use shared device enumeration (hsdaoh + simple_capture + optionally FX3)
@@ -1596,7 +1608,7 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
     gui_capture_promote_callback_priority_once();
 
     gui_app_t *app = (gui_app_t *)data_info->ctx;
-    if (!app || !data_info->buf || data_info->len == 0) return;
+    if (!app || !app->is_capturing || !data_info->buf || data_info->len == 0) return;
 
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
@@ -1695,6 +1707,10 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
             return;
         }
 
+        if (data_info->srate > 0) {
+            uint32_t source_hz = gui_capture_normalize_sample_rate_hz(data_info->srate);
+            if (source_hz) atomic_store(&app->sample_rate, source_hz);
+        }
         // Single-ADC: write A-only immediately (no B expected)
         size_t packed_bytes = sample_count * sizeof(uint32_t);
         uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, packed_bytes, &s_capture_rf_write_policy);
@@ -1826,6 +1842,10 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 int gui_app_start_capture(gui_app_t *app) {
     fprintf(stderr, "[GUI] gui_app_start_capture called\n");
 
+    if (!app || gui_playback_is_starting(app)) {
+        return -1;
+    }
+
     // Client mode (network slave): forward the request to the server instead
     // of opening local hardware. The worker thread drains the flag and sends
     // GET /start; the client ingest then mirrors the server's capture state.
@@ -1847,6 +1867,8 @@ int gui_app_start_capture(gui_app_t *app) {
     }
 
     device_info_t *dev = &app->devices[app->selected_device];
+    // FLAC preparation commits and resets its stream only after it succeeds.
+    if (dev->type != DEVICE_TYPE_PLAYBACK) gui_extract_prepare_stream(app);
     bool use_upstream_backend = (dev->type == DEVICE_TYPE_HSDAOH) && (!app->user_capture_mode_misrc);
     fprintf(stderr, "[GUI] Selected device: %s (type %d, index %d)\n", dev->name, dev->type, dev->index);
 
@@ -1896,11 +1918,7 @@ int gui_app_start_capture(gui_app_t *app) {
             gui_app_set_status(app, "No playback files selected");
             return -1;
         }
-        int playback_rc = gui_playback_start(app, file_a, file_b);
-        if (playback_rc == 0) {
-            gui_capture_hold_power_assertions();
-        }
-        return playback_rc;
+        return gui_playback_start_async(app, file_a, file_b);
     }
 
     if (dev->type == DEVICE_TYPE_CXADC) {
@@ -2149,6 +2167,9 @@ int gui_app_start_capture(gui_app_t *app) {
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
     atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    atomic_store(&app->rf_source_rate_hz[0], 0);
+    atomic_store(&app->rf_source_rate_hz[1], 0);
+    atomic_store(&app->rf_preview_input_supported, true);
     atomic_store(&app->audio_sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     atomic_store(&app->dropout_stop_requested, false);
@@ -2407,6 +2428,15 @@ int gui_app_start_capture(gui_app_t *app) {
     return 0;
 }
 
+void gui_app_poll_capture_start(gui_app_t *app) {
+    if (!app) return;
+    if (gui_playback_poll_start(app) == 1) {
+        gui_capture_hold_power_assertions();
+        app->reconnect_pending = false;
+        app->reconnect_attempts = 0;
+    }
+}
+
 #if defined(__ANDROID__)
 /* Offload gui_app_start_capture() to a worker thread so the render loop stays
  * responsive. hsdaoh_open + start_stream + extraction/display thread spawns can
@@ -2429,6 +2459,14 @@ static void *capture_start_thread(void *arg)
 void gui_app_start_capture_async(gui_app_t *app)
 {
     if (!app) return;
+    if (gui_playback_is_starting(app)) return;
+    if (atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping)) return;
+    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK) {
+        // FLAC preparation already has its own worker and UI-thread commit.
+        (void)gui_app_start_capture(app);
+        return;
+    }
     if (atomic_load(&s_capture_stopping)) {
         /* stop still in flight; don't start on top of it */
         return;
@@ -2463,6 +2501,11 @@ static void *capture_stop_thread(void *arg)
 void gui_app_stop_capture_async(gui_app_t *app)
 {
     if (!app) return;
+    if (gui_playback_is_starting(app) || gui_playback_is_running(app)) {
+        // Active FLAC context publication and retirement belong to the UI.
+        gui_app_stop_capture(app);
+        return;
+    }
     if (atomic_load(&s_capture_starting)) {
         /* start still in flight; let it finish first (watchdog will retry) */
         return;
@@ -2487,6 +2530,14 @@ int gui_app_capture_busy(void)
 
 // Stop capture
 void gui_app_stop_capture(gui_app_t *app) {
+    if (!app) return;
+    if (gui_playback_is_starting(app)) {
+        gui_playback_cancel_start(app);
+        app->reconnect_pending = false;
+        app->reconnect_attempts = 0;
+        return;
+    }
+
     // Client mode: forward stop to the server. The client ingest stops itself
     // when the server reports idle, so we do not tear down locally here.
     if (gui_net_is_client(app)) {
@@ -2869,6 +2920,10 @@ void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 // Check if device has timed out (no callbacks for too long)
 bool gui_capture_device_timeout(gui_app_t *app, uint32_t timeout_ms) {
     if (!app->is_capturing) return false;
+
+    // File playback may intentionally produce no callbacks while paused or at
+    // EOF. Consult its active context, not the device currently selected by UI.
+    if (gui_playback_is_running(app)) return false;
 
     uint64_t last_cb = atomic_load(&app->last_callback_time_ms);
     uint64_t now = get_time_ms();

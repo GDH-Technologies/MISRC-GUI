@@ -6,6 +6,7 @@
  */
 
 #include "panel_interface.h"
+#include "../../common/threading.h"
 #include <string.h>
 
 //-----------------------------------------------------------------------------
@@ -180,7 +181,9 @@ static void process_config_panels(channel_panel_config_t *config,
 
 static inline void panel_cfg_lock(gui_app_t *app) {
     while (atomic_flag_test_and_set(&app->panel_config_lock)) {
-        /* spin */
+        /* The UI may hold this lock while joining a below-normal RF worker.
+         * A capture-priority display thread must let that worker run to exit. */
+        thrd_sleep_ms(1);
     }
 }
 

@@ -394,7 +394,7 @@ def check_meson_vendored_hsdaoh_policy(meson_path: Path) -> int:
     required_snippets = [
         "hsdaoh_vendored_pc",
         "fs.exists(hsdaoh_vendored_pc)",
-        "Using vendored hsdaoh from .deps/install (mirrors CI",
+        "Using vendored hsdaoh from ' + hsdaoh_vendored_prefix",
         "declare_dependency",
         "deps = [ hsdaoh_dep ]",
     ]

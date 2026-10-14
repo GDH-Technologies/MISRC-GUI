@@ -8,6 +8,7 @@
 #include "gui_cvbs.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
+#include "../processing/gui_rf_preview_pressure.h"
 #include "../visualization/gui_text.h"
 #include "../ui/gui_ui.h"
 #include "../../common/threading.h"
@@ -2222,7 +2223,7 @@ typedef struct {
     video_cvbs_plugin_t cvbs;
     video_tape_plugin_t tape_decode;
     video_vhs_fm_plugin_t vhs_fm;
-    video_plugin_kind_t active_plugin;
+    atomic_int active_plugin;
 } video_panel_state_t;
 
 static const char *video_plugin_name(video_plugin_kind_t plugin) {
@@ -2392,19 +2393,6 @@ static void video_tape_apply_runtime_args(video_tape_plugin_t *plugin, const cha
              arg_ire0_adjust);
 }
 
-static void video_vhs_fm_plugin_process(video_vhs_fm_plugin_t *plugin,
-                                        const int16_t *samples,
-                                        size_t count,
-                                        uint32_t sample_rate) {
-    if (!plugin || !samples || count == 0) return;
-    vhs_fm_decoder_t *decoder = &plugin->decoder;
-    if (sample_rate == 0) sample_rate = DEFAULT_SAMPLE_RATE;
-    if (decoder->preview_sample_rate_hz != sample_rate) {
-        gui_vhs_fm_set_sample_rate(decoder, sample_rate);
-    }
-    gui_vhs_fm_process_buffer(decoder, samples, count);
-}
-
 static bool video_tape_plugin_init(video_tape_plugin_t *plugin) {
     if (!plugin) return false;
     if (!video_panel_init_decoder_common(&plugin->decoder, CVBS_DECODER_MODE_TAPE, "create_plugin_tape_decode")) {
@@ -2431,11 +2419,15 @@ static void video_panel_close_all_dropdowns(video_panel_state_t *panel) {
     vhs->overlay.is_visible = false;
 }
 
+static void video_detach_rf(vhs_fm_decoder_t *decoder);
+
 static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin) {
     if (!panel) return;
-    if (panel->active_plugin == plugin) return;
-    video_plugin_kind_t old_plugin = panel->active_plugin;
+    if (atomic_load(&panel->active_plugin) == (int)plugin) return;
+    video_plugin_kind_t old_plugin = atomic_load(&panel->active_plugin);
+    if (old_plugin == VIDEO_PLUGIN_VHS_FM) video_detach_rf(&panel->vhs_fm.decoder);
     video_panel_close_all_dropdowns(panel);
+    gui_vhs_fm_reset(&panel->vhs_fm.decoder);
     panel->active_plugin = plugin;
     TraceLog(LOG_INFO,
              "VIDEO DECODER SWITCH: old=%s new=%s",
@@ -2447,6 +2439,121 @@ static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin
 // Lifecycle Functions
 //-----------------------------------------------------------------------------
 
+// UI reference counts own pooled worker lifetime. The producer only loads
+// published workers under reader registration and never waits for the UI.
+static _Atomic(gui_rf_preview_worker_t *) s_rf_routes[2][2];
+static unsigned s_rf_references[2][2];
+static vhs_fm_decoder_t *s_rf_bindings[4];
+static atomic_uint s_rf_route_readers;
+static atomic_bool s_rf_pressure_paused;
+static bool s_rf_input_supported = true; // Extraction producer owns this.
+static gui_rf_preview_pressure_t s_rf_pressure;
+static void video_detach_rf(vhs_fm_decoder_t *decoder) {
+    if (!decoder || !decoder->worker) return;
+    int ch=decoder->bound_channel, sys=decoder->bound_system;
+    if (ch>=0 && ch<2 && sys>=0 && sys<2 && s_rf_references[ch][sys]) {
+        if (--s_rf_references[ch][sys]==0) {
+            gui_rf_preview_worker_t *worker=atomic_exchange(&s_rf_routes[ch][sys],NULL);
+            while (atomic_load(&s_rf_route_readers)) thrd_sleep_ms(1);
+            gui_rf_preview_worker_destroy(worker);
+        }
+    }
+    for (int i=0;i<4;++i) if (s_rf_bindings[i]==decoder) s_rf_bindings[i]=NULL;
+    gui_vhs_fm_bind_worker(decoder,NULL);
+    decoder->bound_channel=-1;
+}
+static vhs_fm_decoder_t *video_config_rf(panel_view_type_t view, void *state) {
+    if (view!=PANEL_VIEW_CVBS || !state) return NULL;
+    video_panel_state_t *panel=state;
+    return atomic_load(&panel->active_plugin)==VIDEO_PLUGIN_VHS_FM ? &panel->vhs_fm.decoder : NULL;
+}
+void gui_video_update_rf_routes(gui_app_t *app) {
+    if (!app) return;
+    int budget=app->settings.rf_preview_budget_percent;
+    if (budget!=50 && budget!=75) budget=100;
+    static int applied_budget;
+    if (budget!=applied_budget) {
+        gui_rf_preview_worker_set_budget(budget/100.0);
+        applied_budget=budget;
+    }
+    channel_panel_config_t *configs[2]={&app->panel_config_a,&app->panel_config_b};
+    vhs_fm_decoder_t *desired[4]={0};
+    for (int ch=0;ch<2;++ch) {
+        desired[ch*2]=video_config_rf(configs[ch]->left_view,configs[ch]->left_state);
+        desired[ch*2+1]=configs[ch]->split ? video_config_rf(configs[ch]->right_view,configs[ch]->right_state) : NULL;
+    }
+    for (int i=0;i<4;++i) {
+        vhs_fm_decoder_t *old=s_rf_bindings[i];
+        if (!old) continue;
+        bool present=false;
+        for (int j=0;j<4;++j) if (desired[j]==old) present=true;
+        if (!present) video_detach_rf(old);
+    }
+    memset(s_rf_bindings,0,sizeof(s_rf_bindings));
+    for (int i=0;i<4;++i) {
+        vhs_fm_decoder_t *decoder=desired[i];
+        if (!decoder) continue;
+        int ch=i/2, sys=decoder->overlay.selected_system ? 1 : 0;
+        if (decoder->worker && (decoder->bound_channel!=ch || decoder->bound_system!=sys))
+            video_detach_rf(decoder);
+        if (!decoder->worker) {
+            gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][sys]);
+            bool created=worker==NULL;
+            if (created) worker=gui_rf_preview_worker_create(sys ? GUI_RF_NTSC : GUI_RF_PAL);
+            if (!worker) continue;
+            if (!gui_vhs_fm_bind_worker(decoder,worker)) {
+                if (created) gui_rf_preview_worker_destroy(worker);
+                continue;
+            }
+            decoder->bound_channel=ch; decoder->bound_system=sys;
+            s_rf_references[ch][sys]++;
+            gui_rf_preview_worker_set_paused(worker,atomic_load(&s_rf_pressure_paused));
+            if (created) atomic_store(&s_rf_routes[ch][sys],worker);
+        }
+        s_rf_bindings[i]=decoder;
+    }
+}
+static unsigned video_buffer_percent(gui_app_t *app, buffer_id_t id) {
+    if (!app->buffers.initialized[id] || !app->buffers.buffers[id].buffer_size) return 0;
+    uint64_t read=atomic_load(&app->buffers.stats[id].bytes_read);
+    uint64_t written=atomic_load(&app->buffers.stats[id].bytes_written);
+    return gui_rf_preview_pressure_fill_percent(written,read,app->buffers.buffers[id].buffer_size);
+}
+void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
+                          size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
+                          bool input_supported) {
+    if (!app || !info) return;
+    unsigned raw=video_buffer_percent(app,BUF_CAPTURE_RF), record=0;
+    // Keep the drop snapshot independent of recording toggles: re-enabling a
+    // recording must not count its previous session history as a new drop.
+    uint64_t drops=atomic_load(&app->buffers.stats[BUF_CAPTURE_RF].write_drops) +
+                   atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops) +
+                   atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
+    if (app->is_recording) {
+        for (int ch=0;ch<2;++ch) {
+            if (!(ch ? app->settings.capture_b : app->settings.capture_a)) continue;
+            buffer_id_t id=ch ? BUF_RECORD_B : BUF_RECORD_A;
+            unsigned fill=video_buffer_percent(app,id);
+            if (fill>record) record=fill;
+        }
+    }
+    bool paused=gui_rf_preview_pressure_update(&s_rf_pressure,get_time_ms(),raw,record,drops,app->is_capturing);
+    atomic_store(&s_rf_pressure_paused,paused);
+    const int16_t *samples[2]={samples_a,samples_b};
+    size_t counts[2]={count_a,count_b};
+    bool support_changed=s_rf_input_supported!=input_supported;
+    s_rf_input_supported=input_supported;
+    atomic_fetch_add(&s_rf_route_readers,1);
+    for (int ch=0;ch<2;++ch) for (int sys=0;sys<2;++sys) {
+        gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][sys]);
+        if (!worker) continue;
+        gui_rf_preview_worker_set_paused(worker,paused);
+        if (support_changed || (info[ch].discontinuity && !counts[ch])) gui_rf_preview_worker_reset(worker);
+        if (input_supported && samples[ch] && counts[ch])
+            gui_rf_preview_worker_submit(worker,samples[ch],counts[ch],&info[ch]);
+    }
+    atomic_fetch_sub(&s_rf_route_readers,1);
+}
 static void *cvbs_vtable_create(void) {
     video_panel_state_t *panel = calloc(1, sizeof(video_panel_state_t));
     if (!panel) return NULL;
@@ -2467,13 +2574,14 @@ static void *cvbs_vtable_create(void) {
         return NULL;
     }
 
-    panel->active_plugin = VIDEO_PLUGIN_CVBS;
+    atomic_init(&panel->active_plugin, VIDEO_PLUGIN_CVBS);
     return panel;
 }
 
 static void cvbs_vtable_destroy(void *state) {
     if (!state) return;
     video_panel_state_t *panel = (video_panel_state_t *)state;
+    video_detach_rf(&panel->vhs_fm.decoder);
     gui_cvbs_cleanup(&panel->cvbs.decoder);
     gui_cvbs_cleanup(&panel->tape_decode.decoder);
     gui_vhs_fm_cleanup(&panel->vhs_fm.decoder);
@@ -2487,7 +2595,6 @@ static void cvbs_vtable_clear(void *state) {
     gui_cvbs_reset(&panel->tape_decode.decoder);
     gui_vhs_fm_reset(&panel->vhs_fm.decoder);
     video_tape_apply_runtime_args(&panel->tape_decode, "clear");
-    panel->active_plugin = VIDEO_PLUGIN_CVBS;
     video_panel_close_all_dropdowns(panel);
 }
 
@@ -2520,16 +2627,19 @@ static void video_tape_plugin_process(video_tape_plugin_t *plugin,
 static void cvbs_vtable_process(void *state, const int16_t *samples, size_t count, uint32_t sample_rate) {
     if (!state || !samples || count == 0) return;
     video_panel_state_t *panel = (video_panel_state_t *)state;
-    video_cvbs_plugin_process(&panel->cvbs, samples, count);
-    video_tape_plugin_process(&panel->tape_decode, samples, count);
-    video_vhs_fm_plugin_process(&panel->vhs_fm, samples, count, sample_rate);
+    (void)sample_rate;
+    switch (atomic_load(&panel->active_plugin)) {
+        case VIDEO_PLUGIN_CVBS: video_cvbs_plugin_process(&panel->cvbs, samples, count); break;
+        case VIDEO_PLUGIN_TAPE_DECODE: video_tape_plugin_process(&panel->tape_decode, samples, count); break;
+        default: break; // RF receives continuous input directly from extraction.
+    }
 }
 
 //-----------------------------------------------------------------------------
 // Rendering Functions
 //-----------------------------------------------------------------------------
 
-static void render_vhs_decoder_overlay(video_panel_state_t *panel, Rectangle bounds) {
+static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *app, Rectangle bounds) {
     if (!panel) return;
     vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
     decoder->overlay.is_visible = true;
@@ -2549,6 +2659,20 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, Rectangle bou
     float text_x = btn_x + (btn_w - text_w) * 0.5f;
     float text_y = btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
     gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    const char *format_label = decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
+    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    decoder->overlay.format_rect = (Rectangle){btn_x - fmt_w - 6, btn_y, fmt_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
+                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    int budget=app->settings.rf_preview_budget_percent;
+    if (budget!=50 && budget!=75) budget=100;
+    char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
+    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)+16;
+    decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,btn_y+btn_h+6,budget_w,btn_h};
+    DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
+    gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,btn_y+btn_h+6+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
+                  FONT_SIZE_DROPDOWN_OPT,COLOR_TEXT);
 }
 
 static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
@@ -2563,11 +2687,12 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
     // Keep all decoders updated while preserving independent state.
     gui_cvbs_swap_buffers(&panel->cvbs.decoder);
     gui_cvbs_swap_buffers(&panel->tape_decode.decoder);
+    atomic_store(&panel->vhs_fm.decoder.input_supported,atomic_load(&app->rf_preview_input_supported));
     gui_vhs_fm_swap_buffers(&panel->vhs_fm.decoder);
 
     if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
         gui_vhs_fm_render_frame(&panel->vhs_fm.decoder, bounds.x, bounds.y, bounds.width, bounds.height);
-        render_vhs_decoder_overlay(panel, bounds);
+        render_vhs_decoder_overlay(panel, app, bounds);
         return;
     }
 
@@ -2605,11 +2730,13 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             return true;
         }
 
-        // Keep the existing VHS FM debug interaction: Ctrl+click toggles scope mode.
-        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
-            vhs->display_mode = (vhs->display_mode == VHS_FM_DISPLAY_VIDEO)
-                ? VHS_FM_DISPLAY_SCOPE
-                : VHS_FM_DISPLAY_VIDEO;
+        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
+            int current=app->settings.rf_preview_budget_percent;
+            app->settings.rf_preview_budget_percent=current==100 ? 75 : current==75 ? 50 : 100;
+            return true;
+        }
+        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
+            gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
             return true;
         }
         return false;
