@@ -120,6 +120,35 @@ Real set (user-provided): /media/harry/20TB HDD1/Hugo_UK_2025/VHS Tapes/VHS_Tape
 - Drag-and-drop file input onto the GUI.
 - Side-car style loading: same-base-name companion files (e.g. select video_rf -> auto-load hifi_rf on CH B; baseband/HiFi_Decoded audio for the audio monitor).
 
+## Session 3 final state (2026-10-13) — USER CONFIRMED WORKING
+
+User confirmed "current works" after the last test run (run 19 log: independent
+per-channel scrubbing verified — only "Paused scrub CH A" lines appear when
+dragging the A slider; file info line visible next to both sliders).
+
+Committed + pushed:
+- 6be1adf — Playback: DAW-style file analysis (true totals via tail-decode probe,
+  patched-STREAMINFO IO layer, 1:1 sample scaling, pause watchdog feed,
+  paused backfill, full-resolution contiguous analysis windows via 8 parallel
+  segment decoders with worker-side FFTs + heap frame buffers (stack-smash
+  segfault fixed), waveform paused re-process, space-bar pause, in-line
+  timeline file info (basename / bit-depth + real rate / RAW+FLAC sizes),
+  1-10s accelerated wheel scrub, seek-sequence history clears, 512 slices,
+  regression harness, TECHNICAL.md HARD DEV NOTE).
+- 00650c3 — Spectrogram: heat-map palette dropdown (Phosphor/Heat, top-right),
+  reload-on-palette-change (paused: instant same-spectra re-map + re-request;
+  rolling: clear + refill), DAW time axis (Spectro: absolute timecodes bottom
+  while paused / relative seconds rolling; Waterfall: time on the left),
+  per-channel true-rate resolution.
+
+Known container limitation (documented, verified): FLAC cannot represent
+>655,350 Hz rates or >36-bit sample counts; external tools that trust the
+header sample count (ocenaudio) stop at 0.1% of the data while the duration
+looks correct — the full data IS in the file (verified end-to-end).
+
+Restore point: prompt_logs/restore-point_2026-10-13_00650c3.zip (git archive
+of 00650c3).
+
 ## Pending user confirmation (per rules)
 - GUI run: select [Playback] FLAC Files device, pick a finalized capture (e.g. Tape_03) and an old one (e.g. Spiderman); confirm:
   1. In-line readout next to each slider bar shows e.g. "8-bit 20.0 MSPS" / "8-bit 10.0 MSPS" / "12-bit 40.0 MSPS" before AND during playback.
