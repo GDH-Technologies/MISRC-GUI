@@ -2467,10 +2467,30 @@ static vhs_fm_decoder_t *video_config_rf(panel_view_type_t view, void *state) {
     video_panel_state_t *panel=state;
     return atomic_load(&panel->active_plugin)==VIDEO_PLUGIN_VHS_FM ? &panel->vhs_fm.decoder : NULL;
 }
+// Budget button values (percent of one logical core). The DSP steady-state
+// decode costs ~1.1 logical cores per active worker at 20 MSPS (measured:
+// gui_rf_preview_test --bench), so multi-core machines need values above
+// 100% to keep two concurrently decoding preview workers at realtime.
+static int vhs_budget_clamp(int percent) {
+    switch (percent) {
+        case 50: case 75: case 100: case 150: case 200: case 300:
+            return percent;
+        default:
+            return 100;
+    }
+}
+static int vhs_budget_next(int percent) {
+    if (percent < 50) return 50;
+    if (percent < 75) return 75;
+    if (percent < 100) return 100;
+    if (percent < 150) return 150;
+    if (percent < 200) return 200;
+    if (percent < 300) return 300;
+    return 50;
+}
 void gui_video_update_rf_routes(gui_app_t *app) {
     if (!app) return;
-    int budget=app->settings.rf_preview_budget_percent;
-    if (budget!=50 && budget!=75) budget=100;
+    int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
     static int applied_budget;
     if (budget!=applied_budget) {
         gui_rf_preview_worker_set_budget(budget/100.0);
@@ -2642,7 +2662,10 @@ static void cvbs_vtable_process(void *state, const int16_t *samples, size_t coun
 static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *app, Rectangle bounds) {
     if (!panel) return;
     vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
-    decoder->overlay.is_visible = true;
+    decoder->overlay.is_visible = !decoder->overlay.controls_hidden;
+    // Double-click on the panel (cvbs_vtable_handle_click) toggles ALL the
+    // overlay chrome — buttons + stats text — for a clean video preview.
+    if (decoder->overlay.controls_hidden) return;
 
     const float btn_h = 18.0f;
     const char *label = "Decoder: VHS FM";
@@ -2665,8 +2688,76 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
     gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
                    FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    int budget=app->settings.rf_preview_budget_percent;
-    if (budget!=50 && budget!=75) budget=100;
+    // Stats view selector (All / Basic / Off) — a real dropdown so the stats
+    // readout is user-selectable. Right-anchored beside the System button.
+    static const char *stats_names[3] = { "All", "Basic", "Off" };
+    int stats_view = decoder->overlay.stats_view;
+    if (stats_view < 0 || stats_view > 2) stats_view = 0;
+    char stats_label[40];
+    snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
+    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 24;
+    if (stats_w < 96.0f) stats_w = 96.0f;
+    decoder->overlay.stats_btn_rect =
+        (Rectangle){decoder->overlay.format_rect.x - stats_w - 6, btn_y, stats_w, btn_h};
+    Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+    DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
+    {
+        float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(stats_label,
+                      decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
+                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        float as = 5.0f;
+        float ax = decoder->overlay.stats_btn_rect.x + (stats_w + sw) * 0.5f - as - 4.0f;
+        float acy = btn_y + btn_h * 0.5f;
+        if (decoder->overlay.stats_dropdown_open) {
+            Vector2 top = { ax + as * 0.5f, acy - as * 0.5f };
+            Vector2 left = { ax, acy + as * 0.5f };
+            Vector2 right = { ax + as, acy + as * 0.5f };
+            DrawTriangle(top, left, right, COLOR_TEXT);
+        } else {
+            Vector2 bottom = { ax + as * 0.5f, acy + as * 0.5f };
+            Vector2 left = { ax, acy - as * 0.5f };
+            Vector2 right = { ax + as, acy - as * 0.5f };
+            DrawTriangle(bottom, right, left, COLOR_TEXT);
+        }
+    }
+    if (decoder->overlay.stats_dropdown_open) {
+        float opt_h = 20.0f;
+        for (int i = 0; i < 3; i++) {
+            Rectangle opt = {
+                decoder->overlay.stats_btn_rect.x,
+                decoder->overlay.stats_btn_rect.y + btn_h + (float)i * opt_h,
+                decoder->overlay.stats_btn_rect.width,
+                opt_h
+            };
+            decoder->overlay.stats_opts_rect[i] = opt;
+            bool selected = (stats_view == i);
+            bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
+            DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
+            const char *opt_lbl = stats_names[i];
+            float ow = (float)gui_text_measure(opt_lbl, FONT_SIZE_DROPDOWN_OPT);
+            gui_text_draw(opt_lbl,
+                          opt.x + (opt.width - ow) * 0.5f,
+                          opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        }
+    }
+    // Frame display mode toggle (Active / Full): Full widens the horizontal
+    // decode window to the whole line so VBI + sync tip + colour burst render
+    // with decoded chroma instead of only the active picture area.
+    const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
+    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24;
+    if (frame_w < 118.0f) frame_w = 118.0f;
+    decoder->overlay.frame_rect =
+        (Rectangle){decoder->overlay.stats_btn_rect.x - frame_w - 6, btn_y, frame_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    {
+        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(frame_label,
+                      decoder->overlay.frame_rect.x + (frame_w - fw) * 0.5f,
+                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+    int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
     char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
     float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)+16;
     decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,btn_y+btn_h+6,budget_w,btn_h};
@@ -2723,20 +2814,72 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
 
     if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
         vhs_fm_decoder_t *vhs = &panel->vhs_fm.decoder;
-        if (!CheckCollisionPointRec(mouse_pos, bounds)) return false;
+        if (!CheckCollisionPointRec(mouse_pos, bounds)) {
+            // Click outside the panel resets double-click tracking.
+            vhs->overlay.last_click_ms = 0;
+            return false;
+        }
 
+        // Control clicks first (only while the controls are shown) so a
+        // double-click ON a control never toggles the chrome.
         if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
+            vhs->overlay.last_click_ms = 0;
             video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
             return true;
         }
 
         if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
-            int current=app->settings.rf_preview_budget_percent;
-            app->settings.rf_preview_budget_percent=current==100 ? 75 : current==75 ? 50 : 100;
+            vhs->overlay.last_click_ms = 0;
+            app->settings.rf_preview_budget_percent=
+                vhs_budget_next(vhs_budget_clamp(app->settings.rf_preview_budget_percent));
             return true;
         }
         if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
+            vhs->overlay.last_click_ms = 0;
             gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
+            return true;
+        }
+        // Stats view dropdown: option rows first when open, then the button.
+        if (vhs->overlay.is_visible && vhs->overlay.stats_dropdown_open) {
+            for (int i = 0; i < 3; i++) {
+                if (CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_opts_rect[i])) {
+                    vhs->overlay.stats_view = i;
+                    vhs->overlay.stats_dropdown_open = false;
+                    return true;
+                }
+            }
+            // Button or outside click closes the dropdown.
+            vhs->overlay.stats_dropdown_open = false;
+            return true;
+        }
+        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {
+            vhs->overlay.stats_dropdown_open = true;
+            return true;
+        }
+        // Frame display mode: cycle Active <-> Full (whole-line decode window
+        // for VBI + sync tip + colour burst).
+        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.frame_rect)) {
+            vhs->overlay.last_click_ms = 0;
+            gui_vhs_fm_set_frame_mode(vhs, vhs->overlay.frame_mode == 1 ? 0 : 1);
+            return true;
+        }
+
+        // Double-click anywhere else on the panel toggles ALL overlay
+        // chrome (buttons + stats) for a clean video preview.
+        uint64_t now_ms = get_time_ms();
+        bool double_click =
+            vhs->overlay.last_click_ms != 0 &&
+            now_ms >= vhs->overlay.last_click_ms &&
+            now_ms - vhs->overlay.last_click_ms <= 350 &&
+            fabsf(mouse_pos.x - vhs->overlay.last_click_x) <= 6.0f &&
+            fabsf(mouse_pos.y - vhs->overlay.last_click_y) <= 6.0f;
+        vhs->overlay.last_click_ms = now_ms;
+        vhs->overlay.last_click_x = mouse_pos.x;
+        vhs->overlay.last_click_y = mouse_pos.y;
+        if (double_click) {
+            vhs->overlay.controls_hidden = !vhs->overlay.controls_hidden;
+            vhs->overlay.stats_dropdown_open = false;
+            vhs->overlay.last_click_ms = 0;   // require two fresh clicks to toggle back
             return true;
         }
         return false;

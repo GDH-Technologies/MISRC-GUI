@@ -424,7 +424,19 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     strcpy(settings->audio_2ch_34_filename, "stereo_ch3_ch4.wav");
 
     // RF bit depth defaults (per-channel)
+    // Shared preview budget default, scaled to the machine so the RF preview
+    // can sustain realtime decode: measured steady-state DSP cost is ~1.1
+    // logical cores per active worker at 20 MSPS (gui_rf_preview_test --bench)
+    // and the channels' workers share one FIFO-serialized budget. 12+ cores
+    // -> 300%, 6-11 -> 200%, else 100%. The Budget button overrides per session.
     settings->rf_preview_budget_percent = 100;
+#if !defined(__ANDROID__)
+    {
+        uint32_t cores = get_num_cores();
+        if (cores >= 12) settings->rf_preview_budget_percent = 300;
+        else if (cores >= 6) settings->rf_preview_budget_percent = 200;
+    }
+#endif
     settings->rf_bits_a = 16;
     settings->rf_bits_b = 16;
     settings->cxadc_tenbit_mode_card[0] = false;
@@ -1042,7 +1054,13 @@ void gui_settings_load(gui_settings_t *settings) {
     settings->record_limit_seconds = 0;
     if ((value = find_value(content, "rf_preview_budget_percent")) != NULL) {
         int budget = atoi(value);
-        settings->rf_preview_budget_percent = budget == 50 || budget == 75 ? budget : 100;
+        switch (budget) {
+            case 50: case 75: case 100: case 150: case 200: case 300:
+                settings->rf_preview_budget_percent = budget;
+                break;
+            default:
+                break; // invalid saved value: keep the machine-scaled default
+        }
     }
     if ((value = find_value(content, "rf_bits_a")) != NULL) {
         settings->rf_bits_a = (uint8_t)atoi(value);

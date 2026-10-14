@@ -651,6 +651,14 @@ void gui_rf_preview_worker_set_format(gui_rf_preview_worker_t *w, gui_rf_format_
 #endif
 }
 
+void gui_rf_preview_worker_set_frame_mode(gui_rf_preview_worker_t *worker,
+                                         bool full_frame) {
+    if (!worker) return;
+    rf_mutex_lock(&worker->frame_mutex);
+    gui_rf_decoder_set_frame_mode(worker->decoder, full_frame);
+    rf_mutex_unlock(&worker->frame_mutex);
+}
+
 void gui_rf_preview_worker_reset(gui_rf_preview_worker_t *w) {
     if (!w) return;
     atomic_fetch_add_explicit(&w->control, 1, memory_order_release);

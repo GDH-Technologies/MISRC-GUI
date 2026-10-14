@@ -18,7 +18,7 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
 void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *worker) {
     assert(worker); atomic_fetch_add(&destroys,1); free(worker);
 }
-bool gui_rf_preview_worker_set_budget(double cores) { assert(cores>=.5 && cores<=1); return true; }
+bool gui_rf_preview_worker_set_budget(double cores) { assert(cores>=.5 && cores<=8); return true; }
 void gui_rf_preview_worker_set_paused(gui_rf_preview_worker_t *worker,bool paused) {
     atomic_store(&((route_worker_t*)worker)->paused,paused);
 }

@@ -3166,7 +3166,11 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     app->capture_backend_upstream = false;
     app->capture_has_channel_b = (s_playback->file_b != NULL);
-    app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
+    /* Playback files are their own fixed A/B mapping (file A = channel A;
+     * the per-channel seek sliders scrub their own file). The MISRC
+     * hardware-input swap must never leak into playback — it crossed the
+     * panel feeds against the sliders. */
+    app->capture_mode_runtime_misrc = false;
     app->capture_start_time = GetTime();
     app->reconnect_pending = false;
     app->reconnect_attempts = 0;

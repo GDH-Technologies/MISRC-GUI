@@ -48,6 +48,7 @@ static const rf_profile_t rf_profiles[] = {
 struct gui_rf_decoder {
     gui_rf_format_t format;
     rf_profile_t p;
+    bool full_frame;   /* Active/Full display mode (see set_frame_mode). */
     float *storage, *luma, *sync, *ci, *cq, *envelope, *sync_luma;
     uint8_t *rgba;
     uint64_t next_raw, low_first, low_last;
@@ -281,13 +282,21 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     bool valid[RF_MAX_LINES], anchors[RF_MAX_LINES+1];
     int measured_count=0, burst_count=0;
     double nominal = d->p.line_us*5.0;
+    /* Full mode renders from the field boundary (line 0) so the VBI shows;
+     * Active mode crops to the profile's active lines. Unmeasured VBI rows
+     * (EQ/broad pulses carry no H anchors) fall back to nominal positions. */
+    const int line_first = d->full_frame ? 0 : d->p.active_first;
+    /* Full mode widens the horizontal window to the whole line so the sync
+     * tip and the color burst render (with their decoded chroma). */
+    const double win_start_us = d->full_frame ? 0.0 : d->p.active_start_us;
+    const double win_end_us = d->full_frame ? d->p.line_us : d->p.active_end_us;
     int field_lines=d->format==GUI_RF_PAL ? (parity==0 ? 312 : 313)
                                          : (parity==0 ? 263 : 262);
     double average=((double)end_sample*.25-field_start)/field_lines;
     average=rf_clamp(average,nominal*.98,nominal*1.02);
     for (int y=0; y<=rows; ++y) {
         bool measured;
-        int line=d->p.active_first+y;
+        int line=line_first+y;
         double target=y ? lines[y-1]+average : field_start+line*average;
         lines[y]=rf_nearest_h(d,target,nominal*.30,&measured);
         anchors[y]=measured;
@@ -311,7 +320,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         periods[y]=rf_clamp(lines[y+1]-lines[y], nominal*.8, nominal*1.2);
     rf_prepare_luma_wow(d,periods,anchors,rows,nominal,luma_wow);
     for (int y=0; y<rows; ++y) {
-        int line=d->p.active_first+y;
+        int line=line_first+y;
         double start=d->p.burst_start_us*5.0*periods[y]/nominal;
         double end=d->p.burst_end_us*5.0*periods[y]/nominal;
         /* Trim filter settling and transitions at both ends of the burst. */
@@ -372,8 +381,8 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         double scale=periods[y]/nominal;
         /* Display black/IRE are format parameters. Four noisy porch samples
          * and individual sync tips must not offset or amplify entire rows. */
-        double pixel_step=(d->p.active_end_us-d->p.active_start_us)*5.0*scale/d->p.width;
-        double first_offset=d->p.active_start_us*5.0*scale+pixel_step*.5;
+        double pixel_step=(win_end_us-win_start_us)*5.0*scale/d->p.width;
+        double first_offset=win_start_us*5.0*scale+pixel_step*.5;
         double carrier_scale=2.0*RF_PI*d->p.carrier_hz/RF_VIDEO_RATE;
         double timing0=lines[y]-field_start-(d->p.active_first+y)*nominal
                       +first_offset*(1.0-nominal/periods[y]);
@@ -601,12 +610,22 @@ static void rf_commit_pulse(gui_rf_decoder_t *d, double start, double end,
     rf_commit_pulse_mode(d,start,end,callback,context,true);
 }
 
+void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full_frame) {
+    if (!d) return;
+    d->full_frame = full_frame;
+    /* Assemble the next frame with the new geometry: drop any half-built
+     * interlace pair so a mode switch cannot mix modes inside one frame. */
+    d->ready_fields = 0;
+}
+
 void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
     if (!d) return;
     float *storage=d->storage;
     uint8_t *rgba=d->rgba;
+    bool full_frame=d->full_frame;
     memset(d,0,sizeof(*d));
     d->storage=storage; d->rgba=rgba;
+    d->full_frame=full_frame;   /* Display mode survives resets/rebinds. */
     d->luma=storage; d->sync=storage+RF_RING_SIZE;
     d->ci=storage+2u*RF_RING_SIZE; d->cq=storage+3u*RF_RING_SIZE;
     d->envelope=storage+4u*RF_RING_SIZE;

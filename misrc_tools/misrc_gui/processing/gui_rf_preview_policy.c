@@ -4,10 +4,14 @@
 
 bool gui_rf_preview_policy_set_budget(gui_rf_preview_policy_t *p, double cores) {
     /* Bit classification stays valid under the project's -ffast-math build. */
+    /* Ceiling 8 logical cores: measured steady-state DSP cost is ~1.1 cores
+     * per active worker at 20 MSPS (gui_rf_preview_test --bench), so realtime
+     * decode for multiple shared-FIFO workers needs a budget above one core
+     * on multi-core machines. Still a soft pacing budget, not an OS quota. */
     uint64_t bits;
     _Static_assert(sizeof(bits) == sizeof(cores), "IEEE-754 double required");
     memcpy(&bits, &cores, sizeof(bits));
-    if (((bits >> 52) & 0x7ffu) == 0x7ffu || cores < 0.0 || cores > 1.0 ||
+    if (((bits >> 52) & 0x7ffu) == 0x7ffu || cores < 0.0 || cores > 8.0 ||
         (cores > 0.0 && cores < 0.05)) return false;
     p->cores_millionths = (uint32_t)(cores * 1000000.0 + 0.5);
     /* Configuration starts a fresh pacing interval; an active block is still

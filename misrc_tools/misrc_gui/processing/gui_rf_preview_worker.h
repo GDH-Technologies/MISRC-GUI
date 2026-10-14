@@ -46,7 +46,8 @@ typedef struct {
 } gui_rf_preview_stats_t;
 
 /* Shared by all workers in this process, default 1.0 logical core. Accepts
- * 0.05..1.0; 0 disables pacing for offline maximum-speed validation only.
+ * 0.05..8.0 (measured DSP need is ~1.1 cores per active worker at 20 MSPS);
+ * 0 disables pacing for offline maximum-speed validation only.
  * This is a soft processing budget, not an OS quota. A running 65536-source-
  * sample block cannot be interrupted; short intervals can exceed the rate due
  * to block granularity and OS accounting/scheduling. Windows keeps at most
@@ -60,6 +61,11 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format);
 void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *worker);
 void gui_rf_preview_worker_set_format(gui_rf_preview_worker_t *worker,
                                      gui_rf_format_t format);
+/* Frame display mode: Active (default) or Full (VBI + burst with decoded
+ * chroma); forwards to the DSP decoder under the frame mutex. Survives
+ * worker resets and rebinds. */
+void gui_rf_preview_worker_set_frame_mode(gui_rf_preview_worker_t *worker,
+                                         bool full_frame);
 void gui_rf_preview_worker_reset(gui_rf_preview_worker_t *worker);
 /* Atomic, nonblocking pressure control. Paused submissions are rejected before
  * copying. Worker drains old input/reset state, preserving the latest complete

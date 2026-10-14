@@ -1634,6 +1634,13 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     if (cxadc_mode) {
         gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen);
     }
+    /* The Playback device is another fixed A/B mapping: file A IS channel A
+     * (the per-channel seek sliders scrub their own file), so the MISRC
+     * hardware-input swap must not apply there either — the leaked swap
+     * crossed the panel feeds against the sliders. Like cxadc, preserve the
+     * sticky settings.misrc_mode preference; only force the live flags. */
+    bool playback_device = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                           app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
     bool cxadc_has_channel_b = false;
     if (cxadc_mode && app->selected_device >= 0 && app->selected_device < app->device_count) {
         cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
@@ -1649,11 +1656,11 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     bool is_clockgen_mode = cxadc_clockgen || misrc_clockgen || ddd_clockgen;
     bool single_channel_device = ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_channel_b);
     bool expected_mode = s_capture_mode_state_misrc;
-    if (cxadc_mode) {
+    if (cxadc_mode || playback_device) {
         expected_mode = false;
     }
     bool mismatch_user = (app->user_capture_mode_misrc != expected_mode);
-    bool mismatch_settings = (!cxadc_mode && app->settings.misrc_mode != expected_mode);
+    bool mismatch_settings = (!cxadc_mode && !playback_device && app->settings.misrc_mode != expected_mode);
     bool mismatch_runtime = (!app->is_recording && app->capture_mode_runtime_misrc != expected_mode);
     if (mismatch_user || mismatch_settings || mismatch_runtime) {
         TraceLog(LOG_INFO,
@@ -1665,7 +1672,7 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
                  app->is_recording ? 1 : 0);
     }
     app->user_capture_mode_misrc = expected_mode;
-    if (!cxadc_mode) {
+    if (!cxadc_mode && !playback_device) {
         app->settings.misrc_mode = expected_mode;
     }
     if (!app->is_recording) {

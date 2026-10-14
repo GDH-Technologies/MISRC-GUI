@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TEST_PI 3.14159265358979323846
 #define TEST_RATE 20000000.0
@@ -877,7 +878,59 @@ static void run_real_ntsc_bars(const char *path) {
     free(frames.rgba); gui_rf_decoder_destroy(decoder);
 }
 
+/* One-thread steady-state DSP throughput at the 20 MHz decode rate: the full
+ * locked pipeline (FM demod, H/V sync, line map, chroma decode, weave) over a
+ * looping 16-field fixture. Reports the realtime multiple one worker needs
+ * and its share of one core — the measured input for queue-drop budget
+ * decisions, never an assumption. */
+static void run_bench(gui_rf_format_t format, double seconds) {
+    test_quality_t quality={TEST_Q_GRAY,16,0,0,0,{0}};
+    size_t length;
+    float *rf=make_rf_signal(format,0.0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+    assert(rf && length>0);
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create(format); assert(decoder);
+    test_frames_t frames={0};
+    frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(frames.rgba);
+    /* Warm-up: reach the locked steady state before measuring. */
+    gui_rf_decoder_process(decoder,rf,length,0,receive_frame,&frames);
+    gui_rf_decode_status_t before; gui_rf_decoder_get_status(decoder,&before);
+    assert(before.v_locked);
+    uint64_t loops=(uint64_t)((seconds*20000000.0)/(double)length);
+    if (loops<1) loops=1;
+    struct timespec wall0,wall1,cpu0,cpu1;
+    clock_gettime(CLOCK_MONOTONIC,&wall0);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu0);
+    uint64_t position=length;
+    for (uint64_t i=0;i<loops;++i) {
+        gui_rf_decoder_process(decoder,rf,length,position,receive_frame,&frames);
+        position+=length;
+    }
+    clock_gettime(CLOCK_MONOTONIC,&wall1);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu1);
+    double wall=(double)(wall1.tv_sec-wall0.tv_sec)+1e-9*(double)(wall1.tv_nsec-wall0.tv_nsec);
+    double cpu=(double)(cpu1.tv_sec-cpu0.tv_sec)+1e-9*(double)(cpu1.tv_nsec-cpu0.tv_nsec);
+    gui_rf_decode_status_t after; gui_rf_decoder_get_status(decoder,&after);
+    double content=(double)loops*(double)length/20000000.0;
+    double fields=(double)(after.fields_decoded-before.fields_decoded);
+    printf("%s bench: %.2f s content in %.3f s wall / %.3f s cpu -> %.2fx realtime, %.0f%% of one core, %.2f ms/field, %llu frames\n",
+           format==GUI_RF_PAL ? "PAL" : "NTSC",content,wall,cpu,
+           wall>0 ? content/wall : 0,wall>0 ? 100.0*cpu/wall : 0,
+           fields>0 ? 1000.0*cpu/fields : 0,
+           (unsigned long long)frames.frames);
+    fflush(stdout);
+    free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
 int main(int argc, char **argv) {
+    if ((argc==2||argc==3) && strcmp(argv[1],"--bench")==0) {
+        double seconds=argc==3 ? atof(argv[2]) : 5.0;
+        if (!(seconds>=0.5)) seconds=5.0;
+        run_bench(GUI_RF_PAL,seconds);
+        run_bench(GUI_RF_NTSC,seconds);
+        puts("DSP steady-state throughput bench complete");
+        return 0;
+    }
     if (argc==2 && strcmp(argv[1],"--stop-resume-only")==0) {
         run_stop_resume();puts("Continuous RF stop/resume contracts passed");return 0;
     }

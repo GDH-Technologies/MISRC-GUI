@@ -203,7 +203,7 @@ typedef struct {
 
     // RF bit depth selection (per-channel)
     // FLAC supports 8/12/16; RAW supports 8/16 (12 is disabled in RAW UI).
-    int rf_preview_budget_percent;            // Shared preview budget: 50/75/100% of one logical core.
+    int rf_preview_budget_percent;            // Shared preview budget: 50..300% of one logical core (machine-scaled default).
     uint8_t rf_bits_a;
     uint8_t rf_bits_b;
     // CXADC capture mode per card: false=8-bit @ base 40 MSPS,

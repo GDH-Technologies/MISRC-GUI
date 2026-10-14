@@ -41,9 +41,13 @@ int main(void) {
     double nan_value;
     memcpy(&nan_value, &nan_bits, sizeof(nan_value));
     check(!gui_rf_preview_policy_set_budget(&p, nan_value), "NaN rejected under fast-math");
+    /* Ceiling is 8 logical cores (measured DSP need ~1.1 cores/worker):
+     * multi-core budgets are accepted; only the true range edges reject. */
     check(!gui_rf_preview_policy_set_budget(&p, -.5) &&
           !gui_rf_preview_policy_set_budget(&p, .01) &&
-          !gui_rf_preview_policy_set_budget(&p, 1.01), "invalid budget range rejected");
+          !gui_rf_preview_policy_set_budget(&p, 8.01) &&
+          gui_rf_preview_policy_set_budget(&p, 8) &&
+          gui_rf_preview_policy_set_budget(&p, 1.01), "invalid budget range rejected, multi-core budgets accepted");
     check(gui_rf_preview_policy_set_budget(&p, 0), "offline pacing bypass");
     check(gui_rf_preview_policy_acquire(&p, 1, 3000000, &wait), "offline permit");
     gui_rf_preview_policy_finish(&p, 1000000);

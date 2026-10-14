@@ -22,8 +22,16 @@ typedef struct vhs_fm_decoder {
     vhs_fm_format_t format;
     struct {
         Rectangle button_rect, format_rect, budget_rect;
-        bool is_visible, dropdown_open;
+        Rectangle stats_btn_rect, stats_opts_rect[3];
+        Rectangle frame_rect;
+        bool is_visible, dropdown_open, stats_dropdown_open;
         int selected_system;
+        int stats_view;               // 0 = All, 1 = Basic, 2 = Off
+        int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
+        bool controls_hidden;         // Double-click on the panel toggles ALL
+                                       // overlay chrome (buttons + stats text).
+        uint64_t last_click_ms;      // Double-click detection (ms + position)
+        float last_click_x, last_click_y;
     } overlay;
 } vhs_fm_decoder_t;
 bool gui_vhs_fm_init(vhs_fm_decoder_t *decoder);
@@ -33,6 +41,9 @@ void gui_vhs_fm_reset(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_swap_buffers(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float width, float height);
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select);
+// Frame display mode: 0 = Active (default), 1 = Full (VBI + burst with
+// decoded chroma). Persists across worker rebinds.
+void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select);
 vhs_fm_format_t gui_vhs_fm_get_format(vhs_fm_decoder_t *decoder);
 const char *gui_vhs_fm_get_format_name(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_panel_register(void);

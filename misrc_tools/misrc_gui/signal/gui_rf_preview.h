@@ -48,6 +48,12 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
 gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format);
 void gui_rf_decoder_destroy(gui_rf_decoder_t *decoder);
 void gui_rf_decoder_reset(gui_rf_decoder_t *decoder, gui_rf_format_t format);
+/* Frame display mode: Active (profile active lines/horizontal window, the
+ * default) or Full (whole frame from the field boundary including the VBI,
+ * with the horizontal window widened to the full line so the sync tip and
+ * the color burst render with their decoded chroma). Unmeasured VBI lines
+ * (EQ/broad pulse rows carry no H anchors) use nominal line positions. */
+void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *decoder, bool full_frame);
 void gui_rf_decoder_process(gui_rf_decoder_t *decoder, const float *samples,
                             size_t count, uint64_t first_sample,
                             gui_rf_frame_callback_t callback, void *context);
