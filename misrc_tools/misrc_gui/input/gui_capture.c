@@ -2223,6 +2223,54 @@ int gui_app_start_capture(gui_app_t *app) {
         app->capture_backend_upstream = false;
         app->capture_has_channel_b = true;
     } else {
+#if defined(_WIN32)
+        /* Windows hsdaoh RP2350 fix: route the MS2130 VIDEO STREAM through the
+         * Media Foundation (simple_capture) backend — the kernel usbvideo.sys
+         * path that works for FPGA-based MISRC — instead of libuvc (userspace
+         * WinUSB/libusbK), which produces black frames because the MS2130's
+         * HDMI receiver doesn't recover the RP2350's TMDS data through the
+         * libuvc userspace negotiation.
+         *
+         * The HID transparent-mode CONTROL still uses hsdaoh_open on MI_04
+         * (libusbK) below — the MS2130 still gets configured for passthrough.
+         * Only the video stream is rerouted to MF. This mirrors the MISRC
+         * mentality: kernel UVC driver for video, libusb for HID control. */
+        fprintf(stderr, "[GUI] Windows: trying Media Foundation (kernel usbvideo) for hsdaoh video stream...\n");
+        {
+            sc_capture_dev_t *sc_devs = NULL;
+            size_t sc_count = sc_get_devices(&sc_devs);
+            const char *mf_device_id = NULL;
+            /* Match the MS2130 by name ("MS2130" / "USB3.0 UHD") */
+            for (size_t i = 0; i < sc_count; i++) {
+                if (strstr(sc_devs[i].name, "MS2130") || strstr(sc_devs[i].name, "USB3.0") ||
+                    strstr(sc_devs[i].name, "UHD") || strstr(sc_devs[i].name, "2130")) {
+                    mf_device_id = sc_devs[i].device_id;
+                    fprintf(stderr, "[GUI] Windows: found MS2130 via MF: %s (%s)\n",
+                            sc_devs[i].name, sc_devs[i].device_id);
+                    break;
+                }
+            }
+            if (mf_device_id) {
+                proc_set_priority(PROC_PRIORITY_ABOVE);
+                thrd_set_priority(THRD_PRIORITY_CRITICAL);
+                r = sc_start_capture(mf_device_id, 1920, 1080, SC_CODEC_YUYV, 60, 1,
+                                     gui_simple_capture_callback, app, &app->sc_dev);
+                if (r == 0 && app->sc_dev) {
+                    fprintf(stderr, "[GUI] Windows: MF backend capture started (kernel usbvideo path)\n");
+                    app->capture_backend_upstream = false;
+                    app->capture_has_channel_b = true;
+                    /* Still open hsdaoh for HID transparent-mode control on MI_04,
+                     * then jump past the libuvc video-start. */
+                    goto windows_mf_open_hid;
+                }
+                fprintf(stderr, "[GUI] Windows: MF sc_start_capture failed (%d), falling back to libuvc\n", r);
+                app->sc_dev = NULL;
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+            } else {
+                fprintf(stderr, "[GUI] Windows: no MS2130 found via MF (it may be on libusbK); falling back to libuvc\n");
+            }
+        }
+#endif /* _WIN32 */
         fprintf(stderr, "[GUI] Opening hsdaoh device (backend=%s)...\n",
                 use_upstream_backend ? "upstream" : "raw-parser");
 #if !defined(__ANDROID__)
@@ -2296,6 +2344,15 @@ int gui_app_start_capture(gui_app_t *app) {
         hsdaoh_read_cb_t stream_cb = use_upstream_backend
                          ? (hsdaoh_read_cb_t)gui_capture_upstream_callback
                          : (hsdaoh_read_cb_t)gui_capture_callback;
+#if defined(_WIN32)
+        if (app->sc_dev) {
+            /* Windows MF path already started the video stream above; skip the
+             * libuvc hsdaoh_start_stream and go straight to the connected
+             * state. hs_dev is open for HID transparent-mode control only. */
+            fprintf(stderr, "[GUI] Windows: skipping libuvc video start (MF backend active)\n");
+            goto windows_mf_connected;
+        }
+#endif
         r = MISRC_HSDAOH_START_STREAM(app->hs_dev, stream_cb, app);
 
         if (r < 0) {
@@ -2317,6 +2374,13 @@ int gui_app_start_capture(gui_app_t *app) {
                 use_upstream_backend ? "upstream" : "raw-parser",
                 use_upstream_backend ? "A (B auto-detect)" : "A+B");
     }
+
+#if defined(_WIN32)
+windows_mf_connected:
+windows_mf_open_hid:
+    /* Windows: MF video backend is active (or hsdaoh HID open completed).
+     * Both labels land here to skip the libuvc video-start path. */
+#endif
 
     // Capture lifecycle boundary: keep parser setup/reset work after stream
     // startup succeeds, not on pre-open or failed-start paths.
