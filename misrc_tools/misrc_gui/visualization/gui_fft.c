@@ -12,6 +12,7 @@
 #include "../core/gui_app.h"
 #include "gui_phosphor_rt.h"
 #include "../ui/gui_ui.h"
+#include "../ui/gui_chrome_hide.h"  // double-click annotation toggle (panel wrapper below)
 #include "../../common/threading.h"
 
 #include <stdlib.h>
@@ -747,6 +748,14 @@ static void fft_draw_peak_label(Font *fonts, const char *db_text, const char *fr
     }
 }
 
+// Chrome-hidden flag for the gui_fft_render call in progress. gui_fft_render's
+// signature is public API (gui_fft.h) and fft_state_t cannot carry the flag,
+// so the FFT panel render (fft_panel_state_t wrapper below) publishes its
+// double-click chrome-hide state here immediately before its single call.
+// gui_fft_render has no other callers and always runs on the render thread,
+// so the flag never races or leaks between panels.
+static bool s_fft_chrome_hidden = false;
+
 void gui_fft_render(fft_state_t *state, float x, float y,
                     float width, float height, Color color, Font *fonts) {
 #if LIBFFTW_ENABLED
@@ -846,9 +855,13 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         DrawLineV((Vector2){x, line_y}, (Vector2){x + width, line_y},
                 is_zero ? COLOR_GRID_MAJOR : COLOR_GRID);
 
-        char label[16];
-        snprintf(label, sizeof(label), "%+.0fdB", db);
-        fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+        // dB labels are overlay chrome: hidden while the panel's chrome is
+        // toggled off (the gridlines keep rendering).
+        if (!s_fft_chrome_hidden) {
+            char label[16];
+            snprintf(label, sizeof(label), "%+.0fdB", db);
+            fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+        }
 
         div_count++;
     }
@@ -889,8 +902,9 @@ void gui_fft_render(fft_state_t *state, float x, float y,
             if (line_x >= x && line_x <= x + width) {
                 DrawLineV((Vector2){line_x, y}, (Vector2){line_x, y + height}, COLOR_GRID);
 
-                // Draw frequency label (skip if too close to edges)
-                if (line_x > x + 30 && line_x < x + width - 30) {
+                // Draw frequency label (skip if too close to edges; labels
+                // are overlay chrome, hidden with the panel's chrome)
+                if (!s_fft_chrome_hidden && line_x > x + 30 && line_x < x + width - 30) {
                     format_freq_label(freq_buf, sizeof(freq_buf), freq);
                     float label_w = fft_measure_text_mono(fonts, freq_buf, FONT_SIZE_OSC_SCALE).x;
                     fft_draw_text_mono(fonts, freq_buf, line_x - label_w / 2, y + height - 14, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
@@ -899,19 +913,23 @@ void gui_fft_render(fft_state_t *state, float x, float y,
             div_count++;
         }
 
-        // Show frequency per division in top-right corner (below FFT label)
-        format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
-        char div_label[48];
-        snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
-        float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
-        fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+        // /div + zoom readouts are overlay chrome: hidden with the panel's
+        // chrome toggle (the gridlines keep rendering).
+        if (!s_fft_chrome_hidden) {
+            // Show frequency per division in top-right corner (below FFT label)
+            format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
+            char div_label[48];
+            snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
+            float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
+            fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
 
-        // Show zoom level if zoomed in
-        if (zoom > 1.01f) {
-            char zoom_label[32];
-            snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
-            float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
-            fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
+            // Show zoom level if zoomed in
+            if (zoom > 1.01f) {
+                char zoom_label[32];
+                snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
+                float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
+            }
         }
     }
 
@@ -936,8 +954,11 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         }
     }
 
-    // Peak detection on mouse hover - show closest peak to mouse (with zoom/pan support)
-    if (state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
+    // Peak detection on mouse hover - show closest peak to mouse (with
+    // zoom/pan support). The peak marker + readout are overlay chrome:
+    // hidden with the panel's chrome toggle.
+    if (!s_fft_chrome_hidden &&
+        state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
         Vector2 mouse = gui_ui_get_mouse_position();
         Rectangle fft_rect = {x, y, width, height};
 
@@ -1083,10 +1104,13 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         }
     }
 
-    // Draw "FFT" label in top-right corner (matching oscilloscope channel label style)
-    const char *fft_label = "FFT";
-    int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
-    fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    // Draw "FFT" label in top-right corner (matching oscilloscope channel
+    // label style). Overlay chrome: hidden with the panel's chrome toggle.
+    if (!s_fft_chrome_hidden) {
+        const char *fft_label = "FFT";
+        int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
+        fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    }
 
 #else
     (void)state;
@@ -1103,6 +1127,15 @@ void gui_fft_render(fft_state_t *state, float x, float y,
 // Zoom and Pan Interaction
 //=============================================================================
 
+// FFT panel state: the base fft engine plus the per-instance double-click
+// chrome-hide tracker. Declared here (before the zoom/pan handlers and the
+// vtable below) because those functions carry the panel state. Processing
+// still happens in the display thread via the embedded fft_state_t.
+typedef struct {
+    fft_state_t fft;
+    gui_chrome_hide_t chrome_hide;   // double-click toggles the annotation labels
+} fft_panel_state_t;
+
 // Zoom limits
 #define FFT_ZOOM_MIN 1.0f      // No zoom (full spectrum)
 #define FFT_ZOOM_MAX 64.0f     // Maximum zoom (64x)
@@ -1113,7 +1146,8 @@ static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
 #if LIBFFTW_ENABLED
     if (!state_ptr || delta == 0.0f) return false;
 
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
     if (!state->initialized) return false;
 
     Vector2 mouse = gui_ui_get_mouse_position();
@@ -1156,7 +1190,7 @@ static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
 #endif
 }
 
-// Handle mouse click for drag-to-pan
+// Handle mouse click for drag-to-pan and the double-click chrome toggle
 static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
                               Vector2 click, Rectangle bounds) {
 #if LIBFFTW_ENABLED
@@ -1165,17 +1199,28 @@ static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
 
     if (!state_ptr) return false;
 
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
     if (!state->initialized) return false;
 
-    // Only allow panning when zoomed in
-    if (state->zoom_level <= 1.0f) return false;
-
-    // Check if click is inside bounds
+    // Click outside the panel resets double-click tracking (and cancels any
+    // pan drag).
     if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&panel->chrome_hide);
         state->dragging = false;
         return false;
     }
+
+    // The FFT panel has no overlay controls: every in-bounds click feeds the
+    // double-click chrome toggle. A double-click toggles the annotation
+    // labels and consumes the click; a single click still falls through to
+    // the pan drag below (data interaction, unchanged).
+    if (gui_chrome_hide_feed_click(&panel->chrome_hide, click)) {
+        return true;
+    }
+
+    // Only allow panning when zoomed in
+    if (state->zoom_level <= 1.0f) return false;
 
     // Start dragging
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -1231,8 +1276,9 @@ static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
 // Panel Interface (vtable) Implementation
 //=============================================================================
 
-// FFT panel state is just the base fft_state_t
-// Processing happens in display thread, rendering in render thread
+// FFT panel state is the fft_panel_state_t wrapper (see the Zoom and Pan
+// Interaction section above). Processing happens in display thread via the
+// embedded fft_state_t, rendering in render thread.
 
 //-----------------------------------------------------------------------------
 // Lifecycle Functions
@@ -1240,15 +1286,15 @@ static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
 
 static void *fft_vtable_create(void) {
 #if LIBFFTW_ENABLED
-    fft_state_t *state = calloc(1, sizeof(fft_state_t));
-    if (!state) return NULL;
+    fft_panel_state_t *panel = calloc(1, sizeof(fft_panel_state_t));
+    if (!panel) return NULL;
 
-    if (!gui_fft_init(state)) {
-        free(state);
+    if (!gui_fft_init(&panel->fft)) {
+        free(panel);
         return NULL;
     }
 
-    return state;
+    return panel;
 #else
     return NULL;
 #endif
@@ -1256,15 +1302,15 @@ static void *fft_vtable_create(void) {
 
 static void fft_vtable_destroy(void *state_ptr) {
     if (!state_ptr) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
-    gui_fft_cleanup(state);
-    free(state);
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_cleanup(&panel->fft);
+    free(panel);
 }
 
 static void fft_vtable_clear(void *state_ptr) {
     if (!state_ptr) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
-    gui_fft_clear(state);
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_clear(&panel->fft);
 }
 
 //-----------------------------------------------------------------------------
@@ -1273,10 +1319,10 @@ static void fft_vtable_clear(void *state_ptr) {
 
 static void fft_vtable_process(void *state_ptr, const int16_t *samples, size_t count, uint32_t sample_rate) {
     if (!state_ptr || !samples || count == 0) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
 
     // Process raw ADC samples and compute FFT
-    gui_fft_process_raw(state, samples, count, sample_rate);
+    gui_fft_process_raw(&panel->fft, samples, count, sample_rate);
 }
 
 //-----------------------------------------------------------------------------
@@ -1289,7 +1335,8 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     if (!state_ptr || !app) return;
 
-    fft_state_t *fft = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *fft = &panel->fft;
 
     if (!fft->initialized) {
         const char *text = gui_fft_available() ? "FFT Initializing..." : "FFT Not Available";
@@ -1305,6 +1352,10 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     // Swap buffers to get latest FFT data from display thread
     gui_fft_swap_buffers(fft);
+
+    // Publish the panel's double-click chrome state for the annotation-label
+    // draws inside gui_fft_render (see s_fft_chrome_hidden above).
+    s_fft_chrome_hidden = gui_chrome_hide_hidden(&panel->chrome_hide);
 
     // Render FFT (sample_rate is read atomically inside gui_fft_render)
     gui_fft_render(fft, bounds.x, bounds.y, bounds.width, bounds.height,

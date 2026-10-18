@@ -65,11 +65,27 @@ static void pace_realtime(uint64_t start_us, uint64_t samples, uint32_t rate) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5 || argc > 6 ||
-        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0) ||
-        (argc == 6 && strcmp(argv[5], "--max") != 0 && strcmp(argv[5], "--realtime") != 0)) {
-        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc output.ppm [--max|--realtime]\n", argv[0]);
+    bool realtime = false, full_frame = false;
+    double seconds_cap = 0.0;
+    if (argc < 5 || argc > 8 ||
+        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0)) {
+        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc output.ppm"
+                        " [--max|--realtime] [--full] [seconds_cap]\n", argv[0]);
         return 1;
+    }
+    for (int i = 5; i < argc; i++) {
+        if (strcmp(argv[i], "--max") == 0) realtime = false;
+        else if (strcmp(argv[i], "--realtime") == 0) realtime = true;
+        else if (strcmp(argv[i], "--full") == 0) full_frame = true;
+        else {
+            char *cap_end = NULL;
+            errno = 0;
+            seconds_cap = strtod(argv[i], &cap_end);
+            if (errno || !cap_end || *cap_end || !(seconds_cap > 0.0) || seconds_cap > 3600.0) {
+                fprintf(stderr, "Unknown option or invalid seconds cap: %s\n", argv[i]);
+                return 1;
+            }
+        }
     }
     char *end = NULL;
     errno = 0;
@@ -80,7 +96,6 @@ int main(int argc, char **argv) {
     }
     uint32_t rate = (uint32_t)parsed_rate;
     gui_rf_format_t format = strcmp(argv[3], "pal") == 0 ? GUI_RF_PAL : GUI_RF_NTSC;
-    bool realtime = argc == 6 && strcmp(argv[5], "--realtime") == 0;
     if (!gui_rf_preview_worker_set_budget(realtime ? 1.0 : 0.0)) return 1;
     uint64_t wall_start = file_now_us();
     FILE *input = fopen(argv[1], "rb");
@@ -95,6 +110,10 @@ int main(int argc, char **argv) {
         free(bytes); free(samples); free(frame); fclose(input);
         return 1;
     }
+    /* Frame mode must be set before the first submit so the whole run, the
+     * published frame size, and the final PPM use Full geometry from the
+     * start (PAL 626 / NTSC 526 rows). */
+    if (full_frame) gui_rf_preview_worker_set_frame_mode(worker, true);
     uint64_t pace_start = file_now_us();
     uint64_t total_samples = 0, generation = 0, submitted = 0, rejected = 0;
     int width = 0, height = 0, exit_status = 0;
@@ -120,6 +139,8 @@ int main(int argc, char **argv) {
             }
         }
         total_samples += count;
+        if (seconds_cap > 0.0 && (double)total_samples >= seconds_cap * (double)rate)
+            break;
         /* Offline maximum speed still preserves the entire continuous source:
          * eight blocks are below the input-duration cap even at 16 MSPS. */
         if (!realtime && (submitted % 8u) == 0 &&
@@ -148,14 +169,15 @@ int main(int argc, char **argv) {
     free(bytes); free(samples); free(frame);
     uint64_t wall_end = file_now_us();
     double processing_ms = (double)(processing_end - wall_start) / 1000.0;
-    printf("{\"sample_rate_hz\":%u,\"format\":\"%s\",\"mode\":\"%s\","
-           "\"samples\":%llu,\"input_seconds\":%.9f,\"blocks_submitted\":%llu,"
+    printf("{\"sample_rate_hz\":%u,\"format\":\"%s\",\"mode\":\"%s\",\"frame_mode\":\"%s\","
+           "\"seconds_cap\":%.3f,\"samples\":%llu,\"input_seconds\":%.9f,\"blocks_submitted\":%llu,"
            "\"blocks_rejected\":%llu,\"blocks_dropped\":%llu,\"frames\":%llu,"
            "\"width\":%d,\"height\":%d,\"frame_saved\":%s,\"resets\":%llu,"
            "\"processing_wall_ms\":%.3f,\"wall_ms\":%.3f,\"throughput_msps\":%.3f,"
            "\"fps\":%.3f,\"decode_ms\":%.3f,\"latency_ms\":%.3f,"
            "\"h_locked\":%s,\"v_locked\":%s,\"color_locked\":%s,\"reason\":",
-           rate, argv[3], realtime ? "realtime" : "max", (unsigned long long)total_samples,
+           rate, argv[3], realtime ? "realtime" : "max", full_frame ? "full" : "active",
+           seconds_cap, (unsigned long long)total_samples,
            (double)total_samples / rate, (unsigned long long)submitted,
            (unsigned long long)rejected, (unsigned long long)stats.blocks_dropped,
            (unsigned long long)stats.total_frames, width, height, saved ? "true" : "false",

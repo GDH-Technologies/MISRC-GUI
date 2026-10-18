@@ -114,6 +114,20 @@ int file_mkdir_utf8(const char *path, int mode) {
 #endif
 }
 
+int file_remove_utf8(const char *path) {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t *wide = file_wide_path(path);
+    if (!wide) return -1;
+    int result = DeleteFileW(wide) != 0 ? 0 : -1;
+    int saved_errno = errno;
+    free(wide); errno = saved_errno;
+    return result;
+#else
+    if (!path) { errno = EINVAL; return -1; }
+    return remove(path);
+#endif
+}
+
 bool file_disk_free_space_utf8(const char *path, uint64_t *available) {
     if (!path || !available) return false;
 #if defined(_WIN32) || defined(_WIN64)

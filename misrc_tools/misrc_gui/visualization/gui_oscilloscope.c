@@ -15,6 +15,7 @@
 #include "../ui/gui_ui_scale.h"
 #include "gui_panel.h"
 #include "../ui/gui_dropdown.h"
+#include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include "../input/gui_playback.h" // DAW-style pause: re-process on config change
 #include <math.h>
@@ -104,6 +105,11 @@ typedef struct {
     Rectangle scale_btn_rect;
     Rectangle scale_opts_rect[5];
     bool scale_dropdown_open;
+
+    // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
+    // ALL overlay chrome (Scale/Mode/Trig dropdowns + labels); the grid,
+    // channel label, time/div and waveform keep rendering.
+    gui_chrome_hide_t chrome_hide;
 
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
 
@@ -1212,6 +1218,12 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     if (!state->initialized) return;
 
+    // Double-click on the panel (waveform_panel_handle_click) toggles ALL
+    // the overlay chrome — Scale/Mode/Trig dropdowns + their labels — for a
+    // clean waveform view; the grid, channel label and waveform (drawn by
+    // the data render path) keep rendering.
+    if (gui_chrome_hide_hidden(&state->chrome_hide)) return;
+
     float btn_h = 18;
     float render_btn_y = bounds.y + 8;
     float trig_btn_y = render_btn_y;
@@ -1518,12 +1530,12 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 // Waveform Panel Click Handler (with dropdown support)
 //-----------------------------------------------------------------------------
 
-static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, int channel,
-                                         Vector2 click, Rectangle bounds) {
-
-    if (!state_ptr || !app) return false;
-    waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
-    waveform_apply_channel_trigger_source_default(state, channel);
+// Overlay control clicks (Scale / Mode / Trig dropdowns). Returns true when a
+// control consumed the click (button hit or an open dropdown's option/close
+// path); false when no control was hit, so the caller can offer the click to
+// the double-click chrome-hide tracker.
+static bool waveform_handle_control_click(waveform_panel_state_t *state, struct gui_app *app,
+                                           int channel, Vector2 click) {
 
     // A popup can overlap either button after wrapping or shifting upward.
     // Its visible rows (including the Channel header) take click priority.
@@ -1646,12 +1658,45 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return true;
     }
 
+    // No overlay control was hit by this click.
+    return false;
+}
+
+static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, int channel,
+                                         Vector2 click, Rectangle bounds) {
+
+    if (!state_ptr || !app) return false;
+    waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    waveform_apply_channel_trigger_source_default(state, channel);
+
+    // Click outside the panel resets double-click tracking.
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return false;
+    }
+
+    // Control clicks first (only while the overlay is shown — its rectangles
+    // are stale while hidden) so a double-click ON a control never toggles
+    // the chrome; a consumed control click also resets the tracker.
+    if (!gui_chrome_hide_hidden(&state->chrome_hide) &&
+        waveform_handle_control_click(state, app, channel, click)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return true;
+    }
+
+    // Double-click anywhere else on the panel toggles ALL overlay
+    // chrome (Scale/Mode/Trig dropdowns + labels) for a clean
+    // waveform view.
+    if (gui_chrome_hide_feed_click(&state->chrome_hide, click)) {
+        state->render_mode_dropdown_open = false;
+        state->trigger_dropdown_open = false;
+        state->scale_dropdown_open = false;
+        return true;
+    }
+
     //-------------------------------------------------------------------------
     // Trigger Level Drag
     //-------------------------------------------------------------------------
-    if (!CheckCollisionPointRec(click, bounds)) {
-        return false;
-    }
 
     // Trigger level drag adjusts an already-enabled trigger only.
     if (!state->trigger_enabled) {

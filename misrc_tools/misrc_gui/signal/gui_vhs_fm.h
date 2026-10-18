@@ -28,18 +28,20 @@ typedef struct vhs_fm_decoder {
         int selected_system;
         int stats_view;               // 0 = All, 1 = Basic, 2 = Off
         int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
-        bool controls_hidden;         // Double-click on the panel toggles ALL
-                                       // overlay chrome (buttons + stats text).
-        uint64_t last_click_ms;      // Double-click detection (ms + position)
-        float last_click_x, last_click_y;
     } overlay;
+    // controls_hidden + the double-click tracker live on video_panel_state_t
+    // (gui_cvbs.c) so the hidden state is shared by all three decoder modes
+    // and survives decoder-mode cycling; render_frame receives the flag.
 } vhs_fm_decoder_t;
 bool gui_vhs_fm_init(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_cleanup(vhs_fm_decoder_t *decoder);
 bool gui_vhs_fm_bind_worker(vhs_fm_decoder_t *decoder, gui_rf_preview_worker_t *worker);
 void gui_vhs_fm_reset(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_swap_buffers(vhs_fm_decoder_t *decoder);
-void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float width, float height);
+// controls_hidden: the panel-wide chrome-hide flag (video_panel_state_t.chrome
+// in gui_cvbs.c) — it hides the stats readout and the reason line too.
+void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
+                             float width, float height, bool controls_hidden);
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select);
 // Frame display mode: 0 = Active (default), 1 = Full (VBI + burst with
 // decoded chroma). Persists across worker rebinds.

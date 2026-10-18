@@ -110,7 +110,8 @@ static void vhs_draw_stat_fitted(const char *text, float dx, float dy, int font_
     gui_text_draw_mono(fit, dx, dy, font_px, color);
 }
 
-void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float width, float height) {
+void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
+                             float width, float height, bool controls_hidden) {
     DrawRectangleRec((Rectangle){x, y, width, height}, (Color){20, 20, 20, 255});
     if (!decoder) return;
     const gui_rf_decode_status_t *status = &decoder->stats.decode;
@@ -135,8 +136,16 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float 
             decoder->displayed_generation = decoder->generation;
             decoder->displayed_frames++;
         }
-        float draw_w = width, draw_h = width * 0.75f;
-        if (draw_h > height) { draw_h = height; draw_w = height * 4.0f / 3.0f; }
+        /* Draw the frame at its own aspect: Active mode is exactly 4:3
+         * (768x576 PAL / 640x480 NTSC); Full mode includes the whole
+         * vertical blanking interval and is slightly taller (768x626 /
+         * 640x526), so a hardcoded 0.75 would squash it. Before the first
+         * frame (or on an invalid size) fall back to 4:3. */
+        float frame_aspect = (decoder->width > 0 && decoder->height > 0)
+            ? (float)decoder->height / (float)decoder->width : 0.75f;
+        if (!(frame_aspect > 0.05f)) frame_aspect = 0.75f;
+        float draw_w = width, draw_h = width * frame_aspect;
+        if (draw_h > height) { draw_h = height; draw_w = height / frame_aspect; }
         DrawTexturePro(decoder->texture,
                        (Rectangle){0, 0, (float)decoder->width, (float)decoder->height},
                        (Rectangle){x + (width-draw_w)*0.5f, y + (height-draw_h)*0.5f, draw_w, draw_h},
@@ -174,21 +183,38 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float 
     char line[224];
     int stats_view = decoder->overlay.stats_view;
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
-    bool show_stats = !decoder->overlay.controls_hidden && stats_view != 2;
+    // Stats: Off hides the WHOLE readout — the stats lines AND the reason
+    // line below them (user feedback: the colour-lock reason line previously
+    // lingered with all stats disabled). The reason line is part of the
+    // same bottom-stacked block, so both share one gate.
+    bool show_stats = !controls_hidden && stats_view != 2;
     bool show_basic_only = stats_view == 1;
     const int stat_lines = show_stats ? (show_basic_only ? 2 : 5) : 0;
 
     if (show_stats) {
+        // Slight translucent backing behind the whole text block (stats
+        // lines + reason line) so the yellow readout stays readable over
+        // bright video — like an OSD backing on a production monitor. The
+        // top follows the first drawn line: on very short panels the highest
+        // lines are skipped, so clamp to the panel's pad edge.
+        float block_top = y + height - pad - line_h * (float)(stat_lines + 1) - 2.0f;
+        if (block_top < y + pad - 2.0f) block_top = y + pad - 2.0f;
+        DrawRectangleRec((Rectangle){x + pad - 4.0f, block_top,
+                                      width - 2.0f * (pad - 4.0f),
+                                      (y + height - pad + 2.0f) - block_top},
+                         (Color){0, 0, 0, 110});
         float ly = y + height - pad - line_h * (float)(stat_lines + 1); // above the reason line
         snprintf(line, sizeof(line), "%s VHS SP | %.3f -> 20 MHz | H:%s V:%s Color:%s",
                  gui_vhs_fm_get_format_name(decoder), decoder->stats.source_rate_hz / 1000000.0,
                  status->h_locked ? "LOCK" : "SCAN", status->v_locked ? "LOCK" : "SCAN",
                  status->color_locked ? "LOCK" : "OFF");
-        if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){230,230,230,255});
+        // Yellow OSD-style text (matching the reason line) over the backing
+        // above: readable over both bright and dark video (user feedback).
+        if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
         ly += line_h;
         snprintf(line,sizeof(line),"Decode %.1f fps | Display %.1f fps | DSP %.1f ms | Age %.1f ms",
                  decoder->stats.fps,decoder->display_fps,decoder->stats.decode_ms,decoder->stats.latency_ms);
-        if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){230,230,230,255});
+        if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
         if (!show_basic_only) {
             ly += line_h;
             snprintf(line,sizeof(line),"V candidates %llu | Fields %llu | Reject %llu (cad %llu/par %llu/map %llu)",
@@ -198,22 +224,23 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y, float 
                      (unsigned long long)decoder->stats.total_reject_cadence,
                      (unsigned long long)decoder->stats.total_reject_parity,
                      (unsigned long long)decoder->stats.total_reject_line_map);
-            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){230,230,230,255});
+            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
             ly += line_h;
             snprintf(line,sizeof(line),"Queue drops %llu | Pressure skips %llu | Color loss %llu | CPU %.0f%% core",
                      (unsigned long long)decoder->stats.blocks_dropped,
                      (unsigned long long)decoder->stats.pause_drops,
                      (unsigned long long)decoder->stats.total_color_losses,decoder->stats.cpu_percent);
-            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){230,230,230,255});
+            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
             ly += line_h;
             snprintf(line,sizeof(line),"Last field rejection: %s",
                      status->last_reject_reason[0] ? status->last_reject_reason : "none");
-            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){230,230,230,255});
+            if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
         }
     }
     // The reason/sync line is part of the overlay chrome: double-click hides
-    // it too (it once lingered after the controls were hidden).
-    if (!decoder->overlay.controls_hidden) {
+    // it, and Stats: Off hides it with the rest of the readout (user
+    // feedback: it lingered showing "colour locked" with all stats off).
+    if (show_stats) {
         const char *reason = !supported ? "Mixed-rate pair: independent input reader required" :
                          decoder->stats.paused ? "Preview paused: capture/recording pressure (frozen frame)" :
                          decoder->stats.budget_waiting ? "Preview yielding to the shared processing budget" : status->reason;

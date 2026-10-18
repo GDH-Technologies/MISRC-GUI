@@ -652,8 +652,17 @@ static void start_test_index_publish(const char *known,const char *unknown,unsig
     uint64_t epoch=atomic_load(&start_test_app.rf_stream_epoch);
     uint64_t block_epoch[2]={atomic_load(&start_test_last_epoch[0]),atomic_load(&start_test_last_epoch[1])};
     unsigned writes=atomic_load(&start_test_sink_writes);
+    fprintf(stderr, "[DBGT] capture pos=%llu/%llu state=%d backfill=%d/%d\n",
+            (unsigned long long)position[0],(unsigned long long)position[1],
+            (int)gui_playback_get_state(&start_test_app),
+            s_playback->backfill_active_a,s_playback->backfill_active_b);
     atomic_store(&start_test_release_read,true);
     start_test_wait_index();
+    fprintf(stderr, "[DBGT] post-index pos=%llu/%llu state=%d backfill=%d/%d\n",
+            (unsigned long long)gui_playback_get_position_samples_channel(&start_test_app,0),
+            (unsigned long long)gui_playback_get_position_samples_channel(&start_test_app,1),
+            (int)gui_playback_get_state(&start_test_app),
+            s_playback->backfill_active_a,s_playback->backfill_active_b);
     playback_file_info_t info;
     assert(known ? gui_playback_get_file_info_b(&start_test_app,&info)
                  : gui_playback_get_file_info_a(&start_test_app,&info));

@@ -19,6 +19,9 @@
 FILE *file_open_utf8(const char *filename, const char *mode);
 bool file_path_info_utf8(const char *path, uint64_t *size, bool *is_dir);
 int file_mkdir_utf8(const char *path, int mode);
+/* Remove one file (not directories) through the UTF-8 path conversion.
+ * Returns 0 on success, -1 on failure (errno set where supported). */
+int file_remove_utf8(const char *path);
 bool file_disk_free_space_utf8(const char *path, uint64_t *available);
 /* Returns an allocated value (including an empty value), or NULL if absent. */
 char *file_getenv_utf8(const char *name);

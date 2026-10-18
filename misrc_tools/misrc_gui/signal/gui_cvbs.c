@@ -1659,8 +1659,12 @@ static void gui_cvbs_render_osd(cvbs_decoder_t *decoder,
     gui_text_draw_mono(osd_text2, text_x, text2_y, 14, (Color){200, 255, 200, 255});
 }
 
-void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
-                            float x, float y, float width, float height) {
+// Render core shared by the public render (always with OSD) and the panel
+// chrome-hide path: draw_osd=false keeps the decoded picture but hides the
+// OSD text chrome with the rest of the controls.
+static void gui_cvbs_render_frame_impl(cvbs_decoder_t *decoder,
+                                       float x, float y, float width, float height,
+                                       bool draw_osd) {
     if (!decoder || !decoder->display_front) {
         // No frame available - draw placeholder
         DrawRectangle((int)x, (int)y, (int)width, (int)height, (Color){20, 20, 30, 255});
@@ -1749,7 +1753,12 @@ void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
     DrawTexturePro(decoder->frame_texture, src, dst, (Vector2){0, 0}, 0, WHITE);
 
     // Draw OSD overlay (mode-controlled)
-    gui_cvbs_render_osd(decoder, draw_x, draw_y, draw_w, draw_h);
+    if (draw_osd) gui_cvbs_render_osd(decoder, draw_x, draw_y, draw_w, draw_h);
+}
+
+void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
+                            float x, float y, float width, float height) {
+    gui_cvbs_render_frame_impl(decoder, x, y, width, height, true);
 }
 
 //-----------------------------------------------------------------------------
@@ -2224,6 +2233,14 @@ typedef struct {
     video_tape_plugin_t tape_decode;
     video_vhs_fm_plugin_t vhs_fm;
     atomic_int active_plugin;
+    // Panel-wide chrome-hide shared by all three decoder modes (moved from
+    // the VHS FM overlay): one flag + one double-click tracker, stored on
+    // the panel itself so the hidden state survives decoder-mode cycling.
+    struct {
+        bool controls_hidden;      // Double-click toggles ALL overlay chrome.
+        uint64_t last_click_ms;   // Double-click detection (ms + position).
+        float last_click_x, last_click_y;
+    } chrome;
 } video_panel_state_t;
 
 static const char *video_plugin_name(video_plugin_kind_t plugin) {
@@ -2417,6 +2434,29 @@ static void video_panel_close_all_dropdowns(video_panel_state_t *panel) {
     tape->overlay.tape_format_dropdown_open = false;
     vhs->overlay.dropdown_open = false;
     vhs->overlay.is_visible = false;
+}
+
+// Shared double-click chrome toggle (350 ms / 6 px, as first shipped in the
+// VHS FM overlay, now panel-wide): every non-control click feeds this
+// tracker; completing a double-click flips controls_hidden for ALL three
+// decoder modes and closes any open dropdown so no stale options survive.
+static bool video_panel_chrome_toggle_on_click(video_panel_state_t *panel, Vector2 mouse_pos) {
+    if (!panel) return false;
+    uint64_t now_ms = get_time_ms();
+    bool double_click =
+        panel->chrome.last_click_ms != 0 &&
+        now_ms >= panel->chrome.last_click_ms &&
+        now_ms - panel->chrome.last_click_ms <= 350 &&
+        fabsf(mouse_pos.x - panel->chrome.last_click_x) <= 6.0f &&
+        fabsf(mouse_pos.y - panel->chrome.last_click_y) <= 6.0f;
+    panel->chrome.last_click_ms = now_ms;
+    panel->chrome.last_click_x = mouse_pos.x;
+    panel->chrome.last_click_y = mouse_pos.y;
+    if (!double_click) return false;
+    panel->chrome.controls_hidden = !panel->chrome.controls_hidden;
+    video_panel_close_all_dropdowns(panel);
+    panel->chrome.last_click_ms = 0;   // require two fresh clicks to toggle back
+    return true;
 }
 
 static void video_detach_rf(vhs_fm_decoder_t *decoder);
@@ -2662,10 +2702,10 @@ static void cvbs_vtable_process(void *state, const int16_t *samples, size_t coun
 static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *app, Rectangle bounds) {
     if (!panel) return;
     vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
-    decoder->overlay.is_visible = !decoder->overlay.controls_hidden;
+    decoder->overlay.is_visible = !panel->chrome.controls_hidden;
     // Double-click on the panel (cvbs_vtable_handle_click) toggles ALL the
     // overlay chrome — buttons + stats text — for a clean video preview.
-    if (decoder->overlay.controls_hidden) return;
+    if (panel->chrome.controls_hidden) return;
 
     const float btn_h = 18.0f;
     const char *label = "Decoder: VHS FM";
@@ -2695,31 +2735,19 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
     char stats_label[40];
     snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
-    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 24;
+    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16;
     if (stats_w < 96.0f) stats_w = 96.0f;
     decoder->overlay.stats_btn_rect =
         (Rectangle){decoder->overlay.format_rect.x - stats_w - 6, btn_y, stats_w, btn_h};
     Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
     DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
+    // No dropdown arrow: it overlapped the centered label; the open state
+    // is already indicated by the button highlight (stats_bg) above.
     {
         float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT);
         gui_text_draw(stats_label,
                       decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
                       text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-        float as = 5.0f;
-        float ax = decoder->overlay.stats_btn_rect.x + (stats_w + sw) * 0.5f - as - 4.0f;
-        float acy = btn_y + btn_h * 0.5f;
-        if (decoder->overlay.stats_dropdown_open) {
-            Vector2 top = { ax + as * 0.5f, acy - as * 0.5f };
-            Vector2 left = { ax, acy + as * 0.5f };
-            Vector2 right = { ax + as, acy + as * 0.5f };
-            DrawTriangle(top, left, right, COLOR_TEXT);
-        } else {
-            Vector2 bottom = { ax + as * 0.5f, acy + as * 0.5f };
-            Vector2 left = { ax, acy - as * 0.5f };
-            Vector2 right = { ax + as, acy - as * 0.5f };
-            DrawTriangle(bottom, right, left, COLOR_TEXT);
-        }
     }
     if (decoder->overlay.stats_dropdown_open) {
         float opt_h = 20.0f;
@@ -2782,7 +2810,8 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
     gui_vhs_fm_swap_buffers(&panel->vhs_fm.decoder);
 
     if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
-        gui_vhs_fm_render_frame(&panel->vhs_fm.decoder, bounds.x, bounds.y, bounds.width, bounds.height);
+        gui_vhs_fm_render_frame(&panel->vhs_fm.decoder, bounds.x, bounds.y,
+                                bounds.width, bounds.height, panel->chrome.controls_hidden);
         render_vhs_decoder_overlay(panel, app, bounds);
         return;
     }
@@ -2797,8 +2826,16 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
         return;
     }
 
-    gui_cvbs_render_frame(decoder, bounds.x, bounds.y, bounds.width, bounds.height);
-    render_cvbs_system_overlay(decoder, bounds.x, bounds.y, bounds.width);
+    // Chrome-hide (shared panel state): the decoded picture stays, but the
+    // OSD text and the control buttons hide until a double-click restores.
+    gui_cvbs_render_frame_impl(decoder, bounds.x, bounds.y, bounds.width, bounds.height,
+                               !panel->chrome.controls_hidden);
+    if (panel->chrome.controls_hidden) {
+        // No controls rendered this frame: keep click gating consistent.
+        decoder->overlay.is_visible = false;
+    } else {
+        render_cvbs_system_overlay(decoder, bounds.x, bounds.y, bounds.width);
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -2816,81 +2853,84 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         vhs_fm_decoder_t *vhs = &panel->vhs_fm.decoder;
         if (!CheckCollisionPointRec(mouse_pos, bounds)) {
             // Click outside the panel resets double-click tracking.
-            vhs->overlay.last_click_ms = 0;
+            panel->chrome.last_click_ms = 0;
             return false;
         }
 
         // Control clicks first (only while the controls are shown) so a
-        // double-click ON a control never toggles the chrome.
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
-            vhs->overlay.last_click_ms = 0;
+        // double-click ON a control never toggles the chrome. Every control
+        // hit resets the tracker (shared video_panel_state_t.chrome).
+        bool chrome_visible = vhs->overlay.is_visible && !panel->chrome.controls_hidden;
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
+            panel->chrome.last_click_ms = 0;
             video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
             return true;
         }
 
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
-            vhs->overlay.last_click_ms = 0;
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
+            panel->chrome.last_click_ms = 0;
             app->settings.rf_preview_budget_percent=
                 vhs_budget_next(vhs_budget_clamp(app->settings.rf_preview_budget_percent));
             return true;
         }
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
-            vhs->overlay.last_click_ms = 0;
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.format_rect)) {
+            panel->chrome.last_click_ms = 0;
             gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
             return true;
         }
         // Stats view dropdown: option rows first when open, then the button.
-        if (vhs->overlay.is_visible && vhs->overlay.stats_dropdown_open) {
+        if (chrome_visible && vhs->overlay.stats_dropdown_open) {
             for (int i = 0; i < 3; i++) {
                 if (CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_opts_rect[i])) {
+                    panel->chrome.last_click_ms = 0;
                     vhs->overlay.stats_view = i;
                     vhs->overlay.stats_dropdown_open = false;
                     return true;
                 }
             }
             // Button or outside click closes the dropdown.
+            panel->chrome.last_click_ms = 0;
             vhs->overlay.stats_dropdown_open = false;
             return true;
         }
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {
+            panel->chrome.last_click_ms = 0;
             vhs->overlay.stats_dropdown_open = true;
             return true;
         }
         // Frame display mode: cycle Active <-> Full (whole-line decode window
         // for VBI + sync tip + colour burst).
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.frame_rect)) {
-            vhs->overlay.last_click_ms = 0;
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.frame_rect)) {
+            panel->chrome.last_click_ms = 0;
             gui_vhs_fm_set_frame_mode(vhs, vhs->overlay.frame_mode == 1 ? 0 : 1);
             return true;
         }
 
         // Double-click anywhere else on the panel toggles ALL overlay
-        // chrome (buttons + stats) for a clean video preview.
-        uint64_t now_ms = get_time_ms();
-        bool double_click =
-            vhs->overlay.last_click_ms != 0 &&
-            now_ms >= vhs->overlay.last_click_ms &&
-            now_ms - vhs->overlay.last_click_ms <= 350 &&
-            fabsf(mouse_pos.x - vhs->overlay.last_click_x) <= 6.0f &&
-            fabsf(mouse_pos.y - vhs->overlay.last_click_y) <= 6.0f;
-        vhs->overlay.last_click_ms = now_ms;
-        vhs->overlay.last_click_x = mouse_pos.x;
-        vhs->overlay.last_click_y = mouse_pos.y;
-        if (double_click) {
-            vhs->overlay.controls_hidden = !vhs->overlay.controls_hidden;
-            vhs->overlay.stats_dropdown_open = false;
-            vhs->overlay.last_click_ms = 0;   // require two fresh clicks to toggle back
-            return true;
-        }
-        return false;
+        // chrome (buttons + stats) for a clean video preview — and restores
+        // it while hidden, since the control checks above are skipped then.
+        return video_panel_chrome_toggle_on_click(panel, mouse_pos);
     }
     cvbs_decoder_t *decoder = video_panel_active_decoder(panel);
     if (!decoder) return false;
-    if (!decoder->overlay.is_visible) return false;
+    // Click outside the panel resets double-click tracking (VHS FM parity).
+    if (!CheckCollisionPointRec(mouse_pos, bounds)) {
+        panel->chrome.last_click_ms = 0;
+        return false;
+    }
     bool tape_ui = (panel->active_plugin == VIDEO_PLUGIN_TAPE_DECODE);
     video_tape_plugin_t *tape_plugin = &panel->tape_decode;
+    // Control clicks only while the overlay chrome is shown: is_visible is
+    // set by the render path and cleared while hidden, and controls_hidden
+    // closes the stale-rect window between a hide toggle and the next
+    // render. Every control hit resets the double-click tracker so a
+    // double-click ON a control never toggles the chrome; while hidden the
+    // guards skip all control checks and the click falls through to the
+    // shared double-click restore at the bottom.
+    bool chrome_visible = decoder->overlay.is_visible && !panel->chrome.controls_hidden;
     // Decoder button: cycle between independent plugin decoders.
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.decoder_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.decoder_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         video_plugin_kind_t next = video_panel_next_plugin(panel->active_plugin);
         video_panel_activate_plugin(panel, next);
         decoder = video_panel_active_decoder(panel);
@@ -2901,7 +2941,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Tape family dropdown button (Tape mode only)
-    if (tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_btn_rect)) {
+    if (chrome_visible && tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.tape_dropdown_open = !decoder->overlay.tape_dropdown_open;
         decoder->overlay.tape_format_dropdown_open = false;
         decoder->overlay.system_dropdown_open = false;
@@ -2909,7 +2950,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Tape format dropdown button (PAL/NTSC/SECAM, Tape mode only)
-    if (tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_format_btn_rect)) {
+    if (chrome_visible && tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_format_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.tape_format_dropdown_open = !decoder->overlay.tape_format_dropdown_open;
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.system_dropdown_open = false;
@@ -2917,7 +2959,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Tape speed mode button (SP/LP/ELP, Tape mode only)
-    if (tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_mode_btn_rect)) {
+    if (chrome_visible && tape_ui && CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_mode_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         cvbs_tape_mode_t old_mode = decoder->tape_mode;
         if (decoder->tape_mode == CVBS_TAPE_MODE_SP) {
             decoder->tape_mode = CVBS_TAPE_MODE_LP;
@@ -2941,7 +2984,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // OSD mode button: cycle OFF -> MINIMAL -> STATS -> OFF
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.osd_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.osd_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.system_dropdown_open = false;
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.tape_format_dropdown_open = false;
@@ -2956,7 +3000,7 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Tape family dropdown options
-    if (tape_ui && decoder->overlay.tape_dropdown_open) {
+    if (chrome_visible && tape_ui && decoder->overlay.tape_dropdown_open) {
         cvbs_tape_format_t values[] = {
             CVBS_TAPE_FORMAT_VHS,
             CVBS_TAPE_FORMAT_SVHS,
@@ -2967,6 +3011,7 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         };
         for (int i = 0; i < 6; i++) {
             if (CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_options_rect[i])) {
+                panel->chrome.last_click_ms = 0;
                 cvbs_tape_format_t old_format = decoder->tape_format;
                 decoder->tape_format = values[i];
                 decoder->overlay.tape_dropdown_open = false;
@@ -2986,9 +3031,10 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Tape format dropdown options (PAL/NTSC/SECAM)
-    if (tape_ui && decoder->overlay.tape_format_dropdown_open) {
+    if (chrome_visible && tape_ui && decoder->overlay.tape_format_dropdown_open) {
         for (int i = 0; i < 3; i++) {
             if (CheckCollisionPointRec(mouse_pos, decoder->overlay.tape_format_options_rect[i])) {
+                panel->chrome.last_click_ms = 0;
                 decoder->overlay.selected_tape_format = i;
                 decoder->overlay.system_dropdown_open = false;
                 decoder->overlay.tape_format_dropdown_open = false;
@@ -3002,7 +3048,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Frame mode button: toggle Active <-> Full
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.frame_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.frame_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         cvbs_frame_view_t next_mode = (decoder->frame_view_mode == CVBS_FRAME_VIEW_ACTIVE)
                                       ? CVBS_FRAME_VIEW_FULL
                                       : CVBS_FRAME_VIEW_ACTIVE;
@@ -3014,7 +3061,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Levels mode button: toggle Auto <-> Fixed
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.level_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.level_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.system_dropdown_open = false;
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.tape_format_dropdown_open = false;
@@ -3029,7 +3077,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // Sync mode button: toggle Auto <-> Fixed
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.sync_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.sync_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.system_dropdown_open = false;
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.tape_format_dropdown_open = false;
@@ -3041,7 +3090,8 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // System button: toggle dropdown
-    if (CheckCollisionPointRec(mouse_pos, decoder->overlay.system_btn_rect)) {
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.system_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
         decoder->overlay.system_dropdown_open = !decoder->overlay.system_dropdown_open;
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.tape_format_dropdown_open = false;
@@ -3049,10 +3099,11 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     }
 
     // System dropdown options
-    if (decoder->overlay.system_dropdown_open) {
+    if (chrome_visible && decoder->overlay.system_dropdown_open) {
         int sys_values[] = {0, 1};  // 0=625-line PAL/SECAM, 1=525-line NTSC
         for (int i = 0; i < 2; i++) {
             if (CheckCollisionPointRec(mouse_pos, decoder->overlay.system_options_rect[i])) {
+                panel->chrome.last_click_ms = 0;
                 decoder->overlay.selected_system = sys_values[i];
                 if (tape_ui) {
                     if (sys_values[i] == 1) {
@@ -3072,7 +3123,10 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         decoder->overlay.system_dropdown_open = false;
     }
 
-    return false;
+    // Double-click anywhere else on the panel toggles ALL overlay chrome
+    // (buttons + OSD text) for a clean video preview — and restores it while
+    // hidden, since the control checks above are skipped when hidden.
+    return video_panel_chrome_toggle_on_click(panel, mouse_pos);
 }
 
 //-----------------------------------------------------------------------------

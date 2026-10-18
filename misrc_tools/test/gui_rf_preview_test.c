@@ -38,6 +38,27 @@ static double clamp_value(double value, double minimum, double maximum) {
     return value<minimum ? minimum : value>maximum ? maximum : value;
 }
 
+/* Studio-swing display contract shared with the renderer (rf_display_level in
+ * gui_rf_preview.h: black lifted above the floor, white with headroom, sync
+ * clamped at the floor). Physical 0..1 luminance targets are compared through
+ * the same conversion, so the oracle stays exact while the rendered byte
+ * values are lifted — one shared definition, never a drifted duplicate. */
+static double display_level(double y01) {
+    return rf_display_level(y01);
+}
+
+/* Expected display value of one bar channel: the physical RGB target
+ * through the generator's YUV encode and the renderer's YUV->RGB matrix. */
+static double display_bar_channel(int bar,int channel) {
+    double r=bars[bar][0],g=bars[bar][1],b=bars[bar][2];
+    double y=.299*r+.587*g+.114*b;
+    double u=.492*(b-y),v=.877*(r-y),dy=display_level(y);
+    double value=channel==0 ? dy+1.140*v
+               : channel==1 ? dy-.395*u-.581*v
+               : dy+2.032*u;
+    return clamp_value(value,0.0,1.0);
+}
+
 typedef enum {
     TEST_V_NORMAL, TEST_V_SPLIT_FIRST, TEST_V_NEW_EQ, TEST_V_ISOLATED_FRAGMENT,
     TEST_V_NO_PRE_EQ, TEST_V_ONE_PRE_EQ, TEST_V_BAD_SPACING, TEST_V_PAST_HALF,
@@ -281,14 +302,21 @@ static void process_fixture(gui_rf_decoder_t *decoder, const float *rf, size_t l
     }
 }
 
-static double plane_mean(const test_frames_t *f, int bar, int parity, int channel) {
+/* Bar centers inside an explicit horizontal span: Active mode maps bars
+ * onto the full width, Full mode only onto the active-window columns. */
+static double plane_mean_window(const test_frames_t *f, int bar, int parity,
+                                int channel, int x0, int x1) {
     double total=0; int count=0;
-    int center=(int)((bar+.5)*f->width/8.0);
+    int center=x0+(int)((bar+.5)*(x1-x0)/8.0);
     for (int y=120+parity; y<160; y+=2)
         for (int x=center-4; x<=center+4; ++x) {
             total+=f->rgba[((size_t)y*f->width+x)*4u+channel]; count++;
         }
     return total/count/255.0;
+}
+
+static double plane_mean(const test_frames_t *f, int bar, int parity, int channel) {
+    return plane_mean_window(f,bar,parity,channel,0,f->width);
 }
 
 static void check_bars(const test_frames_t *f, double maximum_error) {
@@ -302,11 +330,12 @@ static void check_bars(const test_frames_t *f, double maximum_error) {
     for (int bar=1; bar<8; ++bar) for (int parity=0; parity<2; ++parity)
         for (int c=0; c<3; ++c) {
             double actual=plane_mean(f,bar,parity,c);
-            double error=fabs(actual-bars[bar][c]);
+            double expected=display_bar_channel(bar,c);
+            double error=fabs(actual-expected);
             if (error>largest_error) largest_error=error;
             if (error>maximum_error) {
                 fprintf(stderr,"bar %d field %d channel %d: %.3f expected %.3f\n",
-                        bar,parity,c,actual,bars[bar][c]);
+                        bar,parity,c,actual,expected);
                 assert(error<=maximum_error);
             }
         }
@@ -433,7 +462,7 @@ static void check_quality_gray(const test_frames_t *f,const char *name,
            (unsigned long long)f->status.reject_parity,(unsigned long long)f->status.reject_line_map);
     fflush(stdout);
     for (int parity=0; parity<2; ++parity) {
-        double expected=quality_gray(parity,TEST_Q_GRAY)+offset;
+        double expected=display_level(quality_gray(parity,TEST_Q_GRAY)+offset);
         quality_rows_t rows=quality_rows(f,parity,-1,1,expected);
         printf("%s field %d: gray %.6f expected %.6f, row RMS %.6f, max error %.6f\n",
                name,parity,rows.mean,expected,rows.row_rms,rows.maximum_error);
@@ -441,10 +470,12 @@ static void check_quality_gray(const test_frames_t *f,const char *name,
         assert(fabs(rows.mean-expected)<=mean_limit);
         assert(rows.row_rms<=row_limit && rows.maximum_error<=outlier_limit);
     }
-    /* Adjacent rows still contain two different original fields. */
-    double first=quality_rows(f,0,-1,1,.65+offset).mean;
-    double second=quality_rows(f,1,-1,1,.25+offset).mean;
-    assert(first-second>.35);
+    /* Adjacent rows still contain two different original fields. Studio
+     * swing compresses separations by 219/255: the physical .40 gray gap
+     * between the woven fields renders as .344. */
+    double first=quality_rows(f,0,-1,1,display_level(.65+offset)).mean;
+    double second=quality_rows(f,1,-1,1,display_level(.25+offset)).mean;
+    assert(first-second>.33);
 }
 
 typedef struct {
@@ -465,12 +496,13 @@ static void receive_fade_frame(void *context,const uint8_t *rgba,int width,int h
     for (int parity=0; parity<2; ++parity) {
         int source_field=next-1;
         if ((source_field&1)!=parity) source_field--;
-        double expected=quality_gray(source_field,TEST_Q_FADE);
+        double physical=quality_gray(source_field,TEST_Q_FADE);
+        double expected=display_level(physical);
         quality_rows_t rows=quality_rows(&f->frame,parity,-1,1,expected);
         f->maximum_mean_error=fmax(f->maximum_mean_error,fabs(rows.mean-expected));
         f->maximum_row_rms=fmax(f->maximum_row_rms,rows.row_rms);
         f->maximum_outlier=fmax(f->maximum_outlier,rows.maximum_error);
-        if (expected<.001) {
+        if (physical<.001) {
             f->maximum_black=fmax(f->maximum_black,rows.mean);f->black_planes++;
         }
         f->checked++;
@@ -502,7 +534,7 @@ static void run_quality_format(gui_rf_format_t format) {
     double largest_row_rms=0.0,largest_window_rms=0.0,largest_window_error=0.0;
     for (int bar=1; bar<8; ++bar) for (int parity=0; parity<2; ++parity)
         for (int c=0; c<3; ++c) {
-            quality_rows_t rows=quality_rows(&frames,parity,bar,c,bars[bar][c]);
+            quality_rows_t rows=quality_rows(&frames,parity,bar,c,display_bar_channel(bar,c));
             largest_row_rms=fmax(largest_row_rms,rows.row_rms);
             int center=(int)((bar+.5)*frames.width/8.0),count=0;double sum_square=0.0;
             for (int y=40+parity; y<frames.height-40; y+=2) {
@@ -518,10 +550,14 @@ static void run_quality_format(gui_rf_format_t format) {
         }
     /* Color-under already has line/track texture. The independent paired
      * control changes only porch/tip RF, so its effect on active colors is
-     * bounded separately from the clean fixture's chroma reconstruction. */
+     * bounded separately from the clean fixture's chroma reconstruction.
+     * Studio swing keeps 100 IRE at 235/255, so near-white channels no
+     * longer clip at display 1.0 and their previously hidden chroma
+     * texture now counts in this delta; the bound is slightly larger than
+     * the old crushed-level calibration for that reason. */
     printf("%s noisy color bars: row RMS %.6f, window-only RMS %.6f, max delta %.6f\n",
            system,largest_row_rms,largest_window_rms,largest_window_error);fflush(stdout);
-    assert(largest_window_rms<=.012 && largest_window_error<=.045);
+    assert(largest_window_rms<=.015 && largest_window_error<=.045);
     free(clean_bars);free(rf);
 
     signal.pattern=TEST_Q_GRAY;signal.window_noise_hz=0.0;signal.carrier_offset_hz=35000.0;
@@ -559,7 +595,9 @@ static void run_quality_format(gui_rf_format_t format) {
            fade.maximum_outlier,fade.maximum_black);fflush(stdout);
     assert(fade.checked>=6 && fade.black_planes>=2);
     assert(fade.maximum_mean_error<=.03 && fade.maximum_row_rms<=.012);
-    assert(fade.maximum_outlier<=.045 && fade.maximum_black<=.015);
+    assert(fade.maximum_outlier<=.045);
+    /* Black planes sit at the lifted studio-swing floor, not crushed to 0. */
+    assert(fabs(fade.maximum_black-display_level(0.0))<=.03);
     free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
@@ -829,6 +867,136 @@ static void run_split_gap(gui_rf_format_t format) {
     free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
+static double row_region_mean(const test_frames_t *f,int row,int x0,int x1,
+                              int channel) {
+    double total=0;int count=0;
+    for (int x=x0; x<x1; ++x) {
+        total+=f->rgba[((size_t)row*f->width+x)*4u+channel];count++;
+    }
+    return count ? total/count/255.0 : 0.0;
+}
+
+static double row_region_extreme(const test_frames_t *f,int row,bool maximum) {
+    double extreme=maximum ? 0.0 : 1.0;
+    for (int x=0; x<f->width; ++x)
+        for (int channel=0; channel<3; ++channel) {
+            double value=f->rgba[((size_t)row*f->width+x)*4u+channel]/255.0;
+            extreme=maximum ? fmax(extreme,value) : fmin(extreme,value);
+        }
+    return extreme;
+}
+
+/* Full-frame contract: every field line is woven into one interlaced frame
+ * (PAL 626 / NTSC 526 rows), the VBI renders with the hybrid background
+ * levels (blanking as a visible dark band, sync at the floor), the bottom
+ * active rows of both parities survive (no crop), and each field's content
+ * lands on its own row parity. The generator encodes the exact geometry:
+ * the vertical interval is lines 0..7 (PAL) / 0..9 (NTSC), and bar 0 carries
+ * per-parity gray levels as a physical field marker. */
+static void run_full_frame_format(gui_rf_format_t format) {
+    const bool pal=format==GUI_RF_PAL;
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create(format);assert(decoder);
+    gui_rf_decoder_set_frame_mode(decoder,true);
+    test_frames_t frames={0};
+    frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(frames.rgba);
+    size_t length;
+    float *rf=make_rf(format,0.0,true,1.0,-1,&length);
+    process_fixture(decoder,rf,length,0,&frames);
+    assert(frames.frames>=2);
+    assert(frames.status.h_locked && frames.status.v_locked && frames.status.color_locked);
+    assert(frames.status.fields_accepted==(uint64_t)frames.status.fields_decoded);
+    assert(frames.status.fields_rejected==frames.status.reject_cadence+
+        frames.status.reject_parity+frames.status.reject_line_map);
+    assert(frames.height==(pal ? 626 : 526) && frames.width==(pal ? 768 : 640));
+
+    /* Rows 0..15 (PAL) / 0..18 (NTSC) are the generator's pure vertical
+     * interval: blanking must show the hybrid offset, sync the floor. The
+     * minimum bound tolerates the 2.3 us equalizing pulses, which cannot
+     * fully settle through the NTSC de-emphasis chain and render around
+     * -34 IRE; 4.7 us H sync and 27 us broad pulses do reach the floor. */
+    const int vbi_rows=pal ? 16 : 19;
+    for (int row=0; row<vbi_rows; ++row) {
+        double maximum=row_region_extreme(&frames,row,true);
+        double minimum=row_region_extreme(&frames,row,false);
+        if (maximum<=.15 || maximum>=.30 || minimum>.08)
+            fprintf(stderr,"VBI row %d outside hybrid levels: max %.3f min %.3f\n",
+                    row,maximum,minimum);
+        assert(maximum>.15 && maximum<.30);
+        assert(minimum<=.08);
+    }
+    /* The tail row no parity can write (PAL 624, NTSC 525) stays cleared. */
+    int tail_row=pal ? 624 : 525;
+    for (int x=0; x<frames.width*4; ++x)
+        assert(frames.rgba[(size_t)tail_row*frames.width*4u+x]==0);
+
+    /* Active-window columns mirror the renderer's positional split. */
+    double line_us=pal ? 64.0 : 63.55555555555556;
+    double active_start=pal ? 10.5 : 9.45,active_end=pal ? 62.5 : 62.55555555555556;
+    const int x0=(int)ceil(active_start*frames.width/line_us-.5);
+    const int x1=(int)ceil(active_end*frames.width/line_us-.5);
+    /* Bars decode with the same accuracy as Active mode through the window. */
+    double largest_error=0.0;
+    for (int bar=1; bar<8; ++bar) for (int parity=0; parity<2; ++parity)
+        for (int c=0; c<3; ++c) {
+            double actual=plane_mean_window(&frames,bar,parity,c,x0,x1);
+            largest_error=fmax(largest_error,fabs(actual-display_bar_channel(bar,c)));
+            assert(fabs(actual-display_bar_channel(bar,c))<=.08);
+        }
+    /* No bottom crop: the last row each parity writes carries real bars. */
+    const int last_row[2]={pal ? 622 : 524,pal ? 625 : 523};
+    for (int parity=0; parity<2; ++parity) {
+        int yellow=x0+(int)(1.5*(x1-x0)/8.0),black_bar=x0+(int)(7.5*(x1-x0)/8.0);
+        assert(row_region_mean(&frames,last_row[parity],yellow-4,yellow+5,0)>.60);
+        assert(row_region_mean(&frames,last_row[parity],black_bar-4,black_bar+5,1)<.15);
+    }
+    /* Adjacent-row registration: bar 0 alternates bright (even rows, parity-0
+     * gray .82) and dark (odd rows, parity-1 gray .22); bars 2..6 are shared
+     * content, so adjacent rows must agree. A one-row or one-field vertical
+     * displacement breaks the bright/dark phase or the row agreement. */
+    int marker=x0+(int)(.5*(x1-x0)/8.0);
+    double even_bright=0.0,odd_bright=0.0,registration=0.0;int pairs=0;
+    for (int row=100; row<298; row+=2) {
+        double bright=row_region_mean(&frames,row,marker-4,marker+5,1);
+        double dark=row_region_mean(&frames,row+1,marker-4,marker+5,1);
+        assert(bright>.60 && dark<.40 && bright-dark>.40);
+        even_bright+=bright;odd_bright+=dark;pairs++;
+    }
+    for (int bar=2; bar<=6; ++bar) {
+        int center=x0+(int)((bar+.5)*(x1-x0)/8.0);
+        for (int row=100; row<298; row+=2)
+            registration=fmax(registration,fabs(
+                row_region_mean(&frames,row,center-4,center+5,1)
+               -row_region_mean(&frames,row+1,center-4,center+5,1)));
+    }
+    assert(pairs>90);
+    assert(fabs(even_bright/pairs-display_level(.82))<=.06);
+    assert(fabs(odd_bright/pairs-display_level(.22))<=.06);
+    assert(registration<=.08);
+
+    /* Display levels on one woven active row (row 200 = line 100, parity 0):
+     * the sync tip at the floor, back porch at the hybrid background level,
+     * and active black lifted to the studio-swing floor on the SAME row. */
+    const int porch_x0=pal ? 100 : 82,porch_x1=pal ? 120 : 92;
+    double sync=row_region_mean(&frames,200,16,pal ? 48 : 44,1);
+    double porch=row_region_mean(&frames,200,porch_x0,porch_x1,1);
+    int black_bar=x0+(int)(7.5*(x1-x0)/8.0);
+    double black=row_region_mean(&frames,200,black_bar-4,black_bar+5,1);
+    assert(sync<=.06);
+    assert(fabs(porch-(pal ? 38.7543/174.147 : 44.1843/197.680))<=.06);
+    assert(fabs(black-display_level(0.0))<=.04);
+    printf("%s full frame: %dx%d, %d frames, bars max error %.3f, porch %.3f, sync %.3f, black %.3f, registration %.3f\n",
+           pal ? "PAL" : "NTSC",frames.width,frames.height,frames.frames,
+           largest_error,porch,sync,black,registration);
+    fflush(stdout);
+    free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+static void run_full_frame_contracts(void) {
+    run_full_frame_format(GUI_RF_PAL);
+    run_full_frame_format(GUI_RF_NTSC);
+}
+
 /* Optional external-media regression for the exact 20 MHz mono s16le excerpt
  * of DanDanYouQing-DHX2.ddd.flac, source seconds 5..7. Its SMPTE bars are an
  * independent polarity oracle: an inverted V can pass a synthetic fixture
@@ -970,8 +1138,11 @@ int main(int argc, char **argv) {
         run_split_vertical(GUI_RF_PAL,TEST_V_SPLIT_13P5_FIRST,true);
         run_split_vertical(GUI_RF_NTSC,TEST_V_SPLIT_13P5_FIRST,true);return 0;
     }
+    if (argc==2 && strcmp(argv[1],"--full-frame-only")==0) {
+        run_full_frame_contracts();puts("Full-frame geometry and level contracts passed");return 0;
+    }
     if (argc!=1 && (argc!=3 || strcmp(argv[1],"--real-ntsc-bars")!=0)) {
-        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le]\n",argv[0]);
+        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only]\n",argv[0]);
         return 2;
     }
     run_deemphasis_contract();
@@ -980,6 +1151,7 @@ int main(int argc, char **argv) {
     run_stop_resume();
     run_format(GUI_RF_PAL);
     run_format(GUI_RF_NTSC);
+    run_full_frame_contracts();
     run_damaged_vertical();
     run_split_vertical_cases();
     run_split_gap(GUI_RF_PAL);

@@ -29,6 +29,7 @@
 #include "../input/gui_playback.h"
 #include "../ui/gui_ui.h"
 #include "../ui/gui_dropdown.h"  // gui_dropdown_option_color for the palette dropdown
+#include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +110,11 @@ typedef struct spectro_engine {
     Rectangle palette_btn_rect;
     Rectangle palette_opts_rect[2];
     bool palette_dropdown_open;
+
+    // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
+    // ALL overlay chrome (palette dropdown, axis labels, PAUSED indicator);
+    // the spectrogram texture, gridlines and "now" marker keep rendering.
+    gui_chrome_hide_t chrome_hide;
 } spectro_engine_t;
 
 //-----------------------------------------------------------------------------
@@ -488,6 +494,9 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
     uint32_t sr = e->last_sample_rate;
     double nyq = (double)sr * 0.5;
     if (nyq <= 0.0) nyq = 1.0;   // before first data, avoid divide-by-zero / nonsense labels
+    // Axis labels are overlay chrome: hidden while the panel's chrome is
+    // toggled off (gridlines, "now" marker and border keep rendering).
+    bool labels_hidden = gui_chrome_hide_hidden(&e->chrome_hide);
 
     const int divs = SPEC_AXIS_DIVS;
     const float pad = 3.0f;      // Inset from the border so labels sit inside the window
@@ -515,17 +524,19 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
             float frac = (float)d / (float)divs;
             float px = bounds.x + bounds.width * frac;
             DrawLineEx((Vector2){px, bounds.y}, (Vector2){px, bounds.y + bounds.height}, 1.0f, COLOR_GRID);
-            char buf[16];
-            format_freq(buf, sizeof(buf), nyq * (double)frac);
-            int tw = gui_text_measure_mono(buf, FONT_SIZE_OSC_SCALE);
-            float lx = px - tw / 2.0f;
-            // Keep label horizontally inside bounds.
-            if (lx < bounds.x + pad) lx = bounds.x + pad;
-            if (lx + tw > bounds.x + bounds.width - pad) lx = bounds.x + bounds.width - tw - pad;
-            gui_text_draw_mono(buf, lx, label_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            if (!labels_hidden) {
+                char buf[16];
+                format_freq(buf, sizeof(buf), nyq * (double)frac);
+                int tw = gui_text_measure_mono(buf, FONT_SIZE_OSC_SCALE);
+                float lx = px - tw / 2.0f;
+                // Keep label horizontally inside bounds.
+                if (lx < bounds.x + pad) lx = bounds.x + pad;
+                if (lx + tw > bounds.x + bounds.width - pad) lx = bounds.x + bounds.width - tw - pad;
+                gui_text_draw_mono(buf, lx, label_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            }
         }
         // Time axis (left inside edge, top = now): seconds back from now.
-        if (real_rate_hz > 0.0) {
+        if (!labels_hidden && real_rate_hz > 0.0) {
             const int t_divs = 2;
             float tx = bounds.x + pad;
             for (int d = 0; d <= t_divs; d++) {
@@ -557,13 +568,15 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
             float frac = (float)d / (float)divs;          // 0 = 0 Hz, 1 = Nyquist
             float py = bounds.y + bounds.height * (1.0f - frac);  // frac=1 -> top
             DrawLineEx((Vector2){bounds.x, py}, (Vector2){bounds.x + bounds.width, py}, 1.0f, COLOR_GRID);
-            char buf[16];
-            format_freq(buf, sizeof(buf), nyq * (double)frac);
-            float ly = py - label_h / 2.0f;
-            // Keep label vertically inside bounds.
-            if (ly < bounds.y + pad) ly = bounds.y + pad;
-            if (ly + label_h > bounds.y + bounds.height - pad) ly = bounds.y + bounds.height - label_h - pad;
-            gui_text_draw_mono(buf, label_x, ly, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            if (!labels_hidden) {
+                char buf[16];
+                format_freq(buf, sizeof(buf), nyq * (double)frac);
+                float ly = py - label_h / 2.0f;
+                // Keep label vertically inside bounds.
+                if (ly < bounds.y + pad) ly = bounds.y + pad;
+                if (ly + label_h > bounds.y + bounds.height - pad) ly = bounds.y + bounds.height - label_h - pad;
+                gui_text_draw_mono(buf, label_x, ly, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+            }
         }
         // Time axis (bottom inside edge): DAW-style. Paused analysis shows
         // ABSOLUTE timecodes across the window; rolling shows seconds back
@@ -591,7 +604,9 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
                 if (lx + tw > bounds.x + bounds.width - pad) {
                     lx = bounds.x + bounds.width - tw - pad;
                 }
-                gui_text_draw_mono(tb, lx, ty, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+                if (!labels_hidden) {
+                    gui_text_draw_mono(tb, lx, ty, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
+                }
             }
         }
         // "Now" marker at the right edge (newest slice).
@@ -748,8 +763,9 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     // Paused analysis indicator: window span + pending state. Every column
     // of the paused window is ONE true FFT over that column's full contiguous
-    // samples (full resolution; see gui_playback.c).
-    if (e->analysis_active) {
+    // samples (full resolution; see gui_playback.c). Overlay chrome: hidden
+    // with the panel's chrome toggle.
+    if (e->analysis_active && !gui_chrome_hide_hidden(&e->chrome_hide)) {
         char win_buf[64];
         snprintf(win_buf, sizeof(win_buf), "PAUSED  %.2fs window%s",
                  e->analysis_span_seconds,
@@ -760,7 +776,9 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     // Palette dropdown (top-right): Phosphor / Heat. Selecting a palette
     // RELOADS the view through the new LUT (see spectro_palette_reload).
-    {
+    // Skipped entirely while the chrome is hidden (the button rect then
+    // stays stale; spectro_vtable_handle_click guards clicks on the flag).
+    if (!gui_chrome_hide_hidden(&e->chrome_hide)) {
         static const char *pal_names[2] = { "Phosphor", "Heat" };
         float btn_h = 18;
         float pad = 8;
@@ -828,12 +846,10 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 // Palette dropdown clicks (top-right): open/select/close. Selecting a
 // palette RELOADS the view through the new LUT (paused: the same spectra
 // re-mapped instantly + a fresh request; rolling: history cleared and
-// refilled in the new palette).
-static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
-                                        Vector2 click, Rectangle bounds) {
-    spectro_engine_t *e = (spectro_engine_t *)state_ptr;
-    if (!e) return false;
-    if (!CheckCollisionPointRec(click, bounds)) return false;
+// refilled in the new palette). Returns true when a control consumed the
+// click; false when no control was hit.
+static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, int channel,
+                                         Vector2 click) {
 
     if (e->palette_dropdown_open) {
         for (int i = 0; i < 2; i++) {
@@ -853,6 +869,36 @@ static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int cha
     }
     if (CheckCollisionPointRec(click, e->palette_btn_rect)) {
         e->palette_dropdown_open = true;
+        return true;
+    }
+    return false;
+}
+
+static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
+                                        Vector2 click, Rectangle bounds) {
+    spectro_engine_t *e = (spectro_engine_t *)state_ptr;
+    if (!e) return false;
+
+    // Click outside the panel resets double-click tracking.
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&e->chrome_hide);
+        return false;
+    }
+
+    // Palette clicks only while the chrome is shown (the button rect is
+    // stale while hidden); a consumed control click resets the tracker so
+    // a double-click ON the dropdown never toggles the chrome.
+    if (!gui_chrome_hide_hidden(&e->chrome_hide) &&
+        spectro_handle_palette_click(e, app, channel, click)) {
+        gui_chrome_hide_reset(&e->chrome_hide);
+        return true;
+    }
+
+    // Double-click anywhere else on the panel toggles ALL overlay chrome
+    // (palette dropdown, axis labels, PAUSED indicator) for a clean
+    // spectrogram view.
+    if (gui_chrome_hide_feed_click(&e->chrome_hide, click)) {
+        e->palette_dropdown_open = false;
         return true;
     }
     return false;

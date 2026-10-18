@@ -45,6 +45,7 @@
 #else
 #include <dirent.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #if LIBFLAC_ENABLED == 1
@@ -80,6 +81,27 @@ typedef struct playback_io_ctx {
     size_t head_len;
 } playback_io_t;
 
+// Headerless raw PCM / PCM WAV / packed .lds reader state (one per channel;
+// the FILE handle is ctx->file_a/file_b itself). Everything is derived once at
+// open: the audio byte span (whole file for headerless formats, the RIFF data
+// chunk for WAV), the exact sample count, and the resolved real rate. Reads
+// convert bytes straight into the 12-bit display container; .lds keeps a
+// group-aligned cursor with a leading intra-group skip after a mid-group seek
+// and a small carry for the group mates a bounded read leaves behind.
+typedef struct {
+    playback_input_format_t format;
+    FILE *file;                 // Audio file handle (aliases ctx->file_a/file_b)
+    uint32_t bits;              // On-disk width (8/16/24/32; 10 for .lds)
+    uint64_t data_offset;       // First audio byte (data chunk body for WAV, else 0)
+    uint64_t data_bytes;        // Audio bytes present (clamped to EOF for WAV)
+    uint64_t file_size;
+    uint64_t total_samples;     // Exact (size-derived; lds drops a trailing partial group)
+    uint64_t cursor_sample;     // Next sample index a read converts
+    uint32_t skip;              // .lds only: leading group mates to drop after a mid-group seek (0..3)
+    int16_t carry[3];           // .lds only: unconsumed mates of a partially read group
+    uint32_t carry_len;
+} playback_raw_reader_t;
+
 typedef struct playback_ctx {
     // File handles and decoders
 #if LIBFLAC_ENABLED == 1
@@ -101,6 +123,22 @@ typedef struct playback_ctx {
     gui_playback_length_cache_key_t loaded_key[2];
     bool loaded_key_valid[2]; // Captured from and matched against the held producer FILE
     bool seek_recovery_failed[2]; // Producer-only; failed seek could not restore its old cursor
+
+    // Sniffed input container per channel: native FLAC keeps the libFLAC
+    // decoder path verbatim; Ogg FLAC remuxes to a session temp native FLAC;
+    // the raw formats (u8/s8/u16/s16/lds/WAV) drive the sample readers with
+    // no libFLAC decoder at all (see the input reader section).
+    int input_format[2];        // playback_input_format_t
+    bool input_is_raw[2];       // Raw/WAV/.lds reader channels (no FLAC decoder)
+    playback_raw_reader_t raw[2]; // Reader state (the FILE* aliases file_a/file_b)
+    // Actual decode-source path per channel (the Ogg-FLAC session remux);
+    // equals the info filepath for every on-disk native format. FLAC-domain
+    // work (loaded-file identity, paused-analysis decoders) uses this path.
+    char decode_path[2][512];
+    bool decode_path_temp[2];   // decode_path is a session temp file (unlink on release)
+    // 16-bit source sample-convention state per channel (FLAC frames and raw
+    // s16/WAV16 reads share one sticky detector; see the conversion section).
+    int conv16_state[2];
 
     // Decode buffers (filled by FLAC decoder callbacks)
     int16_t *decode_buf_a;
@@ -995,6 +1033,1457 @@ static bool gui_playback_parse_frame_header(const uint8_t *w, size_t len,
     *out_number = number;
     *out_variable = variable;
     return true;
+}
+
+//-----------------------------------------------------------------------------
+// Input Sample Conversion (16-bit source conventions)
+//-----------------------------------------------------------------------------
+
+// The display/extraction pipeline consumes one fixed 12-bit container per
+// sample (encode_raw_sample's raw packing, the extraction (2047 - field) << 4
+// into the 16-bit display container, VU meters, peaks and clipping all match
+// the live capture preview on that grid). 16-bit sources occur in TWO
+// real-world conventions (measured on real captures): the MISRC recorder
+// stores the 12-bit ADC container << 4 (every sample sits on a 16-grid,
+// +-32752 span), while generic tools (the 20 kHz NTSC tape FLAC) store sample
+// values DIRECTLY - a +-2190 peak file whose samples are 93.8% non-multiples
+// of 16. A blanket >> 4 crushed the second kind to 1/16 amplitude (the
+// waveform-playback accuracy bug); the detector below decides the convention
+// from the first non-silent block and is sticky for the channel's session.
+#define PLAYBACK_CONV16_PENDING 0
+#define PLAYBACK_CONV16_SHIFT4 1  // recorder 12-bit << 4 restore (or full-range display downscale)
+#define PLAYBACK_CONV16_PASS   2  // direct-domain values: pass through unchanged
+#define PLAYBACK_CONV16_DECIDE_FLOOR 16  // a block peaking below this is inconclusive (silence)
+#define PLAYBACK_CONV16_DIRECT_MAX 4096 // direct-domain peak ceiling (13-bit domain)
+
+// Decide (or keep) the 16-bit conversion mode from one frame/block of samples.
+// Thresholds, chosen from the measured files:
+//   - every sample == 0 (mod 16): the recorder's << 4 grid -> >> 4 restore
+//     (RF noise never lands on that grid by chance; a quiet recorder capture
+//     is still all-mod-16, so this decision never depends on level)
+//   - otherwise peak <= 4096: direct-domain storage (the tape file peaks at
+//     +-2190) -> pass through unchanged
+//   - otherwise: full-range generic 16-bit -> >> 4 display-container downscale
+// A block whose peak stays under 16 (digital silence) leaves the decision
+// pending: zero samples convert identically under every convention, so a
+// silent lead can never mislead the detector.
+static void gui_playback_decide_conv16(int *state, const int32_t *in, uint32_t samples) {
+    if (!state || *state != PLAYBACK_CONV16_PENDING || !in || samples == 0) return;
+    int32_t peak = 0;
+    bool all_mod16 = true;
+    for (uint32_t i = 0; i < samples; i++) {
+        int32_t v = in[i];
+        int32_t mag = v < 0 ? -v : v;
+        if (mag > peak) peak = mag;
+        if (v & 0xF) all_mod16 = false;
+    }
+    if (peak < PLAYBACK_CONV16_DECIDE_FLOOR) return;
+    *state = (all_mod16 || peak > PLAYBACK_CONV16_DIRECT_MAX)
+        ? PLAYBACK_CONV16_SHIFT4 : PLAYBACK_CONV16_PASS;
+}
+
+static int16_t gui_playback_apply_conv16(int state, int32_t v) {
+    // PASS keeps direct-domain values (encode_raw_sample clamps into the raw
+    // 12-bit packing domain downstream); SHIFT4 covers both the recorder
+    // restore and the full-range display downscale in one operation.
+    return state == PLAYBACK_CONV16_PASS ? (int16_t)v : (int16_t)(v >> 4);
+}
+
+// Map a signed sample of `bits` width (<= 12) into the 12-bit container by
+// left-justification (8-bit << 4, 10-bit << 2); wider depths take the top 12
+// bits (24-bit >> 12, 32-bit >> 20). Callers center unsigned formats first
+// (WAV 8-bit at 128, cxadc u16 ten-bit at 512).
+static int16_t gui_playback_scale_to_container(int32_t v, int bits) {
+    if (bits >= 12) return (int16_t)(v >> (bits - 12));
+    return (int16_t)(v << (12 - bits));
+}
+
+//-----------------------------------------------------------------------------
+// Input Container Sniffing (content first, extension only for raw PCM)
+//-----------------------------------------------------------------------------
+
+// FLAC-Chop's model: the container is ALWAYS decided by the first bytes
+// (fLaC -> native FLAC, OggS + 0x7F "FLAC" mapping -> Ogg FLAC, RIFF/WAVE ->
+// PCM WAV), so renamed captures just work; the extension is only consulted
+// for headerless raw PCM (which carries no magic at all) and the packed .lds.
+// Known container extensions WITHOUT their magic still route to the matching
+// prober so the failure names what the file actually is ("no Ogg capture
+// pattern at offset 0"), never a generic "unsupported".
+static bool gui_playback_ext_equals(const char *filename, const char *ext) {
+    if (!filename || !ext) return false;
+    const char *dot = strrchr(filename, '.');
+    if (!dot || dot == filename || !dot[1]) return false;
+    return gui_playback_eq_ascii_ci_bytes((const uint8_t *)(dot + 1), strlen(dot + 1), ext);
+}
+
+// Sniff the container of `filepath`. Returns true with *out_fmt set (and the
+// first four bytes copied to out_magic for precise error text); returns false
+// with a specific, actionable message in `err` for files playback cannot read
+// at all (non-FLAC Ogg codecs, ID3-prefixed FLAC, unknown types).
+static bool gui_playback_sniff_format(const char *filepath, playback_input_format_t *out_fmt,
+                                      uint8_t out_magic[4], char *err, size_t err_len) {
+    if (!filepath || !out_fmt || !out_magic || !err || err_len == 0) return false;
+    err[0] = '\0';
+    *out_fmt = PLAYBACK_INPUT_FLAC;
+    out_magic[0] = out_magic[1] = out_magic[2] = out_magic[3] = 0;
+
+    const char *filename = filepath;
+    const char *slash = strrchr(filepath, '/');
+    const char *backslash = strrchr(filepath, '\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+    if (slash) filename = slash + 1;
+
+    FILE *file = file_open_read_utf8(filepath);
+    if (!file) {
+        snprintf(err, err_len, "open failed: %s", filepath);
+        return false;
+    }
+    uint8_t head[64] = {0};
+    size_t n = fread(head, 1, sizeof(head), file);
+    fclose(file);
+    memcpy(out_magic, head, 4);
+
+    if (n >= 4 && memcmp(head, "fLaC", 4) == 0) {
+        *out_fmt = PLAYBACK_INPUT_FLAC;
+        return true;
+    }
+    if (n >= 4 && memcmp(head, "OggS", 4) == 0) {
+        // Classify from the first page payload (never by extension): only an
+        // Ogg FLAC mapping header is playable; name the codec otherwise so
+        // the user gets a real error instead of a decode failure.
+        const char *codec = "unknown";
+        bool classified = false;
+        if (n > 27u + head[26]) {
+            const uint8_t *payload = head + 27u + head[26];
+            size_t payload_len = n - (size_t)(27u + head[26]);
+            if (payload_len >= 5 && payload[0] == 0x7F && memcmp(payload + 1, "FLAC", 4) == 0) {
+                *out_fmt = PLAYBACK_INPUT_OGG_FLAC;
+                return true;
+            }
+            if (payload_len >= 7 && payload[0] == 0x01 && memcmp(payload + 1, "vorbis", 6) == 0) {
+                codec = "Vorbis";
+            } else if (payload_len >= 8 && memcmp(payload, "OpusHead", 8) == 0) {
+                codec = "Opus";
+            } else if (payload_len >= 8 && memcmp(payload, "Speex   ", 8) == 0) {
+                codec = "Speex";
+            } else if (payload_len >= 7 && payload[0] == 0x80 && memcmp(payload + 1, "theora", 6) == 0) {
+                codec = "Theora";
+            }
+            classified = payload_len > 0;
+        }
+        (void)classified;
+        snprintf(err, err_len,
+                 "this is an Ogg %s stream, not Ogg FLAC - playback only cuts FLAC RF/audio captures",
+                 codec);
+        return false;
+    }
+    if (n >= 3 && memcmp(head, "ID3", 3) == 0) {
+        snprintf(err, err_len,
+                 "this FLAC carries a leading ID3v2 tag, which playback cannot read - strip it first, "
+                 "e.g. `ffmpeg -i in.flac -c copy -map_metadata -1 -write_id3v2 0 out.flac`");
+        return false;
+    }
+    if (n >= 12 && memcmp(head, "RIFF", 4) == 0 && memcmp(head + 8, "WAVE", 4) == 0) {
+        *out_fmt = PLAYBACK_INPUT_WAV;
+        return true;
+    }
+
+    // Headerless from here: only the raw PCM extensions and the packed .lds.
+    if (gui_playback_ext_equals(filename, "u8") || gui_playback_ext_equals(filename, "r8") ||
+        gui_playback_ext_equals(filename, "8u")) {
+        *out_fmt = PLAYBACK_INPUT_U8;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "s8") || gui_playback_ext_equals(filename, "8s")) {
+        *out_fmt = PLAYBACK_INPUT_S8;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "u16") || gui_playback_ext_equals(filename, "r16") ||
+        gui_playback_ext_equals(filename, "16u")) {
+        *out_fmt = PLAYBACK_INPUT_U16;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "s16") || gui_playback_ext_equals(filename, "16s")) {
+        *out_fmt = PLAYBACK_INPUT_S16;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "lds")) {
+        *out_fmt = PLAYBACK_INPUT_LDS;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "raw") || gui_playback_ext_equals(filename, "bin") ||
+        gui_playback_ext_equals(filename, "pcm")) {
+        // 8-bit vs 16-bit is ambiguous without a header; the cxadc 8-bit mode
+        // is by far the most common, so default to u8 and warn (FLAC-Chop's
+        // choice). Use .u8/.s8/.u16/.s16 to disambiguate.
+        fprintf(stderr,
+                "[PLAYBACK] headerless .raw/.bin/.pcm: assumed unsigned 8-bit mono; "
+                "use .u8/.s8/.u16/.s16 extensions to disambiguate\n");
+        *out_fmt = PLAYBACK_INPUT_U8;
+        return true;
+    }
+    // Known container extensions without their magic still go to the matching
+    // prober for a precise error naming the actual first bytes.
+    if (gui_playback_ext_equals(filename, "flac")) {
+        *out_fmt = PLAYBACK_INPUT_FLAC;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "wav")) {
+        *out_fmt = PLAYBACK_INPUT_WAV;
+        return true;
+    }
+    if (gui_playback_ext_equals(filename, "ldf") || gui_playback_ext_equals(filename, "oga") ||
+        gui_playback_ext_equals(filename, "ogg")) {
+        *out_fmt = PLAYBACK_INPUT_OGG_FLAC;
+        return true;
+    }
+    snprintf(err, err_len,
+             "unsupported file type (%s): expected FLAC (fLaC marker), Ogg FLAC (OggS), WAV (RIFF), "
+             "or raw u8/s8/u16/s16 RF data (also .8u/.8s/.16u/.16s/.raw/.bin/.pcm/.lds)",
+             filename);
+    return false;
+}
+
+//-----------------------------------------------------------------------------
+// Raw / WAV / .lds sample readers
+//-----------------------------------------------------------------------------
+
+#define PLAYBACK_LDS_GROUP_BYTES 5u     // one DdD packing group: 4 samples
+#define PLAYBACK_LDS_GROUP_SAMPLES 4u
+#define PLAYBACK_LDS_DEFAULT_MSPS 40.0   // every .lds is a 40 MSPS ld-decode RF capture
+                                        // (ld-lds-converter's own default rate, used
+                                        // silently); an <n>msps hint overrides
+
+// Parse a PCM RIFF/WAVE header: walk the chunk list (skipping unknown chunks
+// like JUNK/LIST/bext, honouring the odd-chunk pad byte) to find `fmt ` and
+// `data`. Streaming writers store 0 or 0xFFFFFFFF as the data size; the data
+// span is clamped to EOF in every case. Only PCM (0x0001) and
+// WAVE_FORMAT_EXTENSIBLE (0xFFFE) are accepted, 8/16/24/32-bit mono.
+static bool gui_playback_parse_wav(FILE *file, uint64_t file_size,
+                                   uint32_t *out_rate, uint32_t *out_bits,
+                                   uint64_t *out_data_offset, uint64_t *out_data_bytes,
+                                   char *err, size_t err_len) {
+    uint8_t riff[12];
+    if (!gui_playback_file_seek_abs(file, 0) || fread(riff, 1, 12, file) != 12 ||
+        memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+        snprintf(err, err_len, "not a RIFF/WAVE file");
+        return false;
+    }
+    bool have_fmt = false, have_data = false;
+    uint32_t rate = 0, bits = 0;
+    uint64_t data_offset = 0, data_bytes = 0;
+    uint64_t pos = 12;
+    while (!have_fmt || !have_data) {
+        if (pos + 8 > file_size) break;
+        uint8_t hdr[8];
+        if (!gui_playback_file_seek_abs(file, pos) || fread(hdr, 1, 8, file) != 8) break;
+        uint64_t len = (uint64_t)hdr[4] | ((uint64_t)hdr[5] << 8) |
+                      ((uint64_t)hdr[6] << 16) | ((uint64_t)hdr[7] << 24);
+        uint64_t body = pos + 8;
+        if (memcmp(hdr, "fmt ", 4) == 0) {
+            uint8_t fmt[40];
+            uint64_t want = len < sizeof(fmt) ? len : sizeof(fmt);
+            if (want < 16 || fread(fmt, 1, (size_t)want, file) != (size_t)want) break;
+            uint16_t audio_format = (uint16_t)((uint16_t)fmt[0] | ((uint16_t)fmt[1] << 8));
+            uint16_t channels = (uint16_t)((uint16_t)fmt[2] | ((uint16_t)fmt[3] << 8));
+            rate = (uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) |
+                   ((uint32_t)fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
+            bits = (uint32_t)fmt[14] | ((uint32_t)fmt[15] << 8);
+            if (audio_format != 0x0001 && audio_format != 0xFFFE) {
+                snprintf(err, err_len,
+                         "WAV fmt is not PCM (format tag 0x%04x) - only PCM WAV is supported",
+                         audio_format);
+                return false;
+            }
+            if (bits != 8 && bits != 16 && bits != 24 && bits != 32) {
+                snprintf(err, err_len,
+                         "WAV: unsupported PCM layout (%u-bit, %u ch) - expected 8/16/24/32-bit",
+                         bits, channels);
+                return false;
+            }
+            if (channels != 1) {
+                snprintf(err, err_len,
+                         "WAV has %u channels (expected mono - one playback file per RF channel)",
+                         channels);
+                return false;
+            }
+            have_fmt = true;
+        } else if (memcmp(hdr, "data", 4) == 0) {
+            uint64_t avail = file_size > body ? file_size - body : 0;
+            // Streaming writers store 0 or 0xFFFFFFFF as the data size; clamp
+            // the span to EOF in every case.
+            uint64_t span = (len == 0 || len == 0xFFFFFFFFu) ? avail : len;
+            if (span > avail) span = avail;
+            data_offset = body;
+            data_bytes = span;
+            have_data = true;
+            break;
+        }
+        pos = body + len + (len & 1);  // chunk body + the odd-size pad byte
+    }
+    if (!have_fmt) {
+        snprintf(err, err_len, "WAV: no fmt chunk (not a PCM WAV)");
+        return false;
+    }
+    if (!have_data) {
+        snprintf(err, err_len, "WAV: no data chunk");
+        return false;
+    }
+    if (rate == 0 || bits == 0) {
+        snprintf(err, err_len, "WAV: zero sample rate or bit depth in fmt chunk");
+        return false;
+    }
+    *out_rate = rate;
+    *out_bits = bits;
+    *out_data_offset = data_offset;
+    *out_data_bytes = data_bytes;
+    return true;
+}
+
+// Open + fully resolve a raw/WAV/.lds channel file: everything the reader and
+// the file info need is derived once here (byte span, exact total, real
+// rate). `r` receives the reader state with its FILE* assigned (the caller
+// aliases it into ctx->file_a/file_b); `info` receives the resolved metadata
+// including a specific error message on failure.
+static bool gui_playback_raw_open(playback_raw_reader_t *r, playback_file_info_t *info,
+                                  const char *filepath, playback_input_format_t fmt,
+                                  char *err, size_t err_len) {
+    memset(r, 0, sizeof(*r));
+    r->format = fmt;
+    if (err && err_len) err[0] = '\0';
+    if (!info) {
+        snprintf(err, err_len, "internal: no file info");
+        return false;
+    }
+
+    FILE *file = file_open_read_utf8(filepath);
+    if (!file) {
+        snprintf(err, err_len, "open failed: %s", filepath);
+        goto fail;
+    }
+    if (PLAYBACK_FSEEK(file, 0, SEEK_END) != 0 ||
+        !gui_playback_file_tell(file, &r->file_size) ||
+        !gui_playback_file_seek_abs(file, 0)) {
+        snprintf(err, err_len, "stat failed: %s", filepath);
+        fclose(file);
+        goto fail;
+    }
+
+    double msps = 0.0;
+    bool have_msps = gui_playback_extract_msps_hint(filepath, &msps) && msps > 0.0;
+
+    if (fmt == PLAYBACK_INPUT_WAV) {
+        uint32_t rate = 0, bits = 0;
+        if (!gui_playback_parse_wav(file, r->file_size, &rate, &bits,
+                                    &r->data_offset, &r->data_bytes, err, err_len)) {
+            fclose(file);
+            goto fail;
+        }
+        r->bits = bits;
+        r->total_samples = r->data_bytes / (uint64_t)(bits / 8);  // mono: one byte frame per sample
+        // WAV rate resolution (FLAC-Chop's rule): a standard audio rate is
+        // real audio as-is; a header rate above 1 MHz is a real RF rate (some
+        // cxadc/DdD wav writers record the true MHz rate); anything else
+        // (e.g. 20000) is the RF /1000 convention.
+        if (gui_playback_is_audio_sample_rate(rate) || rate > 1000000u) {
+            info->real_sample_rate_hz = (double)rate;
+        } else {
+            info->real_sample_rate_hz = (double)rate * 1000.0;
+            fprintf(stderr,
+                    "[PLAYBACK] WAV header rate %u Hz is the RF /1000 convention (%.0f Hz real)\n",
+                    rate, info->real_sample_rate_hz);
+        }
+        info->sample_rate = rate;
+        info->bits_per_sample = (uint8_t)bits;
+    } else if (fmt == PLAYBACK_INPUT_LDS) {
+        // Packed 10-bit DdD RF: the packing is fully defined (4 samples per 5
+        // bytes, centre 512), so the totals are exact from the file size. Like
+        // raw PCM there is no header, but the format has exactly one rate:
+        // every .lds is a 40 MSPS ld-decode capture - used silently, not a
+        // guess; an explicit <n>msps hint still wins for renamed files.
+        if (!have_msps) msps = PLAYBACK_LDS_DEFAULT_MSPS;
+        r->bits = 10;
+        r->data_offset = 0;
+        r->data_bytes = r->file_size;
+        r->total_samples = (r->file_size / PLAYBACK_LDS_GROUP_BYTES) * PLAYBACK_LDS_GROUP_SAMPLES;
+        if (r->file_size % PLAYBACK_LDS_GROUP_BYTES) {
+            fprintf(stderr,
+                    "[PLAYBACK] packed .lds file size is not a multiple of 5: dropping %llu "
+                    "trailing byte(s) that don't form a whole 4-sample group\n",
+                    (unsigned long long)(r->file_size % PLAYBACK_LDS_GROUP_BYTES));
+        }
+        info->real_sample_rate_hz = msps * 1000000.0;
+        info->sample_rate = (uint32_t)(msps * 1000.0);  // kHz-domain equivalent (40 MSPS -> 40000)
+        info->bits_per_sample = 10;                     // the true source depth (packed 4-per-5)
+    } else {
+        // Headerless raw PCM: width/signedness come from the sniffed
+        // extension, the count is exact from the file size, and the REAL rate
+        // can only come from an <n>msps filename hint - without it the rate
+        // is unknowable, which is a hard error (never guess).
+        if (!have_msps) {
+            snprintf(err, err_len,
+                     "raw %s audio has no header, so the sample rate is unknowable: rename the file "
+                     "with the rate (e.g. ..._8-bit_20msps.u8) - the <n>msps hint is required",
+                     fmt == PLAYBACK_INPUT_U8 ? "u8" : fmt == PLAYBACK_INPUT_S8 ? "s8"
+                     : fmt == PLAYBACK_INPUT_U16 ? "u16" : "s16");
+            fclose(file);
+            goto fail;
+        }
+        r->bits = (fmt == PLAYBACK_INPUT_U8 || fmt == PLAYBACK_INPUT_S8) ? 8 : 16;
+        r->data_offset = 0;
+        r->data_bytes = r->file_size;
+        r->total_samples = r->file_size / (uint64_t)(r->bits / 8);
+        info->real_sample_rate_hz = msps * 1000000.0;
+        info->sample_rate = (uint32_t)(msps * 1000.0);  // kHz-domain equivalent (20 MSPS -> 20000)
+        info->bits_per_sample = (uint8_t)r->bits;
+    }
+
+    if (r->total_samples == 0) {
+        snprintf(err, err_len, "no audio data in %s", filepath);
+        fclose(file);
+        goto fail;
+    }
+    if (!gui_playback_file_seek_abs(file, r->data_offset)) {
+        snprintf(err, err_len, "seek failed: %s", filepath);
+        fclose(file);
+        goto fail;
+    }
+    r->file = file;
+    info->format = (int)fmt;
+    info->total_samples = r->total_samples;
+    info->header_total_samples = r->total_samples;  // no header lies in these formats
+    info->duration_seconds = info->real_sample_rate_hz > 0.0
+        ? (double)r->total_samples / info->real_sample_rate_hz : 0.0;
+    info->valid = true;
+    return true;
+
+fail:
+    snprintf(info->error, sizeof(info->error), "%s", err ? err : "open failed");
+    info->valid = false;
+    return false;
+}
+
+// Convert up to `want` samples at the reader cursor into the 12-bit display
+// container; returns the number produced (0 = end of the audio span). Reads
+// stay bounded (never more than the requested samples, plus at most three
+// carried .lds group mates from a previous partial group).
+static size_t gui_playback_raw_read(playback_ctx_t *ctx, int channel, int16_t *out, size_t want) {
+    playback_raw_reader_t *r = &ctx->raw[channel];
+    if (!r->file || !out || want == 0 || r->total_samples == 0 ||
+        r->cursor_sample >= r->total_samples) {
+        return 0;
+    }
+    uint64_t remaining = r->total_samples - r->cursor_sample;
+    size_t chunk = want < remaining ? want : (size_t)remaining;
+    size_t produced = 0;
+    uint8_t buf[5120];  // 4096 s16 samples per pass; >= one max .lds group batch
+
+    // .lds group mates a previous bounded read left behind come first (they
+    // are exactly the samples at the cursor).
+    while (r->carry_len > 0 && produced < chunk) {
+        out[produced++] = r->carry[0];
+        r->carry[0] = r->carry[1];
+        r->carry[1] = r->carry[2];
+        r->carry_len--;
+    }
+
+    switch (r->format) {
+        case PLAYBACK_INPUT_U8:
+        case PLAYBACK_INPUT_S8: {
+            while (produced < chunk) {
+                size_t n = chunk - produced;
+                if (n > sizeof(buf)) n = sizeof(buf);
+                size_t got = fread(buf, 1, n, r->file);
+                if (got == 0) break;
+                for (size_t i = 0; i < got; i++) {
+                    // u8: cxadc unsigned, centre 128; s8: signed. Both are the
+                    // 8-bit top of the 12-bit container -> << 4.
+                    int32_t v = (r->format == PLAYBACK_INPUT_U8)
+                        ? ((int32_t)buf[i] - 128) : (int32_t)(int8_t)buf[i];
+                    out[produced++] = gui_playback_scale_to_container(v, 8);
+                }
+            }
+            break;
+        }
+        case PLAYBACK_INPUT_U16:
+        case PLAYBACK_INPUT_S16:
+        case PLAYBACK_INPUT_WAV: {
+            uint32_t width = (r->format == PLAYBACK_INPUT_WAV) ? (r->bits / 8u) : 2u;
+            while (produced < chunk) {
+                size_t samples = chunk - produced;
+                if (samples > sizeof(buf) / width) samples = sizeof(buf) / width;
+                size_t items = fread(buf, width, samples, r->file);
+                if (items == 0) break;
+                if (r->format == PLAYBACK_INPUT_U16) {
+                    // cxadc tenbit: unsigned 10-bit word, centre 512 -> << 2
+                    // into the 12-bit container (the exact (value-512)*64 s16
+                    // grid >> 4). Values beyond the 10-bit grid clamp.
+                    for (size_t i = 0; i < items; i++) {
+                        uint32_t w = (uint32_t)buf[2 * i] | ((uint32_t)buf[2 * i + 1] << 8);
+                        int32_t v = (int32_t)w - 512;
+                        if (v > 511) v = 511;
+                        if (v < -512) v = -512;
+                        out[produced++] = (int16_t)(v << 2);
+                    }
+                } else if (r->format == PLAYBACK_INPUT_WAV && r->bits == 8) {
+                    // WAV 8-bit PCM is unsigned, centred at 128.
+                    for (size_t i = 0; i < items; i++) {
+                        out[produced++] =
+                            gui_playback_scale_to_container((int32_t)buf[i] - 128, 8);
+                    }
+                } else if (width == 2) {
+                    // 16-bit signed sources (raw s16 / WAV16) share the FLAC
+                    // write-callback convention detector: recorder 12-bit
+                    // << 4 grid (>> 4 restore) vs direct-domain values (pass
+                    // through) vs full-range (>> 4 display downscale).
+                    int32_t wide[sizeof(buf) / 2];
+                    for (size_t i = 0; i < items; i++) {
+                        wide[i] = (int32_t)(int16_t)((uint16_t)buf[2 * i] | ((uint16_t)buf[2 * i + 1] << 8));
+                    }
+                    gui_playback_decide_conv16(&ctx->conv16_state[channel], wide, (uint32_t)items);
+                    for (size_t i = 0; i < items; i++) {
+                        out[produced++] =
+                            gui_playback_apply_conv16(ctx->conv16_state[channel], wide[i]);
+                    }
+                } else {
+                    // WAV 24/32-bit: take the top 12 bits of the signed value.
+                    for (size_t i = 0; i < items; i++) {
+                        const uint8_t *b = buf + i * width;
+                        uint32_t u;
+                        int32_t v;
+                        if (r->bits == 24) {
+                            u = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
+                            // Sign-extend from 24 bits in the unsigned domain.
+                            if (u & 0x800000u) u |= 0xFF000000u;
+                        } else {
+                            u = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                                ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+                        }
+                        // unsigned -> signed without impl-defined conversion:
+                        // values below 2^31 map directly; the rest shift down
+                        // and add INT32_MIN (both sides stay in range).
+                        v = (u & 0x80000000u)
+                            ? (int32_t)(u - 0x80000000u) + INT32_MIN
+                            : (int32_t)u;
+                        out[produced++] = (int16_t)(v >> (r->bits - 12));
+                    }
+                }
+            }
+            break;
+        }
+        case PLAYBACK_INPUT_LDS: {
+            while (produced < chunk) {
+                // One 5-byte group -> 4 ten-bit words, centre 512, scaled
+                // (value - 512) * 4 into the 12-bit container (the exact
+                // 16-bit (value-512)*64 grid >> 4 of the reference unpacker).
+                uint8_t group[PLAYBACK_LDS_GROUP_BYTES];
+                if (fread(group, 1, sizeof(group), r->file) != sizeof(group)) break;
+                uint32_t w[PLAYBACK_LDS_GROUP_SAMPLES];
+                w[0] = ((uint32_t)group[0] * 4u) + ((uint32_t)(group[1] & 0xC0) >> 6);
+                w[1] = ((uint32_t)(group[1] & 0x3F) * 16u) + ((uint32_t)(group[2] & 0xF0) >> 4);
+                w[2] = ((uint32_t)(group[2] & 0x0F) * 64u) + ((uint32_t)(group[3] & 0xFC) >> 2);
+                w[3] = ((uint32_t)(group[3] & 0x03) * 256u) + (uint32_t)group[4];
+                for (uint32_t i = 0; i < PLAYBACK_LDS_GROUP_SAMPLES; i++) {
+                    if (r->skip > 0) {
+                        // Mid-group seek target: the leading group mates
+                        // before the cursor sample are dropped, never counted.
+                        r->skip--;
+                        continue;
+                    }
+                    int32_t v = (int32_t)w[i] - 512;
+                    if (v > 511) v = 511;
+                    if (v < -512) v = -512;
+                    int16_t s = (int16_t)(v << 2);
+                    if (produced < chunk) {
+                        out[produced++] = s;
+                    } else {
+                        // Bounded read ended inside the group: keep the
+                        // unconsumed mates for the next call.
+                        r->carry[r->carry_len++] = s;
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    r->cursor_sample += produced;
+    return produced;
+}
+
+// Position a raw channel at an exact sample (whole-sample boundaries for the
+// byte formats; group-aligned with a leading skip for packed .lds). The next
+// read then starts exactly at `sample` - the raw analogue of the FLAC seek
+// attempt's exact-target-slice property.
+static bool gui_playback_raw_seek(playback_ctx_t *ctx, int channel, uint64_t sample) {
+    playback_raw_reader_t *r = &ctx->raw[channel];
+    if (!r->file || r->total_samples == 0) return false;
+    if (sample >= r->total_samples) sample = r->total_samples - 1;
+    uint64_t byte = r->data_offset;
+    if (r->format == PLAYBACK_INPUT_LDS) {
+        byte += (sample / PLAYBACK_LDS_GROUP_SAMPLES) * PLAYBACK_LDS_GROUP_BYTES;
+        r->skip = (uint32_t)(sample % PLAYBACK_LDS_GROUP_SAMPLES);
+    } else {
+        byte += sample * (uint64_t)(r->bits / 8);
+        r->skip = 0;
+    }
+    if (!gui_playback_file_seek_abs(r->file, byte)) return false;
+    r->cursor_sample = sample;
+    r->carry_len = 0;
+    return true;
+}
+
+static bool gui_playback_raw_eof(const playback_ctx_t *ctx, int channel) {
+    const playback_raw_reader_t *r = &ctx->raw[channel];
+    return r->total_samples == 0 || r->cursor_sample >= r->total_samples;
+}
+
+//-----------------------------------------------------------------------------
+// Ogg FLAC (.ldf/.oga/.ogg) demux + remux
+//-----------------------------------------------------------------------------
+
+// The vhs-decode / ld-decode `.ldf` RF capture format is Ogg-wrapped FLAC
+// (ffmpeg ... -acodec flac -f ogg), not native FLAC. Playback bridges it
+// with a full-file remux into a session temp NATIVE FLAC (the FLAC-Chop
+// window-remux model, simplified: a whole-file remux starts at frame 0, so
+// frame packets are copied verbatim - no renumbering, no CRC recompute):
+// the existing native machinery (IO-layer seeks, length resolution,
+// paused-analysis decoders) then works on the temp unchanged, while
+// playback stays streaming (bounded-memory page/packet buffers) and the
+// temp is unlinked on release. The EXACT length comes from the remux's own
+// copied-frame sum (cross-checked against the last Ogg page's 64-bit
+// granule position, which is correct even when a piped ffmpeg writer left
+// STREAMINFO total_samples = 0 - the real-world .ldf case).
+
+#define PLAYBACK_OGG_PAGE_HEADER_BYTES 27u
+#define PLAYBACK_OGG_MAX_SEGMENTS 255u
+#define PLAYBACK_OGG_MAX_PAGE_BYTES \
+    (PLAYBACK_OGG_PAGE_HEADER_BYTES + PLAYBACK_OGG_MAX_SEGMENTS + PLAYBACK_OGG_MAX_SEGMENTS * 255u)
+#define PLAYBACK_OGG_NO_GRANULE UINT64_MAX
+#define PLAYBACK_OGG_HEADER_PAGE_LIMIT 4096u
+#define PLAYBACK_OGG_MAX_COMMENT_BYTES (64u * 1024u)   // larger comments are parsed but not carried into the remux
+#define PLAYBACK_OGG_SCAN_CHUNK_BYTES (1u << 20)
+// One FLAC frame packet (an Ogg packet): a page payload holds at most 255 x
+// 255 bytes, but a frame SPANS pages - the worst case is a 65535-sample
+// 32-bit verbatim frame (~262 KB), so packet buffers/limits use this bound,
+// not the page bound.
+#define PLAYBACK_OGG_MAX_PACKET_BYTES (65535u * 4u + 4096u)
+
+// Ogg page CRC-32 (poly 0x04C11DB7, init 0, MSB-first, no final xor). The
+// table is generated on first use; concurrent first uses (an idle validate
+// on the render thread racing the background loader) both compute identical
+// values into the static table, and the ready flag is an atomic, so the
+// result is published only after the full table is in place.
+static uint32_t s_ogg_crc_table[256];
+static atomic_int s_ogg_crc_table_ready;
+
+static uint32_t gui_playback_ogg_crc(uint32_t crc, const uint8_t *data, size_t len) {
+    if (!atomic_load(&s_ogg_crc_table_ready)) {
+        uint32_t table[256];
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t r = i << 24;
+            for (int k = 0; k < 8; k++) {
+                r = (r & 0x80000000u) ? ((r << 1) ^ 0x04C11DB7u) : (r << 1);
+            }
+            table[i] = r;
+        }
+        memcpy(s_ogg_crc_table, table, sizeof(table));
+        atomic_store(&s_ogg_crc_table_ready, 1);
+    }
+    for (size_t i = 0; i < len; i++) {
+        crc = (crc << 8) ^ s_ogg_crc_table[((crc >> 24) ^ data[i]) & 0xFFu];
+    }
+    return crc;
+}
+
+typedef enum {
+    PLAYBACK_OGG_PAGE_OK = 0,
+    PLAYBACK_OGG_PAGE_EOF,        // clean end of file exactly at a page boundary
+    PLAYBACK_OGG_PAGE_TRUNCATED,  // file ends inside a page (interrupted capture)
+    PLAYBACK_OGG_PAGE_BAD,        // not a valid page (no capture pattern, bad version, CRC mismatch)
+} playback_ogg_page_status_t;
+
+typedef struct {
+    FILE *file;
+    uint64_t file_size;
+    uint64_t offset;              // file offset of the page most recently read
+    uint64_t page_len;            // total bytes of that page (header + lacing + payload)
+    uint8_t header_type;
+    uint64_t granule;             // PLAYBACK_OGG_NO_GRANULE when no packet completes here
+    uint32_t serial;
+    uint32_t nseg;                // lacing value count
+    uint8_t *buf;                 // heap page buffer (max page size)
+    const uint8_t *segments;      // nseg lacing values (inside buf)
+    const uint8_t *payload;       // payload bytes (inside buf)
+    size_t payload_len;
+} playback_ogg_page_t;
+
+static size_t gui_playback_read_full(FILE *file, void *dst, size_t len) {
+    uint8_t *p = (uint8_t *)dst;
+    size_t got = 0;
+    while (got < len) {
+        size_t n = fread(p + got, 1, len - got, file);
+        if (n == 0) break;
+        got += n;
+    }
+    return got;
+}
+
+// Read + CRC-verify one Ogg page at the file's current position.
+static playback_ogg_page_status_t gui_playback_ogg_read_page(playback_ogg_page_t *pg) {
+    uint64_t at = 0;
+    if (!gui_playback_file_tell(pg->file, &at)) return PLAYBACK_OGG_PAGE_BAD;
+    if (at >= pg->file_size) return PLAYBACK_OGG_PAGE_EOF;
+
+    uint8_t header[PLAYBACK_OGG_PAGE_HEADER_BYTES];
+    if (gui_playback_read_full(pg->file, header, sizeof(header)) != sizeof(header)) {
+        return PLAYBACK_OGG_PAGE_TRUNCATED;
+    }
+    if (memcmp(header, "OggS", 4) != 0 || header[4] != 0) return PLAYBACK_OGG_PAGE_BAD;
+
+    // The lacing table follows the 27-byte header (it is NOT part of it): read
+    // it into the page buffer, derive the payload length from its values.
+    uint32_t nseg = header[26];
+    if ((uint64_t)PLAYBACK_OGG_PAGE_HEADER_BYTES + nseg > PLAYBACK_OGG_MAX_PAGE_BYTES) {
+        return PLAYBACK_OGG_PAGE_BAD;
+    }
+    memcpy(pg->buf, header, sizeof(header));
+    if (nseg > 0 &&
+        gui_playback_read_full(pg->file, pg->buf + PLAYBACK_OGG_PAGE_HEADER_BYTES, nseg) != nseg) {
+        return PLAYBACK_OGG_PAGE_TRUNCATED;
+    }
+    uint64_t payload_len = 0;
+    for (uint32_t i = 0; i < nseg; i++) {
+        payload_len += pg->buf[PLAYBACK_OGG_PAGE_HEADER_BYTES + i];
+    }
+    uint64_t total = (uint64_t)PLAYBACK_OGG_PAGE_HEADER_BYTES + nseg + payload_len;
+    if (total > PLAYBACK_OGG_MAX_PAGE_BYTES) return PLAYBACK_OGG_PAGE_BAD;
+    if (at + total > pg->file_size) return PLAYBACK_OGG_PAGE_TRUNCATED;
+    if (payload_len > 0 &&
+        gui_playback_read_full(pg->file, pg->buf + PLAYBACK_OGG_PAGE_HEADER_BYTES + nseg,
+                               (size_t)payload_len) != (size_t)payload_len) {
+        return PLAYBACK_OGG_PAGE_TRUNCATED;
+    }
+
+    // Verify the page CRC (computed over the page with the CRC field zeroed).
+    uint32_t stored = (uint32_t)header[22] | ((uint32_t)header[23] << 8) |
+                      ((uint32_t)header[24] << 16) | ((uint32_t)header[25] << 24);
+    memset(pg->buf + 22, 0, 4);
+    if (gui_playback_ogg_crc(0, pg->buf, (size_t)total) != stored) {
+        return PLAYBACK_OGG_PAGE_BAD;
+    }
+
+    pg->offset = at;
+    pg->page_len = total;
+    pg->header_type = header[5];
+    pg->granule = 0;
+    for (int k = 7; k >= 0; k--) {
+        pg->granule = (pg->granule << 8) | (uint64_t)header[6 + k];
+    }
+    pg->serial = (uint32_t)header[14] | ((uint32_t)header[15] << 8) |
+                 ((uint32_t)header[16] << 16) | ((uint32_t)header[17] << 24);
+    pg->nseg = nseg;
+    pg->segments = pg->buf + PLAYBACK_OGG_PAGE_HEADER_BYTES;
+    pg->payload = pg->segments + nseg;
+    pg->payload_len = (size_t)payload_len;
+    return PLAYBACK_OGG_PAGE_OK;
+}
+
+// STREAMINFO payload offsets (the packed 64-bit rate/ch/bps/total word sits
+// at payload bytes 10..17; the 36-bit total is its low bits).
+#define PLAYBACK_OGG_SI_PACKED_OFF 10u
+#define PLAYBACK_OGG_SI_TOTAL_MASK 0xFFFFFFFFFULL
+
+// Parsed Ogg FLAC headers: the FLAC logical stream's serial, its metadata
+// blocks (STREAMINFO + the first VORBIS_COMMENT), and where audio starts.
+typedef struct {
+    uint32_t serial;
+    uint64_t audio_offset;         // file offset of the first audio page
+    bool have_si;
+    uint8_t streaminfo[34];
+    bool has_vorbis_comment;
+    uint8_t *vorbis_comment;        // heap copy (<= PLAYBACK_OGG_MAX_COMMENT_BYTES)
+    size_t vorbis_comment_len;
+    playback_vorbis_rf_tags_t tags; // RF tags parsed from that comment block
+    bool has_tags;
+} playback_ogg_header_t;
+
+static void gui_playback_ogg_header_cleanup(playback_ogg_header_t *h) {
+    if (!h) return;
+    free(h->vorbis_comment);
+    memset(h, 0, sizeof(*h));
+}
+
+// Parse the RF tag triple from a VORBIS_COMMENT block payload (little-endian
+// lengths: vendor, count, entries). The same key matching as
+// gui_playback_read_vorbis_rf_tags, from the raw bytes the Ogg header carries.
+static bool gui_playback_parse_vorbis_rf_tags_payload(const uint8_t *p, size_t len,
+                                                       playback_vorbis_rf_tags_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!p || !out || len < 8) return false;
+    uint32_t vendor_len = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    size_t pos = 4;
+    if ((uint64_t)vendor_len > len || pos + (uint64_t)vendor_len + 4 > len) return false;
+    pos += vendor_len;
+    uint32_t count = (uint32_t)p[pos] | ((uint32_t)p[pos + 1] << 8) |
+                     ((uint32_t)p[pos + 2] << 16) | ((uint32_t)p[pos + 3] << 24);
+    pos += 4;
+    for (uint32_t i = 0; i < count && pos + 4 <= len; i++) {
+        uint32_t clen = (uint32_t)p[pos] | ((uint32_t)p[pos + 1] << 8) |
+                        ((uint32_t)p[pos + 2] << 16) | ((uint32_t)p[pos + 3] << 24);
+        pos += 4;
+        if (clen > len - pos) return false;  // malformed: keep what was parsed
+        const uint8_t *entry = p + pos;
+        uint32_t split = 0;
+        while (split < clen && entry[split] != '=') split++;
+        if (split > 0 && split < clen) {
+            const uint8_t *key = entry;
+            size_t key_len = split;
+            const uint8_t *value = entry + split + 1;
+            size_t value_len = (size_t)clen - (size_t)split - 1u;
+            if (!out->has_rf_total_samples &&
+                gui_playback_eq_ascii_ci_bytes(key, key_len, "RF_TOTAL_SAMPLES")) {
+                uint64_t parsed = 0;
+                if (gui_playback_parse_u64_bytes(value, value_len, &parsed) && parsed > 0) {
+                    out->has_rf_total_samples = true;
+                    out->rf_total_samples = parsed;
+                }
+            } else if (!out->has_rf_sample_rate &&
+                       gui_playback_eq_ascii_ci_bytes(key, key_len, "RF_SAMPLE_RATE")) {
+                uint64_t parsed = 0;
+                if (gui_playback_parse_u64_bytes(value, value_len, &parsed) && parsed > 0) {
+                    out->has_rf_sample_rate = true;
+                    out->rf_sample_rate = parsed;
+                }
+            } else if (!out->has_duration_seconds &&
+                       gui_playback_eq_ascii_ci_bytes(key, key_len, "DURATION_SECONDS")) {
+                double parsed = 0.0;
+                if (gui_playback_parse_f64_bytes(value, value_len, &parsed) && parsed > 0.0) {
+                    out->has_duration_seconds = true;
+                    out->duration_seconds = parsed;
+                }
+            }
+        }
+        pos += clen;
+    }
+    return out->has_rf_total_samples || out->has_rf_sample_rate || out->has_duration_seconds;
+}
+
+// Collect one metadata block from the mapping header / header packets.
+// Only STREAMINFO and VORBIS_COMMENT are kept: a SEEKTABLE's byte offsets
+// reference the native FLAC stream domain and would actively mis-seek the
+// remux; padding is useless. Returns false only on structural errors.
+static bool gui_playback_ogg_collect_block(playback_ogg_header_t *h, uint8_t type,
+                                            const uint8_t *payload, size_t len,
+                                            char *err, size_t err_len) {
+    if (type == 0) {
+        if (len != 34) {
+            snprintf(err, err_len, "Ogg FLAC: STREAMINFO block is not 34 bytes");
+            return false;
+        }
+        memcpy(h->streaminfo, payload, 34);
+        h->have_si = true;
+        return true;
+    }
+    if (type == 4) {
+        if (h->has_vorbis_comment) return true;  // the first comment block wins
+        if (len > PLAYBACK_OGG_MAX_COMMENT_BYTES) {
+            fprintf(stderr,
+                    "[PLAYBACK] Ogg FLAC: VORBIS_COMMENT larger than %u bytes; not carried into the remux\n",
+                    PLAYBACK_OGG_MAX_COMMENT_BYTES);
+            h->has_tags = gui_playback_parse_vorbis_rf_tags_payload(payload, len, &h->tags);
+            return true;
+        }
+        free(h->vorbis_comment);
+        h->vorbis_comment = (uint8_t *)malloc(len);
+        if (!h->vorbis_comment) {
+            snprintf(err, err_len, "out of memory reading Ogg FLAC metadata");
+            return false;
+        }
+        memcpy(h->vorbis_comment, payload, len);
+        h->vorbis_comment_len = len;
+        h->has_vorbis_comment = true;
+        h->has_tags = gui_playback_parse_vorbis_rf_tags_payload(payload, len, &h->tags);
+        return true;
+    }
+    return true;
+}
+
+// Parse the Ogg FLAC mapping header: pages from offset 0 through the last
+// metadata-block flag. Mirrors the FLAC-Chop demuxer's layout rules (BOS
+// first page, 0x7F "FLAC" mapping packet, one metadata block per further
+// header packet, foreign logical streams skipped by serial).
+static bool gui_playback_ogg_read_header(const char *filepath, playback_ogg_header_t *h,
+                                         char *err, size_t err_len) {
+    memset(h, 0, sizeof(*h));
+    if (err && err_len) err[0] = '\0';
+    FILE *file = file_open_read_utf8(filepath);
+    if (!file) {
+        snprintf(err, err_len, "open failed: %s", filepath);
+        return false;
+    }
+    uint64_t file_size = 0;
+    playback_ogg_page_t pg = {.file = file};
+    uint8_t *carry = NULL;
+    bool ok = false;
+
+    do {
+        if (PLAYBACK_FSEEK(file, 0, SEEK_END) != 0 ||
+            !gui_playback_file_tell(file, &file_size) ||
+            !gui_playback_file_seek_abs(file, 0)) {
+            snprintf(err, err_len, "stat failed: %s", filepath);
+            break;
+        }
+        pg.file_size = file_size;
+        pg.buf = (uint8_t *)malloc(PLAYBACK_OGG_MAX_PAGE_BYTES);
+        carry = (uint8_t *)malloc(PLAYBACK_OGG_MAX_PACKET_BYTES);  // header packets, but sized for any packet
+        if (!pg.buf || !carry) {
+            snprintf(err, err_len, "out of memory reading the Ogg FLAC header");
+            break;
+        }
+
+        bool have_serial = false;
+        bool done = false;
+        uint32_t packets_seen = 0;
+        size_t carry_len = 0;
+        for (uint32_t page_count = 0;
+             page_count < PLAYBACK_OGG_HEADER_PAGE_LIMIT && !done;
+             page_count++) {
+            playback_ogg_page_status_t st = gui_playback_ogg_read_page(&pg);
+            if (st == PLAYBACK_OGG_PAGE_EOF) {
+                snprintf(err, err_len, "Ogg FLAC header: unexpected end of file");
+                goto finish;
+            }
+            if (st == PLAYBACK_OGG_PAGE_TRUNCATED) {
+                snprintf(err, err_len, "Ogg FLAC header: file ends inside an Ogg page");
+                goto finish;
+            }
+            if (st == PLAYBACK_OGG_PAGE_BAD) {
+                snprintf(err, err_len,
+                         "Ogg FLAC header: damaged page at offset %llu (no capture pattern / bad version / CRC mismatch)",
+                         (unsigned long long)pg.offset);
+                goto finish;
+            }
+            if (!have_serial) {
+                if (!(pg.header_type & 0x02)) {
+                    snprintf(err, err_len,
+                             "not an Ogg FLAC stream: the first Ogg page is not a BOS page");
+                    goto finish;
+                }
+                h->serial = pg.serial;
+                have_serial = true;
+            } else if (pg.serial != h->serial) {
+                continue;  // a multiplexed foreign logical stream: skip its pages
+            }
+
+            // Split the page payload into packets using the lacing values: a
+            // value < 255 completes a packet. A page that does not continue an
+            // unfinished packet means the stream was damaged - drop the partial.
+            if (!(pg.header_type & 0x01) && carry_len != 0) carry_len = 0;
+            size_t pos = 0;
+            for (uint32_t s = 0; s < pg.nseg; s++) {
+                size_t seg = pg.segments[s];
+                if (carry_len + seg > PLAYBACK_OGG_MAX_PACKET_BYTES) {
+                    snprintf(err, err_len, "Ogg FLAC: header packet too large");
+                    goto finish;
+                }
+                memcpy(carry + carry_len, pg.payload + pos, seg);
+                carry_len += seg;
+                pos += seg;
+                if (pg.segments[s] == 255) continue;  // packet continues on the next page
+
+                if (done) {
+                    snprintf(err, err_len,
+                             "Ogg FLAC audio data shares a page with the header packets (unsupported layout)");
+                    goto finish;
+                }
+                if (packets_seen == 0) {
+                    // Mapping header: 0x7F "FLAC" major minor nheaders(BE16)
+                    // "fLaC", then the first metadata block (STREAMINFO).
+                    if (carry_len < 13 + 4 + 34 || carry[0] != 0x7F ||
+                        memcmp(carry + 1, "FLAC", 4) != 0 || memcmp(carry + 9, "fLaC", 4) != 0) {
+                        snprintf(err, err_len, "not an Ogg FLAC stream (bad mapping header)");
+                        goto finish;
+                    }
+                    size_t p = 13;
+                    bool first_block = true;
+                    while (p + 4 <= carry_len) {
+                        uint8_t type = carry[p] & 0x7F;
+                        bool last = (carry[p] & 0x80) != 0;
+                        size_t len = ((size_t)carry[p + 1] << 16) | ((size_t)carry[p + 2] << 8) |
+                                     (size_t)carry[p + 3];
+                        if (p + 4 + len > carry_len) {
+                            snprintf(err, err_len,
+                                     "Ogg FLAC mapping header: metadata block overruns the packet");
+                            goto finish;
+                        }
+                        if (first_block && type != 0) {
+                            snprintf(err, err_len,
+                                     "Ogg FLAC: first metadata block is not a STREAMINFO");
+                            goto finish;
+                        }
+                        first_block = false;
+                        if (!gui_playback_ogg_collect_block(h, type, carry + p + 4, len, err, err_len)) {
+                            goto finish;
+                        }
+                        p += 4 + len;
+                        if (last) done = true;
+                        if (p >= carry_len || last) break;
+                    }
+                } else {
+                    // Subsequent header packets: one metadata block each.
+                    if (carry_len < 4) {
+                        snprintf(err, err_len, "Ogg FLAC: truncated metadata packet");
+                        goto finish;
+                    }
+                    uint8_t type = carry[0] & 0x7F;
+                    bool last = (carry[0] & 0x80) != 0;
+                    size_t len = ((size_t)carry[1] << 16) | ((size_t)carry[2] << 8) | (size_t)carry[3];
+                    if (4 + len != carry_len) {
+                        snprintf(err, err_len,
+                                 "Ogg FLAC: metadata packet length mismatch (header says %llu, packet holds %llu)",
+                                 (unsigned long long)len, (unsigned long long)(carry_len - 4));
+                        goto finish;
+                    }
+                    if (!gui_playback_ogg_collect_block(h, type, carry + 4, len, err, err_len)) {
+                        goto finish;
+                    }
+                    if (last) done = true;
+                }
+                packets_seen++;
+                carry_len = 0;
+            }
+        }
+        if (!done) {
+            snprintf(err, err_len,
+                     "Ogg FLAC header is incomplete (no last-metadata-block flag found)");
+            break;
+        }
+        if (carry_len != 0) {
+            snprintf(err, err_len,
+                     "Ogg FLAC audio data shares a page with the header packets (unsupported layout)");
+            break;
+        }
+        h->audio_offset = pg.offset + pg.page_len;
+        ok = true;
+    } while (0);
+
+finish:
+    free(carry);
+    free(pg.buf);
+    fclose(file);
+    if (!ok) {
+        gui_playback_ogg_header_cleanup(h);
+    }
+    return ok;
+}
+
+typedef enum {
+    PLAYBACK_OGG_BUF_PAGE_VALID,
+    PLAYBACK_OGG_BUF_PAGE_INVALID,
+    PLAYBACK_OGG_BUF_PAGE_INCOMPLETE,  // structurally sound; continues past the buffered range
+} playback_ogg_buf_page_status_t;
+
+// Validate one candidate page fully inside a byte buffer (used by the
+// streaming tail scan; the page bytes need not be page-aligned in the file).
+static playback_ogg_buf_page_status_t gui_playback_ogg_parse_page_in_buffer(
+    const uint8_t *p, size_t avail, size_t *out_page_len, uint64_t *out_granule,
+    uint32_t *out_serial) {
+    if (avail < PLAYBACK_OGG_PAGE_HEADER_BYTES) return PLAYBACK_OGG_BUF_PAGE_INCOMPLETE;
+    if (memcmp(p, "OggS", 4) != 0 || p[4] != 0) return PLAYBACK_OGG_BUF_PAGE_INVALID;
+    uint32_t nseg = p[26];
+    size_t seg_end = PLAYBACK_OGG_PAGE_HEADER_BYTES + (size_t)nseg;
+    if (seg_end > avail) return PLAYBACK_OGG_BUF_PAGE_INCOMPLETE;
+    uint64_t payload_len = 0;
+    for (uint32_t i = 0; i < nseg; i++) {
+        payload_len += p[PLAYBACK_OGG_PAGE_HEADER_BYTES + i];
+    }
+    uint64_t total = (uint64_t)seg_end + payload_len;
+    if (total > PLAYBACK_OGG_MAX_PAGE_BYTES) return PLAYBACK_OGG_BUF_PAGE_INVALID;
+    if (total > avail) return PLAYBACK_OGG_BUF_PAGE_INCOMPLETE;
+
+    // Verify the CRC over the in-buffer page with the field zeroed.
+    uint32_t stored = (uint32_t)p[22] | ((uint32_t)p[23] << 8) |
+                      ((uint32_t)p[24] << 16) | ((uint32_t)p[25] << 24);
+    uint32_t crc = 0;
+    crc = gui_playback_ogg_crc(crc, p, 22);
+    static const uint8_t zeros[4] = {0};
+    crc = gui_playback_ogg_crc(crc, zeros, 4);
+    crc = gui_playback_ogg_crc(crc, p + 26, total - 26);
+    if (crc != stored) return PLAYBACK_OGG_BUF_PAGE_INVALID;
+
+    *out_page_len = (size_t)total;
+    *out_granule = 0;
+    for (int k = 7; k >= 0; k--) {
+        *out_granule = (*out_granule << 8) | (uint64_t)p[6 + k];
+    }
+    *out_serial = (uint32_t)p[14] | ((uint32_t)p[15] << 8) |
+                  ((uint32_t)p[16] << 16) | ((uint32_t)p[17] << 24);
+    return PLAYBACK_OGG_BUF_PAGE_VALID;
+}
+
+// Byte-scan [start, end) for CRC-valid pages of `serial` with a granule,
+// reading in bounded chunks (the FLAC-Chop windowed scan kept whole windows
+// in memory; this form never holds more than a chunk + one page). Returns
+// true with the LAST such page's granule (the exact sample count of the
+// audio physically present - a truncated tail still yields the length of
+// the complete pages before it).
+static bool gui_playback_ogg_scan_window(const char *filepath, uint64_t start, uint64_t end,
+                                         uint32_t serial, uint64_t *out_granule) {
+    *out_granule = 0;
+    if (start >= end) return false;
+    FILE *file = file_open_read_utf8(filepath);
+    if (!file) return false;
+    size_t const cap = PLAYBACK_OGG_SCAN_CHUNK_BYTES + PLAYBACK_OGG_MAX_PAGE_BYTES;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    uint64_t best = 0;
+    bool found = false;
+    if (buf && gui_playback_file_seek_abs(file, start)) {
+        uint64_t base = start;  // file offset of buf[0]
+        size_t fill = 0;
+        while (base + fill < end) {
+            uint64_t left = end - (base + fill);
+            size_t want = left < (uint64_t)(cap - fill) ? (size_t)left : (cap - fill);
+            size_t got = fread(buf + fill, 1, want, file);
+            if (got == 0) break;
+            fill += got;
+
+            size_t i = 0;
+            while (i + PLAYBACK_OGG_PAGE_HEADER_BYTES <= fill) {
+                size_t page_len = 0;
+                uint64_t granule = 0;
+                uint32_t page_serial = 0;
+                playback_ogg_buf_page_status_t st = gui_playback_ogg_parse_page_in_buffer(
+                    buf + i, fill - i, &page_len, &granule, &page_serial);
+                if (st == PLAYBACK_OGG_BUF_PAGE_INCOMPLETE) break;  // keep as the carried tail
+                if (st == PLAYBACK_OGG_BUF_PAGE_VALID && base + i + page_len <= end) {
+                    if (page_serial == serial && granule != PLAYBACK_OGG_NO_GRANULE) {
+                        best = granule;
+                        found = true;
+                    }
+                    i += page_len;
+                } else {
+                    i++;
+                }
+            }
+            if (i < fill) {
+                memmove(buf, buf + i, fill - i);
+                fill -= i;
+            } else {
+                fill = 0;
+            }
+            base += i;
+        }
+    }
+    free(buf);
+    fclose(file);
+    if (found) *out_granule = best;
+    return found;
+}
+
+// Exact total sample count: the granule of the last CRC-valid FLAC-serial
+// page that carries one. Tail windows grow (the last page of a healthy
+// capture is in the first window); the final fallback scans the whole audio
+// span (full I/O, still bounded memory) for damaged captures.
+static bool gui_playback_ogg_last_granule(const char *filepath, const playback_ogg_header_t *h,
+                                         uint64_t file_size, uint64_t *out_granule) {
+    *out_granule = 0;
+    if (file_size <= h->audio_offset) return false;
+    static const uint64_t windows[3] = {
+        (uint64_t)256 << 10, (uint64_t)4 << 20, (uint64_t)64 << 20
+    };
+    for (int w = 0; w < 3; w++) {
+        uint64_t start = file_size > windows[w] ? file_size - windows[w] : 0;
+        if (start < h->audio_offset) break;
+        if (gui_playback_ogg_scan_window(filepath, start, file_size, h->serial, out_granule)) {
+            return true;
+        }
+    }
+    return gui_playback_ogg_scan_window(filepath, h->audio_offset, file_size, h->serial,
+                                        out_granule);
+}
+
+static bool gui_playback_stat_file_size(const char *filepath, uint64_t *out_size) {
+    if (!filepath || !out_size) return false;
+    FILE *file = file_open_read_utf8(filepath);
+    if (!file) return false;
+    bool ok = PLAYBACK_FSEEK(file, 0, SEEK_END) == 0 && gui_playback_file_tell(file, out_size);
+    fclose(file);
+    return ok;
+}
+
+// Remux the whole Ogg FLAC file into a standalone native FLAC at `dst`:
+// "fLaC" + the source STREAMINFO (total field patched from the copied frame
+// sum once known) + the VORBIS_COMMENT block, then every frame packet copied
+// verbatim - Ogg packets ARE FLAC frames and a whole-file remux starts at
+// frame 0, so no renumbering or CRC recompute is needed. Each packet's frame
+// header is validated (sync + CRC-8) like the FLAC-Chop demuxer, and the
+// block sizes sum to the exact sample count that is patched into the
+// header. The remux is streaming (one page buffer + one packet buffer).
+static bool gui_playback_ogg_remux(const char *src, uint64_t file_size,
+                                   const playback_ogg_header_t *h, const char *dst,
+                                   const atomic_bool *cancel, uint64_t *out_total_samples,
+                                   char *err, size_t err_len) {
+    *out_total_samples = 0;
+    if (err && err_len) err[0] = '\0';
+    FILE *in = file_open_read_utf8(src);
+    FILE *out = NULL;
+    playback_ogg_page_t pg = {.file = in};
+    uint8_t *packet = NULL;
+    bool ok = false;
+
+    do {
+        if (!in) {
+            snprintf(err, err_len, "open failed: %s", src);
+            break;
+        }
+        pg.file_size = file_size;
+        pg.buf = (uint8_t *)malloc(PLAYBACK_OGG_MAX_PAGE_BYTES);
+        packet = (uint8_t *)malloc(PLAYBACK_OGG_MAX_PACKET_BYTES);
+        if (!pg.buf || !packet) {
+            snprintf(err, err_len, "out of memory for the Ogg FLAC remux");
+            break;
+        }
+        if (!gui_playback_file_seek_abs(in, h->audio_offset)) {
+            snprintf(err, err_len, "seek failed: %s", src);
+            break;
+        }
+        // "w+b": the STREAMINFO total is patched in place afterwards, which
+        // needs read access (seek between the write and the read flushes).
+        out = file_open_utf8(dst, "w+b");
+        if (!out) {
+            snprintf(err, err_len, "cannot create %s", dst);
+            break;
+        }
+
+        // Native header: fLaC + STREAMINFO (+ VORBIS_COMMENT). The total
+        // field is zeroed now and patched from the frame sum at the end.
+        uint8_t si[34];
+        memcpy(si, h->streaminfo, sizeof(si));
+        uint64_t packed = 0;
+        for (int k = 0; k < 8; k++) {
+            packed = (packed << 8) | si[PLAYBACK_OGG_SI_PACKED_OFF + k];
+        }
+        packed &= ~PLAYBACK_OGG_SI_TOTAL_MASK;  // total = 0 (unknown) for now
+        for (int k = 0; k < 8; k++) {
+            si[PLAYBACK_OGG_SI_PACKED_OFF + k] = (uint8_t)(packed >> (56 - 8 * k));
+        }
+        bool last_block = !h->has_vorbis_comment;
+        uint8_t block_hdr[4] = {(uint8_t)(last_block ? 0x80u : 0x00u), 0, 0, 34};
+        if (fwrite("fLaC", 1, 4, out) != 4 || fwrite(block_hdr, 1, 4, out) != 4 ||
+            fwrite(si, 1, sizeof(si), out) != sizeof(si)) {
+            snprintf(err, err_len, "write failed: %s", dst);
+            break;
+        }
+        if (h->has_vorbis_comment) {
+            uint8_t vc_hdr[4] = {0x84, (uint8_t)(h->vorbis_comment_len >> 16),
+                                  (uint8_t)(h->vorbis_comment_len >> 8),
+                                  (uint8_t)h->vorbis_comment_len};
+            if (fwrite(vc_hdr, 1, 4, out) != 4 ||
+                fwrite(h->vorbis_comment, 1, h->vorbis_comment_len, out) != h->vorbis_comment_len) {
+                snprintf(err, err_len, "write failed: %s", dst);
+                break;
+            }
+        }
+
+        // Frames: copy packets verbatim, validating each frame header.
+        uint64_t sum = 0;
+        uint64_t frames = 0;
+        size_t carry_len = 0;
+        while (true) {
+            if (cancel && atomic_load(cancel)) {
+                snprintf(err, err_len, "cancelled");
+                goto remux_finish;
+            }
+            playback_ogg_page_status_t st = gui_playback_ogg_read_page(&pg);
+            if (st == PLAYBACK_OGG_PAGE_EOF) break;
+            if (st == PLAYBACK_OGG_PAGE_TRUNCATED || st == PLAYBACK_OGG_PAGE_BAD) {
+                // Stop at the damage: the pages before it are intact and form
+                // a complete FLAC prefix; the total reflects exactly what the
+                // temp holds (the honest playable length).
+                fprintf(stderr,
+                        "[PLAYBACK] Ogg FLAC remux stopped at %s page at offset %llu; "
+                        "keeping the intact prefix\n",
+                        st == PLAYBACK_OGG_PAGE_TRUNCATED ? "a truncated" : "a damaged",
+                        (unsigned long long)pg.offset);
+                break;
+            }
+            if (pg.serial != h->serial) continue;  // foreign logical stream
+            if (!(pg.header_type & 0x01) && carry_len != 0) carry_len = 0;
+            size_t pos = 0;
+            for (uint32_t s = 0; s < pg.nseg; s++) {
+                size_t seg = pg.segments[s];
+                if (carry_len + seg > PLAYBACK_OGG_MAX_PACKET_BYTES) {
+                    snprintf(err, err_len, "Ogg FLAC: frame packet too large");
+                    goto remux_finish;
+                }
+                memcpy(packet + carry_len, pg.payload + pos, seg);
+                carry_len += seg;
+                pos += seg;
+                if (pg.segments[s] == 255) continue;
+
+                uint16_t block_size = 0;
+                size_t header_len = 0;
+                uint64_t number = 0;
+                bool variable = false;
+                if (!gui_playback_parse_frame_header(packet, carry_len, &block_size,
+                                                     &header_len, &number, &variable)) {
+                    snprintf(err, err_len,
+                             "Ogg packet at offset %llu is not a valid FLAC frame (bad sync / header CRC-8)",
+                             (unsigned long long)pg.offset);
+                    goto remux_finish;
+                }
+                if (frames == 0 && number != 0) {
+                    // Whole-file remux assumes stream-position frame numbers;
+                    // a mid-stream starting file still plays sequentially.
+                    fprintf(stderr,
+                            "[PLAYBACK] Ogg FLAC: first frame number is %llu (not 0); "
+                            "seeking may be offset on this capture\n",
+                            (unsigned long long)number);
+                }
+                if (fwrite(packet, 1, carry_len, out) != carry_len) {
+                    snprintf(err, err_len, "write failed: %s", dst);
+                    goto remux_finish;
+                }
+                sum += block_size;
+                frames++;
+                carry_len = 0;
+            }
+        }
+        if (frames == 0) {
+            snprintf(err, err_len, "Ogg FLAC stream holds no audio frames");
+            break;
+        }
+        if (fflush(out) != 0) {
+            snprintf(err, err_len, "write failed: %s", dst);
+            break;
+        }
+        // Patch the STREAMINFO total (36-bit field; 0 = unknown when the sum
+        // cannot fit - the file info keeps the exact 64-bit sum).
+        uint64_t field = sum < PLAYBACK_IO_SI_TOTAL_MOD ? sum : 0;
+        uint8_t word[8];
+        if (!gui_playback_file_seek_abs(out, PLAYBACK_IO_SI_TOTAL_OFF) ||
+            fread(word, 1, 8, out) != 8) {
+            snprintf(err, err_len, "cannot patch the remux STREAMINFO total");
+            break;
+        }
+        packed = 0;
+        for (int k = 0; k < 8; k++) {
+            packed = (packed << 8) | word[k];
+        }
+        packed = (packed & ~PLAYBACK_OGG_SI_TOTAL_MASK) | (field & PLAYBACK_OGG_SI_TOTAL_MASK);
+        for (int k = 0; k < 8; k++) {
+            word[k] = (uint8_t)(packed >> (56 - 8 * k));
+        }
+        if (!gui_playback_file_seek_abs(out, PLAYBACK_IO_SI_TOTAL_OFF) ||
+            fwrite(word, 1, 8, out) != 8 || fflush(out) != 0) {
+            snprintf(err, err_len, "cannot patch the remux STREAMINFO total");
+            break;
+        }
+        *out_total_samples = sum;
+        ok = true;
+    } while (0);
+
+remux_finish:
+    if (out) fclose(out);
+    free(packet);
+    free(pg.buf);
+    if (in) fclose(in);
+    return ok;
+}
+
+static const char *gui_playback_input_format_name(playback_input_format_t fmt) {
+    switch (fmt) {
+        case PLAYBACK_INPUT_FLAC: return "flac";
+        case PLAYBACK_INPUT_OGG_FLAC: return "ogg-flac";
+        case PLAYBACK_INPUT_WAV: return "wav";
+        case PLAYBACK_INPUT_U8: return "u8";
+        case PLAYBACK_INPUT_S8: return "s8";
+        case PLAYBACK_INPUT_U16: return "u16";
+        case PLAYBACK_INPUT_S16: return "s16";
+        case PLAYBACK_INPUT_LDS: return "lds";
+        default: return "?";
+    }
+}
+
+// Probe an Ogg FLAC file for validation (no remux, no whole-file work): the
+// mapping header gives rate/bits/channels and the RF tags, and the last
+// CRC-valid page's granule position gives the EXACT 64-bit sample count -
+// correct even when a piped ffmpeg writer left STREAMINFO total_samples = 0
+// (the real-world .ldf case). Cheap: header pages plus a bounded tail scan.
+static bool gui_playback_ogg_probe(playback_file_info_t *info, const char *filepath,
+                                   char *err, size_t err_len) {
+    if (!info) return false;
+    playback_ogg_header_t h;
+    if (!gui_playback_ogg_read_header(filepath, &h, err, err_len)) {
+        snprintf(info->error, sizeof(info->error), "%s", err ? err : "unreadable Ogg FLAC");
+        return false;
+    }
+    // STREAMINFO payload: min/max block (4) + min/max frame (6) + the packed
+    // 64-bit word (rate 20 bits, channels-1 3, bps-1 5, total 36) + MD5 (16).
+    uint64_t packed = 0;
+    for (int k = 0; k < 8; k++) {
+        packed = (packed << 8) | h.streaminfo[PLAYBACK_OGG_SI_PACKED_OFF + k];
+    }
+    uint32_t rate = (uint32_t)(packed >> 44);
+    uint32_t channels = (uint32_t)((packed >> 41) & 0x7u) + 1;
+    uint32_t bits = (uint32_t)((packed >> 36) & 0x1Fu) + 1;
+    uint64_t declared = packed & PLAYBACK_OGG_SI_TOTAL_MASK;
+
+    uint64_t file_size = 0;
+    uint64_t granule = 0;
+    bool have_granule = gui_playback_stat_file_size(filepath, &file_size) &&
+                        gui_playback_ogg_last_granule(filepath, &h, file_size, &granule);
+
+    info->format = PLAYBACK_INPUT_OGG_FLAC;
+    info->sample_rate = rate;
+    info->bits_per_sample = (uint8_t)bits;
+    info->header_total_samples = declared;  // the raw source STREAMINFO total
+    info->total_samples = have_granule ? granule : declared;
+    info->real_sample_rate_hz =
+        gui_playback_resolve_real_rate_hz(filepath, rate, h.has_tags ? &h.tags : NULL);
+    info->duration_seconds = info->real_sample_rate_hz > 0.0 && info->total_samples > 0
+        ? (double)info->total_samples / info->real_sample_rate_hz : 0.0;
+    if (channels != 1) {
+        snprintf(info->error, sizeof(info->error),
+                 "Ogg FLAC has %u channels (expected mono - one playback file per RF channel)",
+                 channels);
+        info->valid = false;
+    } else {
+        info->valid = true;
+    }
+    gui_playback_ogg_header_cleanup(&h);
+    return true;  // the info carries the verdict (mono check) like the FLAC probe
+}
+
+// Build the session temp path for an Ogg-FLAC remux (per process + channel;
+// a previous session's temp was unlinked on release, so no collision).
+static bool gui_playback_temp_path(char *out, size_t out_len, int channel) {
+#if defined(_WIN32) || defined(_WIN64)
+    /* The temp path must be UTF-8 like every other path in the file pipeline
+     * (the remux temp is created and removed through the UTF-8 file helpers),
+     * so a non-ASCII TEMP directory has to round-trip via the wide API. */
+    wchar_t wide_dir[MAX_PATH + 1];
+    DWORD n = GetTempPathW(sizeof(wide_dir) / sizeof(*wide_dir), wide_dir);
+    if (n == 0 || n >= sizeof(wide_dir) / sizeof(*wide_dir)) return false;
+    char dir[MAX_PATH * 3 + 1];
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_dir, -1,
+                                    dir, sizeof(dir), NULL, NULL);
+    if (bytes <= 0) return false;
+    dir[bytes - 1] = '\0';  /* drop the converted terminator for concatenation */
+    int w = snprintf(out, out_len, "%smisrc_playback_ogg_%lu_%d.flac",
+                     dir, (unsigned long)GetCurrentProcessId(), channel);
+#else
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !dir[0]) dir = getenv("TMP");
+    if (!dir || !dir[0]) dir = getenv("TEMP");
+    if (!dir || !dir[0]) dir = "/tmp";
+    int w = snprintf(out, out_len, "%s/misrc_playback_ogg_%d_%d.flac",
+                     dir, (int)getpid(), channel);
+#endif
+    return w > 0 && (size_t)w < out_len;
 }
 
 static uint64_t gui_playback_clock_us(void);
@@ -1972,19 +3461,37 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
         debug_count_a++;
     }
 
-    // FLAC returns samples as int32 with the full bit depth.
-    // Recorder conventions (gui_record.c):
-    //   16-bit FLAC: 12-bit ADC container << 4 (range -32768 to 32752)
-    //   12-bit FLAC: 12-bit ADC container as-is (range -2048 to 2047)
-    //   8-bit FLAC:  12-bit ADC container >> 4 (range -128 to 127)
-    // Playback restores the 12-bit container for EVERY depth so the raw
-    // packing, extraction ((2047 - field) << 4 into the 16-bit display
-    // container), VU meters, peaks and clipping all match the live capture
-    // preview 1:1 (verified against the recorder's own scaling code).
+    // FLAC returns samples as int32 with the full bit depth. The 12-bit
+    // display container (raw packing, extraction ((2047 - field) << 4), VU
+    // meters, peaks and clipping) matches the live capture preview 1:1 for
+    // recorder files. 16-bit files now carry TWO real-world conventions
+    // (measured on real captures): the recorder's 12-bit container << 4
+    // (every sample on a 16-grid) AND generic tools writing the sample
+    // values DIRECTLY (a 20000 Hz tape FLAC with +-2190 peaks, 93.8%
+    // non-multiples of 16). A blanket >> 4 crushed the second kind to 1/16
+    // amplitude - the waveform-playback accuracy bug - so the convention
+    // is detected from the first non-silent frame and is sticky per
+    // channel per file (see gui_playback_decide_conv16):
+    //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore; direct-
+    //               domain values -> pass through; full-range generic ->
+    //               >> 4 display downscale
+    //   12-bit FLAC: 12-bit container as-is (range -2048 to 2047)
+    //   8-bit FLAC:  12-bit container >> 4 -> << 4 restore (also the correct
+    //               display scaling for generic full-range 8-bit audio)
     if (bps == 16) {
-        // 16-bit FLAC: shift right 4 to get back to 12-bit range
-        for (uint32_t i = 0; i < samples; i++) {
-            out[i] = (int16_t)(in[i] >> 4);
+        gui_playback_decide_conv16(&ctx->conv16_state[0], in, samples);
+        if (ctx->conv16_state[0] == PLAYBACK_CONV16_PASS) {
+            // Direct-domain values: pass through unchanged (encode_raw_sample
+            // clamps into the raw 12-bit packing domain downstream).
+            for (uint32_t i = 0; i < samples; i++) {
+                out[i] = (int16_t)in[i];
+            }
+        } else {
+            // Recorder << 4 restore, or a full-range generic file scaled
+            // down into the 12-bit display container: both >> 4.
+            for (uint32_t i = 0; i < samples; i++) {
+                out[i] = (int16_t)(in[i] >> 4);
+            }
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -2045,12 +3552,19 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
         debug_count_b++;
     }
 
-    // Same conversion as Channel A - restore the 12-bit container for every
-    // depth so the display matches the live capture preview 1:1.
+    // Same convention detection as Channel A (see the write-callback note
+    // there): restore the 12-bit container for recorder files, pass direct-
+    // domain 16-bit values through, downscale full-range generic 16-bit.
     if (bps == 16) {
-        // 16-bit FLAC: shift right 4 to get back to 12-bit range
-        for (uint32_t i = 0; i < samples; i++) {
-            out[i] = (int16_t)(in[i] >> 4);
+        gui_playback_decide_conv16(&ctx->conv16_state[1], in, samples);
+        if (ctx->conv16_state[1] == PLAYBACK_CONV16_PASS) {
+            for (uint32_t i = 0; i < samples; i++) {
+                out[i] = (int16_t)in[i];
+            }
+        } else {
+            for (uint32_t i = 0; i < samples; i++) {
+                out[i] = (int16_t)(in[i] >> 4);
+            }
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -2186,6 +3700,48 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
     strcpy(info->filepath, filepath);
 
 #if LIBFLAC_ENABLED == 1
+    // Sniff the container first (content, then extension for headerless raw
+    // PCM): native FLAC keeps the metadata-API probe below; Ogg FLAC, WAV and
+    // the raw formats have their own probes. Unsupported containers get a
+    // specific, actionable error instead of a FLAC parse failure.
+    {
+        char probe_err[192] = {0};
+        playback_input_format_t fmt = PLAYBACK_INPUT_FLAC;
+        uint8_t magic[4] = {0};
+        if (!gui_playback_sniff_format(filepath, &fmt, magic, probe_err, sizeof(probe_err))) {
+            snprintf(info->error, sizeof(info->error), "%s", probe_err);
+            fprintf(stderr, "[PLAYBACK] %s (%s)\n", probe_err, filepath);
+            return false;
+        }
+        info->format = (int)fmt;
+        if (fmt != PLAYBACK_INPUT_FLAC) {
+            if (fmt == PLAYBACK_INPUT_OGG_FLAC) {
+                if (!gui_playback_ogg_probe(info, filepath, probe_err, sizeof(probe_err))) {
+                    fprintf(stderr, "[PLAYBACK] %s (%s)\n",
+                            info->error[0] ? info->error : probe_err, filepath);
+                    return false;
+                }
+            } else {
+                playback_raw_reader_t r;
+                if (!gui_playback_raw_open(&r, info, filepath, fmt, probe_err, sizeof(probe_err))) {
+                    fprintf(stderr, "[PLAYBACK] %s (%s)\n",
+                            info->error[0] ? info->error : probe_err, filepath);
+                    return false;
+                }
+                if (r.file) {
+                    fclose(r.file);
+                    r.file = NULL;
+                }
+            }
+            fprintf(stderr,
+                    "[PLAYBACK] Validate: format=%s, total=%" PRIu64
+                    " (real_rate=%.0fHz, %.2f sec)\n",
+                    gui_playback_input_format_name((playback_input_format_t)info->format),
+                    info->total_samples, info->real_sample_rate_hz, info->duration_seconds);
+            return info->valid;
+        }
+    }
+
     // Use FLAC metadata API to read stream info without full decode
     // FLAC__metadata_get_streaminfo fills in an existing struct
     FLAC__StreamMetadata metadata;
@@ -2417,15 +3973,30 @@ static int playback_thread_func(void *ctx_ptr) {
                 if (window < RAW_BUFFER_SAMPLES) window = RAW_BUFFER_SAMPLES;
                 seek_target = target > window ? target - window : 0;
             }
-            // Validate the requested playhead before seeking its backfill
-            // window: a provisional endpoint can exceed the real stream.
-            if ((paused && seek_target != target && !gui_playback_seek_decoder(ctx,0,target)) ||
-                !gui_playback_seek_decoder(ctx,0,seek_target)) {
+            bool seek_ok;
+            if (ctx->input_is_raw[0]) {
+                // Raw readers position exactly at the target sample (the raw
+                // analogue of the FLAC seek attempt's exact-target slice;
+                // totals are exact so no provisional-endpoint validation).
+                seek_ok = gui_playback_raw_seek(ctx, 0, seek_target);
+                if (seek_ok) {
+                    ctx->decode_available_a = 0;
+                    ctx->decode_pos_a = 0;
+                }
+            } else {
+                // Validate the requested playhead before seeking its backfill
+                // window: a provisional endpoint can exceed the real stream.
+                seek_ok = !((paused && seek_target != target &&
+                             !gui_playback_seek_decoder(ctx, 0, target)) ||
+                            !gui_playback_seek_decoder(ctx, 0, seek_target));
+            }
+            if (!seek_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel A seek failed at sample %llu\n",(unsigned long long)target);
                 if (ctx->seek_recovery_failed[0]) atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED);
                 deadline_us = 0; continue;
             }
 #endif
+            fprintf(stderr, "[DBGA] seek store %llu (state=%d)\n", (unsigned long long)seek_target, (int)atomic_load(&ctx->state));
             atomic_store(&ctx->current_sample_a, seek_target);
             atomic_fetch_add(&ctx->seek_seq_a, 1);
             ctx->backfill_active_a = paused;
@@ -2456,8 +4027,19 @@ static int playback_thread_func(void *ctx_ptr) {
                 if (window < RAW_BUFFER_SAMPLES) window = RAW_BUFFER_SAMPLES;
                 seek_target = target > window ? target - window : 0;
             }
-            if ((paused && seek_target != target && !gui_playback_seek_decoder(ctx,1,target)) ||
-                !gui_playback_seek_decoder(ctx,1,seek_target)) {
+            bool seek_ok;
+            if (ctx->input_is_raw[1]) {
+                seek_ok = gui_playback_raw_seek(ctx, 1, seek_target);
+                if (seek_ok) {
+                    ctx->decode_available_b = 0;
+                    ctx->decode_pos_b = 0;
+                }
+            } else {
+                seek_ok = !((paused && seek_target != target &&
+                             !gui_playback_seek_decoder(ctx, 1, target)) ||
+                            !gui_playback_seek_decoder(ctx, 1, seek_target));
+            }
+            if (!seek_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel B seek failed at sample %llu\n",(unsigned long long)target);
                 if (ctx->seek_recovery_failed[1]) atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED);
                 deadline_us = 0; continue;
@@ -2527,6 +4109,19 @@ static int playback_thread_func(void *ctx_ptr) {
             }
         }
 
+        // Raw readers (u8/s8/u16/s16/.lds/WAV): convert bytes straight into
+        // the decode buffer; these channels have no libFLAC decoder. Reads
+        // stop exactly at the size-derived total (the exact audio span).
+        if (channel_a_active && ctx->input_is_raw[0]) {
+            while (ctx->decode_available_a - ctx->decode_pos_a < RAW_BUFFER_SAMPLES) {
+                size_t space = ctx->decode_buf_size - ctx->decode_available_a;
+                size_t got = gui_playback_raw_read(ctx, 0,
+                                                   ctx->decode_buf_a + ctx->decode_available_a, space);
+                ctx->decode_available_a += got;
+                if (got == 0) break;
+            }
+        }
+
         // Decode channel B
         while (channel_b_active && ctx->decoder_b && ctx->decode_available_b - ctx->decode_pos_b < RAW_BUFFER_SAMPLES) {
             if (FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM) {
@@ -2534,6 +4129,16 @@ static int playback_thread_func(void *ctx_ptr) {
             }
             if (!FLAC__stream_decoder_process_single(ctx->decoder_b)) {
                 break;
+            }
+        }
+
+        if (channel_b_active && ctx->input_is_raw[1]) {
+            while (ctx->decode_available_b - ctx->decode_pos_b < RAW_BUFFER_SAMPLES) {
+                size_t space = ctx->decode_buf_size - ctx->decode_available_b;
+                size_t got = gui_playback_raw_read(ctx, 1,
+                                                   ctx->decode_buf_b + ctx->decode_available_b, space);
+                ctx->decode_available_b += got;
+                if (got == 0) break;
             }
         }
 #endif
@@ -2545,10 +4150,16 @@ static int playback_thread_func(void *ctx_ptr) {
 
         // Check for EOF on each channel independently and loop each one
 #if LIBFLAC_ENABLED == 1
-        bool eof_a = channel_a_active && (ctx->decoder_a != NULL) && (avail_a == 0 &&
-                      FLAC__stream_decoder_get_state(ctx->decoder_a) == FLAC__STREAM_DECODER_END_OF_STREAM);
-        bool eof_b = channel_b_active && (ctx->decoder_b != NULL) && (avail_b == 0 &&
-                      FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM);
+        // Raw channels end when their reader consumed the exact size-derived
+        // total; FLAC channels when the decoder reached end-of-stream.
+        bool eof_a = channel_a_active && avail_a == 0 &&
+                      ((ctx->input_is_raw[0] && gui_playback_raw_eof(ctx, 0)) ||
+                       (ctx->decoder_a != NULL &&
+                        FLAC__stream_decoder_get_state(ctx->decoder_a) == FLAC__STREAM_DECODER_END_OF_STREAM));
+        bool eof_b = channel_b_active && avail_b == 0 &&
+                      ((ctx->input_is_raw[1] && gui_playback_raw_eof(ctx, 1)) ||
+                       (ctx->decoder_b != NULL &&
+                        FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM));
 
         if ((eof_a || eof_b) && paused_output) {
             // EOF terminates a paused analysis backfill; it must not loop.
@@ -2564,10 +4175,17 @@ static int playback_thread_func(void *ctx_ptr) {
         // Loop channel A independently
         if (eof_a) {
             fprintf(stderr, "[PLAYBACK] Channel A EOF, looping\n");
-            if (!gui_playback_seek_decoder(ctx,0,0)) {
+            bool loop_ok = ctx->input_is_raw[0] ? gui_playback_raw_seek(ctx, 0, 0)
+                                                : gui_playback_seek_decoder(ctx, 0, 0);
+            if (loop_ok && ctx->input_is_raw[0]) {
+                ctx->decode_available_a = 0;
+                ctx->decode_pos_a = 0;
+            }
+            if (!loop_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel A loop seek failed\n");
                 atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); continue;
             }
+            fprintf(stderr, "[DBGA] loop store 0\n");
             atomic_store(&ctx->current_sample_a, 0);
             epochs[0] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
             deadline_us = 0;
@@ -2577,7 +4195,13 @@ static int playback_thread_func(void *ctx_ptr) {
         // file end just stops the backfill instead of looping).
         if (eof_b) {
             fprintf(stderr, "[PLAYBACK] Channel B EOF, looping\n");
-            if (!gui_playback_seek_decoder(ctx,1,0)) {
+            bool loop_ok = ctx->input_is_raw[1] ? gui_playback_raw_seek(ctx, 1, 0)
+                                                : gui_playback_seek_decoder(ctx, 1, 0);
+            if (loop_ok && ctx->input_is_raw[1]) {
+                ctx->decode_available_b = 0;
+                ctx->decode_pos_b = 0;
+            }
+            if (!loop_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel B loop seek failed\n");
                 atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); continue;
             }
@@ -2685,6 +4309,7 @@ static int playback_thread_func(void *ctx_ptr) {
         // newly published length must not turn an EOF position into zero.
         if (channel_a_active) {
             uint64_t next_a = atomic_load(&ctx->current_sample_a) + (uint64_t)samples_to_output;
+            fprintf(stderr, "[DBGA] output store %llu (state=%d)\n", (unsigned long long)next_a, (int)atomic_load(&ctx->state));
             atomic_store(&ctx->current_sample_a, next_a);
         }
         if (channel_b_active) {
@@ -2916,6 +4541,21 @@ static void gui_playback_release_context(playback_ctx_t *ctx) {
     ctx->file_a = NULL; ctx->file_b = NULL;
     free(ctx->decode_buf_a); free(ctx->decode_buf_b);
     ctx->decode_buf_a = NULL; ctx->decode_buf_b = NULL;
+    // Raw-reader + Ogg-remux session state: the FILE handles were closed above
+    // via file_a/file_b. Drop the reader state and unlink any session temp
+    // remux (decode_path equals the original path for every on-disk format,
+    // so nothing is removed for FLAC/raw channels).
+    for (int ch = 0; ch < 2; ch++) {
+        if (ctx->decode_path_temp[ch] && ctx->decode_path[ch][0]) {
+            file_remove_utf8(ctx->decode_path[ch]);
+        }
+        ctx->decode_path[ch][0] = '\0';
+        ctx->decode_path_temp[ch] = false;
+        ctx->input_is_raw[ch] = false;
+        ctx->input_format[ch] = PLAYBACK_INPUT_FLAC;
+        ctx->conv16_state[ch] = PLAYBACK_CONV16_PENDING;
+        memset(&ctx->raw[ch], 0, sizeof(ctx->raw[ch]));
+    }
     atomic_store(&ctx->running, false);
     atomic_store(&ctx->state, PLAYBACK_STATE_STOPPED);
 }
@@ -2947,10 +4587,184 @@ static bool gui_playback_loaded_file_matches(playback_ctx_t *ctx, int channel) {
     // the index, but must not prevent a usable already-open decoder playing.
     if (!ctx->loaded_key_valid[channel]) return true;
     if (!gui_playback_length_cache_matches_open_file(file, &ctx->loaded_key[channel])) return false;
-    if (!gui_playback_length_cache_snapshot(info->filepath, &path_key)) return true;
+    // Identity is checked in the DECODE domain (the Ogg-FLAC session remux),
+    // which is what the loaded key was fingerprinted from; every on-disk
+    // native format keeps decode_path == the info filepath, so behavior is
+    // unchanged for FLAC/raw channels.
+    const char *decode = ctx->decode_path[channel][0] ? ctx->decode_path[channel] : info->filepath;
+    if (!gui_playback_length_cache_snapshot(decode, &path_key)) return true;
     return gui_playback_length_cache_keys_equal(&path_key, &ctx->loaded_key[channel]);
 }
 #endif
+
+// Open + init the libFLAC decoder for one channel against a native FLAC path
+// (the original file, or the Ogg-FLAC session remux): the IO layer stages the
+// STREAMINFO patch, and the metadata pass fills the file info header fields.
+// Identical operation order to the previous inline prepare path.
+static bool gui_playback_open_native_flac(playback_ctx_t *ctx, int channel, const char *path,
+                                          const atomic_bool *cancel, char *err, size_t err_len) {
+    bool channel_b = channel == 1;
+    FILE **file = channel_b ? &ctx->file_b : &ctx->file_a;
+    FLAC__StreamDecoder **decoder = channel_b ? &ctx->decoder_b : &ctx->decoder_a;
+    playback_io_t *io = channel_b ? &ctx->io_b : &ctx->io_a;
+    playback_file_info_t *info = channel_b ? &ctx->info_b : &ctx->info_a;
+    playback_streaminfo_aux_t *stream = channel_b ? &ctx->stream_b : &ctx->stream_a;
+    gui_playback_length_cache_key_t *loaded_key = &ctx->loaded_key[channel];
+    bool *loaded_key_valid = &ctx->loaded_key_valid[channel];
+
+    if (err && err_len) err[0] = '\0';
+    *file = file_open_read_utf8(path);
+    if (!*file) {
+        snprintf(err, err_len, "open failed: %s", path);
+        return false;
+    }
+    if (gui_playback_length_cache_snapshot(path, loaded_key)) {
+        if (!gui_playback_length_cache_matches_open_file(*file, loaded_key)) {
+            snprintf(err, err_len, "file changed while loading: %s", path);
+            return false;
+        }
+        *loaded_key_valid = true;
+    }
+
+    *decoder = FLAC__stream_decoder_new();
+    if (!*decoder) {
+        snprintf(err, err_len, "failed to create the decoder");
+        return false;
+    }
+
+    FLAC__stream_decoder_set_md5_checking(*decoder, false);
+
+    // Unknown STREAMINFO total removes finalized RF/provisional endpoint
+    // clamps while the UI independently tracks the resolved true length.
+    gui_playback_io_reset(io, *file, ctx, PLAYBACK_IO_SI_TOTAL_MOD);
+    io->cancel = cancel;
+    FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_stream(
+        *decoder,
+        gui_playback_io_read_cb,
+        gui_playback_io_seek_cb,
+        gui_playback_io_tell_cb,
+        gui_playback_io_length_cb,
+        gui_playback_io_eof_cb,
+        channel_b ? decoder_io_write_cb_b : decoder_io_write_cb_a,
+        channel_b ? decoder_io_metadata_cb_b : decoder_io_metadata_cb_a,
+        decoder_error_cb,
+        io
+    );
+
+    if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        snprintf(err, err_len, "failed to init decoder: %s",
+                 FLAC__StreamDecoderInitStatusString[status]);
+        return false;
+    }
+
+    // Process metadata to get file info
+    if (!FLAC__stream_decoder_process_until_end_of_metadata(*decoder) || !info->valid) {
+        snprintf(err, err_len, "not a valid FLAC stream (unreadable metadata)");
+        return false;
+    }
+    if (stream->channels != 1) {
+        snprintf(err, err_len, "FLAC has %u channels (expected mono)", stream->channels);
+        return false;
+    }
+    if (cancel && atomic_load(cancel)) {
+        snprintf(err, err_len, "cancelled");
+        return false;
+    }
+    return true;
+}
+
+// Raw / WAV / .lds channel preparation: open the sample reader and publish
+// its resolved metadata (rate, exact total). No libFLAC decoder exists for
+// this channel; the playback thread's raw branches drive the reader.
+static bool gui_playback_prepare_raw(playback_ctx_t *ctx, int channel, const char *filepath,
+                                     playback_input_format_t fmt, char *err, size_t err_len) {
+    playback_raw_reader_t *r = &ctx->raw[channel];
+    playback_file_info_t *info = channel ? &ctx->info_b : &ctx->info_a;
+    if (err && err_len) err[0] = '\0';
+    if (!gui_playback_raw_open(r, info, filepath, fmt, err, err_len)) {
+        if (err && err[0]) {
+            snprintf(info->error, sizeof(info->error), "%s", err);
+        }
+        return false;
+    }
+    if (channel) ctx->file_b = r->file;
+    else ctx->file_a = r->file;
+    ctx->input_is_raw[channel] = true;
+    ctx->channel_rate_hz[channel] = info->real_sample_rate_hz;
+    fprintf(stderr,
+            "[PLAYBACK] File %c (%s): header rate=%u Hz, %u-bit, total=%" PRIu64
+            " (real_rate=%.0fHz, %.2f sec)\n",
+            channel ? 'B' : 'A', gui_playback_input_format_name(fmt),
+            info->sample_rate, info->bits_per_sample, info->total_samples,
+            info->real_sample_rate_hz, info->duration_seconds);
+    return true;
+}
+
+// Ogg FLAC channel preparation: remux the whole file into a session temp
+// native FLAC, then run the ordinary native-FLAC open path on the temp (the
+// existing machinery - IO-layer seeks, the length resolution, the paused
+// analysis decoders - then works on it unchanged). The temp path is
+// registered BEFORE the remux writes, so any failure path unlinks the
+// partial file on release; the exact length is the copied-frame sum (the
+// last-page granule only cross-checks - it describes the source, the sum
+// describes exactly what the temp holds).
+static bool gui_playback_prepare_ogg(playback_ctx_t *ctx, int channel, const char *filepath,
+                                     const atomic_bool *cancel, char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    playback_ogg_header_t h;
+    if (!gui_playback_ogg_read_header(filepath, &h, err, err_len)) {
+        return false;
+    }
+    bool ok = false;
+    uint64_t file_size = 0;
+    uint64_t granule = 0;
+    uint64_t sum = 0;
+    do {
+        if (!gui_playback_stat_file_size(filepath, &file_size)) {
+            snprintf(err, err_len, "stat failed: %s", filepath);
+            break;
+        }
+        bool have_granule = gui_playback_ogg_last_granule(filepath, &h, file_size, &granule);
+        if (!gui_playback_temp_path(ctx->decode_path[channel],
+                                    sizeof(ctx->decode_path[channel]), channel)) {
+            snprintf(err, err_len, "cannot build a temp path for the Ogg FLAC remux");
+            break;
+        }
+        ctx->decode_path_temp[channel] = true;
+        if (!gui_playback_ogg_remux(filepath, file_size, &h, ctx->decode_path[channel],
+                                   cancel, &sum, err, err_len)) {
+            break;
+        }
+        if (have_granule && granule != sum) {
+            fprintf(stderr,
+                    "[PLAYBACK] Ogg FLAC: last-page granule (%" PRIu64
+                    ") differs from the copied frames (%" PRIu64 " samples); using the copied frames\n",
+                    granule, sum);
+        }
+        if (!gui_playback_open_native_flac(ctx, channel, ctx->decode_path[channel],
+                                           cancel, err, err_len)) {
+            break;
+        }
+        playback_file_info_t *info = channel ? &ctx->info_b : &ctx->info_a;
+        info->format = PLAYBACK_INPUT_OGG_FLAC;
+        info->total_samples = sum;  // the remux is the authority (its STREAMINFO
+                                    // total already holds the sum when it fits)
+        double real_rate = gui_playback_resolve_real_rate_hz(
+            filepath, info->sample_rate, h.has_tags ? &h.tags : NULL);
+        info->real_sample_rate_hz = real_rate > 0.0 ? real_rate : 0.0;
+        info->duration_seconds = info->real_sample_rate_hz > 0.0
+            ? (double)sum / info->real_sample_rate_hz : 0.0;
+        ctx->channel_rate_hz[channel] = info->real_sample_rate_hz;
+        fprintf(stderr,
+                "[PLAYBACK] File %c (Ogg FLAC remux): header rate=%u Hz, %u-bit, total=%" PRIu64
+                " (real_rate=%.0fHz, %.2f sec)\n",
+                channel ? 'B' : 'A', info->sample_rate, info->bits_per_sample, sum,
+                info->real_sample_rate_hz, info->duration_seconds);
+        ok = true;
+    } while (0);
+    gui_playback_ogg_header_cleanup(&h);
+    return ok;
+}
 
 static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
                                 const char *file_a, const char *file_b,
@@ -2978,59 +4792,54 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
         return -1;
     }
 
-    // Open and initialize decoders
+    // Open and initialize the per-channel readers/decoders
     if (file_a) {
         if (file_a != ctx->info_a.filepath)
             snprintf(ctx->info_a.filepath, sizeof(ctx->info_a.filepath), "%s", file_a);
 
-        ctx->file_a = file_open_read_utf8(file_a);
-        if (!ctx->file_a) {
-            fprintf(stderr, "[PLAYBACK] Failed to open file A: %s\n", file_a);
+        // Sniff the container (content first, then the raw extensions):
+        // native FLAC keeps the libFLAC path verbatim; Ogg FLAC remuxes to a
+        // session temp native FLAC; the raw formats open the sample readers
+        // with no decoder at all. Unsupported containers fail with the
+        // sniffer's specific message instead of a FLAC parse failure.
+        char open_err[192] = {0};
+        playback_input_format_t fmt = PLAYBACK_INPUT_FLAC;
+        uint8_t magic[4] = {0};
+        if (!gui_playback_sniff_format(file_a, &fmt, magic, open_err, sizeof(open_err))) {
+            fprintf(stderr, "[PLAYBACK] Channel A rejected: %s (%s)\n", open_err, file_a);
+            snprintf(ctx->info_a.error, sizeof(ctx->info_a.error), "%s", open_err);
             return -1;
         }
-        if (gui_playback_length_cache_snapshot(file_a, &ctx->loaded_key[0])) {
-            if (!gui_playback_length_cache_matches_open_file(ctx->file_a, &ctx->loaded_key[0])) return -1;
-            ctx->loaded_key_valid[0] = true;
+        ctx->input_format[0] = (int)fmt;
+        ctx->info_a.format = (int)fmt;
+        snprintf(ctx->decode_path[0], sizeof(ctx->decode_path[0]), "%s", file_a);
+
+        if (fmt == PLAYBACK_INPUT_OGG_FLAC) {
+            if (!gui_playback_prepare_ogg(ctx, 0, file_a, cancel, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel A (Ogg FLAC): %s (%s)\n", open_err, file_a);
+                snprintf(ctx->info_a.error, sizeof(ctx->info_a.error), "%s", open_err);
+                return -1;
+            }
+        } else if (fmt != PLAYBACK_INPUT_FLAC) {
+            if (!gui_playback_prepare_raw(ctx, 0, file_a, fmt, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel A (%s): %s (%s)\n",
+                        gui_playback_input_format_name(fmt), open_err, file_a);
+                snprintf(ctx->info_a.error, sizeof(ctx->info_a.error), "%s", open_err);
+                return -1;
+            }
+        } else {
+            // Native FLAC (fLaC magic): the original decoder path, unchanged
+            // behavior through the shared open helper + length resolution.
+            if (!gui_playback_open_native_flac(ctx, 0, file_a, cancel, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel A: %s (%s)\n", open_err, file_a);
+                snprintf(ctx->info_a.error, sizeof(ctx->info_a.error), "%s", open_err);
+                return -1;
+            }
+            if (cancel && atomic_load(cancel)) return -1;
+            ctx->channel_rate_hz[0] = gui_playback_apply_resolved_file_info(
+                &ctx->info_a, &ctx->stream_a, "File A", cancel,
+                ctx->loaded_key_valid[0] ? &ctx->loaded_key[0] : NULL, ctx->file_a);
         }
-
-        ctx->decoder_a = FLAC__stream_decoder_new();
-        if (!ctx->decoder_a) {
-            fprintf(stderr, "[PLAYBACK] Failed to create decoder A\n");
-            return -1;
-        }
-
-        FLAC__stream_decoder_set_md5_checking(ctx->decoder_a, false);
-
-        // Unknown STREAMINFO total removes finalized RF/provisional endpoint
-        // clamps while the UI independently tracks the resolved true length.
-        gui_playback_io_reset(&ctx->io_a, ctx->file_a, ctx, PLAYBACK_IO_SI_TOTAL_MOD);
-        ctx->io_a.cancel = cancel;
-        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_stream(
-            ctx->decoder_a,
-            gui_playback_io_read_cb,
-            gui_playback_io_seek_cb,
-            gui_playback_io_tell_cb,
-            gui_playback_io_length_cb,
-            gui_playback_io_eof_cb,
-            decoder_io_write_cb_a,
-            decoder_io_metadata_cb_a,
-            decoder_error_cb,
-            &ctx->io_a
-        );
-
-        if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
-            fprintf(stderr, "[PLAYBACK] Failed to init decoder A: %s\n",
-                    FLAC__StreamDecoderInitStatusString[status]);
-            return -1;
-        }
-
-        // Process metadata to get file info
-        if (!FLAC__stream_decoder_process_until_end_of_metadata(ctx->decoder_a) ||
-            !ctx->info_a.valid || ctx->stream_a.channels != 1) return -1;
-        if (cancel && atomic_load(cancel)) return -1;
-        ctx->channel_rate_hz[0] = gui_playback_apply_resolved_file_info(
-            &ctx->info_a, &ctx->stream_a, "File A", cancel,
-            ctx->loaded_key_valid[0] ? &ctx->loaded_key[0] : NULL, ctx->file_a);
     }
 
     if (cancel && atomic_load(cancel)) return -1;
@@ -3039,53 +4848,42 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
         if (file_b != ctx->info_b.filepath)
             snprintf(ctx->info_b.filepath, sizeof(ctx->info_b.filepath), "%s", file_b);
 
-        ctx->file_b = file_open_read_utf8(file_b);
-        if (!ctx->file_b) {
-            fprintf(stderr, "[PLAYBACK] Failed to open file B: %s\n", file_b);
+        char open_err[192] = {0};
+        playback_input_format_t fmt = PLAYBACK_INPUT_FLAC;
+        uint8_t magic[4] = {0};
+        if (!gui_playback_sniff_format(file_b, &fmt, magic, open_err, sizeof(open_err))) {
+            fprintf(stderr, "[PLAYBACK] Channel B rejected: %s (%s)\n", open_err, file_b);
+            snprintf(ctx->info_b.error, sizeof(ctx->info_b.error), "%s", open_err);
             return -1;
         }
-        if (gui_playback_length_cache_snapshot(file_b, &ctx->loaded_key[1])) {
-            if (!gui_playback_length_cache_matches_open_file(ctx->file_b, &ctx->loaded_key[1])) return -1;
-            ctx->loaded_key_valid[1] = true;
+        ctx->input_format[1] = (int)fmt;
+        ctx->info_b.format = (int)fmt;
+        snprintf(ctx->decode_path[1], sizeof(ctx->decode_path[1]), "%s", file_b);
+
+        if (fmt == PLAYBACK_INPUT_OGG_FLAC) {
+            if (!gui_playback_prepare_ogg(ctx, 1, file_b, cancel, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel B (Ogg FLAC): %s (%s)\n", open_err, file_b);
+                snprintf(ctx->info_b.error, sizeof(ctx->info_b.error), "%s", open_err);
+                return -1;
+            }
+        } else if (fmt != PLAYBACK_INPUT_FLAC) {
+            if (!gui_playback_prepare_raw(ctx, 1, file_b, fmt, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel B (%s): %s (%s)\n",
+                        gui_playback_input_format_name(fmt), open_err, file_b);
+                snprintf(ctx->info_b.error, sizeof(ctx->info_b.error), "%s", open_err);
+                return -1;
+            }
+        } else {
+            if (!gui_playback_open_native_flac(ctx, 1, file_b, cancel, open_err, sizeof(open_err))) {
+                fprintf(stderr, "[PLAYBACK] Channel B: %s (%s)\n", open_err, file_b);
+                snprintf(ctx->info_b.error, sizeof(ctx->info_b.error), "%s", open_err);
+                return -1;
+            }
+            if (cancel && atomic_load(cancel)) return -1;
+            ctx->channel_rate_hz[1] = gui_playback_apply_resolved_file_info(
+                &ctx->info_b, &ctx->stream_b, "File B", cancel,
+                ctx->loaded_key_valid[1] ? &ctx->loaded_key[1] : NULL, ctx->file_b);
         }
-
-        ctx->decoder_b = FLAC__stream_decoder_new();
-        if (!ctx->decoder_b) {
-            fprintf(stderr, "[PLAYBACK] Failed to create decoder B\n");
-            return -1;
-        }
-
-        FLAC__stream_decoder_set_md5_checking(ctx->decoder_b, false);
-
-        // Unknown STREAMINFO total removes finalized RF/provisional endpoint
-        // clamps while the UI independently tracks the resolved true length.
-        gui_playback_io_reset(&ctx->io_b, ctx->file_b, ctx, PLAYBACK_IO_SI_TOTAL_MOD);
-        ctx->io_b.cancel = cancel;
-        FLAC__StreamDecoderInitStatus status = FLAC__stream_decoder_init_stream(
-            ctx->decoder_b,
-            gui_playback_io_read_cb,
-            gui_playback_io_seek_cb,
-            gui_playback_io_tell_cb,
-            gui_playback_io_length_cb,
-            gui_playback_io_eof_cb,
-            decoder_io_write_cb_b,
-            decoder_io_metadata_cb_b,
-            decoder_error_cb,
-            &ctx->io_b
-        );
-
-        if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
-            fprintf(stderr, "[PLAYBACK] Failed to init decoder B: %s\n",
-                    FLAC__StreamDecoderInitStatusString[status]);
-            return -1;
-        }
-
-        if (!FLAC__stream_decoder_process_until_end_of_metadata(ctx->decoder_b) ||
-            !ctx->info_b.valid || ctx->stream_b.channels != 1) return -1;
-        if (cancel && atomic_load(cancel)) return -1;
-        ctx->channel_rate_hz[1] = gui_playback_apply_resolved_file_info(
-            &ctx->info_b, &ctx->stream_b, "File B", cancel,
-            ctx->loaded_key_valid[1] ? &ctx->loaded_key[1] : NULL, ctx->file_b);
     }
 
     if ((file_a && !gui_playback_loaded_file_matches(ctx, 0)) ||
@@ -4186,8 +5984,14 @@ void gui_playback_request_analysis_window(gui_app_t *app, int channel,
     if (!atomic_load(&s_playback->running) || !file || !(rate > 0.0) || total == 0) return;
     if (!a->worker_valid) {
         a->owner = s_playback;
-        snprintf(a->session_path, sizeof(a->session_path), "%s", channel == 1
-            ? s_playback->info_b.filepath : s_playback->info_a.filepath);
+        // The analysis decoders need a NATIVE FLAC path: the Ogg-FLAC session
+        // remux (decode_path), which equals the info filepath for every
+        // on-disk format. Raw channels have no FLAC analysis (their session
+        // init fails cleanly and reports unavailability).
+        const char *session = channel == 1
+            ? (s_playback->decode_path[1][0] ? s_playback->decode_path[1] : s_playback->info_b.filepath)
+            : (s_playback->decode_path[0][0] ? s_playback->decode_path[0] : s_playback->info_a.filepath);
+        snprintf(a->session_path, sizeof(a->session_path), "%s", session);
         a->reader_idx = -1;
     }
     // Worker thread creation is cheap (no file IO): safe on the render

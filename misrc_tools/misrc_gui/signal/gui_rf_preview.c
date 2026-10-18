@@ -29,20 +29,34 @@ typedef struct { float b0, b1, b2, a1, a2, z1, z2; } rf_biquad_t;
 typedef struct { double re, im; } rf_complex_t;
 typedef enum { RF_PULSE_NONE, RF_PULSE_EQ, RF_PULSE_H, RF_PULSE_V } rf_pulse_kind_t;
 
+/* Hybrid Full-mode background levels, in the IRE domain. Translated from
+ * tbc-tools OutputWriter's fixed 16-bit TBC offsets (commit 063d83e: NTSC
+ * 0x0d48, PAL 0x0708) through the canonical VHS-composite IRE calibration
+ * in tbc-tools' sample metadata (NTSC 0 IRE=18048 / 100 IRE=51200, PAL
+ * 0 IRE=16384 / 100 IRE=54016), then into this decoder's absolute FM
+ * references. NTSC: (3400-18048)/331.52 = -44.184 IRE; PAL: (1800-16384)/
+ * 376.32 = -38.754 IRE. Like tbc-tools' full-range RGB hybrid path, the
+ * span maps the whole 16-bit demod range onto display 0..1: 65535/331.52 =
+ * 197.680 IRE (NTSC), 65535/376.32 = 174.147 IRE (PAL). Result: 0 IRE
+ * blanking renders as a ~57/255 dark grey band; NTSC sync tips (-40 IRE)
+ * sit 4.2 IRE above the background black and stay faintly visible (~5/255),
+ * while PAL's deeper -42.9 IRE tip (sync_hz below blank_hz) clamps at the
+ * floor — the CRT/production-panel VBI contrast of tbc-tools' hybrid mode. */
 typedef struct {
     int width, height, active_first, eq_count;
     double line_us, blank_hz, sync_hz, hz_ire, carrier_hz;
     double burst_start_us, burst_end_us, active_start_us, active_end_us;
     double deemph_zero, deemph_pole;
+    double hybrid_black_ire, hybrid_span_ire;
 } rf_profile_t;
 
 /* SP carrier/IRE/burst/geometry parameters from the referenced format snapshot. */
 static const rf_profile_t rf_profiles[] = {
     {768, 576, 22, 5, 64.0, 4100000.0, 3800000.0, 7000.0, 626953.0,
-     5.6, 7.85, 10.5, 62.5, 100e-9, 400e-9},
+     5.6, 7.85, 10.5, 62.5, 100e-9, 400e-9, -38.7543, 174.147},
     {640, 480, 20, 6, 63.55555555555556, 3685714.2857142854, 3400000.0,
      7142.857142857143, 629370.6293706294,
-     5.3, 7.8, 9.45, 62.55555555555556, 120e-9, 320e-9}
+     5.3, 7.8, 9.45, 62.55555555555556, 120e-9, 320e-9, -44.1843, 197.680}
 };
 
 struct gui_rf_decoder {
@@ -275,7 +289,6 @@ static void rf_reject_field(gui_rf_decoder_t *d, rf_reject_t cause, const char *
 static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                             uint64_t end_sample, gui_rf_frame_callback_t callback,
                             void *context) {
-    int rows = d->p.height/2;
     double lines[RF_MAX_LINES+1], periods[RF_MAX_LINES];
     rf_complex_t burst[RF_MAX_LINES], corrected[RF_MAX_LINES];
     double magnitudes[RF_MAX_LINES], gain[RF_MAX_LINES], luma_wow[RF_MAX_LINES];
@@ -290,8 +303,21 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
      * tip and the color burst render (with their decoded chroma). */
     const double win_start_us = d->full_frame ? 0.0 : d->p.active_start_us;
     const double win_end_us = d->full_frame ? d->p.line_us : d->p.active_end_us;
+    /* Hybrid level split (tbc-tools OutputWriter hybrid mode): only the
+     * active horizontal window of active lines keeps the leveled mapping.
+     * The split is positional, like tbc's activeVideoStart/End check: the
+     * rendered window and the active area stay the same fraction of the
+     * line at any per-line tape-speed scale. */
+    const int active_x0 = (int)ceil(d->p.active_start_us*d->p.width/d->p.line_us-.5);
+    const int active_x1 = (int)ceil(d->p.active_end_us*d->p.width/d->p.line_us-.5);
     int field_lines=d->format==GUI_RF_PAL ? (parity==0 ? 312 : 313)
                                          : (parity==0 ? 263 : 262);
+    /* Full mode renders every field line, so the woven frame is twice the
+     * taller parity's line count (PAL 2x313=626, NTSC 2x263=526); Active
+     * mode keeps the profile's cropped active rows and 576/480 height. */
+    const int rows = d->full_frame ? field_lines : d->p.height/2;
+    const int frame_height = d->full_frame
+        ? (d->format==GUI_RF_PAL ? 313 : 263)*2 : d->p.height;
     double average=((double)end_sample*.25-field_start)/field_lines;
     average=rf_clamp(average,nominal*.98,nominal*1.02);
     for (int y=0; y<=rows; ++y) {
@@ -369,6 +395,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     /* PAL swings its burst about the -U axis. Use neighboring measured burst
      * vectors after the tape rotation is removed, rather than field number. */
     for (int y=0; y<rows; ++y) {
+        int line=line_first+y;
         rf_complex_t aligned=rf_rotate(corrected[y], -common_phase);
         int vswitch = d->format==GUI_RF_PAL ? (aligned.im>=0.0 ? 1 : -1) : 1;
         double reference_phase = d->format==GUI_RF_PAL
@@ -384,17 +411,32 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         double pixel_step=(win_end_us-win_start_us)*5.0*scale/d->p.width;
         double first_offset=win_start_us*5.0*scale+pixel_step*.5;
         double carrier_scale=2.0*RF_PI*d->p.carrier_hz/RF_VIDEO_RATE;
-        double timing0=lines[y]-field_start-(d->p.active_first+y)*nominal
+        /* Chroma timing follows the actual demodulated line number: Full
+         * mode starts at line 0, so VBI rows keep their true burst phase
+         * instead of an active-line-shifted one (wrong hue on VBI rows). */
+        double timing0=lines[y]-field_start-(line_first+y)*nominal
                       +first_offset*(1.0-nominal/periods[y]);
         double angle=phase+carrier_scale*timing0;
         double rotate_re=cos(angle), rotate_im=sin(angle);
         double step_angle=carrier_scale*pixel_step*(1.0-nominal/periods[y]);
         double step_re=cos(step_angle), step_im=sin(step_angle);
+        const bool active_line=line>=d->p.active_first;
         for (int x=0; x<d->p.width; ++x) {
             double offset=first_offset+x*pixel_step;
             double hz=rf_read(d,d->luma,lines[y]+offset+d->luma_delay-d->sync_delay);
-            double luminance=rf_clamp((hz*luma_wow[y]-d->p.blank_hz)
-                                      /(100.0*d->p.hz_ire),0.0,1.0);
+            double ire=(hz*luma_wow[y]-d->p.blank_hz)/d->p.hz_ire;
+            /* Studio-swing display levels (shared rf_display_level contract:
+             * 0 IRE -> RF_DISPLAY_BLACK_255/255 lifted black, 100 IRE ->
+             * RF_DISPLAY_WHITE_255/255 with headroom, sync clamps at the
+             * floor). Full-mode background (VBI lines plus blanking/sync/
+             * burst of active lines) uses the hybrid mapping instead, so
+             * EQ/broad/sync pulses and VBI data stay inspectable below
+             * active black. */
+            bool leveled=!d->full_frame
+                       || (active_line && x>=active_x0 && x<active_x1);
+            double luminance=leveled
+                ? rf_display_level(ire/100.0)
+                : rf_clamp((ire-d->p.hybrid_black_ire)/d->p.hybrid_span_ire,0.0,1.0);
             double u=0.0,v=0.0;
             if (color && valid[y]) {
                 double pos=lines[y]+offset+d->chroma_delay-d->sync_delay;
@@ -417,6 +459,12 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         if (y&1) rf_render_rows(d,y-1,2,parity,color&&valid[y-1],color&&valid[y]);
         else if (y+1==rows) rf_render_rows(d,y,1,parity,color&&valid[y],false);
     }
+    /* PAL parity-0 (312 lines) can never write row 624 and NTSC parity-1
+     * never writes row 525; each field clears its own beyond-last row so no
+     * stale content survives from earlier geometry or mode switches. */
+    if (rows*2+parity<frame_height)
+        memset(&d->rgba[(size_t)(rows*2+parity)*d->p.width*4u],0,
+               (size_t)d->p.width*4u);
     d->status.fields_decoded++;
     d->status.fields_accepted++;
     d->status.h_locked=true;
@@ -430,7 +478,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         snprintf(d->status.reason,sizeof(d->status.reason),"%s VHS SP %s",
                  d->format==GUI_RF_PAL ? "PAL" : "NTSC",
                  d->status.color_locked ? "color locked" : "luma locked; weak burst");
-        if (callback) callback(context,d->rgba,d->p.width,d->p.height,end_sample,&d->status);
+        if (callback) callback(context,d->rgba,d->p.width,frame_height,end_sample,&d->status);
         d->ready_fields=0;
     }
     return true;

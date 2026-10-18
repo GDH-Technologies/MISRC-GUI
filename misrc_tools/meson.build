@@ -456,6 +456,7 @@ if raylib_dep.found()
     'misrc_gui/ui/gui_font.c',
     'misrc_gui/ui/gui_ui_scale.c',
     'misrc_gui/ui/gui_ui.c',
+    'misrc_gui/ui/gui_chrome_hide.c',
     'misrc_gui/ui/gui_device_label.c',
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
@@ -629,8 +630,11 @@ if raylib_dep.found()
       overlay_test_deps += dep.partial_dependency(compile_args: true, includes: true)
     endforeach
     overlay_test_deps += meson.get_compiler('c').find_library('m', required: false)
+    # The harness includes the waveform implementation, which now calls the
+    # shared chrome-hide helper (double-click overlay toggle), so compile it
+    # in too. Same for the other panel harnesses below.
     waveform_overlay_test = executable('gui_waveform_overlay_test',
-      'test/gui_waveform_overlay_harness.c',
+      ['test/gui_waveform_overlay_harness.c', 'misrc_gui/ui/gui_chrome_hide.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -639,7 +643,7 @@ if raylib_dep.found()
     test('gui_waveform_overlay', waveform_overlay_test)
 
     fft_label_test = executable('gui_fft_label_test',
-      'test/gui_fft_label_harness.c',
+      ['test/gui_fft_label_harness.c', 'misrc_gui/ui/gui_chrome_hide.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -701,7 +705,7 @@ if raylib_dep.found()
     test('gui_viewport_layout', viewport_layout_test)
 
     spectrogram_lifetime_test = executable('gui_spectrogram_playback_lifetime_test',
-      'test/gui_spectrogram_playback_lifetime_test.c',
+      ['test/gui_spectrogram_playback_lifetime_test.c', 'misrc_gui/ui/gui_chrome_hide.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -718,7 +722,8 @@ if raylib_dep.found()
       playback_resolve_test = executable('gui_playback_resolve_test',
         ['test/gui_playback_resolve_harness.c', 'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
-         'misrc_gui/visualization/gui_fft.c'],
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
         include_directories: gui_includes,
         c_args: gui_cflags,
@@ -755,7 +760,8 @@ if raylib_dep.found()
       rf_seek_test = executable('gui_rf_playback_seek_test',
         ['test/gui_rf_playback_seek_test.c', 'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
-         'misrc_gui/visualization/gui_fft.c'],
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep],
         include_directories: gui_includes,
         c_args: gui_cflags,
@@ -766,7 +772,8 @@ if raylib_dep.found()
       rf_start_test = executable('gui_rf_playback_start_test',
         ['test/gui_rf_playback_start_test.c', 'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
-         'misrc_gui/visualization/gui_fft.c'],
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
         include_directories: gui_includes,
         c_args: gui_cflags,
@@ -781,6 +788,7 @@ if raylib_dep.found()
         'test/gui_rf_playback_reconnect_test.c', 'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
+        'misrc_gui/ui/gui_chrome_hide.c',
         'common/extract.c', 'common/ringbuffer.c',
         'common/rb_event.c', 'common/buffer_manager.c',
         'misrc_gui/processing/gui_rf_stream_marks.c',
