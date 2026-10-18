@@ -12,9 +12,12 @@
 #include <soxr.h>
 #endif
 
+/* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
+ * exact fast paths for 20/40/80 MSPS (80 covers the 2x40 dual-channel cards);
+ * arbitrary soxr rates otherwise, up to 200 MSPS single-stream captures. */
 #define RF_OUTPUT_RATE_HZ 20000000u
 #define RF_MIN_INPUT_RATE_HZ 16000000u
-#define RF_MAX_INPUT_RATE_HZ 160000000u
+#define RF_MAX_INPUT_RATE_HZ 200000000u
 #define RF_SOXR_BLOCK_SAMPLES 2048u
 /* The HQ converter uses DFT blocks capped at 1024 samples. Leave room for
  * delayed output from preceding calls as well as the current input block. */

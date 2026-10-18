@@ -90,8 +90,8 @@ int main(int argc, char **argv) {
     char *end = NULL;
     errno = 0;
     unsigned long parsed_rate = strtoul(argv[2], &end, 10);
-    if (errno || !end || *end || parsed_rate < 16000000u || parsed_rate > 160000000u) {
-        fprintf(stderr, "RF sample rate must be 16000000..160000000 Hz\n");
+    if (errno || !end || *end || parsed_rate < 16000000u || parsed_rate > 200000000u) {
+        fprintf(stderr, "RF sample rate must be 16000000..200000000 Hz\n");
         return 1;
     }
     uint32_t rate = (uint32_t)parsed_rate;

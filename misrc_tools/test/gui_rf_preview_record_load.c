@@ -296,7 +296,7 @@ int main(int argc,char **argv) {
         fprintf(stderr,"Usage: %s source.s16le FsHz pal|ntsc prefix seconds on|off channels flac_threads [core_budget] [consumer_stall_ms]\n",argv[0]); return 1;
     }
     char *end=NULL; unsigned long rate=strtoul(argv[2],&end,10);
-    if (!end||*end||rate<16000000u||rate>160000000u) return 1;
+    if (!end||*end||rate<16000000u||rate>200000000u) return 1;
     bool preview=!strcmp(argv[6],"on");
     if (!preview&&strcmp(argv[6],"off")) return 1;
     int channels=atoi(argv[7]),threads=atoi(argv[8]);

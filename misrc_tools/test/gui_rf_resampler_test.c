@@ -156,7 +156,7 @@ static void bypass_and_contract(void) {
     gui_rf_resampler_destroy(resampler);
     CHECK(gui_rf_resampler_create(0) == NULL, "reject zero rate");
     CHECK(gui_rf_resampler_create(15000000u) == NULL, "reject insufficient input band");
-    CHECK(gui_rf_resampler_create(161000000u) == NULL, "reject rate outside contract");
+    CHECK(gui_rf_resampler_create(201000000u) == NULL, "reject rate outside contract");
     CHECK(gui_rf_resampler_output_capacity(16000000u, SIZE_MAX) == 0,
           "oversized output bound cannot wrap");
 #if !LIBSOXR_ENABLED
@@ -207,8 +207,8 @@ int main(void) {
     impulse_delay(80000000u, 4u, 11.25);
     CHECK(tone_gain(80000000u, 30000000.0) < 0.025, "first 80 MSPS stage rejects high RF");
 #if LIBSOXR_ENABLED
-    const uint32_t rates[] = {16000000u, 25000000u, 28636363u, 54000000u, 160000000u};
-    for (size_t index = 0; index < 5u; ++index) {
+    const uint32_t rates[] = {16000000u, 25000000u, 28636363u, 54000000u, 160000000u, 200000000u};
+    for (size_t index = 0; index < 6u; ++index) {
         partition_and_reset(rates[index]);
         dc_and_frequency(rates[index], index ? 11000000.0 : 0.0);
     }

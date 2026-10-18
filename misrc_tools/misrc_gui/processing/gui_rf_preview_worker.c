@@ -29,8 +29,11 @@ static void rf_mutex_unlock(rf_mutex_t *m) { pthread_mutex_unlock(m); }
 #define RF_QUEUE_SLOTS 256u
 #define RF_BLOCK_SAMPLES 65536u
 #define RF_QUEUE_MAX_US 200000u
+/* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
+ * 2x 40 MSPS dual-channel captures use two per-channel workers (each on the
+ * 40 MSPS exact path); single-stream captures up to 200 MSPS are accepted. */
 #define RF_MIN_RATE 16000000u
-#define RF_MAX_RATE 160000000u
+#define RF_MAX_RATE 200000000u
 #define RF_FRAME_BYTES ((size_t)GUI_RF_FRAME_MAX_WIDTH * GUI_RF_FRAME_MAX_HEIGHT * 4)
 
 typedef struct {
