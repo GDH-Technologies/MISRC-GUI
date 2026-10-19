@@ -45,8 +45,26 @@ sync tips at the floor, studio-swing active window, background keeps decoded chr
   and the white bar reads ~83% display — possible follow-up calibration items, noted
   for the next session if the GUI look warrants it.
 
+## Round 2 + 3 outcome (same day, user-confirmed)
+- Round 2 (the GUI panel path): `--panel` diag mode reproduced the exact GUI failure
+  headlessly; three stacked root causes fixed (the per-line carrier frame's origin
+  wobble at the panel's 4x-fsc rate breaking the V-switch on every other line; the
+  absolute carrier frame demanding an exact rate; the rate self-calibration
+  overriding the panel resampler's exact-by-construction rate -> `rate_trusted` +
+  the hybrid carrier frame + sub-sample sync edges). Every EBU bar within +-0.2 deg
+  on the exact plugin path, coherence 1.00.
+- Round 3 (the render path): the RGB24->RGBA uint32 packing swapped R/B against
+  raylib's Color byte order (yellow<->cyan, red<->blue in the GUI while every
+  headless dump was correct) - fixed by writing through Color struct fields.
+- Hard rules added: `misrc_tools/misrc_gui/dev/gui_output_verification_rules.md`
+  + the render conversion extracted to `cvbs_blit_rgb24_to_color` with a byte-layout
+  contract in the suite. Rounds 2+3 committed after the user's GUI colour-order
+  confirmation; the FFT Linear/Log feature stays uncommitted pending its own check.
+- Handed off (user request, next round): the sync/PLL robustness - the picture does
+  not lock stably about half the time and sync is easily lost.
+
 ## Deliberately not done
-- No commits/push (not requested); everything is in the working tree on top of the
-  crashed session's uncommitted CVBS rework + the FFT Linear/Log feature.
+- The FFT Linear/Log feature files stay uncommitted pending their own GUI
+  confirmation (gui_fft.c, gui_fft_label_harness.c, the meson.build harness hunk).
 - Zip restore point (`git archive` snapshot) waits for the user's "fully working"
   confirmation per the user's rule; update this log + create it after confirmation.

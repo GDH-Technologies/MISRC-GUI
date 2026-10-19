@@ -148,6 +148,18 @@ static void cvbs_rederive_sample_domain(cvbs_decoder_t *decoder) {
 // is committed as the measured rate. A fresh commit re-derives the
 // sample-domain state exactly like a declared-rate change.
 static void cvbs_measure_hh_spacing(cvbs_decoder_t *decoder, double spacing) {
+    // A TRUSTED declared rate (the panel plugin's fixed-rate resampler
+    // output, exact by construction) disables the self-calibration: the
+    // median's edge quantization (+-0.5 samples/pulse) and the refinement's
+    // own residual error are both far worse than exact, and at the panel's
+    // 4x-fsc decode rate even 0.01% of rate error slips the absolute-frame
+    // carrier table tens of degrees per line (measured on the resampled
+    // EBU capture: the refinement committed ~0.01-0.06% off, the per-line
+    // burst-phase steps lost the +-90 PAL alternation, the V-switch flipped
+    // on every other line and half the frame's hues scrambled - while the
+    // same decoder at the exact resampler rate decodes every bar within
+    // +-0.2 deg of the EBU vectors).
+    if (decoder->rate_trusted) return;
     const cvbs_baseband_profile_t *profile = cvbs_profile(decoder);
     // Acceptance band. Pre-commit it is anchored to the DECLARED nominal
     // (a CONSTANT): anchoring to the running median made the FIRST accepted
@@ -635,6 +647,12 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     const int16_t *src = samples;
     int n = (int)sample_count;
 
+    // ABSOLUTE carrier anchor: the sample-stream position of the line
+    // buffer's k=0 (the first sample after the previous wrap). Captured
+    // before the trims below so it spans the buffer's real content.
+    uint64_t carrier_anchor = decoder->global_sample_pos + 1
+                               - (uint64_t)sample_count;
+
     const cvbs_baseband_profile_t *profile = cvbs_profile(decoder);
     int full_line_samples = cvbs_us_to_samples(decoder, profile->line_us);
     if (n > full_line_samples) n = full_line_samples;
@@ -736,13 +754,38 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         double rate = cvbs_rate(decoder);
         double dphase = 2.0 * M_PI * profile->fsc_hz / rate;
 
-        // Build the line-local carrier tables (incremental, resync every 256
-        // samples so drift stays far below the demod resolution).
+        // Carrier table frame, by rate trust:
+        // - TRUSTED declared rate (the panel plugin's fixed-rate resampler
+        //   output, exact by construction): the ABSOLUTE sample-stream
+        //   frame - the phase at buffer index k is (carrier_anchor + k) *
+        //   dphase. A per-line k=0 reset carries every quantized wrap/snap
+        //   offset of the line origin into the measured burst phase; at the
+        //   panel's fixed 4x-fsc decode rate one sample of origin wobble is
+        //   ~89 degrees, and the per-line burst-phase steps measured on the
+        //   resampled EBU capture landed on a +-90-scattered grid instead
+        //   of the true +-90 PAL alternation, flipping the V-switch on every
+        //   other line and scrambling half the frame's hues. With the exact
+        //   trusted rate the absolute frame is quantization-free: the
+        //   sample positions are exact and dphase is exact, so the
+        //   per-line steps are the true alternation (measured: every bar
+        //   within +-0.2 deg of the EBU vectors, coherence 1.00).
+        // - Self-calibrated rate (the direct input paths): the PER-LINE
+        //   k=0 reset. The absolute frame demands an exact rate - the
+        //   self-calibration's ~0.01% residual error accumulates into tens
+        //   of degrees of per-line slip against the real carrier and
+        //   scrambles the hues (measured on the direct-rate EBU decode
+        //   after the absolute frame landed: FIXED-sync coherence 0.28) -
+        //   while the per-line reset absorbs the rate residual per line
+        //   (the direct-path decode measured every bar within +-0.7 deg
+        //   through the refinement). Incremental rotation with a resync
+        //   every 256 samples (drift far below the demod resolution).
+        uint64_t table_anchor = decoder->rate_trusted ? carrier_anchor : 0;
         double cd = cos(dphase), sd = sin(dphase);
-        double c = 1.0, s = 0.0;
+        double c = cos((double)table_anchor * dphase);
+        double s = sin((double)table_anchor * dphase);
         for (int k = 0; k < n; k++) {
             if ((k & 255) == 0) {
-                double ph = (double)k * dphase;
+                double ph = (double)(table_anchor + (uint64_t)k) * dphase;
                 c = cos(ph);
                 s = sin(ph);
             }
@@ -2076,7 +2119,9 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
     // Store for derivative term (not currently used)
     pll->phase_error = phase_error;
 
-    // Rate refinement from the PLL's sub-sample period estimate (the
+    // Rate refinement from the PLL's sub-sample period estimate (skipped
+    // entirely when the declared rate is TRUSTED - the panel plugin's exact
+    // resampler output; see cvbs_measure_hh_spacing). The
     // measured_rate bootstrap median is edge-quantized: real-capture jitter
     // biased it 39.98 MHz against a true 40.000 on the EBU PAL capture, and
     // a 0.05% rate error sweeps the line-local carrier ~0.02 deg/sample,
@@ -2089,6 +2134,9 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
     // lock (the estimate needs ~1000 lines to settle) and bounded to +-10%
     // of the running rate (a real stream change re-bootstraps through the
     // median path's reject escape instead, never through this refinement).
+    // lines_since_lock always counts (the FIXED-mode freeze gate depends
+    // on it); the rate measurements themselves (the frozen-period EMA and
+    // the commit) are skipped under a TRUSTED declared rate.
     if (pll->locked && good_sync) {
         if (pll->lines_since_lock < 1000000) pll->lines_since_lock++;
         // FIXED lock: the EMA tracks the frozen period's residual as a pure
@@ -2096,11 +2144,11 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
         // below - it is deliberately NOT fed back into the wrap period (an
         // EMA-in-the-loop correction was measured unstable; see
         // cvbs_effective_line_period).
-        if (fixed_mode && decoder->fixed_sync_locked) {
+        if (fixed_mode && decoder->fixed_sync_locked && !decoder->rate_trusted) {
             decoder->fixed_period_ema =
                 decoder->fixed_period_ema * 0.99 + phase_error * 0.01;
         }
-        if (pll->lines_since_lock > 1000) {
+        if (pll->lines_since_lock > 1000 && !decoder->rate_trusted) {
             double effective;
             if (fixed_mode && decoder->fixed_sync_locked) {
                 effective = decoder->fixed_line_period + decoder->fixed_period_ema;
@@ -2321,7 +2369,11 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
     for (size_t i = 0; i < count; i++) {
         int16_t sample = buf[i];
 
-        // Apply lowpass filter for cleaner sync detection (fixed-point)
+        // Apply lowpass filter for cleaner sync detection (fixed-point).
+        // prev_filtered is the filter's PREVIOUS output, read from the Q8
+        // state before this sample's update - it feeds the sub-sample edge
+        // interpolation below.
+        int16_t prev_filtered = (int16_t)(decoder->lpf_state >> LPF_SHIFT);
         int16_t filtered = apply_lowpass(decoder, sample);
 
         // Accumulate samples for histogram-based level detection (raw
@@ -2366,6 +2418,22 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
         if (falling_edge) {
             vs->in_pulse = true;
             vs->pulse_start = global_sample_pos;
+            // Sub-sample pulse start: linear interpolation of the threshold
+            // crossing between the previous and current filtered samples.
+            // The integer crossing quantizes +-0.5 samples per pulse, and
+            // every sync edge feeds the PLL snap - the quantization bias
+            // measurably corrupted the panel-rate decode chain (the frozen
+            // period latched ~+0.5 samples, the refined rate ran ~0.04% off
+            // and the carrier reference slipped against the real signal,
+            // scrambling the hues; the 40 MSPS direct path hid it because a
+            // half sample there is only ~20 degrees of carrier phase).
+            double frac = (prev_filtered > filtered)
+                ? (double)(prev_filtered - threshold) /
+                  (double)(prev_filtered - filtered)
+                : 0.0;
+            if (frac < 0.0) frac = 0.0;
+            if (frac > 1.0) frac = 1.0;
+            vs->pulse_start_sub = (double)global_sample_pos - 1.0 + frac;
         }
 
         // Rising edge: a low pulse ends - classify it by WIDTH IN
@@ -2377,8 +2445,18 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
         // verified model.
         if (rising_edge && vs->in_pulse) {
             vs->in_pulse = false;
-            double pulse_us =
-                (double)(global_sample_pos - vs->pulse_start) * 1000000.0 / rate_hz;
+            // Sub-sample pulse end (same interpolation as the start): the
+            // width and the PLL snap both carry sub-sample resolution.
+            double frac_end = (filtered > prev_filtered)
+                ? (double)(threshold - prev_filtered) /
+                  (double)(filtered - prev_filtered)
+                : 0.0;
+            if (frac_end < 0.0) frac_end = 0.0;
+            if (frac_end > 1.0) frac_end = 1.0;
+            double pulse_end_sub =
+                (double)global_sample_pos - 1.0 + frac_end;
+            double pulse_us = (pulse_end_sub - vs->pulse_start_sub) *
+                              1000000.0 / rate_hz;
             if (pulse_us >= 0.6 && pulse_us < 3.5) {
                 // Equalizing pulse: part of a vertical-blanking train. The
                 // FIRST EQ after normal H pulses is a field-boundary
@@ -2403,7 +2481,7 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                 // reconstructed at the pulse START) and the VBI H reference.
                 vs->eq_run = 0;
                 double phase_at_start = pll->phase -
-                    (double)(global_sample_pos - vs->pulse_start);
+                    ((double)global_sample_pos - vs->pulse_start_sub);
                 pll_process_hsync(decoder, phase_at_start);
                 vs->last_h_pos = vs->pulse_start;
                 // Update effective period after PLL adjustment
@@ -2440,8 +2518,11 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
 
         // Check if PLL indicates line complete (phase >= line_period)
         if (pll->phase >= effective_period) {
-            // Write back line_buffer_count before decode
+            // Write back line_buffer_count (and the global position, which
+            // decode_line_to_pixels reads as the ABSOLUTE carrier anchor)
+            // before decode.
             decoder->line_buffer_count = line_buffer_count;
+            decoder->global_sample_pos = global_sample_pos;
 
             // Line complete - decode it
             decode_current_line(decoder);
@@ -2565,6 +2646,32 @@ static void gui_cvbs_render_osd(cvbs_decoder_t *decoder,
     gui_text_draw_mono(osd_text3, text_x, text3_y, 14, (Color){200, 200, 255, 255});
 }
 
+// Pure RGB24 -> raylib Color blit for the render path. Kept a standalone
+// pure function (no raylib drawing dependencies) so the test harness can
+// contract-test its byte layout - the 2026-10-19 incident: a hand-packed
+// uint32 conversion here (0xFF000000 | r<<16 | g<<8 | b, whose little-endian
+// memory is b,g,r,a against raylib Color's r,g,b,a) displayed the decoded
+// BLUE as red and RED as blue while every headless verification path -
+// which read the RGB24 buffers directly, BYPASSING this conversion - was
+// green. Byte-layout contract: test/gui_cvbs_test.c
+// (run_render_conversion_contract); HARD rules:
+// misrc_gui/dev/gui_output_verification_rules.md. dst_pitch is in Color
+// pixels (the frame image's row pitch - MAX_WIDTH - so NTSC (width <
+// MAX_WIDTH) does not shear).
+static void cvbs_blit_rgb24_to_color(const uint8_t *src, Color *dst,
+                                      int width, int height, int dst_pitch) {
+    for (int py = 0; py < height; py++) {
+        const uint8_t *src_row = src + (size_t)py * (size_t)width * 3u;
+        Color *dst_row = dst + (size_t)py * (size_t)dst_pitch;
+        for (int px = 0; px < width; px++) {
+            dst_row[px].r = src_row[px * 3 + 0];
+            dst_row[px].g = src_row[px * 3 + 1];
+            dst_row[px].b = src_row[px * 3 + 2];
+            dst_row[px].a = 255;
+        }
+    }
+}
+
 // Render core shared by the public render (always with OSD) and the panel
 // chrome-hide path: draw_osd=false keeps the decoded picture but hides the
 // OSD text chrome with the rest of the controls.
@@ -2619,23 +2726,15 @@ static void gui_cvbs_render_frame_impl(cvbs_decoder_t *decoder,
     if (active_x + active_w > frame_w) active_w = frame_w - active_x;
     if (active_y + active_h > field_h) active_h = field_h - active_y;
 
-    // Convert the decoded RGB24 frame to RGBA for the image.
-    // Write with the image row pitch (MAX_WIDTH) so NTSC (frame_w < MAX_WIDTH)
-    // does not shear. Grayscale mode decoded R=G=B so the layout is shared.
-    const uint8_t *rgb_src = decoder->display_front;
-    uint32_t *rgba_dst = (uint32_t *)decoder->frame_image.data;
-    int img_pitch = decoder->frame_image.width;  // CVBS_MAX_WIDTH (1135)
-
-    for (int py = 0; py < field_h; py++) {
-        const uint8_t *src_row = rgb_src + (size_t)py * (size_t)frame_w * 3u;
-        int dst_row = py * img_pitch;
-        for (int px = 0; px < frame_w; px++) {
-            rgba_dst[dst_row + px] = 0xFF000000 |
-                                     ((uint32_t)src_row[px * 3 + 0] << 16) |
-                                     ((uint32_t)src_row[px * 3 + 1] << 8)  |
-                                     (uint32_t)src_row[px * 3 + 2];
-        }
-    }
+    // Convert the decoded RGB24 frame to the image through the pure,
+    // contract-tested blit (see cvbs_blit_rgb24_to_color): the GUI-consumed
+    // conversion is code under test, not glue - the 2026-10-19 R/B swap
+    // incident (dev/gui_output_verification_rules.md). The row pitch is the
+    // image width (MAX_WIDTH) so NTSC (frame_w < MAX_WIDTH) does not shear.
+    // Grayscale mode decoded R=G=B so the layout is shared.
+    cvbs_blit_rgb24_to_color(decoder->display_front,
+                             (Color *)decoder->frame_image.data,
+                             frame_w, field_h, decoder->frame_image.width);
 
     // Upload to GPU
     UpdateTexture(decoder->frame_texture, decoder->frame_image.data);
@@ -3740,6 +3839,13 @@ static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
         size_t out_count = 0;
         if (cvbs_plugin_resample_grow(plugin, need) &&
             cvbs_plugin_resample_block(plugin, samples, count, &out_count)) {
+            // The resampler's OUTPUT rate is exact by construction: mark the
+            // declared rate TRUSTED so the decoder's rate self-calibration
+            // (the H-spacing median + the PLL refinement, both ~0.01-0.06%
+            // error) never overrides it - at this 4x-fsc decode rate that
+            // error would slip the carrier reference tens of degrees per
+            // line and scramble the hues (see cvbs_measure_hh_spacing).
+            decoder->rate_trusted = true;
             gui_cvbs_process_buffer(decoder, plugin->resample_scratch,
                                     out_count, out_rate);
             resampled = true;
@@ -3747,8 +3853,12 @@ static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
     }
     if (!resampled) {
         // Passthrough (already at the target) or resampler failure: the
-        // direct feed. On failure the decoder's rate self-calibration
-        // recovers whatever rate the stream really is.
+        // direct feed at the INPUT path's own rate claim (not exact by
+        // construction) - clear the trust flag so a stale one from an
+        // earlier resample cannot disable the self-calibration here. On
+        // failure the decoder's rate self-calibration recovers whatever
+        // rate the stream really is.
+        decoder->rate_trusted = false;
         gui_cvbs_process_buffer(decoder, samples, count,
                                 in_rate == out_rate ? out_rate : sample_rate);
     }

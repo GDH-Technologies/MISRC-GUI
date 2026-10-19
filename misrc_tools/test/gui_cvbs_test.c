@@ -7,10 +7,12 @@
 #include "../misrc_gui/signal/gui_cvbs.c"
 #include <assert.h>
 
-// Headless stub: gui_cvbs_cleanup is the only decode-path caller of a raylib
-// symbol (UnloadTexture on a texture this harness never created; LTO drops
+// Headless stubs: gui_cvbs_cleanup is the only decode-path caller of a raylib
+// symbol (UnloadTexture on a texture this harness never created), and the
+// --panel plugin path traces mode transitions through TraceLog (LTO drops
 // every other render-path reference).
 void UnloadTexture(Texture2D texture) { (void)texture; }
+void TraceLog(int logLevel, const char *text, ...) { (void)logLevel; (void)text; }
 
 #define TEST_PI 3.14159265358979323846
 
@@ -93,7 +95,15 @@ static int16_t *gen_baseband(const gen_cfg_t *cfg) {
         for (size_t k = 0; k < line_samples; k++) {
             double t_us = (double)k * 1000000.0 / rate;  // time in the line
             double t_field = (double)line_in_field * line_us + t_us;  // field-local
-            double theta = 2.0 * TEST_PI * fsc * t_us / 1000000.0;  // line-local carrier
+            // CONTINUOUS carrier (the REAL subcarrier never resets at line
+            // boundaries - PAL advances 283.75 cycles/line, NTSC 227.5): the
+            // phase comes from the ABSOLUTE sample position, matching the
+            // decoder's absolute-frame carrier table. A per-line theta reset
+            // made the synthetic's burst-phase steps the mirror of the real
+            // convention's, which would flip PAL V-switch detection between
+            // the synthetic and real signals.
+            double theta = 2.0 * TEST_PI * fsc
+                           * (double)(i * line_samples + k) / rate;
             double ire = 0.0;    // luma
             double chroma = 0.0; // chroma, in IRE units
             bool burst_slot = false;
@@ -498,6 +508,58 @@ static void run_full_view_hybrid(bool pal) {
     free(sig);
 }
 
+// Render-path conversion contract (dev/gui_output_verification_rules.md):
+// the RGB24 -> raylib Color blit the GUI render ACTUALLY calls must carry the
+// decoder's channel order into Color's r,g,b,a bytes. The 2026-10-19
+// incident: a hand-packed uint32 conversion (0xFF000000 | r<<16 | g<<8 | b,
+// whose little-endian memory is b,g,r,a against Color's r,g,b,a) displayed
+// the decoded BLUE as red and RED as blue - yellow<->cyan, red<->blue -
+// while EVERY headless dump (reading the RGB24 buffers directly, bypassing
+// the conversion) was green. Editing the blit REQUIRES editing this contract
+// with it.
+static void run_render_conversion_contract(void) {
+    // 4x3 RGB24 source with distinct channels, plus the incident
+    // discriminators: a yellow pixel (r=g, b=0) must stay yellow in Color
+    // bytes (the swapped packing turned it cyan), a red pixel must stay red
+    // (the swapped packing turned it blue).
+    uint8_t src[4 * 3 * 3];
+    for (int i = 0; i < 4 * 3; i++) {
+        src[i * 3 + 0] = 0x12;  // R
+        src[i * 3 + 1] = 0x34;  // G
+        src[i * 3 + 2] = 0x56;  // B
+    }
+    src[(0 * 4 + 1) * 3 + 0] = 0xF0;  // pixel (1,0): yellow
+    src[(0 * 4 + 1) * 3 + 1] = 0xF0;
+    src[(0 * 4 + 1) * 3 + 2] = 0x00;
+    src[(2 * 4 + 3) * 3 + 0] = 0xF0;  // pixel (3,2): red
+    src[(2 * 4 + 3) * 3 + 1] = 0x00;
+    src[(2 * 4 + 3) * 3 + 2] = 0x00;
+    // Pitch 6 > width 4 (the MAX_WIDTH-style row pitch) and 2 spare rows:
+    // stride handling + untouched-beyond-the-blit coverage.
+    static Color dst[5 * 6];
+    memset(dst, 0, sizeof(dst));
+    cvbs_blit_rgb24_to_color(src, dst, 4, 3, 6);
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 4; x++) {
+            Color c = dst[y * 6 + x];
+            if (x == 1 && y == 0) {
+                assert(c.r == 0xF0 && c.g == 0xF0 && c.b == 0x00 && c.a == 255);
+            } else if (x == 3 && y == 2) {
+                assert(c.r == 0xF0 && c.g == 0x00 && c.b == 0x00 && c.a == 255);
+            } else {
+                assert(c.r == 0x12 && c.g == 0x34 && c.b == 0x56 && c.a == 255);
+            }
+        }
+        // Beyond the row width: untouched (the pitch gap).
+        assert(dst[y * 6 + 4].a == 0 && dst[y * 6 + 5].a == 0);
+    }
+    // Beyond the height: untouched rows.
+    for (int x = 0; x < 6; x++) {
+        assert(dst[3 * 6 + x].a == 0 && dst[4 * 6 + x].a == 0);
+    }
+    puts("render-path RGB24->Color conversion contract passed");
+}
+
 static void run_off_mode_gray(bool pal) {
     cvbs_decoder_t decoder;
     assert(gui_cvbs_init(&decoder));
@@ -531,7 +593,12 @@ static void run_off_mode_gray(bool pal) {
 // TEMP live-capture diagnostic (real-signal convention measurement; NOT
 // part of the synthetic contract). Usage:
 //   gui_cvbs_test.exe [--pal|--ntsc] [--rate=<MHz>] [--u8|--s16]
-//                     [--full] [--ppm=<path>] [--declared] <live_raw>
+//                     [--full] [--fixed] [--panel] [--ppm=<path>] [--declared]
+//                     <live_raw>
+// --panel drives the EXACT GUI path: the panel plugin's fixed-rate soxr
+// resample (to the 4x-fsc classic target - PAL 17.9 / NTSC 14.3 MHz -
+// LIBSOXR_ENABLED builds) plus the panel's decoder defaults (FIXED sync,
+// PAL), reproducing the GUI's decode regime headlessly.
 // Decodes a raw baseband capture through the production decoder and prints
 // per-bar measured U/V (inverted from the decoded RGB) so the real encoder
 // convention can be fitted from data. Sample domain: unsigned 8-bit (the
@@ -542,8 +609,8 @@ static void run_off_mode_gray(bool pal) {
 // --ppm additionally dumps the decoded display frame (P6) for offline
 // inspection (signalstats / visual A-B against a reference).
 static void run_live_diag(const char *path, bool pal, double rate,
-                          bool s16, bool full, bool fixed, const char *ppm,
-                          bool declared_rate_only) {
+                          bool s16, bool full, bool fixed, bool panel,
+                          const char *ppm, bool declared_rate_only) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return; }
     fseek(f, 0, SEEK_END);
@@ -567,38 +634,69 @@ static void run_live_diag(const char *path, bool pal, double rate,
     }
     free(raw);
 
-    cvbs_decoder_t decoder;
-    assert(gui_cvbs_init(&decoder));
-    gui_cvbs_set_format(&decoder, pal ? 0 : 1);
-    if (full) gui_cvbs_set_frame_view_mode(&decoder, CVBS_FRAME_VIEW_FULL);
-    if (fixed) decoder.sync_mode = CVBS_SYNC_MODE_FIXED;  // GUI panel default
-    decoder.colour_mode = CVBS_COLOUR_AUTO;
-    // declared_rate_only suppresses the H-spacing self-calibration so the
-    // decode runs at the DECLARED rate (A/B for measured-rate hue bias).
-    run_decoder(&decoder, sig, count, rate, declared_rate_only);
-    gui_cvbs_swap_buffers(&decoder);
+    video_cvbs_plugin_t plugin;      // only initialized in --panel mode
+    cvbs_decoder_t stack_decoder;
+    cvbs_decoder_t *decoder;
+    if (panel) {
+        // The EXACT GUI path: the panel plugin (its fixed-rate soxr resample
+        // to the 4x-fsc target + the panel decoder defaults: FIXED sync,
+        // PAL) driven chunk-wise like the app's display thread.
+        // The panel vtable callocs the whole plugin state; zero it the same
+        // way here: video_cvbs_plugin_init initializes ONLY the decoder - the
+        // soxr fields must start NULL/0 or the resampler ensure dereferences
+        // garbage pointers (measured: an access violation on the first
+        // process call).
+        memset(&plugin, 0, sizeof(plugin));
+        assert(video_cvbs_plugin_init(&plugin));
+        decoder = &plugin.decoder;
+        if (full) gui_cvbs_set_frame_view_mode(decoder, CVBS_FRAME_VIEW_FULL);
+        decoder->colour_mode = CVBS_COLOUR_AUTO;
+        fprintf(stderr, "[panel] feed start\n");
+        size_t pos = 0;
+        while (pos < count) {
+            size_t chunk = (pos & 1) ? 4093u : 8191u;
+            if (chunk > count - pos) chunk = count - pos;
+            video_cvbs_plugin_process(&plugin, sig + pos, chunk,
+                                       (uint32_t)rate);
+            if (declared_rate_only) decoder->hh_ring_count = 0;
+            pos += chunk;
+            if ((pos & 0xFFFFF) == 0) fprintf(stderr, "[panel] fed %zu\n", pos);
+        }
+        fprintf(stderr, "[panel] feed done\n");
+    } else {
+        assert(gui_cvbs_init(&stack_decoder));
+        decoder = &stack_decoder;
+        gui_cvbs_set_format(decoder, pal ? 0 : 1);
+        if (full) gui_cvbs_set_frame_view_mode(decoder, CVBS_FRAME_VIEW_FULL);
+        if (fixed) decoder->sync_mode = CVBS_SYNC_MODE_FIXED;  // GUI default
+        decoder->colour_mode = CVBS_COLOUR_AUTO;
+        // declared_rate_only suppresses the H-spacing self-calibration so
+        // the decode runs at the DECLARED rate (A/B for rate bias).
+        run_decoder(decoder, sig, count, rate, declared_rate_only);
+    }
+    gui_cvbs_swap_buffers(decoder);
 
-    printf("LIVE %s (%s @ %.1f MSPS%s): locked=%d accepted=%d rejected=%d "
+    printf("LIVE %s (%s @ %.1f MSPS%s%s): locked=%d accepted=%d rejected=%d "
            "(cad %d par %d) frames=%d lines=%d reason='%s'\n",
            path, pal ? "PAL" : "NTSC", rate / 1e6,
-           full ? ", full view" : "",
-           decoder.pll.locked ? 1 : 0, decoder.vsync.fields_accepted,
-           decoder.vsync.fields_rejected, decoder.vsync.reject_cadence,
-           decoder.vsync.reject_parity, decoder.state.frames_decoded,
-           decoder.pll.current_line, decoder.vsync.last_reject_reason);
+           full ? ", full view" : "", panel ? ", panel path" : "",
+           decoder->pll.locked ? 1 : 0, decoder->vsync.fields_accepted,
+           decoder->vsync.fields_rejected, decoder->vsync.reject_cadence,
+           decoder->vsync.reject_parity, decoder->state.frames_decoded,
+           decoder->pll.current_line, decoder->vsync.last_reject_reason);
     printf("LIVE levels: black=%d white=%d tip=%d thresh=%d meas_rate=%.2f MHz\n",
-           (int)decoder.levels.black_level, (int)decoder.levels.white_level,
-           (int)decoder.levels.sig_min, (int)decoder.levels.sync_threshold,
-           (double)decoder.measured_rate_hz / 1e6);
+           (int)decoder->levels.black_level, (int)decoder->levels.white_level,
+           (int)decoder->levels.sig_min, (int)decoder->levels.sync_threshold,
+           (double)decoder->measured_rate_hz / 1e6);
 
     // Optional P6 dump of the decoded display frame for offline inspection
     // (signalstats / visual A-B against a reference).
     if (ppm) {
         FILE *p = fopen(ppm, "wb");
         if (p) {
-            int fw = decoder.frame_width, fh = decoder.frame_height;
+            int fw = decoder->frame_width, fh = decoder->frame_height;
             fprintf(p, "P6\n%d %d\n255\n", fw, fh);
-            fwrite(decoder.display_front, 1u,
+            fwrite(decoder->display_front, 1u,
                    (size_t)fw * 3u * (size_t)fh, p);
             fclose(p);
             printf("LIVE frame dump: %s (%dx%d RGB24)\n", ppm, fw, fh);
@@ -618,14 +716,14 @@ static void run_live_diag(const char *path, bool pal, double rate,
         "gray?", "yellow", "cyan", "green", "magenta", "red", "blue", "black"
     };
     int row0 = 100;
-    int row1 = decoder.frame_height - 100;
+    int row1 = decoder->frame_height - 100;
     for (int bar = 1; bar < 8; bar++) {
         double su = 0.0, sv = 0.0, sa = 0.0;
         int rows = 0;
         for (int row = row0; row <= row1; row++) {
-            double r = frame_bar_mean(&decoder, bar, row, 0);
-            double g = frame_bar_mean(&decoder, bar, row, 1);
-            double b = frame_bar_mean(&decoder, bar, row, 2);
+            double r = frame_bar_mean(decoder, bar, row, 0);
+            double g = frame_bar_mean(decoder, bar, row, 1);
+            double b = frame_bar_mean(decoder, bar, row, 2);
             double dy = (g + 0.1944 * b + 0.5096 * r) / 1.7040;
             double u = (b - dy) / 2.032;
             double v = (r - dy) / 1.140;
@@ -642,14 +740,23 @@ static void run_live_diag(const char *path, bool pal, double rate,
                "amp=%.3f coherence=%.2f (%d rows)\n",
                bar, bar_names[bar], mu, mv, ang, ma, coh, rows);
     }
-    gui_cvbs_cleanup(&decoder);
+    if (panel) {
+#if LIBSOXR_ENABLED
+        if (plugin.resample) soxr_delete(plugin.resample);
+        free(plugin.resample_scratch);
+#endif
+        gui_cvbs_cleanup(&plugin.decoder);
+    } else {
+        gui_cvbs_cleanup(&stack_decoder);
+    }
     free(sig);
 }
 
 int main(int argc, char **argv) {
     if (argc > 1) {
         // TEMP live diagnostic mode: gui_cvbs_test [flags] <live_raw>
-        bool pal = true, s16 = false, full = false, fixed = false, declared = false;
+        bool pal = true, s16 = false, full = false, fixed = false;
+        bool panel = false, declared = false;
         double rate_mhz = 20.0;
         const char *path = NULL, *ppm = NULL;
         for (int i = 1; i < argc; i++) {
@@ -659,6 +766,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "--u8")) s16 = false;
             else if (!strcmp(argv[i], "--full")) full = true;
             else if (!strcmp(argv[i], "--fixed")) fixed = true;
+            else if (!strcmp(argv[i], "--panel")) panel = true;
             else if (!strcmp(argv[i], "--declared")) declared = true;
             else if (!strncmp(argv[i], "--rate=", 7)) rate_mhz = atof(argv[i] + 7);
             else if (!strncmp(argv[i], "--ppm=", 6)) ppm = argv[i] + 6;
@@ -666,12 +774,12 @@ int main(int argc, char **argv) {
         }
         if (!path) {
             fprintf(stderr, "usage: gui_cvbs_test [--pal|--ntsc] [--rate=<MHz>] "
-                            "[--u8|--s16] [--full] [--fixed] [--ppm=<file>] "
-                            "[--declared] <live_raw>\n");
+                            "[--u8|--s16] [--full] [--fixed] [--panel] "
+                            "[--ppm=<file>] [--declared] <live_raw>\n");
             return 1;
         }
-        run_live_diag(path, pal, rate_mhz * 1000000.0, s16, full, fixed, ppm,
-                      declared);
+        run_live_diag(path, pal, rate_mhz * 1000000.0, s16, full, fixed,
+                      panel, ppm, declared);
         return 0;
     }
     // Rate awareness: the SAME geometry decodes at 40 MSPS and 25 MSPS
@@ -698,6 +806,9 @@ int main(int argc, char **argv) {
     // Full-frame view hybrid (tbc-tools analyse HYBRID mode) contracts.
     run_full_view_hybrid(true);
     run_full_view_hybrid(false);
+    // Render-path conversion contract (dev/gui_output_verification_rules.md):
+    // the GUI-consumed RGB24 -> Color blit is code under test.
+    run_render_conversion_contract();
     puts("CVBS baseband profile, VBI sync model and burst-locked colour contracts passed");
     return 0;
-}
+} 

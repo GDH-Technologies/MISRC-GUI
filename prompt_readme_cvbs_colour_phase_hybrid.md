@@ -71,6 +71,79 @@ python -m mesonbuild.mesonmain test -C build-local                     # 34/34 O
 - The real pattern's white bar decodes ~83% display (pure gray, correct hue): pattern/level-model amplitude scaling, cosmetic.
 - The NTSC 20 MHz synthetic red-bar 0.192 blue-leak print persists (a tolerance REPORT, not an abort; pre-existing from the crashed session).
 
+## Round 2 (same day): the GUI panel path — the actual user symptom, root-caused and fixed
+
+User GUI check: hybrid GOOD (committed as `83a97e8`), the colours STILL wrong in the GUI. The GUI panel
+path differs from every headless path verified in round 1: the panel plugin RESAMPLES the input to a
+fixed 4x-fsc-classic target (PAL 17.9 / NTSC 14.3 MHz) via streaming soxr (`cvbs_panel_target_rate` /
+`video_cvbs_plugin_process`) - the GUI decoder never sees the 40 MSPS stream, so the round-1 live
+verification never exercised the GUI's decode regime. New diag mode `--panel` drives the EXACT plugin
+path headlessly (the plugin struct zeroed first - `video_cvbs_plugin_init` initializes only the decoder,
+so the soxr fields must start NULL/0 or the resampler ensure dereferences garbage; `TraceLog` stubbed
+for the link). Reproduced the symptom immediately: green 280.8-338.1 deg (truth 240.6), coherence
+0.25-0.31, every other line wrong.
+
+Root causes - three stacked, found by A/B runs plus per-line burst/PLL traces:
+1. The per-line k=0 carrier-table frame carries every quantized wrap/snap line-origin offset into the
+   measured burst phase. At the panel's 4x-fsc decode rate ONE SAMPLE of origin wobble is ~89 degrees,
+   so the per-line burst-phase steps lost the true +-90 PAL alternation (they landed on a
+   +-90-scattered grid), the V-switch flipped on every other line and half the frame's hues scrambled.
+   At 40 MSPS the same wobble is only ~40 degrees, which the +-90 steps survive - why the round-1
+   direct-rate verification looked correct while the GUI did not.
+2. The obvious fix for (1) - an ABSOLUTE sample-stream frame - demands an EXACT dphase: the
+   self-calibrated rate (median + PLL refinement, ~0.01% residual) slips the absolute table tens of
+   degrees per line against the real carrier. Measured: with the always-absolute frame the direct-40
+   FIXED path regressed to green 281.6 deg / coherence 0.28.
+3. The panel resampler's OUTPUT rate is exact by construction (the soxr ratio is exact) - but the
+   self-calibration kept overriding that exact declared rate with its own ~0.01-0.06% error. Proven by
+   forcing the declared rate in `cvbs_rate` for one A/B build: with the exact 17.9 MHz the panel path
+   decoded every bar within +-0.2 deg with coherence 1.00.
+
+Fixes (all in the working tree, uncommitted):
+- `rate_trusted` (gui_cvbs.h + the plugin): the plugin marks the declared rate trusted after a
+  successful resample (and clears it on the passthrough, so a stale flag cannot outlive a resampler
+  failure); `cvbs_measure_hh_spacing` (the median) and the PLL refinement's EMA + commit are skipped
+  when trusted. `lines_since_lock` still counts under trust (the FIXED freeze gate depends on it).
+- Hybrid carrier frame in `decode_line_to_pixels`: ABSOLUTE sample-stream frame when the rate is
+  trusted (the exact-rate panel path), per-line k=0 reset when the rate is self-calibrated (the
+  direct paths). The anchor source: `decoder->global_sample_pos` written back at the wrap.
+- Sub-sample sync edges: linear threshold-crossing interpolation on the falling/rising edges
+  (`prev_filtered` read from the Q8 LPF state) - the pulse width and the PLL snap carry sub-sample
+  resolution instead of the integer crossing's +-0.5 samples/pulse quantization.
+- The synthetic generator's carrier is now CONTINUOUS across lines (the real PAL 283.75-cycles/line,
+  NTSC 227.5 convention - it previously reset per line), matching the absolute-frame decoder.
+
+Verified (all headless, live EBU capture):
+- The EXACT GUI plugin path (`--panel`): every bar within +-0.2 deg of the EBU vectors (yellow
+  167.1/167.1, green 240.7/240.6, red 103.5/103.5, blue 347.1/347.1), coherence 1.00 on every bar,
+  99/99 fields accepted, 0 rejected.
+- The direct paths (AUTO + FIXED at 40 MSPS, self-calibrated, per-line frame): every bar within
+  +-1 deg, coherence 0.97-1.00 (restored from the absolute-frame regression).
+- The synthetic suite (incl. the new full-view hybrid contracts) and the full meson suite 34/34;
+  canonical build + smoke test PASS.
+
+## Round 3 (same day): the render-path R/B channel swap — the last visible symptom
+
+User GUI report: White/Cyan/Yellow/Green/Magenta/Red/Black ("bust is Blue") instead of the standard
+White/Yellow/Cyan/... — while the user VISUALLY CONFIRMED the decoded PNGs correct. Decoder right,
+GUI render wrong. Root cause: the RGB24->RGBA conversion packed raw uint32s
+(`0xFF000000 | r<<16 | g<<8 | b`) whose LITTLE-ENDIAN byte sequence is b,g,r,a - but the image is
+raylib `Color` memory (r,g,b,a bytes; the init allocates `Color*` and sets
+PIXELFORMAT_UNCOMPRESSED_R8G8B8A8), so the display read the decoded BLUE as red and RED as blue:
+every hue mirrored across the gray axis (yellow<->cyan, red<->blue; white/green/magenta/black
+unchanged) - exactly the reported bar pattern. The PPM/PNG dumps bypass the conversion (they read
+the RGB24 buffers directly), which is why they were correct. The user-verified RF preview path
+(`rf_render_rows`, gui_rf_preview.c) packs byte-wise [r,g,b,a] - the working convention.
+FIX: the conversion writes through raylib's own `Color` struct fields (type-safe, matching the
+allocation and the RF preview convention). Rebuilt: misrc_gui.exe 14:44, smoke PASS, the CVBS
+contract suite green. This render bug predates today (it appeared with the crashed session's
+colour decode; invisible in grayscale) - the earlier GUI colour reports were the composite of
+the real decoder bugs (rounds 1-2, all measured) AND this swap.
+
 ## Not done / pending
-- GUI confirmation checklist: `prompt_logs/2026-10-19_cvbs-colour-phase-hybrid_README.md` (the user).
-- NO commit, NO zip restore point — only after the user confirms "fully working" (per rule).
+- GUI confirmation checklist: `prompt_logs/2026-10-19_cvbs-colour-phase-hybrid_README.md` (the user) -
+  the colour items are now verified headlessly on the EXACT panel plugin path AND the render-path
+  swap is fixed (the decoded PNG the user confirmed = what the GUI should now display).
+- Rounds 2+3 are UNCOMMITTED (the user's flow: GUI confirmation first). `83a97e8` (round 1 + the
+  hybrid) is committed locally, not pushed.
+- NO zip restore point — only after the user confirms "fully working" (per rule).

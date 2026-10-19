@@ -165,6 +165,13 @@ typedef struct {
     // Pulse classification state (per low pulse, driven on its rising edge)
     bool in_pulse;                 // Currently inside a low pulse
     size_t pulse_start;            // Sample position where the pulse began
+    double pulse_start_sub;        // Sub-sample pulse-start position (linear
+                                   // threshold-crossing interpolation): the
+                                   // integer crossing quantization is
+                                   // +-0.5 samples per pulse and every sync
+                                   // edge feeds the PLL snap, so without it
+                                   // the converged line period carries the
+                                   // quantization bias
     size_t last_h_pos;             // Start of the last classified H pulse
     size_t last_classified_pos;    // Start of the last EQ-or-H classified pulse
                                    // (rate self-calibration spacing source; any
@@ -296,6 +303,12 @@ typedef struct cvbs_decoder {
     // the demod carrier as soon as it is established.
     uint32_t measured_rate_hz;
     bool measured_rate_valid;
+    bool rate_trusted;            // The DECLARED rate is exact by construction
+                                   // (the panel plugin's fixed-rate soxr
+                                   // resampler output): the rate self-
+                                   // calibration (median + refinement) is
+                                   // disabled - its own error would override
+                                   // an exact rate
     double hh_ring[64];            // Recent classified-pulse spacings (samples)
     int hh_ring_count;
     double hh_period_samples;      // Median spacing = the line period estimate
