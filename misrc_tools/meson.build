@@ -643,7 +643,8 @@ if raylib_dep.found()
     test('gui_waveform_overlay', waveform_overlay_test)
 
     fft_label_test = executable('gui_fft_label_test',
-      ['test/gui_fft_label_harness.c', 'misrc_gui/ui/gui_chrome_hide.c'],
+      ['test/gui_fft_label_harness.c', 'misrc_gui/ui/gui_chrome_hide.c',
+       'misrc_gui/visualization/gui_text.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,

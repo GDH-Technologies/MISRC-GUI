@@ -159,6 +159,65 @@ int main(void) {
     expect_true(fft_measure_text_mono(test_fonts, buffer.text, FONT_SIZE_NORMAL).x <= 100,
                 "maximum-length label fits its width");
 
+    test_case = "log axis transform";
+    {
+        const int bins = 4096;
+        const float log_min = 1.0f / (float)(bins - 1);
+        // The linear axis is the identity.
+        expect_true(fft_freq_norm_to_axis(0.37f, false, bins) == 0.37f,
+                    "linear axis is identity");
+        // Log endpoints: DC collapses to axis 0, the first non-DC bin sits
+        // at axis 0, Nyquist sits at axis 1.
+        expect_true(fft_freq_norm_to_axis(0.0f, true, bins) == 0.0f,
+                    "DC collapses to axis 0");
+        expect_true(fft_freq_norm_to_axis(log_min, true, bins) == 0.0f,
+                    "first non-DC bin sits at axis 0");
+        expect_true(fft_freq_norm_to_axis(1.0f, true, bins) == 1.0f,
+                    "Nyquist sits at axis 1");
+        // Monotonic and bounded between the endpoints.
+        bool monotonic = true;
+        float previous = -1.0f;
+        for (int i = 1; i <= 64; i++) {
+            float axis = fft_freq_norm_to_axis((float)i / 64.0f, true, bins);
+            if (axis < previous || axis > 1.0f) monotonic = false;
+            previous = axis;
+        }
+        expect_true(monotonic, "log axis is monotonic and bounded");
+        // The transforms invert each other exactly.
+        bool round_trip = true;
+        for (int i = 0; i <= 10; i++) {
+            float axis = (float)i / 10.0f;
+            float back = fft_freq_norm_to_axis(
+                fft_axis_to_freq_norm(axis, true, bins), true, bins);
+            if (fabsf(back - axis) > 1e-5f) round_trip = false;
+        }
+        expect_true(round_trip, "axis transform round-trips");
+    }
+
+    test_case = "log decade gridlines";
+    {
+        float grid[FFT_GRID_MAX_DIVISIONS];
+        // Full-range 40 MSPS view (4.88k-20MHz): 1-2-5 per decade, ascending,
+        // inside the visible range (12 candidates: 5k, 10k..50k, .. 10M, 20M).
+        int count = fft_log_grid_lines(4882.8f, 20000000.0f, grid, FFT_GRID_MAX_DIVISIONS);
+        expect_true(count == 12, "40 MSPS full-range decade grid holds 12 lines");
+        bool ascending = count > 1;
+        for (int i = 1; i < count; i++)
+            if (grid[i] <= grid[i - 1]) ascending = false;
+        expect_true(ascending, "decade grid is ascending");
+        expect_true(grid[0] >= 4882.8f && grid[count - 1] <= 20000000.0f,
+                    "decade grid stays inside the visible range");
+        // A sub-decade span yields fewer than 3 candidates: the render falls
+        // back to the linear 1-2-5 grid there.
+        expect_true(fft_log_grid_lines(3000.0f, 6000.0f, grid, FFT_GRID_MAX_DIVISIONS) == 1,
+                    "sub-decade span yields the sparse fallback");
+        // Degenerate ranges never emit lines.
+        expect_true(fft_log_grid_lines(0.0f, 1000.0f, grid, FFT_GRID_MAX_DIVISIONS) == 0,
+                    "zero start never emits lines");
+        expect_true(fft_log_grid_lines(5000.0f, 5000.0f, grid, FFT_GRID_MAX_DIVISIONS) == 0,
+                    "empty span never emits lines");
+    }
+
     printf("FFT labels: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
