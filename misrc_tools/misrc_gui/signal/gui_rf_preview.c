@@ -29,19 +29,11 @@ typedef struct { float b0, b1, b2, a1, a2, z1, z2; } rf_biquad_t;
 typedef struct { double re, im; } rf_complex_t;
 typedef enum { RF_PULSE_NONE, RF_PULSE_EQ, RF_PULSE_H, RF_PULSE_V } rf_pulse_kind_t;
 
-/* Hybrid Full-mode background levels, in the IRE domain. Translated from
- * tbc-tools OutputWriter's fixed 16-bit TBC offsets (commit 063d83e: NTSC
- * 0x0d48, PAL 0x0708) through the canonical VHS-composite IRE calibration
- * in tbc-tools' sample metadata (NTSC 0 IRE=18048 / 100 IRE=51200, PAL
- * 0 IRE=16384 / 100 IRE=54016), then into this decoder's absolute FM
- * references. NTSC: (3400-18048)/331.52 = -44.184 IRE; PAL: (1800-16384)/
- * 376.32 = -38.754 IRE. Like tbc-tools' full-range RGB hybrid path, the
- * span maps the whole 16-bit demod range onto display 0..1: 65535/331.52 =
- * 197.680 IRE (NTSC), 65535/376.32 = 174.147 IRE (PAL). Result: 0 IRE
- * blanking renders as a ~57/255 dark grey band; NTSC sync tips (-40 IRE)
- * sit 4.2 IRE above the background black and stay faintly visible (~5/255),
- * while PAL's deeper -42.9 IRE tip (sync_hz below blank_hz) clamps at the
- * floor — the CRT/production-panel VBI contrast of tbc-tools' hybrid mode. */
+/* Hybrid Full-mode background levels: the IRE-domain constants live in
+ * gui_rf_preview.h (RF_HYBRID_*) - shared with the CVBS full-frame decode
+ * so the two decoders can never drift apart. The derivation is documented
+ * there (translated from tbc-tools OutputWriter's fixed 16-bit TBC offsets,
+ * commit 063d83e: NTSC 0x0d48, PAL 0x0708). */
 typedef struct {
     int width, height, active_first, eq_count;
     double line_us, blank_hz, sync_hz, hz_ire, carrier_hz;
@@ -53,10 +45,12 @@ typedef struct {
 /* SP carrier/IRE/burst/geometry parameters from the referenced format snapshot. */
 static const rf_profile_t rf_profiles[] = {
     {768, 576, 22, 5, 64.0, 4100000.0, 3800000.0, 7000.0, 626953.0,
-     5.6, 7.85, 10.5, 62.5, 100e-9, 400e-9, -38.7543, 174.147},
+     5.6, 7.85, 10.5, 62.5, 100e-9, 400e-9,
+     RF_HYBRID_BLACK_IRE_PAL, RF_HYBRID_SPAN_IRE_PAL},
     {640, 480, 20, 6, 63.55555555555556, 3685714.2857142854, 3400000.0,
      7142.857142857143, 629370.6293706294,
-     5.3, 7.8, 9.45, 62.55555555555556, 120e-9, 320e-9, -44.1843, 197.680}
+     5.3, 7.8, 9.45, 62.55555555555556, 120e-9, 320e-9,
+     RF_HYBRID_BLACK_IRE_NTSC, RF_HYBRID_SPAN_IRE_NTSC}
 };
 
 struct gui_rf_decoder {

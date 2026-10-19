@@ -747,6 +747,25 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_rf_routes', rf_routes_test)
+
+    # Synthetic baseband composite contracts for the ported CVBS profile +
+    # VBI sync model + burst-locked colour (gui_cvbs.c included directly,
+    # trigger_analyze_cvbs_levels links from gui_trigger.c; LTO drops UI paths).
+    # gui_cvbs.c now carries the fixed-rate input resampler, so the soxr
+    # link dependency is needed wherever it is compiled.
+    cvbs_baseband_deps = overlay_test_deps + [dependency('threads')]
+    if soxr_dep.found()
+      cvbs_baseband_deps += [soxr_dep]
+    endif
+    cvbs_baseband_test = executable('gui_cvbs_test',
+      ['test/gui_cvbs_test.c', 'misrc_gui/signal/gui_trigger.c'],
+      dependencies: cvbs_baseband_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_cvbs_baseband', cvbs_baseband_test)
     capture_watchdog_test = executable('gui_capture_watchdog_test',
       ['test/gui_capture_watchdog_test.c', 'common/file_utils.c'],
       dependencies: overlay_test_deps + [dependency('threads')],

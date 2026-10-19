@@ -1,0 +1,52 @@
+# Prompt Log — 2026-10-19 — CVBS colour phase (real-capture fit), full-frame hybrid (tbc-tools analyse), FFT wording/chrome scope
+
+Companion to `prompt_readme_cvbs_colour_phase_hybrid.md` (the full commands, outputs, A/B
+measurements, the reconstruction of the hard-crashed 2026-10-18 session, and the fix
+derivations).
+
+Headless-verified state (not GUI-confirmed): canonical build + smoke test PASS; full
+meson suite 34/34 (incl. the new `gui_cvbs_baseband` full-view hybrid contracts and
+`gui_fft_label`); the real HackDAC EBU PAL capture decodes with every bar within ±0.7°
+of the EBU vectors in BOTH sync modes (AUTO and the GUI-default FIXED), 99/99 fields
+accepted / 0 rejected, self-calibrated rate 40.00 MHz; the full-frame hybrid profiled
+on the decoded frame matches the tbc-tools-analyse model (porch ~57/255 blanking band,
+sync tips at the floor, studio-swing active window, background keeps decoded chroma).
+
+## Pending GUI verification checklist (user)
+
+1. CVBS panel on the live EBU signal (play the
+   `Desktop\EBU_PAL_HackDac2_MISRC_V2.5\10sec-40msps\...Video_RF_12-bit.flac` channel A,
+   or make a fresh capture):
+   - Colours: the EBU bars decode in the correct order and hues (white, yellow, cyan,
+     green, magenta, red, blue, black) — no rotation/mirroring, no per-line hue
+     flicker (Hanover bars), stable across both Sync modes (Auto/Fixed).
+   - Frame: Active — CRT/production levels: black lifted (not crushed at floor),
+     whites with headroom, no pumping.
+   - Frame: Full — the hybrid look, comparable to tbc-tools analyse: the VBI
+     EQ/broad pulse trains readable at CRT contrast BELOW active black, a ~dark-grey
+     blanking band, sync tips at/below the band, the burst region tinted with its
+     decoded colour, and the active picture area unchanged (correct levels + colour).
+   - Colour: Off — the exact grayscale (R=G=B) in both Frame views.
+   - The mode survives worker rebinds / DSP resets as before.
+2. FFT panel:
+   - The Scale button reads the full words "Scale: Linear" / "Scale: Log" and the
+     panel starts on Linear (the stock original mode).
+   - Double-click chrome-hide hides ONLY the UI (the Scale button + the "FFT"
+     corner title). The dB axis labels (left), the frequency labels (bottom), the
+     /div (or visible-span) + zoom readouts and the peak-hover marker + readout must
+     STAY VISIBLE while hidden; a second double-click restores everything.
+   - Clicks where the hidden button was must NOT trigger it; a control click still
+     resets the double-click tracker.
+3. Sanity: the VHS FM preview and the other panels are unchanged (this session
+   touched `gui_cvbs.c/h`, `gui_rf_preview.h/.c`, `gui_fft.c`, `gui_cvbs_test.c` only).
+
+## Known observations (recorded, non-blocking; see the readme)
+- The live bars decode ~10–20% under-saturated vs the EBU 75% amplitudes (hue exact)
+  and the white bar reads ~83% display — possible follow-up calibration items, noted
+  for the next session if the GUI look warrants it.
+
+## Deliberately not done
+- No commits/push (not requested); everything is in the working tree on top of the
+  crashed session's uncommitted CVBS rework + the FFT Linear/Log feature.
+- Zip restore point (`git archive` snapshot) waits for the user's "fully working"
+  confirmation per the user's rule; update this log + create it after confirmation.

@@ -28,6 +28,25 @@ static inline double rf_display_level(double y01) {
     return level > 1.0 ? 1.0 : level;
 }
 
+/* Hybrid Full-mode background levels, in the IRE domain - shared by the RF
+ * preview's profiles and the CVBS full-frame decode so the two decoders can
+ * never drift apart. Translated from tbc-tools OutputWriter's fixed 16-bit
+ * TBC offsets (commit 063d83e: NTSC 0x0d48, PAL 0x0708) through the canonical
+ * VHS-composite IRE calibration in tbc-tools' sample metadata (NTSC 0 IRE
+ * = 18048 / 100 IRE = 51200, PAL 0 IRE = 16384 / 100 IRE = 54016), then into
+ * each decoder's own level domain. NTSC: (3400-18048)/331.52 = -44.1843 IRE;
+ * PAL: (1800-16384)/376.32 = -38.7543 IRE. Like tbc-tools' full-range RGB
+ * hybrid path, the span maps the whole demod range onto display 0..1:
+ * 65535/331.52 = 197.680 IRE (NTSC), 65535/376.32 = 174.147 IRE (PAL).
+ * Result: 0 IRE blanking renders as a ~57/255 dark grey band; NTSC sync
+ * tips (-40 IRE) sit ~4 IRE above the background black and stay faintly
+ * visible, while PAL's deeper tip clamps at the floor - the
+ * CRT/production-panel VBI contrast of tbc-tools' hybrid mode. */
+#define RF_HYBRID_BLACK_IRE_PAL  (-38.7543)
+#define RF_HYBRID_SPAN_IRE_PAL   (174.147)
+#define RF_HYBRID_BLACK_IRE_NTSC (-44.1843)
+#define RF_HYBRID_SPAN_IRE_NTSC  (197.680)
+
 typedef enum { GUI_RF_PAL = 0, GUI_RF_NTSC = 1 } gui_rf_format_t;
 typedef struct gui_rf_decoder gui_rf_decoder_t;
 

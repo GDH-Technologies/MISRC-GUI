@@ -139,6 +139,8 @@ typedef struct {
     int good_sync_count;           // Consecutive syncs within tolerance
     int bad_sync_count;            // Consecutive syncs out of tolerance
     bool locked;                   // True if PLL is locked
+    int lines_since_lock;          // Good syncs since the last lock (rate
+                                   // refinement settle gate)
 
     // Line tracking
     int current_line;              // Current line number in field (0-312 for PAL)
@@ -146,11 +148,42 @@ typedef struct {
     size_t total_samples;          // Total samples processed (for debug)
 } cvbs_pll_state_t;
 
-// V-sync detection state (persistent across buffers)
+// Colour decode mode: Auto decodes burst-gated baseband chroma; Off keeps
+// the legacy grayscale output exactly.
+typedef enum {
+    CVBS_COLOUR_OFF = 0,
+    CVBS_COLOUR_AUTO = 1,
+} cvbs_colour_mode_t;
+
+// VBI / field sync state (persistent across buffers). Ported from the
+// verified VHS FM decoder model (gui_rf_preview.c): pulses are classified
+// by WIDTH (EQ 2.35us / H 4.7us / broad ~27.3us), field parity comes from the
+// first-EQ-to-last-H phase (half-line vs integer), the field boundary is
+// placed exactly (first_eq - boundary*line), and the next train's cadence
+// is validated against 312.5/262.5 lines per field.
 typedef struct {
-    int half_line_count;           // Count of consecutive half-line intervals
-    int total_half_lines;          // Total half-line pulses in V-sync (for field detection)
-    bool in_vsync;                 // Currently in V-sync region
+    // Pulse classification state (per low pulse, driven on its rising edge)
+    bool in_pulse;                 // Currently inside a low pulse
+    size_t pulse_start;            // Sample position where the pulse began
+    size_t last_h_pos;             // Start of the last classified H pulse
+    size_t last_classified_pos;    // Start of the last EQ-or-H classified pulse
+                                   // (rate self-calibration spacing source; any
+                                   // classified pulse counts because a wrong
+                                   // declared rate reclassifies H as EQ)
+    // Pre-EQ train tracking
+    int eq_run;                     // Consecutive EQ pulses in the current train
+    int good_h;                     // H pulses seen since the last EQ/broad pulse
+    // Candidate / committed field geometry (global sample positions)
+    bool have_field;                // A field start has been committed
+    size_t field_start;             // Committed field start position
+    int field_parity;               // 0 = first/odd field, 1 = second/even field
+    // Diagnostics (surfaced in the OSD stats)
+    int vsync_candidates;           // EQ trains observed
+    int fields_accepted;           // Field boundaries committed
+    int fields_rejected;            // Rejected boundary candidates
+    int reject_cadence;             // Rejected for cadence outside profile
+    int reject_parity;              // Rejected for parity phase/cadence errors
+    char last_reject_reason[80];    // Last rejection reason
 } cvbs_vsync_state_t;
 
 // Histogram-based level detection buffer size
@@ -163,6 +196,20 @@ typedef struct {
     int16_t black;                 // Estimated black level
     int16_t white;                 // Estimated white level (highest ~95%)
     int16_t threshold;             // Current sync threshold
+    // Per-field porch (back porch, true 0 IRE blanking) accumulation: the
+    // porch is flat, chroma-free and ramp-free, so its mean is the most
+    // robust blanking estimate on colour signals (the histogram's
+    // second-lowest peak runs below true blank on saturated chroma).
+    // Gated on PLL lock so misaligned acquisition lines never pollute it.
+    int64_t porch_sum;             // Per-field porch sample sum
+    int porch_count;               // Per-field porch sample count
+    int16_t porch_level;           // Committed porch estimate (EMA-smoothed)
+    bool porch_valid;              // At least one field committed porch data
+    // Per-field FILTERED (luma-domain) maximum: the sync lowpass removes the
+    // chroma, so this tracks the true luma peak (the white-bar plateau),
+    // immune to the raw max's chroma/noise overshoot.
+    int16_t luma_max;              // Per-field filtered-domain maximum
+    bool luma_max_valid;           // Filtered max seen this field
     // Per-field sample buffer for histogram analysis
     int16_t *level_sample_buf;     // Buffer for histogram samples (allocated)
     size_t level_sample_count;     // Current count of samples in buffer
@@ -170,8 +217,10 @@ typedef struct {
 } cvbs_adaptive_levels_t;
 
 // Line buffer size - stores one complete line of samples for decoding
-// We need this because H-sync edges may not align with buffer boundaries
-#define CVBS_LINE_BUFFER_SIZE   3000  // Slightly more than max line period (2560 PAL)
+// We need this because H-sync edges may not align with buffer boundaries.
+// Sized for a full PAL line at the highest supported rate (200 MSPS = 12800
+// samples) so rate awareness never truncates the line.
+#define CVBS_LINE_BUFFER_SIZE   13100
 
 // Main decoder structure
 typedef struct cvbs_decoder {
@@ -195,8 +244,10 @@ typedef struct cvbs_decoder {
     int16_t fixed_white_level;          // Latched white level used in fixed mode
     bool fixed_sync_locked;             // FIXED mode has acquired lock and frozen line period
     double fixed_line_period;           // Frozen line period used while fixed sync lock is active
+    double fixed_period_ema;            // Slow EMA of good-sync phase error = the frozen
+                                       // period's sub-sample residual (rate refinement)
     int fixed_bad_syncs;                // Consecutive bad H-syncs while fixed lock is active
-    int16_t fixed_sync_threshold;       // Latched sync threshold used while fixed lock is active
+    int16_t fixed_sync_threshold;      // Latched sync threshold used while fixed lock is active
 
     // Field buffers (grayscale, 720 x field_height each)
     // Each field buffer stores half the vertical resolution
@@ -222,6 +273,40 @@ typedef struct cvbs_decoder {
     // Line buffer for cross-boundary line assembly
     int16_t *line_buffer;          // Buffer for current line samples
     int line_buffer_count;         // Samples currently in line buffer
+
+    // Live capture rate (Hz). 0 = not yet known: all timing falls back to the
+    // 40 MSPS legacy default until the display thread reports a real rate.
+    uint32_t sample_rate_hz;
+
+    // Self-calibrated capture rate (Hz), measured from the H-to-H sync
+    // spacing (median-filtered) and refined by the locked PLL's converged
+    // line period (AUTO mode: the converged line_period+freq_adjust; FIXED
+    // lock: the frozen period plus the good-sync phase-error EMA). The
+    // median alone is edge-quantized (real-capture jitter biased it 39.98
+    // MHz against a true 40.000 - enough to rotate late-line hues ~10 deg),
+    // so the refinement is what makes the hue decode exact. The declared
+    // rate above is only a bootstrap: input paths
+    // have been measured feeding a 20 MSPS stream while the app-level rate
+    // stays at the legacy 40 MSPS default (live capture AND playback) - a
+    // wrong declared rate leaves the geometry scale-invariant (every
+    // window derives through the same rate) so the picture still looks
+    // structurally perfect, but the subcarrier demod's carrier table runs
+    // at the wrong frequency and every hue decodes wrong. The measured rate
+    // overrides the declared value for every window, the PLL nominal and
+    // the demod carrier as soon as it is established.
+    uint32_t measured_rate_hz;
+    bool measured_rate_valid;
+    double hh_ring[64];            // Recent classified-pulse spacings (samples)
+    int hh_ring_count;
+    double hh_period_samples;      // Median spacing = the line period estimate
+    int hh_reject_streak;          // Consecutive band rejections (rate-change escape)
+
+    // Colour decode control + per-line chroma reference state. The burst
+    // vector is measured per decoded line in the line-local carrier frame;
+    // prev_burst_phase carries the PAL V-switch alternation between lines.
+    cvbs_colour_mode_t colour_mode; // Auto: burst-gated baseband chroma
+    double prev_burst_phase;         // Previous line's burst phase (PAL V-switch)
+    int prev_burst_valid;           // Previous line had a usable burst
 
     // Software PLL and sync detection (persistent across buffers)
     cvbs_adaptive_levels_t adaptive;   // Adaptive threshold tracking
@@ -275,6 +360,7 @@ typedef struct cvbs_decoder {
         Rectangle frame_btn_rect;      // Hit box for frame mode button
         Rectangle level_btn_rect;      // Hit box for levels mode button
         Rectangle sync_btn_rect;       // Hit box for sync mode button
+        Rectangle colour_btn_rect;    // Hit box for colour mode button
         Rectangle system_btn_rect;     // Hit box for system selector button
         Rectangle tape_btn_rect;       // Hit box for tape family selector button
         Rectangle tape_format_btn_rect;// Hit box for tape format selector button
@@ -314,10 +400,12 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder);
 // Decoding
 //-----------------------------------------------------------------------------
 
-// Process a buffer of raw ADC samples
-// Call this from the extraction thread with each new buffer
+// Process a buffer of raw ADC samples at the LIVE capture rate
+// (0/invalid falls back to the last known / 40 MSPS default). Every
+// profile timing window derives from the rate.
 void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
-                              const int16_t *buf, size_t count);
+                              const int16_t *buf, size_t count,
+                              uint32_t sample_rate);
 
 //-----------------------------------------------------------------------------
 // Rendering
