@@ -524,10 +524,22 @@ if raylib_dep.found()
     # MSYS2 install list does not include, so the flag breaks the link with
     # "cannot find -l:libglfw3.dll.a". OpenGL/GDI/winmm are still required.
     gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
-    # RTL-SDR: link the static archive by filename (MSYS2 names it librtlsdr_static.a;
-    # the .pc -lrtlsdr resolves to the DLL import lib which -static rejects).
+    # RTL-SDR: link the static archive by filename (MSYS2 names it
+    # librtlsdr_static.a; the .pc -lrtlsdr resolves to the DLL import lib
+    # which -static rejects), with the .pc's OWN libdir on the search path:
+    # the .pc may resolve from a different MSYS2 environment's pkgconfig
+    # dir than the compiler's (e.g. rtl-sdr installed only under mingw64
+    # while the GUI builds with the ucrt64 toolchain for CI parity) - ld's
+    # default search path only covers the compiler's own environment, so
+    # the by-filename archive link failed with "cannot find
+    # -l:librtlsdr_static.a". CI is unaffected (it installs no rtlsdr:
+    # RTLSDR stays disabled there).
     if rtlsdr_enabled
       gui_ldflags += ['-l:librtlsdr_static.a']
+      rtlsdr_libdir = rtlsdr_pc.get_variable(pkgconfig : 'libdir', default_value : '')
+      if rtlsdr_libdir != ''
+        gui_ldflags += ['-L' + rtlsdr_libdir]
+      endif
     endif
     # Need mincore for VirtualAlloc2/MapViewOfFile3 used by ringbuffer
     gui_ldflags += ['-lmincore']

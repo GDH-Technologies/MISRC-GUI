@@ -769,6 +769,12 @@ def check_no_tracked_generated_dirty_sources(repo_root: Path) -> int:
 # soxr_in_buf/soxr_out_buf inside #if LIBSOXR_ENABLED but referenced them
 # unguarded; Windows arm64 (no mingw-w64-clang-aarch64-libsoxr =>
 # LIBSOXR_ENABLED=0) failed to compile with "no member named 'soxr_in_buf'".
+# Regression e34dce9: gui_playback.c's channel-preparation helpers sat
+# outside #if LIBFLAC_ENABLED while touching guarded members (decoder_a/b,
+# io_a/b) and calling functions defined inside the guard. Member
+# declarations are resolved across the source AND the repo headers, so
+# members declared unguarded in headers (playback_file_info_t.duration_seconds
+# in gui_playback.h) are not false-flagged.
 _OPTIONAL_DEP_MACROS = (
     "LIBSOXR_ENABLED",
     "LIBFLAC_ENABLED",
@@ -842,21 +848,18 @@ def _make_c_stripper():
     return strip
 
 
-def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[int, str]]:
-    """Return [(lineno, member_name), ...] for struct member references
-    (->name / .name) that occur in plain code NOT enclosed by any conditional
-    chain that mentions <macro>, while the member is declared only inside an
-    enabled #if <macro> branch (not outside it, not in a #else branch). Those
-    compile-fail when <macro> is undefined.
-
-    Limitation: to avoid false positives on the legitimate #if/#elif !MACRO/
-    #else idiom (where the final #else is only reached when MACRO is defined),
-    a reference is NOT flagged if any enclosing #if/#elif/#else chain mentions
-    <macro> at all. This means references inside a negated guard (#if !MACRO)
-    are not caught — that rarer pattern would need a real preprocessor to
-    evaluate precisely. The guard still catches the common regression where a
-    guarded-only member is referenced in plain code with no macro conditional
-    around it (regression 64b2171 in gui_demod.c)."""
+def _scan_struct_member_source(
+    source: str,
+    macro: str,
+    members: Optional[Dict[str, Dict[str, bool]]],
+    refs: Optional[List[Tuple[int, str, str, bool]]],
+) -> None:
+    """One comment/string-stripped pass over a C source. When `members` is
+    given, record per-region struct member DECLARATIONS (a name declared
+    inside an enabled #if <macro> branch / inside a #else branch of that
+    chain / outside it). When `refs` is given, record member-style references
+    (->name / .name) with their region/enclosure state. Both may be given
+    (declarations + references from the same source in one pass)."""
     strip = _make_c_stripper()
     lines = [strip(l) for l in source.splitlines()]
 
@@ -868,11 +871,6 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
     member_re = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;")
     ref_re = re.compile(r"(?:->|\.)\s*([A-Za-z_]\w*)")
     macro_token_re = re.compile(rf"\b{re.escape(macro)}\b")
-
-    # member name -> per-region declared flags
-    members: Dict[str, Dict[str, bool]] = {}
-    # (lineno, name, region, enclosed_by_macro_chain)
-    refs: List[Tuple[int, str, str, bool]] = []
 
     for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -921,12 +919,13 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
             if struct_depth <= 0:
                 in_struct = False
                 continue
-            for m in member_re.finditer(line):
-                name = m.group(1)
-                if name in _C_TYPE_KEYWORDS:
-                    continue
-                rec = members.setdefault(name, {"enabled": False, "disabled": False, "outside": False})
-                rec[region] = True
+            if members is not None:
+                for m in member_re.finditer(line):
+                    name = m.group(1)
+                    if name in _C_TYPE_KEYWORDS:
+                        continue
+                    rec = members.setdefault(name, {"enabled": False, "disabled": False, "outside": False})
+                    rec[region] = True
             continue
 
         if struct_open_re.search(line):
@@ -942,8 +941,60 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
             continue
 
         # Outside any struct body: collect member-style references.
-        for m in ref_re.finditer(line):
-            refs.append((idx, m.group(1), region, enclosed))
+        if refs is not None:
+            for m in ref_re.finditer(line):
+                refs.append((idx, m.group(1), region, enclosed))
+
+
+def _struct_member_decl_baseline(header_texts: List[str], macro: str) -> Dict[str, Dict[str, bool]]:
+    """Member-name declaration records collected from the repo's headers.
+
+    Struct types legitimately live in headers regardless of whether the
+    header text mentions <macro>, so the baseline scans EVERY header: a
+    member name declared by any header struct outside an enabled
+    #if <macro> branch is NOT guard-only. False-positive class this fixes
+    (2026-10-19): gui_playback.c declares duration_seconds inside
+    #if LIBFLAC_ENABLED (playback_vorbis_rf_tags_t) while
+    playback_file_info_t in gui_playback.h also declares it unguarded, so
+    file-local-only analysis false-flagged a plain info->duration_seconds
+    reference outside the guard."""
+    members: Dict[str, Dict[str, bool]] = {}
+    for text in header_texts:
+        _scan_struct_member_source(text, macro, members, None)
+    return members
+
+
+def _find_unguarded_struct_member_refs(
+    source: str,
+    macro: str,
+    preseed_members: Optional[Dict[str, Dict[str, bool]]] = None,
+) -> List[Tuple[int, str]]:
+    """Return [(lineno, member_name), ...] for struct member references
+    (->name / .name) that occur in plain code NOT enclosed by any conditional
+    chain that mentions <macro>, while the member is declared only inside an
+    enabled #if <macro> branch (not outside it, not in a #else branch) across
+    the source file AND the repo headers (preseed_members: struct types
+    legitimately live in headers, so a member declared unguarded in any
+    header is not guard-only). Those compile-fail when <macro> is undefined.
+
+    Limitation: to avoid false positives on the legitimate #if/#elif !MACRO/
+    #else idiom (where the final #else is only reached when MACRO is defined),
+    a reference is NOT flagged if any enclosing #if/#elif/#else chain mentions
+    <macro> at all. This means references inside a negated guard (#if !MACRO)
+    are not caught — that rarer pattern would need a real preprocessor to
+    evaluate precisely. The guard still catches the common regression where a
+    guarded-only member is referenced in plain code with no macro conditional
+    around it (regression 64b2171 in gui_demod.c; regression e34dce9 in
+    gui_playback.c: decoder_a/b + io_a/b referenced by unguarded
+    channel-preparation helpers)."""
+    # member name -> per-region declared flags, pre-seeded from the headers
+    members: Dict[str, Dict[str, bool]] = {}
+    if preseed_members:
+        for name, rec in preseed_members.items():
+            members[name] = dict(rec)
+    # (lineno, name, region, enclosed_by_macro_chain)
+    refs: List[Tuple[int, str, str, bool]] = []
+    _scan_struct_member_source(source, macro, members, refs)
 
     guarded_only = {
         name for name, rec in members.items()
@@ -982,16 +1033,30 @@ def check_optional_dep_guard_consistency(repo_root: Path) -> int:
     referenced (->name / .name) outside the branch. Those fail to compile
     when the dependency is absent. Regression 64b2171: gui_demod.c soxr
     scratch buffers were #if LIBSOXR_ENABLED-guarded but referenced unguarded,
-    breaking the Windows arm64 build (no libsoxr => LIBSOXR_ENABLED=0)."""
+    breaking the Windows arm64 build (no libsoxr => LIBSOXR_ENABLED=0).
+    Regression e34dce9: gui_playback.c channel-preparation helpers sat
+    outside #if LIBFLAC_ENABLED while touching guarded members (decoder_a/b,
+    io_a/b) and calling FLAC/reader functions defined inside the guard.
+    Member declarations are resolved across the source file AND the repo
+    headers, so members declared unguarded in headers
+    (playback_file_info_t.duration_seconds in gui_playback.h) are not
+    false-flagged."""
     tools_dir = repo_root / "misrc_tools"
-    sources = sorted(tools_dir.rglob("*.c"))
+    sources = [(p, read_text(p)) for p in sorted(tools_dir.rglob("*.c"))]
+    header_texts = [read_text(p) for p in sorted(tools_dir.rglob("*.h"))]
     any_problem = False
-    for src_path in sources:
-        text = read_text(src_path)
-        for macro in _OPTIONAL_DEP_MACROS:
+    for macro in _OPTIONAL_DEP_MACROS:
+        # Per-macro header declaration baseline (lazy: only built when some
+        # source mentions the macro).
+        header_baseline: Optional[Dict[str, Dict[str, bool]]] = None
+        for src_path, text in sources:
             if macro not in text:
                 continue
-            for lineno, name in _find_unguarded_struct_member_refs(text, macro):
+            if header_baseline is None:
+                header_baseline = _struct_member_decl_baseline(header_texts, macro)
+            for lineno, name in _find_unguarded_struct_member_refs(
+                text, macro, preseed_members=header_baseline
+            ):
                 any_problem = True
                 rel = src_path.relative_to(repo_root)
                 print(
@@ -1653,7 +1718,10 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         "create_release:",
         "release_tag:",
         "push:",
-        "- 'v*'",
+        # CI must also run on direct pushes to main (regression e34dce9: a
+        # guard break was pushed straight to main and ran no CI for a day;
+        # the tags-only push trigger never fired).
+        "push:\n    branches:\n      - main\n    tags:\n      - 'v*'",
         "preflight-guard-tests:",
         "linux-appimage:",
         "windows-exe:",
@@ -1741,7 +1809,7 @@ def check_local_build_bootstrap_contract(repo_root: Path,
 def check_local_deps_cache_contract(repo_root: Path,
                                      workflow_path: Path,
                                      dev_notes_path: Path,
-                                     tools_readme_path: Path) -> int:
+                                     installation_md_path: Path) -> int:
     """Assert the local==CI deps caching path is present and wired.
 
     Prevents silent removal of the deps scripts, stamp gate, build-local
@@ -1800,7 +1868,10 @@ def check_local_deps_cache_contract(repo_root: Path,
         if snippet not in dev_notes_text:
             return fail(f"Dev notes are missing deps-cache contract snippet: {snippet}")
 
-    installation_text = read_text(tools_readme_path)
+    # The Vendored deps caching model section lives in the repo-root
+    # INSTALLATION.md (misrc_tools/README.md only points here); the
+    # parameter is named for the file it actually receives.
+    installation_text = read_text(installation_md_path)
     required_installation_snippets = [
         "Vendored deps caching model",
         "build-deps-windows.sh",
@@ -1810,6 +1881,39 @@ def check_local_deps_cache_contract(repo_root: Path,
     for snippet in required_installation_snippets:
         if snippet not in installation_text:
             return fail(f"INSTALLATION.md is missing deps-cache contract snippet: {snippet}")
+    return 0
+
+
+def check_local_guard_gate_contract(repo_root: Path) -> int:
+    """The local build scripts must run the static CI guard tests before any
+    build work, and direct pushes to main must run CI. Regression e34dce9:
+    guarded libFLAC struct members (decoder_a/b, io_a/b) were referenced
+    outside the guard in gui_playback.c; local builds passed because the
+    guard tests were never run locally, and the direct push to main ran no
+    CI (the push trigger was tags-only), so the break surfaced only when a
+    manually dispatched workflow run failed a day later."""
+    ps1_path = repo_root / "scripts/build-local.ps1"
+    sh_path = repo_root / "scripts/build-local.sh"
+    workflow_path = repo_root / ".github/workflows/build.yml"
+    for path in (ps1_path, sh_path, workflow_path):
+        if not path.exists():
+            return fail(f"Missing local guard-gate contract file: {path}")
+    for label, script_path in [("build-local.ps1", ps1_path), ("build-local.sh", sh_path)]:
+        text = read_text(script_path)
+        if "misrc_tools/test/ci_guard_tests.py" not in text:
+            return fail(f"{label} must run the static CI guard tests before building")
+        if "--static-only" not in text:
+            return fail(f"{label} must run the guard in --static-only mode (the documented local mode)")
+        if "CI guard tests failed" not in text:
+            return fail(f"{label} must FAIL the build when the CI guard tests fail ('CI guard tests failed')")
+    workflow_text = read_text(workflow_path)
+    push_main = "push:\n    branches:\n      - main\n    tags:\n      - 'v*'"
+    if push_main not in workflow_text:
+        return fail(
+            "build.yml must run CI on direct pushes to main (push: branches: [main] "
+            "alongside the v* tags trigger); a tags-only push trigger let a guard "
+            "break reach main with no CI (regression e34dce9)"
+        )
     return 0
 
 
@@ -2464,7 +2568,6 @@ def main() -> int:
     gui_ui_c_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
     flac_writer_c_path = repo_root / "misrc_tools/common/flac_writer.c"
     meson_path = repo_root / "misrc_tools/meson.build"
-    tools_readme_path = repo_root / "misrc_tools/README.md"
     installation_md_path = repo_root / "INSTALLATION.md"
     dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
@@ -2505,6 +2608,7 @@ def main() -> int:
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
+        ("local CI guard gate contract", lambda: check_local_guard_gate_contract(repo_root)),
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),

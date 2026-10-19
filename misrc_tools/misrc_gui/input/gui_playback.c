@@ -269,6 +269,33 @@ const char* gui_playback_speed_name(playback_speed_t speed) {
         default: return "?";
     }
 }
+
+//-----------------------------------------------------------------------------
+// Input Sample Conversion (16-bit source conventions)
+//-----------------------------------------------------------------------------
+
+// The display/extraction pipeline consumes one fixed 12-bit container per
+// sample (encode_raw_sample's raw packing, the extraction (2047 - field) << 4
+// into the 16-bit display container, VU meters, peaks and clipping all match
+// the live capture preview on that grid). 16-bit sources occur in TWO
+// real-world conventions (measured on real captures): the MISRC recorder
+// stores the 12-bit ADC container << 4 (every sample sits on a 16-grid,
+// +-32752 span), while generic tools (the 20 kHz NTSC tape FLAC) store sample
+// values DIRECTLY - a +-2190 peak file whose samples are 93.8% non-multiples
+// of 16. A blanket >> 4 crushed the second kind to 1/16 amplitude (the
+// waveform-playback accuracy bug); the detector below decides the convention
+// from the first non-silent block and is sticky for the channel's session.
+#define PLAYBACK_CONV16_PENDING 0
+#define PLAYBACK_CONV16_SHIFT4 1  // recorder 12-bit << 4 restore (or full-range display downscale)
+#define PLAYBACK_CONV16_PASS   2  // direct-domain values: pass through unchanged
+#define PLAYBACK_CONV16_DECIDE_FLOOR 16  // a block peaking below this is inconclusive (silence)
+#define PLAYBACK_CONV16_DIRECT_MAX 4096 // direct-domain peak ceiling (13-bit domain)
+// These constants and the unguarded ctx->conv16_state member are
+// dependency-independent (FLAC frames and raw s16/WAV16 reads share the
+// sticky detector) and gui_playback_release_context() resets the state
+// OUTSIDE the LIBFLAC guard - keep these defines outside it. Found by the
+// LIBFLAC_ENABLED=0 translation proof, 2026-10-19.
+
 #if LIBFLAC_ENABLED == 1
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1034,27 +1061,6 @@ static bool gui_playback_parse_frame_header(const uint8_t *w, size_t len,
     *out_variable = variable;
     return true;
 }
-
-//-----------------------------------------------------------------------------
-// Input Sample Conversion (16-bit source conventions)
-//-----------------------------------------------------------------------------
-
-// The display/extraction pipeline consumes one fixed 12-bit container per
-// sample (encode_raw_sample's raw packing, the extraction (2047 - field) << 4
-// into the 16-bit display container, VU meters, peaks and clipping all match
-// the live capture preview on that grid). 16-bit sources occur in TWO
-// real-world conventions (measured on real captures): the MISRC recorder
-// stores the 12-bit ADC container << 4 (every sample sits on a 16-grid,
-// +-32752 span), while generic tools (the 20 kHz NTSC tape FLAC) store sample
-// values DIRECTLY - a +-2190 peak file whose samples are 93.8% non-multiples
-// of 16. A blanket >> 4 crushed the second kind to 1/16 amplitude (the
-// waveform-playback accuracy bug); the detector below decides the convention
-// from the first non-silent block and is sticky for the channel's session.
-#define PLAYBACK_CONV16_PENDING 0
-#define PLAYBACK_CONV16_SHIFT4 1  // recorder 12-bit << 4 restore (or full-range display downscale)
-#define PLAYBACK_CONV16_PASS   2  // direct-domain values: pass through unchanged
-#define PLAYBACK_CONV16_DECIDE_FLOOR 16  // a block peaking below this is inconclusive (silence)
-#define PLAYBACK_CONV16_DIRECT_MAX 4096 // direct-domain peak ceiling (13-bit domain)
 
 // Decide (or keep) the 16-bit conversion mode from one frame/block of samples.
 // Thresholds, chosen from the measured files:
@@ -4597,6 +4603,16 @@ static bool gui_playback_loaded_file_matches(playback_ctx_t *ctx, int channel) {
 }
 #endif
 
+// The three channel-preparation helpers are libFLAC-only as a block:
+// open_native_flac drives the FLAC decoder API and the guarded ctx members
+// (decoder_a/b, io_a/b), prepare_ogg remuxes through it (the Ogg header
+// model also lives in the guarded region above), and prepare_raw's reader
+// (gui_playback_raw_open) is defined inside that same guarded region.
+// gui_playback_prepare() below rejects startup entirely when
+// LIBFLAC_ENABLED != 1, so none of this is reachable without libFLAC;
+// keeping the block unguarded broke the dep-less build (CI optional-dep
+// guard, 2026-10-19).
+#if LIBFLAC_ENABLED == 1
 // Open + init the libFLAC decoder for one channel against a native FLAC path
 // (the original file, or the Ogg-FLAC session remux): the IO layer stages the
 // STREAMINFO patch, and the metadata pass fills the file info header fields.
@@ -4765,6 +4781,7 @@ static bool gui_playback_prepare_ogg(playback_ctx_t *ctx, int channel, const cha
     gui_playback_ogg_header_cleanup(&h);
     return ok;
 }
+#endif // LIBFLAC_ENABLED
 
 static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
                                 const char *file_a, const char *file_b,

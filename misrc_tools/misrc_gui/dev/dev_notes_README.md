@@ -1,5 +1,27 @@
 # MISRC GUI development notes
 
+## 2026-10-19 CI guard break on main + local build gate (HARD rules)
+
+- Symptom: a manual workflow_dispatch run launched to test failed in ~40 s at the
+  preflight guards (optional-dep guard consistency) and every build job was skipped.
+- Root causes: e34dce9 pushed the playback channel-preparation helpers outside the
+  `#if LIBFLAC_ENABLED` guard straight to a tags-only-CI main; a second plain-identifier
+  break (`PLAYBACK_CONV16_*` inside the guard, unguarded `conv16_state` reset) found only
+  by the `LIBFLAC_ENABLED=0` translation proof; the local link then failed on
+  `-l:librtlsdr_static.a` (rtl-sdr installed only under mingw64 vs the ucrt64 CI-parity
+  toolchain; ucrt64 ld never searches mingw64\lib).
+- Fixes: the three helpers guarded as one block; conv16 constants moved outside the
+  guard; header-aware optional-dep member checker (no more `duration_seconds` false
+  positives); `local CI guard gate contract` + static guards wired into
+  `build-local.ps1`/`build-local.sh` before any build work; CI now runs on direct
+  pushes to main (`push: branches: [main]`, release job still tag/dispatch-gated);
+  rtlsdr static link carries the pc libdir `-L`. Purity note: the clean local fix is
+  installing `mingw-w64-ucrt-x86_64-rtl-sdr`.
+- Verified: 40/40 static guards, `LIBFLAC_ENABLED=0` translation of gui_playback.c
+  EXIT 0, `build-local.ps1` + smoke OK, `meson test` 34/34; the pushed main run must be
+  green before this is closed (it now runs CI automatically).
+- HARD rules + procedure: `ci_guard_local_build_gate.md`.
+
 ## 2026-10-19 CVBS decoder: real-time budget, feed drops, baseline wander (HARD rules)
 
 - Symptom: live AND playback CVBS decode "chokes after 8-10 s" (sync instability,
@@ -278,3 +300,13 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - `misrc_tools/misrc_gui/output/gui_record.c` (replaced `gui_record_embed_flac_duration_metadata` + `gui_record_update_flac_streaminfo_duration` with `gui_record_finalize_flac_metadata`; updated call site).
 - Validation (local, Linux Mint): `scripts/build-local.sh` build + smoke OK (libFLAC 1.5.0 multithreading; pre-existing warnings only); `misrc_tools/test/ci_guard_tests.py` 34/34 PASS; `meson test -C build-local` 3/3 OK.
 - Not yet validated: real multi-GB FLAC recording + finalize against live hardware - confirm (a) no large `flac.metadata`/temp file appears in the output directory during finalize, (b) finalize completes in seconds not minutes, (c) the written FLAC still reports correct duration in a player/Audacity and the DURATION_SECONDS/LENGTH/etc. Vorbis comment tags are present.
+
+## 2026-09-11 RP2350 dual_external_adc black frames on Windows (HARD note)
+
+- `rp2350_firmware_timing_fix.md`: every Windows software layer was instrumented and
+  proven working (libusb transfers, libuvc frame assembly, hsdaoh HID, UVC
+  negotiation) — the failure is the RP2350 firmware's HDMI timing (45-px hsync vs the
+  FPGA's 4-px), outside the MS2130's TMDS data-recovery lock range. Fix-to-make
+  (MODE_H_SYNC_WIDTH 45→4, MODE_V_SYNC_WIDTH 2→1, MODE_V_FRONT_PORCH 1→0) plus the
+  what-NOT-to-touch-again rules (no Windows driver / MS2130 / libuvc-libusb-hsdaoh
+  changes — all proven working) are recorded there.
