@@ -1,5 +1,34 @@
 # MISRC GUI development notes
 
+## 2026-10-19 CVBS decoder: real-time budget, feed drops, baseline wander (HARD rules)
+
+- Symptom: live AND playback CVBS decode "chokes after 8-10 s" (sync instability,
+  horizontally shifted top rows, mid-frame tears; toggling the decoder off/on fixed it
+  for another 8-10 s). After that was fixed, the first picture rows still shifted ~13 px
+  and crept back over ~20 rows.
+- Root causes (all measured, see `cvbs_decoder_realtime_sync_rules.md` and
+  `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`):
+  1. The panel decode ran at 1.08x real time (per-pixel divisions/trig/window loops in
+     `decode_line_to_pixels`); the display ring (`BUF_DISPLAY`, no-wait drop policy)
+     overran after ~8-10 s and dropped ~26-line chunks; the PLL integrators ingested
+     those jumps as period error (period walked 3000 ppm).
+  2. The source baseline rises ~+25 IRE after the vertical broad pulses (AC coupling);
+     a fixed sync threshold lost ~24 lines of H sync and sliced the recovering edges
+     late - each line's origin followed that error.
+- Fixes: O(1)-per-pixel prefix-sum chroma/luma decode (56 -> 13 us/line, 1.08x -> 0.43x
+  real time, output numerically identical); vectorisable luma FIR; frequency
+  integrators gated on good syncs; per-line back-porch DC clamp driving the sync
+  threshold and the luma black; field blanking commit from on-baseline lines; RF-style
+  EQ+broad cadence gate for VBI candidates; field-buffer clearing + valid-row weave;
+  `jumps:` and true per-field "ms" in the OSD; live-diag file dumps off in the GUI.
+- Verified: `meson test` 34/34; headless exact-GUI-path decode of the user's 1-minute
+  EBU HackDAC capture: 999/0 fields, bars within 0.3 deg, rows aligned top to bottom;
+  user GUI confirmation ("dead stable", top shift gone).
+- HARD rules + mandatory verification procedure: `cvbs_decoder_realtime_sync_rules.md`.
+- Backlog recorded there: player-mode drag-and-drop; Windows move/resize freeze;
+  sync robustness on real media (fast-action 4:3 anime, Philips pattern); a separate
+  SECAM CVBS mode from the tbc-tools implementation.
+
 Recent capture regressions showed that small callback-gating changes can silently break GUI feeds. Keep the following constraints in mind when touching capture/parser/audio paths:
 
 - Preserve tolerated-frame behavior in MISRC frame mode: only drop frames when `result.error_count > 0 && result.report_errors`.

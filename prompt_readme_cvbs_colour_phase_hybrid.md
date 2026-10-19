@@ -140,10 +140,91 @@ contract suite green. This render bug predates today (it appeared with the crash
 colour decode; invisible in grayscale) - the earlier GUI colour reports were the composite of
 the real decoder bugs (rounds 1-2, all measured) AND this swap.
 
+## Round 4 (same day): sync robustness — always-snap + stream-jump recovery
+
+User reports: the picture does not lock stably ~half the time; sync easily lost (especially after
+toggling video enable/disable); a shift at the top side. Rounds 2+3 were committed first
+(`bd311e0`) on request.
+
+Measurement (a TEMP lock/unlock/bad-sync trace + the exact `--panel` plugin path):
+- Clean FLAC playback is perfectly stable (lock at line 11, 499/499 fields, no unlock) — the
+  instability comes from what the live path adds: sample-stream GAPS (display-buffer drops
+  splice the stream; a pain already recorded in the round-2 panel-target comment). Gap-injected
+  variants of the 10 s capture (2 ms periodic / 40 ms burst / 1-8 ms random):
+  1. The wild-sync guard (a >0.4-line phase error: drop the sync, never snap) DEADLOCKED after a
+     jump — the phase stayed off, every sync stayed wild, the lock dropped to the transitional
+     hold (which never re-anchored), and the decoder never re-locked: measured stuck at a
+     constant -504-sample error for hundreds of lines. This was the "easily loses sync / then
+     unstable".
+  2. The VBI field model: a splice near a train poisoned the cadence reference — 2-3 rejected
+     fields per gap, each anchored by the overflow fallback with a GUESSED parity and misplaced
+     line numbering — the "shift at the top" + the weave instability. The enable/disable-video
+     symptom: the rebind burst drops buffers -> gaps -> (1) and (2).
+
+Fixes (all in gui_cvbs.c):
+- ALWAYS snap to any width-classified H sync: the 3.5-8 us width classification IS the noise
+  filter, and a huge phase error on a width-valid H is a STREAM JUMP, not noise. Applied in the
+  FIXED-locked branch (the wild-guard early return removed), the acquisition branch, the
+  transitional branch (was hold-without-snap — the deadlock), and the AUTO branch. The bad-sync
+  accounting is unchanged (decay on good, ++ on wild) — genuinely noisy stretches still drop
+  the fixed lock after 20.
+- The VBI "EQ lacks recent H" reject (a splice inside a train) now drops the stale boundary
+  reference (have_field = false): the next train re-bootstraps the field sequence instead of
+  failing cadence against a two-field-old reference.
+- Cadence-reject RECOVERY ANCHOR: a cadence-off candidate that passed the recent-H and parity
+  gates is a real train whose SEQUENCE broke (a jump) — the new field is anchored at the MEASURED
+  boundary anyway (complete the old short/long); the overflow fallback's guessed parity +
+  misplaced numbering was the shifted-top picture. Parity-repeat rejects stay unanchored
+  (ambiguous).
+
+Verified (all through the exact `--panel` plugin path, instrumentation then removed):
+- Random 1-8 ms gaps (31 over 10 s): every gap = exactly ONE bad sync, recovered on the next
+  line; ZERO unlocks; frames 483 (477 before; the splices remove ~4.9M samples ~ 12 fields).
+- 2 ms periodic gaps (19): one bad sync + one field reject per gap, zero unlocks, full 499
+  frames.
+- Startup at 5 stream offsets (0/300/700/1400/2200 ms): locks at line 11-18, 24/24 fields, zero
+  rejects — the "half the time" startup instability gone.
+- Clean 10 s: 499/499, lock at line 11; the full contract suite (incl. the render conversion
+  contract) PASS; full meson suite 34/34; the GUI rebuilt + smoke PASS.
+
+## Round 4b (same day): the frozen-period drift tracking — the FIXED-mode over-time fix
+
+User GUI check (on the 15:11 build, i.e. round 4 without this): sync "vastly more stable but still
+breaks a bit", the whole picture overall more stable, but the horizontal/top-side shift persists and
+FIXED sync mode "starts to get unstable over time". Headless measurement of a clean decode found
+the geometry exact (the bar edges within ~2 px of the profile expectation, every line's sync tip at
+the buffer origin, both field weaves aligned) — so the shift is live-path behavior: the input clock
+drift. The frozen period was a SNAPSHOT: it never tracked the true line period as the live capture's
+clock drifts, and the drift accumulates uncorrected across the EQ trains (7.5 un-snapped lines per
+field x (frozen - true)) — which lands exactly on the FIRST PICTURE LINES AFTER EACH TRAIN (the
+top-side shift) and grows as the clock drifts (the FIXED-mode over-time instability).
+
+Fix: the always-snap made each line's phase_error a CLEAN (true - frozen) period measurement, so a
+slow EMA of it (tau = 1000 lines) now feeds back into the frozen period at a tiny per-line gain
+(<= 0.0005 samples/line of wrap change - invisible; clamped to the fixed-period band) in the
+FIXED-locked and transitional branches. The EMA moved OUT of the rate-refinement block (it must
+run under a TRUSTED rate too - a trusted declared rate does not make a drifting input clock exact);
+the rate commit itself stays trusted-skipped and now uses the (self-tracking) frozen directly.
+
+Verified (ramped-drift streams synthesized by sample insertion - the input clock drifting 0 to
+~60 ppm and a 0 to ~600 ppm stress, through the exact `--panel` path):
+- The frozen period TRACKS: 1145.610 -> 1145.631 -> 1145.665 across the 60 ppm ramp; 1146.281
+  against a true 1146.33 on the 600 ppm stress (the tracking lag ~0.05 samples).
+- The sync holds through the drift: 499/499 fields, ZERO rejects, zero bad syncs on every drift run
+  (2 s / 5 s / 10 s snapshots) - the FIXED mode no longer decays as the clock drifts, and the
+  EQ-train freewheel error (the top-shift source) drains with the tracking.
+- The hues hold at real-world drift levels (60 ppm peak: yellow 166.9 deg, red 102.3 deg,
+  coherence 0.99). KNOWN LIMIT: at extreme drift (600 ppm stress) the carrier table's trusted
+  declared rate no longer matches the true output rate and the hues degrade (red 86.6 deg) while
+  the sync stays solid - documented; a real HDMI-relock step of that size re-bootstraps via the
+  non-trusted path.
+- The clean 10 s run: fixed settles at 1145.597, ema ~0 - no drift, no change. The gap run
+  unchanged (483 frames, one bad sync per gap). The full contract suite (incl. the render
+  conversion contract) PASS.
+
 ## Not done / pending
-- GUI confirmation checklist: `prompt_logs/2026-10-19_cvbs-colour-phase-hybrid_README.md` (the user) -
-  the colour items are now verified headlessly on the EXACT panel plugin path AND the render-path
-  swap is fixed (the decoded PNG the user confirmed = what the GUI should now display).
-- Rounds 2+3 are UNCOMMITTED (the user's flow: GUI confirmation first). `83a97e8` (round 1 + the
-  hybrid) is committed locally, not pushed.
+- GUI confirmation checklist: `prompt_logs/2026-10-19_cvbs-colour-phase-hybrid_README.md` (the user).
+- Rounds 4+4b are UNCOMMITTED pending the user's GUI check (enable/disable video repeatedly, live
+  capture over time, the top-side/horizontal shift). Rounds 1-3 committed locally (`83a97e8`,
+  `bd311e0`), not pushed.
 - NO zip restore point — only after the user confirms "fully working" (per rule).

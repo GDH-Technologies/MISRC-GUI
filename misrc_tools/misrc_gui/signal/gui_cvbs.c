@@ -24,9 +24,135 @@
 #include <soxr.h>
 #endif
 
+// Live diagnostics: a 2048-entry H-sync ring plus a periodic full state +
+// woven-frame (P6) dump to the CWD every CVBS_LIVE_DIAG_EVERY fields. OFF in
+// the GUI build (the periodic 2 MB file writes ran on the display thread,
+// a self-inflicted stall every ~2.5 s); the headless harness
+// (test/gui_cvbs_test.c) defines it to 1 before including this file, so
+// every headless decode of a capture still leaves the per-interval dumps
+// for inspection.
+#ifndef CVBS_LIVE_DIAG
+#define CVBS_LIVE_DIAG 0
+#endif
+
 // Debug timing for luma filter performance (per-field accumulation)
 static uint64_t g_field_decode_us = 0;      // Accumulated decode time for current field
 static double g_field_decode_avg_ms = 0.0;  // Last completed field's decode time (for OSD)
+
+// Cumulative throughput profile (process-lifetime, microseconds): the panel
+// resampler, the whole per-sample process_buffer pass, and the per-line
+// pixel decode inside it. Read through gui_cvbs_profile_get() by the
+// headless harness to split the real-time budget (a PAL field is 20 ms).
+static uint64_t g_prof_resample_us = 0;
+static uint64_t g_prof_process_us = 0;
+static uint64_t g_prof_lines_us = 0;
+static uint64_t g_prof_lines = 0;
+
+void gui_cvbs_profile_get(uint64_t *resample_us, uint64_t *process_us,
+                          uint64_t *lines_us, uint64_t *lines) {
+    if (resample_us) *resample_us = g_prof_resample_us;
+    if (process_us) *process_us = g_prof_process_us;
+    if (lines_us) *lines_us = g_prof_lines_us;
+    if (lines) *lines = g_prof_lines;
+}
+
+#if CVBS_LIVE_DIAG
+// Ring of the last 2048 H-syncs: the reconstructed phase at the pulse start
+// (the origin offset) + the wrapped phase error (the period error), with the
+// line/field identity - the horizontal-shift fingerprint per line.
+typedef struct { int line, field; double phase_at_sync, phase_error; } cvbs_diag_sync_t;
+static cvbs_diag_sync_t g_diag_ring[2048];
+static unsigned g_diag_ring_head;
+static int g_diag_dumps;
+// Per-line DC clamp trace for the first 64 lines of the most recent field.
+typedef struct { int line; double porch, tip, swing, offset; int accepted; int thr; } cvbs_diag_dc_t;
+static cvbs_diag_dc_t g_diag_dc[64];
+static int g_diag_dc_count;
+static void cvbs_diag_record(int line, int field, double at_sync, double perr) {
+    cvbs_diag_sync_t *e = &g_diag_ring[g_diag_ring_head & 2047u];
+    e->line = line; e->field = field;
+    e->phase_at_sync = at_sync; e->phase_error = perr;
+    g_diag_ring_head++;
+}
+// Dump every CVBS_LIVE_DIAG_EVERY frames (~5 s at PAL 25 fps) to the CWD:
+// the full decoder state + the ring + the woven frame as P6 PPM.
+#define CVBS_LIVE_DIAG_EVERY 125
+static void cvbs_diag_dump(cvbs_decoder_t *decoder) {
+    char txt_path[64], ppm_path[64];
+    snprintf(txt_path, sizeof(txt_path), "cvbs_live_diag_%d.txt", g_diag_dumps);
+    snprintf(ppm_path, sizeof(ppm_path), "cvbs_live_diag_%d.ppm", g_diag_dumps);
+    FILE *f = fopen(txt_path, "w");
+    if (f) {
+        fprintf(f, "dump %d frames=%d field=%d line=%d\n", g_diag_dumps,
+                decoder->state.frames_decoded, decoder->state.current_field,
+                decoder->pll.current_line);
+        fprintf(f, "pll: phase=%.3f period=%.4f freq_adj=%.4f "
+                   "locked=%d good=%d bad=%d gsl=%d perr=%.3f\n",
+                decoder->pll.phase, decoder->pll.line_period,
+                decoder->pll.freq_adjust, decoder->pll.locked ? 1 : 0,
+                decoder->pll.good_sync_count, decoder->pll.bad_sync_count,
+                decoder->pll.lines_since_lock, decoder->pll.phase_error);
+        fprintf(f, "fixed: locked=%d period=%.4f ema=%+.5f bad=%d "
+                   "thresh=%d sync_mode=%d\n",
+                decoder->fixed_sync_locked ? 1 : 0, decoder->fixed_line_period,
+                decoder->fixed_period_ema, decoder->fixed_bad_syncs,
+                (int)decoder->fixed_sync_threshold, (int)decoder->sync_mode);
+        fprintf(f, "rate: declared=%u measured=%u valid=%d trusted=%d\n",
+                decoder->sample_rate_hz, decoder->measured_rate_hz,
+                decoder->measured_rate_valid ? 1 : 0,
+                decoder->rate_trusted ? 1 : 0);
+        fprintf(f, "levels: black=%d white=%d tip=%d thresh=%d "
+                   "porch=%d/%d dc=%+.1f/%d lvl_mode=%d\n",
+                (int)decoder->levels.black_level,
+                (int)decoder->levels.white_level,
+                (int)decoder->levels.sig_min,
+                (int)decoder->levels.sync_threshold,
+                (int)decoder->adaptive.porch_level,
+                decoder->adaptive.porch_valid,
+                decoder->dc_offset, decoder->dc_offset_valid ? 1 : 0,
+                (int)decoder->level_mode);
+        fprintf(f, "vbi: acc=%d rej=%d (cad %d par %d) cands=%d "
+                   "have=%d parity=%d start=%llu reason='%s'\n",
+                decoder->vsync.fields_accepted, decoder->vsync.fields_rejected,
+                decoder->vsync.reject_cadence, decoder->vsync.reject_parity,
+                decoder->vsync.vsync_candidates, decoder->vsync.have_field,
+                decoder->vsync.field_parity,
+                (unsigned long long)decoder->vsync.field_start,
+                decoder->vsync.last_reject_reason);
+        fprintf(f, "dc clamp trace (last field, first %d lines): line porch tip swing offset acc thr\n",
+                g_diag_dc_count);
+        for (int i = 0; i < g_diag_dc_count; i++) {
+            fprintf(f, "dc %d %.0f %.0f %.0f %+.0f %d %d\n", g_diag_dc[i].line,
+                    g_diag_dc[i].porch, g_diag_dc[i].tip, g_diag_dc[i].swing,
+                    g_diag_dc[i].offset, g_diag_dc[i].accepted, g_diag_dc[i].thr);
+        }
+        unsigned n = g_diag_ring_head < 2048u ? g_diag_ring_head : 2048u;
+        unsigned base = g_diag_ring_head - n;
+        fprintf(f, "syncs %u (oldest first): line field at_sync perr\n", n);
+        for (unsigned i = 0; i < n; i++) {
+            cvbs_diag_sync_t *e = &g_diag_ring[(base + i) & 2047u];
+            fprintf(f, "%d %d %.3f %.3f\n",
+                    e->line, e->field, e->phase_at_sync, e->phase_error);
+        }
+        fclose(f);
+    }
+    int fw = decoder->frame_width, fh = decoder->frame_height;
+    if (fw > CVBS_MAX_WIDTH) fw = CVBS_MAX_WIDTH;
+    if (fh > CVBS_MAX_HEIGHT) fh = CVBS_MAX_HEIGHT;
+    if (fw > 0 && decoder->frame_buffer) {
+        FILE *p = fopen(ppm_path, "wb");
+        if (p) {
+            fprintf(p, "P6\n%d %d\n255\n", fw, fh);
+            fwrite(decoder->frame_buffer, 1u,
+                   (size_t)fw * 3u * (size_t)fh, p);
+            fclose(p);
+        }
+    }
+    g_diag_dumps++;
+}
+#else
+#define cvbs_diag_record(...) ((void)0)
+#endif
 
 static inline double cvbs_nominal_line_period(const cvbs_decoder_t *decoder);
 static inline double cvbs_effective_line_period(const cvbs_decoder_t *decoder);
@@ -139,6 +265,8 @@ static void cvbs_rederive_sample_domain(cvbs_decoder_t *decoder) {
     decoder->pll.good_sync_count = 0;
     decoder->pll.bad_sync_count = 0;
     decoder->pll.locked = false;
+    decoder->dc_offset = 0.0;
+    decoder->dc_offset_valid = false;
     cvbs_reset_fixed_sync_lock(decoder);
 }
 
@@ -603,11 +731,27 @@ static void cvbs_decoder_cycle_sync_mode(cvbs_decoder_t *decoder, const char *so
 #define FILTERED_LINE_MAX 13120
 static int16_t g_filtered_line[FILTERED_LINE_MAX];
 
-// Per-line carrier tables for the chroma demod (line-local frame, k = sample
-// index within the line). Built incrementally with periodic resync so long
-// lines at high rates do not accumulate rotation drift.
-static float g_chroma_cos[FILTERED_LINE_MAX];
-static float g_chroma_sin[FILTERED_LINE_MAX];
+// Vectorisable FIR accumulator for the luma kernel (outer loop over taps,
+// inner over samples - the form GCC's vectoriser handles at -O3).
+static int32_t g_fir_acc[FILTERED_LINE_MAX];
+
+// Per-line PREFIX SUMS over the line-local carrier frame (index k = sample
+// index within the line, entry k = the sum over samples [0, k)):
+//   g_pf_s  = sum src              g_pf_c = sum cos        g_pf_n = sum sin
+//   g_pf_i  = sum src*cos          g_pf_q = sum src*sin
+// Every window measurement (the burst, each pixel's mean-subtracted I/Q
+// correlation and its box-mean luma) is then two loads and a subtraction
+// per quantity instead of a loop over the window - the per-pixel window
+// loops plus their divisions measured 56 us per PAL line at the panel's
+// 4x-fsc rate (88% of the real-time budget on their own: the display
+// thread fell behind, the feed buffer overran after ~8-10 s and every
+// drop kicked the sync chain). Doubles: the running sums reach ~4e7 and
+// window differences must keep full sample precision.
+static double g_pf_s[FILTERED_LINE_MAX + 1];
+static double g_pf_c[FILTERED_LINE_MAX + 1];
+static double g_pf_n[FILTERED_LINE_MAX + 1];
+static double g_pf_i[FILTERED_LINE_MAX + 1];
+static double g_pf_q[FILTERED_LINE_MAX + 1];
 
 // Sync-edge delay of the pulse classifier, in SAMPLES: the PLL wrap (and so
 // the line buffer's k = 0) lands at the sync-pulse START CROSSING of the
@@ -660,9 +804,16 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     if (n < 16) return;
 
     // Pre-calculate level normalization (fixed-point: multiply by 255, divide by range)
+    // DC restoration: this line's black is the committed black shifted by
+    // the line's own measured back-porch offset (the mid-line clamp in
+    // gui_cvbs_process_buffer), so a sagging baseline decodes at the right
+    // brightness line by line. The gain (range) is the field's.
     int32_t black = levels->black_level;
     int32_t range = levels->white_level - black;
     if (range < 1) range = 1;
+    if (decoder->pll.locked && decoder->dc_offset_valid) {
+        black += (int32_t)lrint(decoder->dc_offset);
+    }
     cvbs_luma_kernel_t kernel = cvbs_select_luma_kernel(decoder);
     const int half_taps = kernel.taps / 2;
 
@@ -682,15 +833,27 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         g_filtered_line[i] = (int16_t)(sum >> kernel.shift);
     }
 
-    // Main body - compiler will unroll the small fixed-size loop
+    // Main body: outer loop over taps, inner over samples, so each inner
+    // loop is a plain widening multiply-accumulate the vectoriser maps to
+    // SIMD (the former per-sample inner reduction over a runtime tap count
+    // stayed scalar: ~20k scalar MACs per line).
     int end = n - half_taps;
-    for (int i = half_taps; i < end; i++) {
-        const int16_t *p = src + i - half_taps;
-        int32_t sum = 0;
-        for (int k = 0; k < kernel.taps; k++) {
-            sum += p[k] * kernel.coeffs[k];
+    if (end > half_taps) {
+        const int body = end - half_taps;
+        int32_t *acc = g_fir_acc;
+        {
+            const int32_t c0 = kernel.coeffs[0];
+            for (int i = 0; i < body; i++) acc[i] = (int32_t)src[i] * c0;
         }
-        g_filtered_line[i] = (int16_t)(sum >> kernel.shift);
+        for (int k = 1; k < kernel.taps; k++) {
+            const int32_t ck = kernel.coeffs[k];
+            const int16_t *p = src + k;
+            for (int i = 0; i < body; i++) acc[i] += (int32_t)p[i] * ck;
+        }
+        const int shift = kernel.shift;
+        for (int i = 0; i < body; i++) {
+            g_filtered_line[half_taps + i] = (int16_t)(acc[i] >> shift);
+        }
     }
 
     // Handle right edge (last half_taps samples) - clamp to edge
@@ -783,14 +946,28 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         double cd = cos(dphase), sd = sin(dphase);
         double c = cos((double)table_anchor * dphase);
         double s = sin((double)table_anchor * dphase);
+        // One pass over the line: the incremental carrier rotation feeds the
+        // five prefix sums directly (no per-sample table store; every
+        // window below reads prefix differences).
+        double acc_s = 0.0, acc_c = 0.0, acc_n = 0.0, acc_i = 0.0, acc_q = 0.0;
+        g_pf_s[0] = g_pf_c[0] = g_pf_n[0] = g_pf_i[0] = g_pf_q[0] = 0.0;
         for (int k = 0; k < n; k++) {
             if ((k & 255) == 0) {
                 double ph = (double)(table_anchor + (uint64_t)k) * dphase;
                 c = cos(ph);
                 s = sin(ph);
             }
-            g_chroma_cos[k] = (float)c;
-            g_chroma_sin[k] = (float)s;
+            double v = (double)src[k];
+            acc_s += v;
+            acc_c += c;
+            acc_n += s;
+            acc_i += v * c;
+            acc_q += v * s;
+            g_pf_s[k + 1] = acc_s;
+            g_pf_c[k + 1] = acc_c;
+            g_pf_n[k + 1] = acc_n;
+            g_pf_i[k + 1] = acc_i;
+            g_pf_q[k + 1] = acc_q;
             double nc = c * cd - s * sd;
             s = s * cd + c * sd;
             c = nc;
@@ -827,16 +1004,15 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
             // phase step instead of the true +-90 deg (V-switch) - every
             // downstream hue wrong. Removing the window mean kills the DC
             // term exactly; the carrier term is unaffected.
-            double wmean = 0.0;
-            for (int k = b0; k < b1; k++) wmean += (double)src[k];
-            wmean /= (double)(b1 - b0);
-            double sum_i = 0.0, sum_q = 0.0;
-            for (int k = b0; k < b1; k++) {
-                double s = (double)src[k] - wmean;
-                sum_i += s * (double)g_chroma_cos[k];
-                sum_q += s * (double)g_chroma_sin[k];
-            }
-            double norm = 2.0 / (double)(b1 - b0);
+            // sum (src - mean) * carrier = sum src*carrier - mean * sum carrier,
+            // all four sums as prefix differences.
+            double wlen = (double)(b1 - b0);
+            double wmean = (g_pf_s[b1] - g_pf_s[b0]) / wlen;
+            double sum_i = (g_pf_i[b1] - g_pf_i[b0])
+                           - wmean * (g_pf_c[b1] - g_pf_c[b0]);
+            double sum_q = (g_pf_q[b1] - g_pf_q[b0])
+                           - wmean * (g_pf_n[b1] - g_pf_n[b0]);
+            double norm = 2.0 / wlen;
             double bi = sum_i * norm, bq = sum_q * norm;
             burst_amp = sqrt(bi * bi + bq * bq);
             burst_phase = atan2(bq, bi);
@@ -888,6 +1064,23 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
             for (int k = p0; k < p1; k++) psum += src[k];
             decoder->adaptive.porch_sum += psum;
             decoder->adaptive.porch_count += (p1 - p0);
+            // Clean subset: lines on the committed baseline (the per-line
+            // clamp's offset within ~4 IRE). The field commit prefers this
+            // subset so the ~30 sagging lines after a vertical interval do
+            // not bias the committed blanking (measured: +1.5 IRE), and
+            // falls back to all lines when most of the field moved.
+            bool on_baseline = true;
+            if (decoder->adaptive.porch_valid && decoder->dc_offset_valid) {
+                double swing_nom = (double)decoder->adaptive.porch_level
+                                   - (double)levels->sig_min;
+                if (swing_nom > 0.0 && fabs(decoder->dc_offset) > 0.1 * swing_nom) {
+                    on_baseline = false;
+                }
+            }
+            if (on_baseline) {
+                decoder->adaptive.porch_sum_clean += psum;
+                decoder->adaptive.porch_count_clean += (p1 - p0);
+            }
         }
     }
 
@@ -928,6 +1121,58 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     // =========================================================================
     // Pass 2: Resample filtered line to output pixels (simple lookup) + chroma
     // =========================================================================
+    //
+    // THROUGHPUT CONTRACT. This loop runs for every output pixel of every
+    // line (~18M pixels/s at the panel's 4x-fsc PAL rate), so nothing that
+    // is constant per line may be computed here: no per-pixel divisions,
+    // trig, rate lookups or window loops. The earlier form of this loop
+    // (two window loops + ~5 divisions + cos/sin per pixel) measured 56 us
+    // per line = 88% of the real-time budget by itself; the display thread
+    // then fell behind the feed, the capture buffer overran after ~8-10 s
+    // and every dropped chunk was a stream jump into the sync chain (the
+    // live "decoder chokes after 8-10 s" + growing row shift). Every window
+    // quantity is a prefix-sum difference; every reciprocal is a per-line
+    // (or per-window-length) constant.
+
+    // Per-line constants hoisted out of the pixel loop.
+    const double ire_per_count = 100.0 / (double)range;
+    const double inv_hybrid_span = 1.0 / hybrid_span_ire;
+    const double ca = colour ? cos(alpha) : 1.0;
+    const double sa = colour ? sin(alpha) : 0.0;
+    const double vsw_gain = (double)vswitch * gain;
+
+    // Whole-cycle window snap by window LENGTH (the burst block's rule: the
+    // box mean and the I/Q correlation are exact over whole carrier cycles,
+    // shrink-only). The nominal window is 2*chroma_half samples; only the
+    // line edges clamp it shorter, so a small table indexed by the clamped
+    // length replaces the per-pixel division + rounding. Alongside it the
+    // per-length reciprocals (mean and 2/len correlation norm).
+    enum { CVBS_WIN_TABLE = 256 };
+    int snap_len[CVBS_WIN_TABLE];
+    double snap_inv[CVBS_WIN_TABLE];
+    double snap_norm[CVBS_WIN_TABLE];
+    int win_nominal = 2 * chroma_half;
+    if (win_nominal > CVBS_WIN_TABLE - 1) win_nominal = CVBS_WIN_TABLE - 1;
+    if (colour) {
+        double cyc = cvbs_rate(decoder) / profile->fsc_hz;
+        for (int len = 0; len <= win_nominal; len++) {
+            int n_cyc = (int)((double)len / cyc);
+            int snapped = (n_cyc >= 1) ? (int)(n_cyc * cyc + 0.5) : 0;
+            if (snapped > len) snapped = len;
+            snap_len[len] = snapped;
+            snap_inv[len] = snapped > 0 ? 1.0 / (double)snapped : 0.0;
+            snap_norm[len] = snapped > 0 ? 2.0 / (double)snapped : 0.0;
+        }
+    }
+
+    // Exact integer window centre per pixel, x_center(px) =
+    // floor(((2px+1) * n) / (2W)), advanced incrementally (Bresenham) -
+    // bit-identical to the former per-pixel 64-bit division.
+    const int64_t xc_den = 2 * (int64_t)pixel_width;
+    const int64_t xc_inc_q = (2 * (int64_t)n) / xc_den;
+    const int64_t xc_inc_r = (2 * (int64_t)n) % xc_den;
+    int64_t xc = (int64_t)n / xc_den;
+    int64_t xc_rem = (int64_t)n % xc_den;
 
     // Fixed-point position tracking (16.16 format)
     int32_t pos = 0;
@@ -947,8 +1192,7 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // unchanged, only the level transfer differs from the legacy raw
         // 0..255 mapping.
         bool leveled = picture_line && px >= ax0 && px < ax1;
-        double ire = (double)(g_filtered_line[idx] - black) * 100.0
-                     / (double)range;
+        double ire = (double)(g_filtered_line[idx] - black) * ire_per_count;
 
         // Chroma: integrate I/Q over a window of TWO carrier periods
         // centered on the pixel (chroma_half each side), clamped to the
@@ -960,76 +1204,56 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // integrating only the span aliases the subcarrier into full-
         // saturation alternating pixels (measured: 255,255,0 / 0,255,0 /
         // 0,0,255 patterns). The wider window is the demod lowpass; the
-        // line-local tables carry the carrier phase.
+        // line-local prefix sums carry the carrier phase.
         double u01 = 0.0, v01 = 0.0;
         if (colour) {
-        int x_center = (int)(((int64_t)px * n + (int64_t)(px + 1) * n)
-                             / (2 * (int64_t)pixel_width));
-        int c0 = x_center - chroma_half;
-        int c1 = x_center + chroma_half;
-        if (c0 < 1) c0 = 1;
-        if (c1 > n) c1 = n;
-        // Whole-cycle window (see the burst block): the box mean (the
-        // colour-path luma) and the I/Q correlation both become exact when
-        // the window spans whole carrier cycles - a 1.6- or 2.2-period
-        // window leaks several percent of the subcarrier into both
-        // (measured: the 20 MSPS box at 2.22 periods lifted the strongly-
-        // coloured bars' off-channels by ~0.15).
-        if (c1 > c0) {
-            double cyc = cvbs_rate(decoder) / profile->fsc_hz;
-            int n_cyc = (int)((double)(c1 - c0) / cyc);
-            if (n_cyc >= 1) {
-                c1 = c0 + (int)(n_cyc * cyc + 0.5);
-                if (c1 > n) c1 = n;
-            } else {
-                c1 = c0;  // narrower than one cycle: no usable chroma here
+            int x_center = (int)xc;
+            int c0 = x_center - chroma_half;
+            int c1 = x_center + chroma_half;
+            if (c0 < 1) c0 = 1;
+            if (c1 > n) c1 = n;
+            int len = c1 - c0;
+            if (len > win_nominal) len = win_nominal;
+            int wl = len > 0 ? snap_len[len] : 0;
+            if (wl > 0) {
+                c1 = c0 + wl;
+                // Same mean subtraction as the burst measurement: the local
+                // luma DC (up to 100 IRE at the white bar) leaks into a
+                // non-integer-cycle window and shifts u/v by up to ~0.2
+                // (bar-dependent hue error). Removing the window mean makes
+                // the chroma measurement luma-independent. Colour-path
+                // luma: the SAME box window's mean (the +-2-carrier-period
+                // box rejects the subcarrier to ~2-3%, while the 17-tap
+                // luma kernel still passes ~10% of it - measured: every
+                // strongly-coloured bar's luma lifted by ~10% of its chroma
+                // amplitude). All sums are prefix differences.
+                double cmean = (g_pf_s[c1] - g_pf_s[c0]) * snap_inv[len];
+                ire = (cmean - (double)black) * ire_per_count;
+                double sum_i = (g_pf_i[c1] - g_pf_i[c0])
+                               - cmean * (g_pf_c[c1] - g_pf_c[c0]);
+                double sum_q = (g_pf_q[c1] - g_pf_q[c0])
+                               - cmean * (g_pf_n[c1] - g_pf_n[c0]);
+                double norm = snap_norm[len];
+                double ic = sum_i * norm, qc = sum_q * norm;
+                // Correlation algebra for the REAL encoder convention
+                // (C = U sin(wt) + V cos(wt)): the mean-subtracted pair is
+                // (ic, qc) = R(-delta) * (V, U); alpha = expected_burst -
+                // measured_burst = delta exactly, so R(+delta) recovers
+                // (uc, vc) = (V, U) with NO residual rotation. The U/V
+                // assignment swaps the axes back (u01 from vc, v01 from
+                // uc) and vswitch unflips PAL's alternating V. Validated by
+                // the synthetic bar-hue contract (red ~103 deg, burst 180
+                // deg vectorscope) and the EBU capture (every bar within
+                // +-0.3 deg).
+                double uc = ic * ca - qc * sa;
+                double vc = ic * sa + qc * ca;
+                u01 = vc * gain;
+                v01 = uc * vsw_gain;
             }
-        }
-        if (c1 > c0) {
-            // Same mean subtraction as the burst measurement: the local
-            // luma DC (up to 100 IRE = 3200 counts at the white bar) leaks
-            // into a non-integer-cycle window and shifts u/v by up to ~0.2
-            // (bar-dependent hue error). Removing the window mean makes the
-            // chroma measurement luma-independent.
-            double cmean = 0.0;
-            for (int k = c0; k < c1; k++) cmean += (double)src[k];
-            cmean /= (double)(c1 - c0);
-            // Colour-path luma: the SAME box window's mean. The +-2-carrier-
-            // period box rejects the subcarrier to ~2-3% (truncation
-            // leakage only), while the 17-tap luma kernel still passes ~10%
-            // of it (measured: every strongly-coloured bar's luma lifted by
-            // ~10% of its chroma amplitude - green bar +5.9 IRE, which
-            // shifted every channel of the bar). The box's luma bandwidth
-            // (~1.1 MHz at 40 MSPS PAL) is comparable to the kernel's, and
-            // gray lines above keep the exact kernel mapping.
-            ire = (cmean - (double)black) * 100.0 / (double)range;
-            double sum_i = 0.0, sum_q = 0.0;
-            for (int k = c0; k < c1; k++) {
-                double s = (double)src[k] - cmean;
-                sum_i += s * (double)g_chroma_cos[k];
-                sum_q += s * (double)g_chroma_sin[k];
-            }
-            double norm = 2.0 / (double)(c1 - c0);
-            double ic = sum_i * norm, qc = sum_q * norm;
-            // Correlation algebra for the REAL encoder convention
-            // (C = U sin(wt) + V cos(wt)): the mean-subtracted pair is
-            // (ic, qc) = R(-delta) * (V, U) (ic = v cos(delta) + u sin(delta),
-            // qc = u cos(delta) - v sin(delta); delta = the line-local table
-            // offset), and the measured burst angle = -90 deg - delta
-            // (NTSC) / -90 -/+ 45 - delta (PAL, tracking the V-switch).
-            // alpha = expected_burst - measured_burst = delta exactly, so
-            // R(+delta) recovers (uc, vc) = (V, U) with NO residual rotation.
-            // The U/V assignment then swaps the axes back (u01 from vc,
-            // v01 from uc), and vswitch unflips PAL's alternating V
-            // (vswitch equals the transmitted inversion state: the burst
-            // swing's V component carries it). Validated by the synthetic
-            // bar-hue contract (red ~103 deg, burst 180 deg vectorscope).
-            double ca = cos(alpha), sa = sin(alpha);
-            double uc = ic * ca - qc * sa;
-            double vc = ic * sa + qc * ca;
-            u01 = vc * gain;
-            v01 = (double)vswitch * uc * gain;
-        }
+            // Advance the exact window centre to the next pixel.
+            xc += xc_inc_q;
+            xc_rem += xc_inc_r;
+            if (xc_rem >= xc_den) { xc_rem -= xc_den; xc++; }
         }
 
         // Display luma through the hybrid split: studio-swing mapping for
@@ -1040,16 +1264,19 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // blanking band). + the standard YUV->RGB matrix the RF renderer
         // uses (u01/v01 are 0 on gray lines -> R=G=B).
         double dy = leveled
-            ? rf_display_level(ire / 100.0)
-            : (ire - hybrid_black_ire) / hybrid_span_ire;
+            ? rf_display_level(ire * 0.01)
+            : (ire - hybrid_black_ire) * inv_hybrid_span;
         if (dy < 0.0) dy = 0.0;
         if (dy > 1.0) dy = 1.0;
         double r01 = dy + 1.140 * v01;
         double g01 = dy - 0.395 * u01 - 0.581 * v01;
         double b01 = dy + 2.032 * u01;
-        if (r01 < 0.0) r01 = 0.0; if (r01 > 1.0) r01 = 1.0;
-        if (g01 < 0.0) g01 = 0.0; if (g01 > 1.0) g01 = 1.0;
-        if (b01 < 0.0) b01 = 0.0; if (b01 > 1.0) b01 = 1.0;
+        if (r01 < 0.0) r01 = 0.0;
+        if (r01 > 1.0) r01 = 1.0;
+        if (g01 < 0.0) g01 = 0.0;
+        if (g01 > 1.0) g01 = 1.0;
+        if (b01 < 0.0) b01 = 0.0;
+        if (b01 > 1.0) b01 = 1.0;
         pixels[px * 3 + 0] = (uint8_t)(r01 * 255.0 + 0.5);
         pixels[px * 3 + 1] = (uint8_t)(g01 * 255.0 + 0.5);
         pixels[px * 3 + 2] = (uint8_t)(b01 * 255.0 + 0.5);
@@ -1339,6 +1566,8 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
     // Reset field ready flags (important when switching modes)
     decoder->field_ready[0] = false;
     decoder->field_ready[1] = false;
+    decoder->field_line_count[0] = 0;
+    decoder->field_line_count[1] = 0;
     decoder->field_sequence = 0;
     decoder->field_last_update_seq[0] = 0;
     decoder->field_last_update_seq[1] = 0;
@@ -1355,6 +1584,8 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
 
     // Reset legacy state
     decoder->lines_since_vsync = 0;
+    decoder->dc_offset = 0.0;
+    decoder->dc_offset_valid = false;
 
     // Reset frame state (preserve decoder->state.format set by gui_cvbs_set_format)
     decoder->state.current_line = 0;
@@ -1366,6 +1597,7 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
     // Reset statistics
     decoder->sync_errors = 0;
     decoder->format_changes = 0;
+    decoder->stream_jumps = 0;
 
     // Reset debug statistics
     memset(&decoder->debug, 0, sizeof(decoder->debug));
@@ -1430,8 +1662,16 @@ static void commit_adaptive_levels(cvbs_decoder_t *decoder) {
     bool have_porch = (decoder->adaptive.porch_count >= 64);
     bool have_luma_max = decoder->adaptive.luma_max_valid;
     if (have_porch) {
-        int16_t porch_now = (int16_t)(decoder->adaptive.porch_sum /
-                                      (int64_t)decoder->adaptive.porch_count);
+        // Prefer the on-baseline subset when it covers at least half of the
+        // field's porch samples (see decode_line_to_pixels).
+        int64_t psum = decoder->adaptive.porch_sum;
+        int pcount = decoder->adaptive.porch_count;
+        if (decoder->adaptive.porch_count_clean >= 64 &&
+            decoder->adaptive.porch_count_clean * 2 >= pcount) {
+            psum = decoder->adaptive.porch_sum_clean;
+            pcount = decoder->adaptive.porch_count_clean;
+        }
+        int16_t porch_now = (int16_t)(psum / (int64_t)pcount);
         if (!decoder->adaptive.porch_valid) {
             decoder->adaptive.porch_level = porch_now;
             decoder->adaptive.porch_valid = true;
@@ -1466,6 +1706,8 @@ static void commit_adaptive_levels(cvbs_decoder_t *decoder) {
     // Reset the per-field accumulators for the next field.
     decoder->adaptive.porch_sum = 0;
     decoder->adaptive.porch_count = 0;
+    decoder->adaptive.porch_sum_clean = 0;
+    decoder->adaptive.porch_count_clean = 0;
     decoder->adaptive.luma_max_valid = false;
 
     if (!picker_ok && !(decoder->adaptive.porch_valid && have_luma_max)) {
@@ -1544,9 +1786,13 @@ static void commit_adaptive_levels(cvbs_decoder_t *decoder) {
     }
 
     // Update compatibility range value (used as signal-validity guard).
-    int16_t range = decoder->levels.white_level - decoder->levels.sig_min;
-    if (range < 100) range = 100;
-    decoder->levels.range = range;
+    // Saturate: in the 16x s16 domain white - tip exceeds int16 and the
+    // wrapped negative value used to clamp to 100 (measured: 38619 -> 100).
+    int32_t range32 = (int32_t)decoder->levels.white_level
+                      - (int32_t)decoder->levels.sig_min;
+    if (range32 < 100) range32 = 100;
+    if (range32 > 32767) range32 = 32767;
+    decoder->levels.range = (int16_t)range32;
 
     // In FIXED sync mode, keep the lock threshold slowly tracking long-term gain shifts
     // (AGC/scene changes) without letting scene content cause abrupt threshold jumps.
@@ -1673,21 +1919,18 @@ static void deinterlace_fields(cvbs_decoder_t *decoder) {
     if (!decoder || !decoder->field_buffer[0] || !decoder->field_buffer[1]) return;
     if (!decoder->frame_buffer) return;
     int frame_width = decoder->frame_width;
-    int field_height = decoder->field_height;
     int frame_height = decoder->frame_height;
     int max_field_height = (CVBS_MAX_HEIGHT + 1) / 2;
+    int odd_height = decoder->field_line_count[0];
+    int even_height = decoder->field_line_count[1];
 
     if (frame_width < 1 || frame_width > CVBS_MAX_WIDTH) return;
-    if (field_height < 1) return;
-    if (field_height > max_field_height) field_height = max_field_height;
     if (frame_height < 1) return;
     if (frame_height > CVBS_MAX_HEIGHT) frame_height = CVBS_MAX_HEIGHT;
-
-    int generated_lines = field_height * 2;
-    if (generated_lines > frame_height) {
-        field_height = frame_height / 2;
-        generated_lines = field_height * 2;
-    }
+    if (odd_height < 0) odd_height = 0;
+    if (even_height < 0) even_height = 0;
+    if (odd_height > max_field_height) odd_height = max_field_height;
+    if (even_height > max_field_height) even_height = max_field_height;
 
     uint8_t *odd_field = decoder->field_buffer[0];   // Odd field (frame lines 1, 3, 5...)
     uint8_t *even_field = decoder->field_buffer[1];  // Even field (frame lines 0, 2, 4...)
@@ -1713,59 +1956,93 @@ static void deinterlace_fields(cvbs_decoder_t *decoder) {
 
     // RGB24 row stride (3 bytes per pixel since the colour decode).
     const size_t row_bytes = (size_t)frame_width * 3u;
+    int generated_lines = 0;
+    decoder->last_weave = have_odd && have_even;
 
     if (have_odd && have_even) {
-        // Weave mode: interleave both fields for full vertical resolution
-        for (int fl = 0; fl < field_height; fl++) {
-            const uint8_t *src_odd = odd_field + (size_t)fl * row_bytes;
-            const uint8_t *src_even = even_field + (size_t)fl * row_bytes;
-
-            // Even frame lines (0, 2, 4...) from even field
-            // Odd frame lines (1, 3, 5...) from odd field
-            uint8_t *dst_even = frame + (size_t)(fl * 2) * row_bytes;
-            uint8_t *dst_odd = frame + (size_t)(fl * 2 + 1) * row_bytes;
-
-            memcpy(dst_even, src_even, row_bytes);
-            memcpy(dst_odd, src_odd, row_bytes);
+        // Weave mode: keep each field's real row count so odd-height systems
+        // render 625/525 rows correctly instead of collapsing to an even count.
+        int max_rows = odd_height > even_height ? odd_height : even_height;
+        for (int fl = 0; fl < max_rows; fl++) {
+            int even_y = fl * 2;
+            int odd_y = even_y + 1;
+            if (fl < even_height && even_y < frame_height) {
+                const uint8_t *src_even = even_field + (size_t)fl * row_bytes;
+                uint8_t *dst_even = frame + (size_t)even_y * row_bytes;
+                memcpy(dst_even, src_even, row_bytes);
+                if (generated_lines < even_y + 1) generated_lines = even_y + 1;
+            }
+            if (fl < odd_height && odd_y < frame_height) {
+                const uint8_t *src_odd = odd_field + (size_t)fl * row_bytes;
+                uint8_t *dst_odd = frame + (size_t)odd_y * row_bytes;
+                memcpy(dst_odd, src_odd, row_bytes);
+                if (generated_lines < odd_y + 1) generated_lines = odd_y + 1;
+            }
         }
     } else if (have_odd) {
         // Bob mode with odd field only: duplicate lines with interpolation.
         // Per-byte averaging keeps the RGB channels independent (the legacy
         // 32-bit word trick would now straddle pixel boundaries at x3).
-        memcpy(frame + row_bytes, odd_field, row_bytes);  // dst_odd line 0
-        memcpy(frame, odd_field, row_bytes);               // dst_even line 0
+        int field_height = odd_height;
+        if (field_height < 1) return;
+        if (frame_height > 0) memcpy(frame, odd_field, row_bytes);  // dst_even line 0
+        if (frame_height > 1) memcpy(frame + row_bytes, odd_field, row_bytes);  // dst_odd line 0
 
         for (int fl = 1; fl < field_height; fl++) {
             const uint8_t *src = odd_field + (size_t)fl * row_bytes;
             const uint8_t *src_prev = odd_field + (size_t)(fl - 1) * row_bytes;
-            uint8_t *dst_even = frame + (size_t)(fl * 2) * row_bytes;
-            uint8_t *dst_odd = frame + (size_t)(fl * 2 + 1) * row_bytes;
+            int even_y = fl * 2;
+            int odd_y = even_y + 1;
 
-            memcpy(dst_odd, src, row_bytes);
-            for (size_t x = 0; x < row_bytes; x++) {
-                dst_even[x] = (uint8_t)((src_prev[x] + src[x]) >> 1);
+            if (odd_y < frame_height) {
+                uint8_t *dst_odd = frame + (size_t)odd_y * row_bytes;
+                memcpy(dst_odd, src, row_bytes);
+            }
+            if (even_y < frame_height) {
+                uint8_t *dst_even = frame + (size_t)even_y * row_bytes;
+                for (size_t x = 0; x < row_bytes; x++) {
+                    dst_even[x] = (uint8_t)((src_prev[x] + src[x]) >> 1);
+                }
             }
         }
+        generated_lines = field_height * 2;
+        if (generated_lines > frame_height) generated_lines = frame_height;
     } else if (have_even) {
         // Bob mode with even field only
+        int field_height = even_height;
+        if (field_height < 1) return;
         for (int fl = 0; fl < field_height - 1; fl++) {
             const uint8_t *src = even_field + (size_t)fl * row_bytes;
             const uint8_t *src_next = even_field + (size_t)(fl + 1) * row_bytes;
-            uint8_t *dst_even = frame + (size_t)(fl * 2) * row_bytes;
-            uint8_t *dst_odd = frame + (size_t)(fl * 2 + 1) * row_bytes;
+            int even_y = fl * 2;
+            int odd_y = even_y + 1;
 
-            memcpy(dst_even, src, row_bytes);
-            for (size_t x = 0; x < row_bytes; x++) {
-                dst_odd[x] = (uint8_t)((src[x] + src_next[x]) >> 1);
+            if (even_y < frame_height) {
+                uint8_t *dst_even = frame + (size_t)even_y * row_bytes;
+                memcpy(dst_even, src, row_bytes);
+            }
+            if (odd_y < frame_height) {
+                uint8_t *dst_odd = frame + (size_t)odd_y * row_bytes;
+                for (size_t x = 0; x < row_bytes; x++) {
+                    dst_odd[x] = (uint8_t)((src[x] + src_next[x]) >> 1);
+                }
             }
         }
         // Last line: just duplicate
         int last_fl = field_height - 1;
         const uint8_t *src_last = even_field + (size_t)last_fl * row_bytes;
-        uint8_t *dst_even_last = frame + (size_t)(last_fl * 2) * row_bytes;
-        uint8_t *dst_odd_last = frame + (size_t)(last_fl * 2 + 1) * row_bytes;
-        memcpy(dst_even_last, src_last, row_bytes);
-        memcpy(dst_odd_last, src_last, row_bytes);
+        int even_y = last_fl * 2;
+        int odd_y = even_y + 1;
+        if (even_y < frame_height) {
+            uint8_t *dst_even_last = frame + (size_t)even_y * row_bytes;
+            memcpy(dst_even_last, src_last, row_bytes);
+        }
+        if (odd_y < frame_height) {
+            uint8_t *dst_odd_last = frame + (size_t)odd_y * row_bytes;
+            memcpy(dst_odd_last, src_last, row_bytes);
+        }
+        generated_lines = field_height * 2;
+        if (generated_lines > frame_height) generated_lines = frame_height;
     }
 
     // Full-frame line systems are odd-height (625/525). Duplicate final line if needed.
@@ -1805,7 +2082,9 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
 
     // Mark this field as received
     int field_idx = decoder->state.current_field ? 1 : 0;
+    if (line_count > decoder->field_height) line_count = decoder->field_height;
     decoder->field_ready[field_idx] = true;
+    decoder->field_line_count[field_idx] = line_count;
     decoder->field_sequence++;
     decoder->field_last_update_seq[field_idx] = decoder->field_sequence;
 
@@ -1827,6 +2106,11 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
     decoder->state.frame_complete = true;
     decoder->state.frames_decoded++;
     decoder->debug.fields_decoded++;
+#if CVBS_LIVE_DIAG
+    if (decoder->state.frames_decoded % CVBS_LIVE_DIAG_EVERY == 0) {
+        cvbs_diag_dump(decoder);
+    }
+#endif
 }
 
 // Commit a verified field boundary (the ported RF-decoder model; see
@@ -1851,6 +2135,13 @@ static void cvbs_start_field_anchored(cvbs_decoder_t *decoder, int parity,
     if (into_field < 0.0) into_field = 0.0;
     int line = (int)(into_field / period);
     double phase = into_field - (double)line * period;
+    int field_idx = parity ? 1 : 0;
+    if (decoder->field_buffer[field_idx]) {
+        size_t clear_bytes = (size_t)decoder->frame_width * 3u * (size_t)decoder->field_height;
+        memset(decoder->field_buffer[field_idx], 0, clear_bytes);
+    }
+    decoder->field_ready[field_idx] = false;
+    decoder->field_line_count[field_idx] = 0;
     pll->current_line = line;
     pll->phase = phase;
     pll->samples_in_line = 0;
@@ -1893,6 +2184,14 @@ static void cvbs_vbi_first_eq(cvbs_decoder_t *decoder, size_t first_eq_pos,
         vs->reject_parity++;
         snprintf(vs->last_reject_reason, sizeof(vs->last_reject_reason),
                  "vertical EQ lacks recent H reference");
+        // A stream jump (a display-buffer drop splicing the sample stream)
+        // can land inside a train, leaving the last H reference across the
+        // gap. Drop the stale boundary reference too, so the NEXT train
+        // re-bootstraps the field sequence instead of failing its cadence
+        // against a two-field-old reference (measured: two to three
+        // rejected fields per gap before this - each reject anchoring via
+        // the overflow fallback, shifting the picture's line numbering).
+        vs->have_field = false;
         return;
     }
 
@@ -1928,10 +2227,29 @@ static void cvbs_vbi_first_eq(cvbs_decoder_t *decoder, size_t first_eq_pos,
                 vs->reject_cadence++;
                 snprintf(vs->last_reject_reason, sizeof(vs->last_reject_reason),
                          "vertical field cadence outside profile");
+                // RECOVERY ANCHOR: a cadence-off candidate passed the
+                // recent-H and parity-phase gates, so it is a real train
+                // whose SEQUENCE broke - a stream jump (a display-buffer
+                // drop splicing the sample stream) shifted the elapsed
+                // sample count by the gap. Anchor the new field at the
+                // MEASURED boundary anyway (complete the old field short or
+                // long): the overflow fallback would instead re-anchor at
+                // the line-count cap with a GUESSED parity and misplaced
+                // line numbering - measured on the gap tests as the
+                // shifted-top/weaving picture for a full field per gap.
+                // The reject stays counted for the diagnostics; the
+                // sequence reference below still tracks this candidate, so
+                // the next train's cadence validates normally.
+                cvbs_start_field_anchored(decoder, parity, global_pos,
+                                          new_field_start);
             } else {
                 vs->reject_parity++;
                 snprintf(vs->last_reject_reason, sizeof(vs->last_reject_reason),
                          "vertical fields repeat parity");
+                // A parity-repeat candidate is ambiguous (a parity glitch
+                // or a false candidate that passed the gates): do NOT
+                // anchor on it - the old field continues to the overflow
+                // fallback and the next train re-establishes.
             }
         }
     }
@@ -1961,7 +2279,20 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
         phase_error -= line_period;
     }
 
-    // Update PLL lock status based on phase error magnitude
+#if CVBS_LIVE_DIAG
+    cvbs_diag_record(pll->current_line, decoder->state.current_field,
+                     phase_at_sync, phase_error);
+#endif
+
+    // Update PLL lock status based on phase error magnitude.
+    // good_sync is ALSO the frequency-measurement gate below: once locked
+    // (snap each line) a good sync's phase_error is a clean (true - model)
+    // period measurement, while an out-of-threshold error on a width-valid
+    // H is a STREAM JUMP (a dropped/duplicated feed chunk), not a period
+    // error. The snap absorbs the jump; the integrators must not see it -
+    // measured on the live path: each drop kicked the frozen-period EMA by
+    // up to 0.57 samples and the period walked ~3.5 samples (3000 ppm) off
+    // within seconds, shifting every post-VBI line horizontally.
     bool good_sync = fabs(phase_error) < tuning.lock_threshold;
     if (good_sync) {
         pll->good_sync_count++;
@@ -1988,12 +2319,19 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
             // per-line residual jitter, smearing the profile's burst/active
             // sample windows and turning the colour decode into noise.
             //
-            // Bad-sync accounting first (the drop-back-to-acquisition
-            // path), THEN the wild-sync guard, THEN the snap: a wild
-            // phase_error (way off - a noise/garbage classification) must
-            // never be snapped to (the AUTO path guards the same way): a
-            // wild snap derails the phase mid-field, and the derailed wraps
-            // spawn false first-EQ candidates that reject real trains.
+            // ALWAYS snap, whatever the phase error magnitude: the pulse
+            // was classified H by WIDTH (3.5-8 us) - that classification is
+            // the noise filter, and a width-valid H with a huge phase error
+            // is a STREAM JUMP (a display-buffer drop splices the sample
+            // stream), not noise. The old wild-sync guard (drop syncs with
+            // > 0.4 line of error, never snap to them) deadlocked after a
+            // jump: the phase stayed off, every sync stayed wild, the lock
+            // dropped to the transitional hold which never re-anchored, and
+            // the decoder never re-locked (measured: random 1-8 ms gaps in
+            // the EBU capture left it stuck at a constant -504-sample error
+            // for the rest of the stream, ~300 lines and counting). Snapping
+            // absorbs a jump in ONE sync line; the bad-sync accounting below
+            // still tracks genuinely noisy stretches.
             if (fabs(phase_error) < tuning.lock_threshold) {
                 if (decoder->fixed_bad_syncs > 0) decoder->fixed_bad_syncs--;
             } else if (fabs(phase_error) > line_period * 0.30) {
@@ -2004,16 +2342,42 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
                 if (!near_field_boundary) {
                     decoder->fixed_bad_syncs++;
                 }
-            }
-            if (fabs(phase_error) > line_period * 0.4) {
-                // This sync is way off - probably noise or a V-sync pulse.
-                decoder->debug.hsyncs_last_field++;
-                return;
+                decoder->stream_jumps++;
             }
             pll->phase -= phase_at_sync;
             pll->line_period = decoder->fixed_line_period;
             pll->freq_adjust = 0.0;
             pll->phase_integral = 0.0;
+
+            // Slow FROZEN-PERIOD DRIFT TRACKING. The always-snap makes each
+            // line's phase_error a clean measurement of (true - frozen)
+            // period error (the snap removes the origin, the sub-sample
+            // edges remove the crossing quantization). A slow EMA of it,
+            // fed back into the frozen period at a tiny per-line gain, lets
+            // the frozen value track the TRUE line period as the input
+            // device's clock drifts (a live capture's crystal/TMDS relock
+            // drifts tens to hundreds of ppm over minutes) - WITHOUT the
+            // fixed mode's stability intent being lost: the per-line wrap
+            // change from the correction is <= 0.0005 samples (invisible),
+            // and the correction is clamped to the fixed-period band. This
+            // also drains the EQ-train freewheel error (7.5 un-snapped lines
+            // per field accumulate (frozen - true) and shift the FIRST
+            // picture lines after each train - the drifting top-side
+            // horizontal shift, growing as the clock drifts).
+            if (good_sync) {
+                decoder->fixed_period_ema =
+                    decoder->fixed_period_ema * 0.999 + phase_error * 0.001;
+                if (fabs(decoder->fixed_period_ema) < 8.0) {
+                    double nominal = cvbs_nominal_line_period(decoder);
+                    double clamp = cvbs_fixed_period_clamp(decoder);
+                    double tracked = decoder->fixed_line_period
+                                     + decoder->fixed_period_ema * 0.001;
+                    if (tracked > nominal - clamp && tracked < nominal + clamp) {
+                        decoder->fixed_line_period = tracked;
+                        pll->line_period = decoder->fixed_line_period;
+                    }
+                }
+            }
 
             if (decoder->fixed_bad_syncs >= PLL_FIXED_UNLOCK_COUNT) {
                 cvbs_reset_fixed_sync_lock(decoder);
@@ -2026,30 +2390,29 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
             }
         } else if (!fixed_locked) {
             // Acquisition phase for fixed mode: mirror the AUTO path
-            // exactly (wild-sync guard, per-line snap once locked so the
-            // windows carry no residual jitter, integral converging the
-            // period) and FREEZE only after the integral has CONVERGED:
+            // exactly (per-line snap once locked so the windows carry no
+            // residual jitter, integral converging the period - and ALWAYS
+            // snapping to width-classified H syncs, see the locked branch:
+            // a huge phase error on a width-valid H is a stream jump, not
+            // noise) and FREEZE only after the integral has CONVERGED:
             // ~1000 good syncs since lock leaves <0.01 samples of residual.
             // The freeze at the FIRST lock (10 syncs) latched a ~1.3-sample
             // residual (measured on the real EBU capture): every wrap - and
             // so every porch/burst/active window - then ran the same ~1.3
             // samples late, the porch mean caught sync residue, the
             // committed black ran ~2 IRE high, the sync threshold landed
-            // ~300 counts shallow, dark-bar chroma dips crossed it, and the
-            // resulting false fragments rejected every second VBI train for
-            // cadence. A converged freeze has none of that, and the frozen
-            // value stays as stable as the first-lock freeze ever was.
-            if (fabs(phase_error) > line_period * 0.4) {
-                // This sync is way off - probably noise or a V-sync pulse.
-                decoder->debug.hsyncs_last_field++;
-                return;
-            }
+            // ~300 counts shallow, and the resulting false fragments rejected
+            // every second VBI train for cadence. A converged freeze has
+            // none of that, and the frozen value stays as stable as the
+            // first-lock freeze ever was.
             if (pll->locked) {
                 pll->phase -= phase_at_sync;
-                pll->phase_integral += phase_error * tuning.integral_gain;
-                if (pll->phase_integral > 50) pll->phase_integral = 50;
-                if (pll->phase_integral < -50) pll->phase_integral = -50;
-                pll->freq_adjust = pll->phase_integral;
+                if (good_sync) {
+                    pll->phase_integral += phase_error * tuning.integral_gain;
+                    if (pll->phase_integral > 50) pll->phase_integral = 50;
+                    if (pll->phase_integral < -50) pll->phase_integral = -50;
+                    pll->freq_adjust = pll->phase_integral;
+                }
                 if (pll->lines_since_lock >= 1000) {
                     double nominal = cvbs_nominal_line_period(decoder);
                     double fixed_period = pll->line_period + pll->freq_adjust;
@@ -2078,9 +2441,21 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
             }
         } else {
             // fixed_locked but not re-locked yet (transitional): hold the
-            // frozen period constant; the next good H resumes snapping.
+            // frozen period and KEEP SNAPPING to every width-classified H.
+            // The old hold-without-snap deadlocked after a stream jump: the
+            // phase stayed off, every sync stayed bad, and the re-lock (10
+            // consecutive good syncs) could never happen - measured: stuck
+            // at a constant -504-sample error for hundreds of lines. With
+            // the snap, the phase re-anchors immediately and the re-lock
+            // follows within ~10 lines. The drift-tracking EMA keeps
+            // running (the phase_error stays a clean period measurement).
+            pll->phase -= phase_at_sync;
             pll->line_period = decoder->fixed_line_period;
             pll->freq_adjust = 0.0;
+            if (good_sync) {
+                decoder->fixed_period_ema =
+                    decoder->fixed_period_ema * 0.999 + phase_error * 0.001;
+            }
         }
     } else {
         // AUTO mode: while ACQUIRING, adapt phase and frequency gently. Once
@@ -2089,24 +2464,26 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
         // windows carry no per-line residual jitter (the legacy gentle-gain
         // approach smeared the windows by up to lock_threshold samples and
         // turned the burst-locked colour decode into noise).
-        if (fabs(phase_error) > line_period * 0.4) {
-            // This sync is way off - probably noise or V-sync region.
-            decoder->debug.hsyncs_last_field++;
-            return;
-        }
+        // ALWAYS snap to width-classified H syncs (see the fixed-locked
+        // branch: a huge phase error on a width-valid H is a stream jump,
+        // not noise - the old wild-sync guard deadlocked after one).
         if (pll->locked) {
             // Snap so the NEXT line wrap lands exactly on the next sync
-            // START (phase - phase_at_sync = pulse width; the wrap then
+            // START (phase - phase_at_sync = the pulse width; the wrap then
             // fires period-width after the rising edge = the next sync
             // start) - the RF decoder's per-line measured-H anchor. Keep
             // the frequency tracking alive: the next line's phase_error
             // measures the per-line drift, so the integral still converges
             // the period for off-nominal capture rates.
             pll->phase -= phase_at_sync;
-            pll->phase_integral += phase_error * tuning.integral_gain;
-            if (pll->phase_integral > 50) pll->phase_integral = 50;
-            if (pll->phase_integral < -50) pll->phase_integral = -50;
-            pll->freq_adjust = pll->phase_integral;
+            if (good_sync) {
+                pll->phase_integral += phase_error * tuning.integral_gain;
+                if (pll->phase_integral > 50) pll->phase_integral = 50;
+                if (pll->phase_integral < -50) pll->phase_integral = -50;
+                pll->freq_adjust = pll->phase_integral;
+            } else if (fabs(phase_error) > line_period * 0.30) {
+                decoder->stream_jumps++;
+            }
         } else {
             pll->phase -= phase_error * tuning.phase_gain;
             pll->phase_integral += phase_error * tuning.integral_gain;
@@ -2135,23 +2512,16 @@ static void pll_process_hsync(cvbs_decoder_t *decoder, double phase_at_sync) {
     // of the running rate (a real stream change re-bootstraps through the
     // median path's reject escape instead, never through this refinement).
     // lines_since_lock always counts (the FIXED-mode freeze gate depends
-    // on it); the rate measurements themselves (the frozen-period EMA and
-    // the commit) are skipped under a TRUSTED declared rate.
+    // on it); the rate commit itself is skipped under a TRUSTED declared
+    // rate. (The frozen-period DRIFT-tracking EMA now lives in the FIXED
+    // branches above - it must run under a trusted rate too, since a
+    // trusted rate does not make a drifting input clock exact.)
     if (pll->locked && good_sync) {
         if (pll->lines_since_lock < 1000000) pll->lines_since_lock++;
-        // FIXED lock: the EMA tracks the frozen period's residual as a pure
-        // MEASUREMENT (each good sync's phase_error) for the rate estimate
-        // below - it is deliberately NOT fed back into the wrap period (an
-        // EMA-in-the-loop correction was measured unstable; see
-        // cvbs_effective_line_period).
-        if (fixed_mode && decoder->fixed_sync_locked && !decoder->rate_trusted) {
-            decoder->fixed_period_ema =
-                decoder->fixed_period_ema * 0.99 + phase_error * 0.01;
-        }
         if (pll->lines_since_lock > 1000 && !decoder->rate_trusted) {
             double effective;
             if (fixed_mode && decoder->fixed_sync_locked) {
-                effective = decoder->fixed_line_period + decoder->fixed_period_ema;
+                effective = decoder->fixed_line_period;
             } else {
                 effective = pll->line_period + pll->freq_adjust;
             }
@@ -2204,6 +2574,9 @@ static void decode_current_line(cvbs_decoder_t *decoder) {
                 decode_line_to_pixels(decoder,
                                       decoder->line_buffer, samples_available,
                                       &decoder->levels, row_ptr, frame_width);
+                if (decoder->field_line_count[field_idx] < field_line + 1) {
+                    decoder->field_line_count[field_idx] = field_line + 1;
+                }
             }
         }
     }
@@ -2347,12 +2720,38 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
     }
 
     // Cache frequently accessed values in local variables
-    int16_t threshold = cvbs_get_sync_threshold(decoder, buf, count);
+    const int16_t base_threshold = cvbs_get_sync_threshold(decoder, buf, count);
     cvbs_pll_state_t *pll = &decoder->pll;
     int16_t *line_buffer = decoder->line_buffer;
     int line_buffer_count = decoder->line_buffer_count;
     size_t global_sample_pos = decoder->global_sample_pos;
     bool last_filtered_above = decoder->last_filtered_above;
+
+    // Per-line DC restoration (back-porch clamp). The slicing threshold is
+    // the committed tip/blank midpoint PLUS the latest line's measured DC
+    // offset, so a baseline sag (AC-coupled source after the vertical broad
+    // pulses) moves the threshold with the signal instead of leaving the
+    // blanking below it. Measured mid-line from the raw line buffer the
+    // moment the back porch is complete (dc_p1 samples into the line), so
+    // the NEXT sync edge already slices at the corrected level and this
+    // line's own luma black (decode_line_to_pixels) uses its own porch.
+    // Windows relative to the line origin (the filtered falling-edge
+    // crossing, CVBS_SYNC_EDGE_DELAY_SAMPLES after the true sync start):
+    // tip interior 1.0..3.5 us into the 4.7 us pulse, porch = burst end +2
+    // .. active start -2 (the field-commit porch window).
+    const int dc_t0 = cvbs_us_to_samples(decoder, 1.0) - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    const int dc_t1 = cvbs_us_to_samples(decoder, 3.5) - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    const int dc_p0 = cvbs_us_to_samples(decoder, profile->burst_end_us) + 2
+                      - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    const int dc_p1 = cvbs_us_to_samples(decoder, profile->active_start_us) - 2
+                      - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    const bool dc_windows_ok = dc_t0 >= 0 && dc_t1 > dc_t0 + 4 &&
+                               dc_p0 > dc_t1 && dc_p1 > dc_p0 + 8 &&
+                               dc_p1 < CVBS_LINE_BUFFER_SIZE;
+    int16_t threshold = base_threshold;
+    if (pll->locked && decoder->dc_offset_valid) {
+        threshold = (int16_t)(base_threshold + lrint(decoder->dc_offset));
+    }
 
     // Pre-calculate effective period (only changes on H-sync/state transitions)
     double effective_period = cvbs_effective_line_period(decoder);
@@ -2397,6 +2796,56 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
         // Store UNFILTERED sample in line buffer (for video decoding)
         if (line_buffer_count < CVBS_LINE_BUFFER_SIZE) {
             line_buffer[line_buffer_count++] = sample;
+        }
+
+        // Back porch complete for this line: measure the line's DC (porch)
+        // and sync tip from the raw samples and re-slice from here on. Gated
+        // on PLL lock (an unlocked wrap lands anywhere) and on a plausible
+        // tip-to-porch swing (a VBI broad-pulse line puts the porch window
+        // on the tip: swing ~0 -> keep the previous offset).
+        if (line_buffer_count == dc_p1 && dc_windows_ok && pll->locked &&
+            decoder->adaptive.porch_valid) {
+            int64_t ps = 0, ts = 0;
+            for (int k = dc_p0; k < dc_p1; k++) ps += line_buffer[k];
+            for (int k = dc_t0; k < dc_t1; k++) ts += line_buffer[k];
+            double porch = (double)ps / (double)(dc_p1 - dc_p0);
+            double tip = (double)ts / (double)(dc_t1 - dc_t0);
+            // Nominal tip-to-blank swing from the committed levels (int32:
+            // levels.range is an int16 that saturates in the 16x s16 domain).
+            double swing_nom = (double)decoder->adaptive.porch_level
+                               - (double)decoder->levels.sig_min;
+            double range32 = (double)((int32_t)decoder->levels.white_level
+                                      - (int32_t)decoder->levels.sig_min);
+            if (swing_nom < 0.1 * range32) swing_nom = 0.4 * range32;
+            double swing = porch - tip;
+            double offset = porch - (double)decoder->adaptive.porch_level;
+            // Accept a line whose tip window holds a real sync pulse: a full
+            // H sync reads ~1.0x the nominal swing, a post-EQ line ~0.45-0.55x
+            // (the 2.35 us EQ pulse half-fills the 1.0-3.5 us window), a
+            // broad-pulse line ~0 (porch window on the tip) and a misaligned
+            // window on picture content well above 1.6x. The offset bound is
+            // a full tip-to-blank swing (~40 IRE) of baseline wander.
+            bool accept = swing > 0.35 * swing_nom && swing < 1.6 * swing_nom &&
+                          fabs(offset) < 1.0 * swing_nom;
+            if (accept) {
+                decoder->dc_offset = offset;
+                decoder->dc_offset_valid = true;
+                threshold = (int16_t)(base_threshold + lrint(offset));
+            }
+#if CVBS_LIVE_DIAG
+            if (pll->current_line < 64) {
+                if (pll->current_line == 0 || g_diag_dc_count >= 64 ||
+                    (g_diag_dc_count > 0 &&
+                     g_diag_dc[g_diag_dc_count - 1].line > pll->current_line)) {
+                    g_diag_dc_count = 0;
+                }
+                if (g_diag_dc_count < 64) {
+                    g_diag_dc[g_diag_dc_count++] = (cvbs_diag_dc_t){
+                        pll->current_line, porch, tip, swing, offset, accept ? 1 : 0,
+                        (int)threshold };
+                }
+            }
+#endif
         }
 
         // Advance PLL phase
@@ -2457,35 +2906,63 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                 (double)global_sample_pos - 1.0 + frac_end;
             double pulse_us = (pulse_end_sub - vs->pulse_start_sub) *
                               1000000.0 / rate_hz;
+            double spacing = vs->last_pulse_pos
+                ? (double)vs->pulse_start - (double)vs->last_pulse_pos
+                : 0.0;
+            bool half_line_cadence = vs->last_pulse_pos != 0 &&
+                fabs(spacing - effective_period * 0.5) < effective_period * 0.12;
             if (pulse_us >= 0.6 && pulse_us < 3.5) {
                 // Equalizing pulse: part of a vertical-blanking train. The
-                // FIRST EQ after normal H pulses is a field-boundary
-                // candidate; the cadence validation rejects strays.
-                if (vs->eq_run == 0) {
-                    // Write back cached state: cvbs_vbi_first_eq may commit a
-                    // field boundary (which re-anchors the PLL and resets the
-                    // line bookkeeping through the anchored field start).
-                    decoder->line_buffer_count = line_buffer_count;
-                    decoder->global_sample_pos = global_sample_pos;
-                    decoder->last_filtered_above = is_above;
-
-                    cvbs_vbi_first_eq(decoder, vs->pulse_start, global_sample_pos);
-
-                    // Refresh cached values that the commit may have changed.
-                    effective_period = cvbs_effective_line_period(decoder);
-                    line_buffer_count = decoder->line_buffer_count;
+                // FIRST EQ after a normal H pulse starts a candidate train,
+                // but it is not trusted until the expected broad-pulse cadence
+                // appears - mirroring the verified RF decoder path.
+                if (vs->last_kind == 1 && half_line_cadence) {
+                    vs->eq_run++;
+                } else {
+                    vs->eq_run = 1;
+                    vs->first_eq_pos = vs->pulse_start;
                 }
-                vs->eq_run++;
+                vs->v_run = 0;
+                vs->last_kind = 1;
+                vs->last_pulse_pos = vs->pulse_start;
             } else if (pulse_us >= 3.5 && pulse_us <= 8.0) {
                 // Normal H-sync tip: feeds the PLL (with the phase
                 // reconstructed at the pulse START) and the VBI H reference.
                 vs->eq_run = 0;
+                vs->v_run = 0;
                 double phase_at_start = pll->phase -
                     ((double)global_sample_pos - vs->pulse_start_sub);
                 pll_process_hsync(decoder, phase_at_start);
                 vs->last_h_pos = vs->pulse_start;
+                vs->last_kind = 2;
+                vs->last_pulse_pos = vs->pulse_start;
                 // Update effective period after PLL adjustment
                 effective_period = cvbs_effective_line_period(decoder);
+            } else if (pulse_us >= 19.0 && pulse_us <= 36.0) {
+                // Broad pulses confirm a real VBI train only after a valid
+                // pre-EQ cadence. Trigger the field-boundary logic on the
+                // third broad pulse, matching the RF path.
+                if (vs->eq_run >= 3 && half_line_cadence) {
+                    if (vs->last_kind == 3) {
+                        vs->v_run++;
+                    } else if (vs->last_kind == 1) {
+                        vs->v_run = 1;
+                    } else {
+                        vs->v_run = 0;
+                    }
+                    if (vs->v_run == 3) {
+                        decoder->line_buffer_count = line_buffer_count;
+                        decoder->global_sample_pos = global_sample_pos;
+                        decoder->last_filtered_above = is_above;
+                        cvbs_vbi_first_eq(decoder, vs->first_eq_pos, global_sample_pos);
+                        effective_period = cvbs_effective_line_period(decoder);
+                        line_buffer_count = decoder->line_buffer_count;
+                    }
+                } else {
+                    vs->v_run = 0;
+                }
+                vs->last_kind = 3;
+                vs->last_pulse_pos = vs->pulse_start;
             }
             // Broad pulses (19-36us) and anything unclassified: neither an H
             // reference nor a PLL correction - exactly the RF decoder's model.
@@ -2525,7 +3002,12 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
             decoder->global_sample_pos = global_sample_pos;
 
             // Line complete - decode it
-            decode_current_line(decoder);
+            {
+                uint64_t t_line = get_time_us();
+                decode_current_line(decoder);
+                g_prof_lines_us += get_time_us() - t_line;
+                g_prof_lines++;
+            }
 
             // Refresh line_buffer_count (decode_current_line resets it)
             line_buffer_count = decoder->line_buffer_count;
@@ -2557,7 +3039,11 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
     decoder->last_filtered_above = last_filtered_above;
 
     // Accumulate total decode time for this field
-    g_field_decode_us += get_time_us() - start_time;
+    {
+        uint64_t spent = get_time_us() - start_time;
+        g_field_decode_us += spent;
+        g_prof_process_us += spent;
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -2592,8 +3078,10 @@ static void gui_cvbs_render_osd(cvbs_decoder_t *decoder,
         return;
     }
 
-    const char *deint_mode = (decoder->field_ready[0] && decoder->field_ready[1])
-                             ? "weave" : "bob";
+    // The field being decoded has its ready flag cleared at its start, so
+    // the flags alone always read as one field; report the mode the last
+    // deinterlace pass actually used.
+    const char *deint_mode = decoder->last_weave ? "weave" : "bob";
 
     float text_x = draw_x + 8.0f;
     float text_y = draw_y + draw_h - 24.0f;
@@ -2617,12 +3105,15 @@ static void gui_cvbs_render_osd(cvbs_decoder_t *decoder,
     gui_text_draw_mono(osd_text, text_x + 1, text_y + 1, 14, BLACK);
     gui_text_draw_mono(osd_text, text_x, text_y, 14, (Color){255, 255, 220, 255});
 
-    // Line 2: frames + sync stats + the VBI model diagnostics
-    char osd_text2[96];
+    // Line 2: frames + sync stats + the VBI model diagnostics. jumps = H
+    // syncs that arrived > 0.3 line off the locked prediction = sample
+    // stream discontinuities (feed-buffer drops); a clean feed reads 0.
+    char osd_text2[128];
     snprintf(osd_text2, sizeof(osd_text2),
-             "frames:%d sync_err:%d hsync/field:%d VBI %d/%d rej %d (cad %d/par %d)",
+             "frames:%d sync_err:%d jumps:%d hsync/field:%d VBI %d/%d rej %d (cad %d/par %d)",
              decoder->state.frames_decoded,
              decoder->sync_errors,
+             decoder->stream_jumps,
              decoder->debug.hsyncs_last_field,
              decoder->vsync.fields_accepted,
              decoder->vsync.vsync_candidates,
@@ -3837,8 +4328,15 @@ static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
         size_t need = (size_t)((double)count * (double)out_rate /
                                (double)in_rate) + 8192u;
         size_t out_count = 0;
-        if (cvbs_plugin_resample_grow(plugin, need) &&
-            cvbs_plugin_resample_block(plugin, samples, count, &out_count)) {
+        uint64_t t_rs = get_time_us();
+        bool rs_ok = cvbs_plugin_resample_grow(plugin, need) &&
+                     cvbs_plugin_resample_block(plugin, samples, count, &out_count);
+        uint64_t rs_spent = get_time_us() - t_rs;
+        g_prof_resample_us += rs_spent;
+        // The OSD per-field "ms" is the WHOLE panel cost against the field
+        // budget (PAL 20 ms / NTSC 16.7 ms): the resampler is part of it.
+        g_field_decode_us += rs_spent;
+        if (rs_ok) {
             // The resampler's OUTPUT rate is exact by construction: mark the
             // declared rate TRUSTED so the decoder's rate self-calibration
             // (the H-spacing median + the PLL refinement, both ~0.01-0.06%

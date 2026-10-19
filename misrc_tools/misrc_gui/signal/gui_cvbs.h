@@ -162,6 +162,8 @@ typedef enum {
 // placed exactly (first_eq - boundary*line), and the next train's cadence
 // is validated against 312.5/262.5 lines per field.
 typedef struct {
+    int last_kind;                 // 0 none, 1 EQ, 2 H, 3 broad
+    size_t last_pulse_pos;         // Start position of the last classified pulse
     // Pulse classification state (per low pulse, driven on its rising edge)
     bool in_pulse;                 // Currently inside a low pulse
     size_t pulse_start;            // Sample position where the pulse began
@@ -180,6 +182,8 @@ typedef struct {
     // Pre-EQ train tracking
     int eq_run;                     // Consecutive EQ pulses in the current train
     int good_h;                     // H pulses seen since the last EQ/broad pulse
+    int v_run;                      // Consecutive broad pulses in the confirmed VBI train
+    size_t first_eq_pos;            // Start of the first EQ in the current candidate train
     // Candidate / committed field geometry (global sample positions)
     bool have_field;                // A field start has been committed
     size_t field_start;             // Committed field start position
@@ -210,6 +214,8 @@ typedef struct {
     // Gated on PLL lock so misaligned acquisition lines never pollute it.
     int64_t porch_sum;             // Per-field porch sample sum
     int porch_count;               // Per-field porch sample count
+    int64_t porch_sum_clean;       // Same, lines within ~4 IRE of the committed
+    int porch_count_clean;         // blanking (excludes a post-VBI baseline sag)
     int16_t porch_level;           // Committed porch estimate (EMA-smoothed)
     bool porch_valid;              // At least one field committed porch data
     // Per-field FILTERED (luma-domain) maximum: the sync lowpass removes the
@@ -233,6 +239,8 @@ typedef struct {
 typedef struct cvbs_decoder {
     // Track whether we've received each field for the current frame
     bool field_ready[2];
+    int field_line_count[2];         // Valid decoded row count in each field buffer
+    bool last_weave;                 // Last deinterlace pass wove both fields (OSD)
     uint64_t field_sequence;          // Monotonic sequence number for completed fields
     uint64_t field_last_update_seq[2];// Last sequence value written to each field buffer
     // Frame state
@@ -344,9 +352,25 @@ typedef struct cvbs_decoder {
     cvbs_levels_t levels;          // Current signal levels
     int lines_since_vsync;         // Lines counted since last V-sync detection
 
+    // Per-line DC restoration (the back-porch clamp a hardware sync
+    // separator performs). dc_offset = this line's measured back-porch
+    // level minus the field-committed blanking (adaptive.porch_level), in
+    // raw counts; it shifts the sync slicing threshold for the following
+    // edges and the line's own luma black. Measured on the EBU HackDAC
+    // capture: the signal baseline sags >20 IRE right after the vertical
+    // broad pulses (AC coupling) and recovers over ~30 lines - with a fixed
+    // threshold the H syncs of field lines 8-31 were never seen (blanking
+    // below the threshold) and lines 32-55 sliced 11..1 samples late, each
+    // decoded line's origin following that error (the top-of-picture
+    // horizontal shift decaying over ~20 rows).
+    double dc_offset;
+    bool dc_offset_valid;
+
     // Statistics
     int sync_errors;               // Count of sync detection failures
     int format_changes;            // Count of format auto-detections
+    int stream_jumps;              // Locked H syncs > 0.3 line off prediction =
+                                   // sample-stream discontinuities (feed drops)
 
     // Debug statistics
     struct {
@@ -419,6 +443,13 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder);
 void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                               const int16_t *buf, size_t count,
                               uint32_t sample_rate);
+
+// Cumulative throughput profile (microseconds since process start): the
+// panel resampler, the per-sample process_buffer pass, the per-line pixel
+// decode inside it, and the number of decoded lines. Headless harness
+// readout for the real-time budget split; any pointer may be NULL.
+void gui_cvbs_profile_get(uint64_t *resample_us, uint64_t *process_us,
+                          uint64_t *lines_us, uint64_t *lines);
 
 //-----------------------------------------------------------------------------
 // Rendering

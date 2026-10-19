@@ -4,6 +4,10 @@
  * exact field geometry (EQ/broad trains, parity boundaries, per-parity field
  * line counts) in the IRE/sample domain at ANY rate, with ITU baseband
  * subcarrier colour (PAL V-switch alternation included). */
+// Headless harness: keep the decoder's live diagnostics (H-sync ring +
+// periodic state/frame dumps to the CWD) compiled in - the GUI build has
+// them off (the dump writes would run on the display thread).
+#define CVBS_LIVE_DIAG 1
 #include "../misrc_gui/signal/gui_cvbs.c"
 #include <assert.h>
 
@@ -684,10 +688,35 @@ static void run_live_diag(const char *path, bool pal, double rate,
            decoder->vsync.fields_rejected, decoder->vsync.reject_cadence,
            decoder->vsync.reject_parity, decoder->state.frames_decoded,
            decoder->pll.current_line, decoder->vsync.last_reject_reason);
-    printf("LIVE levels: black=%d white=%d tip=%d thresh=%d meas_rate=%.2f MHz\n",
+    printf("LIVE levels: black=%d white=%d tip=%d thresh=%d dc=%+.1f/%d "
+           "meas_rate=%.2f MHz\n",
            (int)decoder->levels.black_level, (int)decoder->levels.white_level,
            (int)decoder->levels.sig_min, (int)decoder->levels.sync_threshold,
+           decoder->dc_offset, decoder->dc_offset_valid ? 1 : 0,
            (double)decoder->measured_rate_hz / 1e6);
+    printf("LIVE sync: fixed=%.3f ema=%+.4f fsl=%d gsl=%d bad=%d "
+           "phase_err=%+.2f\n",
+           decoder->fixed_line_period, decoder->fixed_period_ema,
+           decoder->fixed_sync_locked ? 1 : 0, decoder->pll.lines_since_lock,
+           decoder->pll.bad_sync_count, decoder->pll.phase_error);
+    {
+        // Throughput split against the real-time budget: signal seconds
+        // from the sample count at the declared rate vs CPU seconds spent
+        // in the resampler, the per-sample pass and the per-line decode.
+        uint64_t rs_us = 0, pr_us = 0, ln_us = 0, lines = 0;
+        gui_cvbs_profile_get(&rs_us, &pr_us, &ln_us, &lines);
+        double signal_s = (double)count / rate;
+        printf("LIVE profile: signal %.2f s | resample %.2f s (%.0f%%) | "
+               "process %.2f s (%.0f%%) of which line decode %.2f s (%.0f%%) "
+               "| %.1f us/line over %llu lines | total CPU %.2f s = %.2fx "
+               "real time\n",
+               signal_s, rs_us / 1e6, 100.0 * rs_us / 1e6 / signal_s,
+               pr_us / 1e6, 100.0 * pr_us / 1e6 / signal_s,
+               ln_us / 1e6, 100.0 * ln_us / 1e6 / signal_s,
+               lines ? (double)ln_us / (double)lines : 0.0,
+               (unsigned long long)lines,
+               (rs_us + pr_us) / 1e6, (rs_us + pr_us) / 1e6 / signal_s);
+    }
 
     // Optional P6 dump of the decoded display frame for offline inspection
     // (signalstats / visual A-B against a reference).
