@@ -19,9 +19,37 @@ static atomic_uint active_processes;
 static atomic_uint max_active_processes;
 static atomic_uint_fast64_t latest_first_sample;
 static atomic_uint_fast64_t counter_seed;
+static atomic_bool hold_audio,audio_entered,hold_resample,resample_entered;
+static atomic_uint audio_calls,audio_callbacks,audio_resets;
+static atomic_uint_fast64_t audio_first,audio_end;
+static atomic_int audio_marker,expected_audio_marker;
+static atomic_uint wrong_audio_callbacks;
+struct gui_beta_hifi_decoder { int placeholder; };
+gui_beta_hifi_decoder_t *gui_beta_hifi_create(void) {return calloc(1,sizeof(gui_beta_hifi_decoder_t));}
+void gui_beta_hifi_destroy(gui_beta_hifi_decoder_t *d) {free(d);}
+void gui_beta_hifi_reset(gui_beta_hifi_decoder_t *d) {(void)d;atomic_fetch_add(&audio_resets,1);}
+void gui_beta_hifi_process(gui_beta_hifi_decoder_t *d,const float *samples,size_t count,uint64_t first,
+                          gui_beta_hifi_pcm_callback_t cb,void *ctx) {
+    (void)d;atomic_store(&audio_entered,true);
+    while(atomic_load(&hold_audio)) thrd_sleep_ms(1);
+    atomic_store(&audio_first,first);atomic_store(&audio_marker,(int)samples[0]);
+    float pcm[2]={samples[0],-samples[0]};gui_beta_hifi_status_t status={.locked=true};
+    cb(ctx,pcm,1,first+count,&status);atomic_fetch_add(&audio_calls,1);
+}
+void gui_beta_hifi_get_status(const gui_beta_hifi_decoder_t *d,gui_beta_hifi_status_t *s) {(void)d;memset(s,0,sizeof(*s));}
+static void audio_test_callback(void *ctx,const float *pcm,size_t frames,uint64_t end) {
+    (void)ctx;if(pcm && frames) {
+        int expected=atomic_load(&expected_audio_marker);
+        if(expected && (int)pcm[0]!=expected) atomic_fetch_add(&wrong_audio_callbacks,1);
+        atomic_store(&audio_end,end);atomic_fetch_add(&audio_callbacks,1);
+    }
+}
 static int failures;
 
 struct gui_rf_decoder { gui_rf_format_t format; gui_rf_decode_status_t status; };
+bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
+    return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+}
 struct gui_rf_resampler { uint32_t rate; };
 
 gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
@@ -30,6 +58,13 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
     return d;
 }
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) { free(d); }
+void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full) { (void)d; (void)full; }
+gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
+    return gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+}
+void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile) {
+    gui_rf_decoder_reset(d, profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+}
 void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
     d->format = format;
     memset(&d->status, 0, sizeof(d->status));
@@ -90,10 +125,12 @@ size_t gui_rf_resampler_output_capacity(uint32_t rate, size_t count) {
 }
 bool gui_rf_resampler_process(gui_rf_resampler_t *r, const int16_t *input, size_t count,
                               float *output, size_t capacity, size_t *output_count) {
+    atomic_store(&resample_entered,true);
+    while(atomic_load(&hold_resample)) thrd_sleep_ms(1);
     size_t n = (uint64_t)count * GUI_RF_DECODE_RATE_HZ / r->rate;
     if (!n) n = 1;
     if (n > capacity) return false;
-    output[0] = (float)input[0];
+    for(size_t i=0;i<n;i++) output[i]=(float)input[0];
     *output_count = n;
     return true;
 }
@@ -555,6 +592,120 @@ static void test_fast_block_handoffs(void) {
     gui_rf_preview_worker_destroy(b);
 }
 
+static void test_parallel_budget(void) {
+    check(gui_rf_preview_worker_set_budget(2),"parallel workers budget");
+    atomic_store(&busy_ms,0);atomic_store(&hold_process,true);atomic_store(&active_processes,0);
+    gui_rf_preview_worker_t *a=gui_rf_preview_worker_create(GUI_RF_PAL),*b=gui_rf_preview_worker_create(GUI_RF_NTSC);
+    check(a && b,"parallel fixture workers");
+    if(a && b) {
+        check(submit_marker(a,20000000u,0,1,false,1) && submit_marker(b,20000000u,0,1,false,2),"parallel fixture input");
+        uint64_t until=get_time_ms()+3000;while(atomic_load(&active_processes)<2 && get_time_ms()<until) thrd_sleep_ms(1);
+        check(atomic_load(&active_processes)==2,"two-core budget really runs two video consumers");
+    }
+    atomic_store(&hold_process,false);
+    check((!a || gui_rf_preview_worker_wait_idle(a,3000)) && (!b || gui_rf_preview_worker_wait_idle(b,3000)),"parallel fixtures drain");
+    gui_rf_preview_worker_destroy(a);gui_rf_preview_worker_destroy(b);
+}
+static void test_independent_audio(gui_rf_profile_t profile) {
+    check(gui_rf_preview_worker_set_budget(0),"independent audio offline budget");
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(profile);
+    check(w!=NULL,"HiFi worker has independent consumer");if(!w) return;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    unsigned int initial_calls=atomic_load(&audio_calls);
+    for(unsigned int i=0;i<8;i++) check(submit_marker(w,20000000u,i*32u,1,false,80),"initial file-like eight-block batch");
+    check(gui_rf_preview_worker_wait_idle(w,3000) && atomic_load(&audio_calls)==initial_calls+8,
+          "first stream-boundary reset preserves every legal prequeued audio block");
+    atomic_store(&audio_entered,false);atomic_store(&hold_audio,true);
+    unsigned int video_before=atomic_load(&process_calls),callbacks=atomic_load(&audio_callbacks);
+    check(submit_marker(w,20000000u,256,1,false,81),"independent audio input");
+    uint64_t until=get_time_ms()+3000;while(!atomic_load(&audio_entered) && get_time_ms()<until) thrd_sleep_ms(1);
+    check(atomic_load(&audio_entered) && wait_calls(video_before+1),"video completes while audio consumer remains blocked");
+    check(!gui_rf_preview_worker_wait_idle(w,0),"wait_idle includes in-flight audio");
+    gui_rf_preview_worker_set_audio_enabled(w,false);atomic_store(&hold_audio,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000) && atomic_load(&audio_callbacks)==callbacks,"disable suppresses in-flight old generation PCM");
+    gui_rf_preview_worker_set_audio_enabled(w,true);
+    check(submit_marker(w,20000000u,288,1,false,83) && gui_rf_preview_worker_wait_idle(w,3000),"audio restarts at next copied block");
+    check(atomic_load(&audio_marker)==83 && atomic_load(&audio_first)==288 && atomic_load(&audio_end)==320,"audio copied payload and 20MSPS timeline remain exact");
+    /* A disable/enable between resample entry and enqueue must not retag the
+     * old payload with the new audio generation. */
+    atomic_store(&resample_entered,false);atomic_store(&hold_resample,true);
+    callbacks=atomic_load(&audio_callbacks);
+    check(submit_marker(w,20000000u,320,1,false,84),"inflight resample generation fixture");
+    until=get_time_ms()+3000;while(!atomic_load(&resample_entered) && get_time_ms()<until) thrd_sleep_ms(1);
+    check(atomic_load(&resample_entered),"old block begins resampling");
+    gui_rf_preview_worker_set_audio_enabled(w,false);gui_rf_preview_worker_set_audio_enabled(w,true);
+    atomic_store(&hold_resample,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000) && atomic_load(&audio_callbacks)==callbacks,"reenable cannot relabel inflight old RF audio");
+    int16_t *wide=calloc(65536,sizeof(*wide));check(wide!=NULL,"maximum-ratio audio input allocation");
+    if(wide) {
+        wide[0]=89;unsigned int audio_before=atomic_load(&audio_calls);
+        gui_rf_block_info_t info={16000000u,0,2,true};
+        check(gui_rf_preview_worker_submit(w,wide,65536,&info),"16MSPS maximum RF block submits");free(wide);
+        check(gui_rf_preview_worker_wait_idle(w,3000),"maximum-ratio audio split drains");
+        check(atomic_load(&audio_calls)==audio_before+3 && atomic_load(&audio_first)==65536 &&
+              atomic_load(&audio_end)==81920 && atomic_load(&audio_marker)==89,"81920 resampled RF samples split into exact 32768/32768/16384 audio blocks");
+    }
+    atomic_store(&audio_entered,false);atomic_store(&hold_audio,true);
+    check(submit_marker(w,20000000u,96,3,true,85),"audio overload initial input");
+    until=get_time_ms()+3000;while(!atomic_load(&audio_entered) && get_time_ms()<until) thrd_sleep_ms(1);
+    video_before=atomic_load(&process_calls);
+    for(unsigned int i=0;i<40;i++) {
+        check(submit_marker(w,20000000u,128+i*32u,3,false,87),"audio overload input");
+        check(wait_calls(video_before+i+1),"audio queue pressure never stalls video");
+    }
+    gui_rf_preview_stats_t stats;gui_rf_preview_worker_get_stats(w,&stats);
+    check(stats.audio_blocks_dropped>0 && stats.audio_active,"bounded audio queue reports its independent overload");
+    callbacks=atomic_load(&audio_callbacks);atomic_store(&hold_audio,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"audio overload drains with re-calibration");
+    check(atomic_load(&audio_callbacks)>=callbacks,"post-overload consumer safely settles");
+    /* Hold an old video block and its old audio, queue more old RF, then
+     * submit a seek. No queued/inflight old RF may claim the new source epoch. */
+    atomic_store(&hold_process,true);atomic_store(&process_entered,false);
+    atomic_store(&hold_audio,true);atomic_store(&audio_entered,false);
+    check(submit_marker(w,20000000u,1408,3,false,91),"seek old inflight fixture");
+    until=get_time_ms()+3000;while((!atomic_load(&process_entered) || !atomic_load(&audio_entered)) && get_time_ms()<until) thrd_sleep_ms(1);
+    check(atomic_load(&process_entered) && atomic_load(&audio_entered),"seek fixture holds both old consumers");
+    for(unsigned int i=0;i<4;i++) check(submit_marker(w,20000000u,1440+i*32u,3,false,93),"seek queues old RF");
+    callbacks=atomic_load(&audio_callbacks);atomic_store(&expected_audio_marker,99);atomic_store(&wrong_audio_callbacks,0);
+    check(submit_marker(w,20000000u,0,4,true,99),"seek publishes new source generation immediately");
+    atomic_store(&hold_process,false);atomic_store(&hold_audio,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000) && atomic_load(&wrong_audio_callbacks)==0 &&
+          atomic_load(&audio_callbacks)==callbacks+1,"seek suppresses inflight and queued old RF PCM without relabeling");
+    atomic_store(&expected_audio_marker,0);
+    gui_rf_preview_worker_set_audio_enabled(w,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"disabled audio flush callback settles");
+    gui_rf_preview_worker_get_stats(w,&stats);
+    check(!stats.audio_enabled && !stats.audio_active && stats.processing_cpu_ms>=stats.audio_cpu_ms &&
+          stats.processing_wall_ms>=stats.audio_wall_ms,"aggregate CPU/wall includes audio and reports disabled state");
+    gui_rf_preview_worker_destroy(w);check(gui_rf_preview_worker_set_budget(1),"audio fixture restores default budget");
+}
+
+static void test_superbeta_optional_audio(void) {
+    check(gui_rf_preview_worker_set_budget(0),"SuperBeta profile fixture offline budget");
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_SUPERBETA);
+    check(w!=NULL,"video-only SuperBeta worker created");if(!w) return;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    unsigned int calls=atomic_load(&audio_calls),video=atomic_load(&process_calls);
+    check(submit_marker(w,20000000u,0,1,false,101) && gui_rf_preview_worker_wait_idle(w,3000),
+          "video-only SuperBeta processes RF");
+    check(atomic_load(&audio_calls)==calls && atomic_load(&process_calls)==video+1,
+          "SuperBeta without HiFi performs zero audio DSP while audio flag defaults true");
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"SuperBeta optional HiFi profile applies");
+    check(submit_marker(w,20000000u,32,1,false,103) && gui_rf_preview_worker_wait_idle(w,3000),
+          "SuperBeta HiFi starts its audio consumer after profile transition");
+    check(atomic_load(&audio_calls)==calls+1 && atomic_load(&audio_marker)==103,
+          "SuperBeta HiFi decodes enabled audio from its current RF block");
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_SUPERBETA);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"SuperBeta optional HiFi removal applies");
+    check(submit_marker(w,20000000u,64,1,false,105) && gui_rf_preview_worker_wait_idle(w,3000),
+          "video-only SuperBeta continues after removing optional HiFi");
+    gui_rf_preview_stats_t stats;gui_rf_preview_worker_get_stats(w,&stats);
+    check(atomic_load(&audio_calls)==calls+1 && stats.audio_enabled && !stats.audio_active,
+          "removing SuperBeta HiFi stops audio independently of the monitor flag");
+    gui_rf_preview_worker_destroy(w);check(gui_rf_preview_worker_set_budget(1),"SuperBeta fixture restores default budget");
+}
+
 int main(void) {
     atomic_init(&hold_process, false);
     atomic_init(&process_entered, false);
@@ -576,6 +727,10 @@ int main(void) {
     test_long_running_counters();
     test_measured_shared_budget();
     test_fast_block_handoffs();
+    test_parallel_budget();
+    test_superbeta_optional_audio();
+    test_independent_audio(GUI_RF_PROFILE_NTSC_BETAMAX_HIFI);
+    test_independent_audio(GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI);
     free(frame);
     if (!failures) puts("RF preview worker tests passed");
     return failures ? 1 : 0;

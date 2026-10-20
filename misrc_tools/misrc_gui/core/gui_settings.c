@@ -459,9 +459,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
 
     // RF bit depth defaults (per-channel)
     // Shared preview budget default, scaled to the machine so the RF preview
-    // can sustain realtime decode: measured steady-state DSP cost is ~1.1
-    // logical cores per active worker at 20 MSPS (gui_rf_preview_test --bench)
-    // and the channels' workers share one FIFO-serialized budget. 12+ cores
+    // can admit parallel video/HiFi consumers while retaining an aggregate
+    // CPU allowance. Actual cost depends on the profile and hardware. 12+ cores
     // -> 300%, 6-11 -> 200%, else 100%. The Budget button overrides per session.
     settings->rf_preview_budget_percent = 100;
 #if !defined(__ANDROID__)

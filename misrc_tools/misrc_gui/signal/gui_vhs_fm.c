@@ -61,9 +61,16 @@ void gui_vhs_fm_reset(vhs_fm_decoder_t *decoder) {
 }
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select) {
     if (!decoder) return;
-    decoder->overlay.selected_system = format_select == 1;
-    decoder->format = format_select == 1 ? VHS_FM_FORMAT_NTSC : VHS_FM_FORMAT_PAL;
+    decoder->overlay.selected_system = decoder->overlay.selected_tape ? 1 : format_select == 1;
+    decoder->format = decoder->overlay.selected_system ? VHS_FM_FORMAT_NTSC : VHS_FM_FORMAT_PAL;
     // The UI route update rebinds this subscriber; other subscribers keep their system.
+}
+gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder) {
+    if (decoder && decoder->overlay.selected_tape == 1 && decoder->overlay.beta_super)
+        return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI : GUI_RF_PROFILE_NTSC_SUPERBETA;
+    if (decoder && decoder->overlay.selected_tape == 1)
+        return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX;
+    return decoder && decoder->overlay.selected_system ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
 }
 void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select) {
     if (!decoder) return;
@@ -189,7 +196,8 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
     // same bottom-stacked block, so both share one gate.
     bool show_stats = !controls_hidden && stats_view != 2;
     bool show_basic_only = stats_view == 1;
-    const int stat_lines = show_stats ? (show_basic_only ? 2 : 5) : 0;
+    const bool show_hifi = gui_rf_profile_has_hifi(gui_vhs_fm_get_profile(decoder));
+    const int stat_lines = show_stats ? (show_basic_only ? 2 : 5) + (show_hifi ? 1 : 0) : 0;
 
     if (show_stats) {
         // Slight translucent backing behind the whole text block (stats
@@ -204,8 +212,8 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                                       (y + height - pad + 2.0f) - block_top},
                          (Color){0, 0, 0, 110});
         float ly = y + height - pad - line_h * (float)(stat_lines + 1); // above the reason line
-        snprintf(line, sizeof(line), "%s VHS SP | %.3f -> 20 MHz | H:%s V:%s Color:%s",
-                 gui_vhs_fm_get_format_name(decoder), decoder->stats.source_rate_hz / 1000000.0,
+        snprintf(line, sizeof(line), "%s | %.3f -> 20 MHz | H:%s V:%s Color:%s",
+                 gui_rf_profile_name(gui_vhs_fm_get_profile(decoder)), decoder->stats.source_rate_hz / 1000000.0,
                  status->h_locked ? "LOCK" : "SCAN", status->v_locked ? "LOCK" : "SCAN",
                  status->color_locked ? "LOCK" : "OFF");
         // Yellow OSD-style text (matching the reason line) over the backing
@@ -215,6 +223,16 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
         snprintf(line,sizeof(line),"Decode %.1f fps | Display %.1f fps | DSP %.1f ms | Age %.1f ms",
                  decoder->stats.fps,decoder->display_fps,decoder->stats.decode_ms,decoder->stats.latency_ms);
         if (ly >= y + pad) vhs_draw_stat_fitted(line, x + pad, ly, font_px, max_w_px, (Color){255,220,120,255});
+        if (show_hifi) {
+            ly += line_h;
+            snprintf(line,sizeof(line),"Beta Hi-Fi: %s | switches %llu | dropouts %llu | queue %llu",
+                     !decoder->stats.audio_enabled ? "monitor off" :
+                     decoder->stats.hifi.locked ? "LOCK" : "calibrating / muted",
+                     (unsigned long long)decoder->stats.hifi.head_switches,
+                     (unsigned long long)decoder->stats.hifi.dropouts,
+                     (unsigned long long)decoder->stats.audio_blocks_dropped);
+            if (ly >= y + pad) vhs_draw_stat_fitted(line,x+pad,ly,font_px,max_w_px,(Color){220,240,220,255});
+        }
         if (!show_basic_only) {
             ly += line_h;
             snprintf(line,sizeof(line),"V candidates %llu | Fields %llu | Reject %llu (cad %llu/par %llu/map %llu)",

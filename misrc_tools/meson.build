@@ -436,7 +436,7 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_rf_preview.c',
     'misrc_gui/signal/gui_rf_resampler.c',
-    'misrc_gui/processing/gui_rf_preview_worker.c',
+    'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
     'misrc_gui/processing/gui_rf_preview_policy.c',
     'misrc_gui/processing/gui_rf_preview_pressure.c',
     'misrc_gui/processing/gui_rf_stream_marks.c',
@@ -784,6 +784,21 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_cvbs_baseband', cvbs_baseband_test)
+
+    audio_hifi_monitor_test = executable('gui_audio_hifi_monitor_test',
+      'test/gui_audio_hifi_monitor_test.c',
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
+    test('gui_audio_hifi_monitor', audio_hifi_monitor_test)
+    if soxr_dep.found()
+      audio_soxr_lifecycle_test = executable('gui_audio_soxr_lifecycle_test',
+        'test/gui_audio_soxr_lifecycle_test.c',
+        dependencies: overlay_test_deps + [dependency('threads')],
+        include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
+      test('gui_audio_soxr_lifecycle', audio_soxr_lifecycle_test)
+    endif
+
+
     capture_watchdog_test = executable('gui_capture_watchdog_test',
       ['test/gui_capture_watchdog_test.c', 'common/file_utils.c',
        'test/gui_playback_audio_stub.c'],
@@ -836,7 +851,7 @@ if raylib_dep.found()
         'misrc_gui/signal/gui_vhs_fm.c',
         'misrc_gui/signal/gui_rf_preview.c',
         'misrc_gui/signal/gui_rf_resampler.c',
-        'misrc_gui/processing/gui_rf_preview_worker.c',
+        'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
         'misrc_gui/processing/gui_rf_preview_policy.c',
         'misrc_gui/processing/gui_rf_preview_pressure.c',
       ]
@@ -903,9 +918,13 @@ test('gui_rf_resampler', rf_resampler_test)
 rf_worker_test = executable('gui_rf_preview_worker_test',
   ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
-  dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)], c_args: cflags, link_args: ldflags)
 test('gui_rf_preview_worker', rf_worker_test)
 if host_machine.system() == 'windows'
+  rf_handoff_test = executable('gui_rf_preview_handoff_test',
+    ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+  test('gui_rf_preview_handoff', rf_handoff_test)
   rf_idle_cpu_probe = executable('gui_rf_preview_idle_cpu_probe',
     ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
     dependencies: [dependency('threads')], c_args: rf_test_cflags, link_args: ldflags)
@@ -913,7 +932,7 @@ if host_machine.system() == 'windows'
 endif
 rf_file_harness = executable('gui_rf_preview_file',
   ['test/gui_rf_preview_file.c', 'misrc_gui/signal/gui_rf_preview.c',
-   'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
+   'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 rf_marks_test = executable('gui_rf_stream_marks_test',
@@ -939,7 +958,7 @@ if flac_dep.found()
     ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
      'common/ringbuffer.c', 'common/rb_event.c', 'common/flac_writer.c',
      'misrc_gui/signal/gui_rf_preview.c', 'misrc_gui/signal/gui_rf_resampler.c',
-     'misrc_gui/processing/gui_rf_preview_worker.c',
+     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
      'misrc_gui/processing/gui_rf_preview_policy.c',
      'misrc_gui/processing/gui_rf_preview_pressure.c'],
     dependencies: rf_record_deps, c_args: rf_test_cflags, link_args: ldflags)
@@ -1017,3 +1036,13 @@ endif
 
 gui_text_edit_test = executable('gui_text_edit_test', 'test/gui_text_edit_test.c', c_args: cflags)
 test('gui_text_edit', gui_text_edit_test)
+
+# NTSC Beta Hi-Fi streaming contracts; production DSP, no audio device required.
+beta_hifi_test = executable('gui_beta_hifi_test',
+  ['test/gui_beta_hifi_test.c', 'misrc_gui/signal/gui_beta_hifi.c'],
+  c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
+test('gui_beta_hifi', beta_hifi_test, timeout: 120)
+beta_hifi_state_test = executable('gui_beta_hifi_state_test',
+  'test/gui_beta_hifi_state_test.c',
+  c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
+test('gui_beta_hifi_state', beta_hifi_state_test)

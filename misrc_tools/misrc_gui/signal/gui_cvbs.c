@@ -6,6 +6,7 @@
  */
 
 #include "gui_cvbs.h"
+#include "../output/gui_audio.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
 #include "../processing/gui_rf_preview_pressure.h"
@@ -4910,7 +4911,7 @@ typedef struct {
 static const char *video_plugin_name(video_plugin_kind_t plugin) {
     switch (plugin) {
         case VIDEO_PLUGIN_TAPE_DECODE: return "Tape Decode";
-        case VIDEO_PLUGIN_VHS_FM:      return "VHS FM";
+        case VIDEO_PLUGIN_VHS_FM:      return "RF Preview";
         case VIDEO_PLUGIN_CVBS:
         default:                       return "CVBS";
     }
@@ -5175,19 +5176,30 @@ static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin
 
 // UI reference counts own pooled worker lifetime. The producer only loads
 // published workers under reader registration and never waits for the UI.
-static _Atomic(gui_rf_preview_worker_t *) s_rf_routes[2][2];
-static unsigned s_rf_references[2][2];
+static _Atomic(gui_rf_preview_worker_t *) s_rf_routes[2][GUI_RF_PROFILE_COUNT];
+static unsigned s_rf_references[2][GUI_RF_PROFILE_COUNT];
 static vhs_fm_decoder_t *s_rf_bindings[4];
+static gui_rf_preview_worker_t *s_rf_audio_source;
+static void video_rf_audio(void *context, const float *stereo, size_t frames, uint64_t end_sample) {
+    (void)end_sample; // Audio and video consume the same continuous RF worker.
+    if (stereo && frames) gui_audio_push_hifi(context, stereo, frames);
+    else gui_audio_reset_hifi(context);
+}
 static atomic_uint s_rf_route_readers;
 static atomic_bool s_rf_pressure_paused;
 static bool s_rf_input_supported = true; // Extraction producer owns this.
 static gui_rf_preview_pressure_t s_rf_pressure;
 static void video_detach_rf(vhs_fm_decoder_t *decoder) {
     if (!decoder || !decoder->worker) return;
-    int ch=decoder->bound_channel, sys=decoder->bound_system;
-    if (ch>=0 && ch<2 && sys>=0 && sys<2 && s_rf_references[ch][sys]) {
+    int ch=decoder->bound_channel, sys=decoder->bound_profile;
+    if (ch>=0 && ch<2 && sys>=0 && sys<GUI_RF_PROFILE_COUNT && s_rf_references[ch][sys]) {
         if (--s_rf_references[ch][sys]==0) {
             gui_rf_preview_worker_t *worker=atomic_exchange(&s_rf_routes[ch][sys],NULL);
+            if (s_rf_audio_source == worker) {
+                gui_rf_preview_worker_set_audio_enabled(worker,false);
+                gui_audio_set_hifi_source(NULL);
+                s_rf_audio_source = NULL;
+            }
             while (atomic_load(&s_rf_route_readers)) thrd_sleep_ms(1);
             gui_rf_preview_worker_destroy(worker);
         }
@@ -5201,10 +5213,8 @@ static vhs_fm_decoder_t *video_config_rf(panel_view_type_t view, void *state) {
     video_panel_state_t *panel=state;
     return atomic_load(&panel->active_plugin)==VIDEO_PLUGIN_VHS_FM ? &panel->vhs_fm.decoder : NULL;
 }
-// Budget button values (percent of one logical core). The DSP steady-state
-// decode costs ~1.1 logical cores per active worker at 20 MSPS (measured:
-// gui_rf_preview_test --bench), so multi-core machines need values above
-// 100% to keep two concurrently decoding preview workers at realtime.
+// Shared CPU budget values (percent of one logical core). Above one core,
+// bounded DSP lanes may run concurrently within the aggregate allowance.
 static int vhs_budget_clamp(int percent) {
     switch (percent) {
         case 50: case 75: case 100: case 150: case 200: case 300:
@@ -5247,24 +5257,51 @@ void gui_video_update_rf_routes(gui_app_t *app) {
     for (int i=0;i<4;++i) {
         vhs_fm_decoder_t *decoder=desired[i];
         if (!decoder) continue;
-        int ch=i/2, sys=decoder->overlay.selected_system ? 1 : 0;
-        if (decoder->worker && (decoder->bound_channel!=ch || decoder->bound_system!=sys))
+        int ch=i/2, sys=(int)gui_vhs_fm_get_profile(decoder);
+        if (decoder->worker && (decoder->bound_channel!=ch || decoder->bound_profile!=sys))
             video_detach_rf(decoder);
         if (!decoder->worker) {
             gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][sys]);
             bool created=worker==NULL;
-            if (created) worker=gui_rf_preview_worker_create(sys ? GUI_RF_NTSC : GUI_RF_PAL);
+            if (created) {
+                worker=gui_rf_preview_worker_create_profile((gui_rf_profile_t)sys);
+                if (worker) {
+                    gui_rf_preview_worker_set_audio_callback(worker, video_rf_audio, worker);
+                    gui_rf_preview_worker_set_audio_enabled(worker,false);
+                }
+            }
             if (!worker) continue;
             if (!gui_vhs_fm_bind_worker(decoder,worker)) {
                 if (created) gui_rf_preview_worker_destroy(worker);
                 continue;
             }
-            decoder->bound_channel=ch; decoder->bound_system=sys;
+            decoder->bound_channel=ch; decoder->bound_profile=sys;
+            decoder->bound_system=gui_rf_profile_format((gui_rf_profile_t)sys)==GUI_RF_NTSC;
             s_rf_references[ch][sys]++;
             gui_rf_preview_worker_set_paused(worker,atomic_load(&s_rf_pressure_paused));
             if (created) atomic_store(&s_rf_routes[ch][sys],worker);
         }
         s_rf_bindings[i]=decoder;
+    }
+    // One monitor source: first visible Hi-Fi-capable panel (A before B).
+    gui_rf_preview_worker_t *audio_source = NULL;
+    for (int i=0; i<4; ++i) if (desired[i] && desired[i]->worker &&
+        gui_rf_profile_has_hifi(gui_vhs_fm_get_profile(desired[i]))) {
+        audio_source=desired[i]->worker;
+        break;
+    }
+    if (audio_source != s_rf_audio_source) {
+        if (s_rf_audio_source) gui_rf_preview_worker_set_audio_enabled(s_rf_audio_source,false);
+        gui_audio_set_hifi_source(audio_source);
+        s_rf_audio_source=audio_source;
+    }
+    // Decode audio only for the selected, audible live source. Keep the Hi-Fi
+    // video profile when muted; its FM carriers and RF filtering still apply.
+    bool audible=app->is_capturing && app->settings.audio_monitor_playback;
+    for (int ch=0;ch<2;++ch) for (int profile=0;profile<GUI_RF_PROFILE_COUNT;++profile) {
+        if (!gui_rf_profile_has_hifi((gui_rf_profile_t)profile)) continue;
+        gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][profile]);
+        if (worker) gui_rf_preview_worker_set_audio_enabled(worker,audible && worker==audio_source);
     }
 }
 static unsigned video_buffer_percent(gui_app_t *app, buffer_id_t id) {
@@ -5298,7 +5335,7 @@ void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t
     bool support_changed=s_rf_input_supported!=input_supported;
     s_rf_input_supported=input_supported;
     atomic_fetch_add(&s_rf_route_readers,1);
-    for (int ch=0;ch<2;++ch) for (int sys=0;sys<2;++sys) {
+    for (int ch=0;ch<2;++ch) for (int sys=0;sys<GUI_RF_PROFILE_COUNT;++sys) {
         gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][sys]);
         if (!worker) continue;
         gui_rf_preview_worker_set_paused(worker,paused);
@@ -5535,136 +5572,134 @@ static void cvbs_vtable_process(void *state, const int16_t *samples, size_t coun
 //-----------------------------------------------------------------------------
 
 static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *app, Rectangle bounds) {
-    if (!panel) return;
+    if (!panel || !app) return;
     vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
     decoder->overlay.is_visible = !panel->chrome.controls_hidden;
     // Double-click on the panel (cvbs_vtable_handle_click) toggles ALL the
     // overlay chrome — buttons + stats text — for a clean video preview.
     if (panel->chrome.controls_hidden) return;
 
-    // Vertically stacked like the CVBS overlay (user request 2026-10-20):
-    // the previous layout ran [Frame][Stats][System][Decoder] as one
-    // horizontal row across the top with Budget on a second row - four
-    // buttons abreast overflowed narrow and split panels and scaled badly
-    // with the UI zoom. The CVBS-style right-aligned vertical column with
-    // one uniform width stays inside the panel at every scale. The
-    // dropdown owner (Stats) sits LAST so its option list drops below the
-    // column over the video - the same pattern as the CVBS System
-    // dropdown - and the options are drawn after every button so they
-    // always paint on top.
+    decoder->overlay.tape_rect = decoder->overlay.super_rect = decoder->overlay.hifi_rect = (Rectangle){0};
+    for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
+    if (bounds.width <= 0 || bounds.height <= 0) {
+        decoder->overlay.is_visible = false;
+        return;
+    }
+
     const float btn_h = 18.0f;
-    const float gap = 6.0f;
-    const float row_step = btn_h + gap;
+    const char *label = "Decoder: RF Preview";
+    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
+    float btn_w = text_w + 16.0f;
+    if (btn_w < 128.0f) btn_w = 128.0f;
 
-    static const char *stats_names[3] = { "All", "Basic", "Off" };
-    int stats_view = decoder->overlay.stats_view;
-    if (stats_view < 0 || stats_view > 2) stats_view = 0;
+    float x_right = bounds.x + bounds.width - 8.0f;
+    float btn_x = x_right - btn_w;
+    float btn_y = bounds.y + 8.0f;
+    decoder->overlay.button_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
 
-    const char *label = "Decoder: VHS FM";
-    const char *format_label = decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
-    char stats_label[40];
-    snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
+    DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    float text_x = btn_x + (btn_w - text_w) * 0.5f;
+    float text_y = btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
+    gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    float control_y = btn_y + btn_h + 6;
+    // One compact control per row, ordered from recording format to options.
+    const char *tape_label = decoder->overlay.selected_tape == 1 ? "Tape: Betamax" : "Tape: VHS";
+    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    float tape_y = control_y;
+    decoder->overlay.tape_rect = (Rectangle){x_right - tape_w, tape_y, tape_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.tape_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    gui_text_draw(tape_label, decoder->overlay.tape_rect.x + 8,
+                  tape_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    control_y += btn_h + 6;
+    const char *format_label = decoder->overlay.selected_tape ? "NTSC (fixed)"
+        : decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
+    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    decoder->overlay.format_rect = (Rectangle){x_right - fmt_w, control_y, fmt_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
+    gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
+                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    control_y += btn_h + 6;
+    if (decoder->overlay.selected_tape) {
+        const char *super_label = decoder->overlay.beta_super ? "SuperBeta: On" : "SuperBeta: Off";
+        float super_w = (float)gui_text_measure(super_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+        decoder->overlay.super_rect =
+            (Rectangle){x_right - super_w, control_y, super_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.super_rect, 0.15f, 4,
+                             decoder->overlay.beta_super ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+        gui_text_draw(super_label, decoder->overlay.super_rect.x + 8,
+                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        control_y += btn_h + 6;
+        const char *hifi_label = decoder->overlay.beta_hifi ? "Beta Hi-Fi: On" : "Beta Hi-Fi: Off";
+        float hifi_w = (float)gui_text_measure(hifi_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+        decoder->overlay.hifi_rect =
+            (Rectangle){x_right - hifi_w, control_y, hifi_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.hifi_rect, 0.15f, 4,
+                             decoder->overlay.beta_hifi ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+        gui_text_draw(hifi_label, decoder->overlay.hifi_rect.x + 8,
+                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        control_y += btn_h + 6;
+    }
     // Frame display mode toggle (Active / Full): Full widens the horizontal
     // decode window to the whole line so VBI + sync tip + colour burst render
     // with decoded chroma instead of only the active picture area.
     const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
-    int budget = vhs_budget_clamp(app->settings.rf_preview_budget_percent);
-    char budget_label[40];
-    snprintf(budget_label, sizeof(budget_label), "Budget: %.2f core (shared)", budget / 100.0);
-
-    // Per-button widths with their historical minimums, then one uniform
-    // column width (the max) so the stack reads as a single column - the
-    // CVBS overlay's col_btn_w pattern.
-    float dec_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-    if (dec_w < 128.0f) dec_w = 128.0f;
-    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-    if (fmt_w < 110.0f) fmt_w = 110.0f;
-    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-    if (stats_w < 96.0f) stats_w = 96.0f;
-    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24.0f;
+    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24;
     if (frame_w < 118.0f) frame_w = 118.0f;
-    float budget_w = (float)gui_text_measure(budget_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-    if (budget_w < 120.0f) budget_w = 120.0f;
-
-    float col_w = dec_w;
-    if (fmt_w > col_w) col_w = fmt_w;
-    if (stats_w > col_w) col_w = stats_w;
-    if (frame_w > col_w) col_w = frame_w;
-    if (budget_w > col_w) col_w = budget_w;
-
-    float x_right = bounds.x + bounds.width - 8.0f;
-    float col_x = x_right - col_w;
-    float y0 = bounds.y + 8.0f;
-    int row = 0;
-    const float text_y_of = (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-
-    // [Decoder: VHS FM]
+    decoder->overlay.frame_rect =
+        (Rectangle){x_right - frame_w, control_y, frame_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
     {
-        float bx = col_x + (col_w - dec_w);
-        float by = y0 + row_step * row++;
-        decoder->overlay.button_rect = (Rectangle){bx, by, dec_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-        float tw = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(label, bx + (dec_w - tw) * 0.5f, by + text_y_of,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
+        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(frame_label,
+                      decoder->overlay.frame_rect.x + (frame_w - fw) * 0.5f,
+                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     }
-
-    // [System: PAL/NTSC]
+    control_y += btn_h + 6;
+    int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
+    char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
+    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)+16;
+    decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,control_y,budget_w,btn_h};
+    DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
+    gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,control_y+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
+                  FONT_SIZE_DROPDOWN_OPT,COLOR_TEXT);
+    control_y += btn_h + 6;
+    // Stats view selector (All / Basic / Off) — a real dropdown so the stats
+    // readout is user-selectable. Its popup follows the final control row.
+    static const char *stats_names[3] = { "All", "Basic", "Off" };
+    int stats_view = decoder->overlay.stats_view;
+    if (stats_view < 0 || stats_view > 2) stats_view = 0;
+    char stats_label[40];
+    snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
+    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    if (stats_w < 96.0f) stats_w = 96.0f;
+    decoder->overlay.stats_btn_rect =
+        (Rectangle){x_right - stats_w, control_y, stats_w, btn_h};
+    Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+    DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
+    // No dropdown arrow: it overlapped the centered label; the open state
+    // is already indicated by the button highlight (stats_bg) above.
     {
-        float bx = col_x + (col_w - fmt_w);
-        float by = y0 + row_step * row++;
-        decoder->overlay.format_rect = (Rectangle){bx, by, fmt_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-        float tw = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(format_label, bx + (fmt_w - tw) * 0.5f, by + text_y_of,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    }
-
-    // [Frame: Active/Full]
-    {
-        float bx = col_x + (col_w - frame_w);
-        float by = y0 + row_step * row++;
-        decoder->overlay.frame_rect = (Rectangle){bx, by, frame_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-        float tw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(frame_label, bx + (frame_w - tw) * 0.5f, by + text_y_of,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    }
-
-    // [Budget: x core (shared)]
-    {
-        float bx = col_x + (col_w - budget_w);
-        float by = y0 + row_step * row++;
-        decoder->overlay.budget_rect = (Rectangle){bx, by, budget_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.budget_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-        float tw = (float)gui_text_measure(budget_label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(budget_label, bx + (budget_w - tw) * 0.5f, by + text_y_of,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    }
-
-    // [Stats: All/Basic/Off] - the LAST row: the dropdown owner, so its
-    // option list drops below the column over the video (the CVBS System
-    // dropdown pattern). No dropdown arrow: it overlapped the centered
-    // label; the open state is indicated by the button highlight below.
-    {
-        float bx = col_x + (col_w - stats_w);
-        float by = y0 + row_step * row++;
-        decoder->overlay.stats_btn_rect = (Rectangle){bx, by, stats_w, btn_h};
-        Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
-        DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
+        text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
         float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT);
         gui_text_draw(stats_label,
                       decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
-                      by + text_y_of, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     }
-
-    // Stats dropdown options, drawn after every button so they paint on top.
+    // Keep the popup inside shorter panels; hit-testing gives it priority.
     if (decoder->overlay.stats_dropdown_open) {
         float opt_h = 20.0f;
+        float menu_y = decoder->overlay.stats_btn_rect.y + btn_h;
+        if (menu_y + 3 * opt_h > bounds.y + bounds.height - 8)
+            menu_y = decoder->overlay.stats_btn_rect.y - 3 * opt_h;
         for (int i = 0; i < 3; i++) {
             Rectangle opt = {
                 decoder->overlay.stats_btn_rect.x,
-                decoder->overlay.stats_btn_rect.y + btn_h + (float)i * opt_h,
+                menu_y + (float)i * opt_h,
                 decoder->overlay.stats_btn_rect.width,
                 opt_h
             };
@@ -5745,40 +5780,60 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             return false;
         }
 
-        // Control clicks first (only while the controls are shown) so a
-        // double-click ON a control never toggles the chrome. Every control
-        // hit resets the tracker (shared video_panel_state_t.chrome).
         bool chrome_visible = vhs->overlay.is_visible && !panel->chrome.controls_hidden;
-        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
-            panel->chrome.last_click_ms = 0;
-            video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
-            return true;
-        }
-
-        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
-            panel->chrome.last_click_ms = 0;
-            app->settings.rf_preview_budget_percent=
-                vhs_budget_next(vhs_budget_clamp(app->settings.rf_preview_budget_percent));
-            return true;
-        }
-        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.format_rect)) {
-            panel->chrome.last_click_ms = 0;
-            gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
-            return true;
-        }
-        // Stats view dropdown: option rows first when open, then the button.
+        // An open popup owns clicks, including when it opens above the button.
         if (chrome_visible && vhs->overlay.stats_dropdown_open) {
+            panel->chrome.last_click_ms = 0;
             for (int i = 0; i < 3; i++) {
                 if (CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_opts_rect[i])) {
-                    panel->chrome.last_click_ms = 0;
                     vhs->overlay.stats_view = i;
                     vhs->overlay.stats_dropdown_open = false;
                     return true;
                 }
             }
             // Button or outside click closes the dropdown.
-            panel->chrome.last_click_ms = 0;
             vhs->overlay.stats_dropdown_open = false;
+            return true;
+        }
+        // Control clicks first (only while the controls are shown) so a
+        // double-click ON a control never toggles the chrome.
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
+            panel->chrome.last_click_ms = 0;
+            video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
+            return true;
+        }
+
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.tape_rect)) {
+            panel->chrome.last_click_ms=0;
+            vhs->overlay.selected_tape=(vhs->overlay.selected_tape+1)%2;
+            if (vhs->overlay.selected_tape) {
+                gui_vhs_fm_set_format(vhs,1);
+                if (vhs->overlay.beta_hifi) gui_audio_set_playback_enabled(app,true);
+            }
+            return true;
+        }
+        if (chrome_visible && vhs->overlay.selected_tape &&
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.super_rect)) {
+            panel->chrome.last_click_ms=0;
+            vhs->overlay.beta_super=!vhs->overlay.beta_super;
+            return true;
+        }
+        if (chrome_visible && vhs->overlay.selected_tape &&
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.hifi_rect)) {
+            panel->chrome.last_click_ms=0;
+            vhs->overlay.beta_hifi=!vhs->overlay.beta_hifi;
+            if (vhs->overlay.beta_hifi) gui_audio_set_playback_enabled(app,true);
+            return true;
+        }
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
+            panel->chrome.last_click_ms = 0;
+            app->settings.rf_preview_budget_percent=
+                vhs_budget_next(vhs_budget_clamp(app->settings.rf_preview_budget_percent));
+            return true;
+        }
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
+            panel->chrome.last_click_ms = 0;
+            gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {

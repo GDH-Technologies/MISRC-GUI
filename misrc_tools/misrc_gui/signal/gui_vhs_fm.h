@@ -8,8 +8,8 @@
 
 typedef enum { VHS_FM_FORMAT_UNKNOWN, VHS_FM_FORMAT_PAL, VHS_FM_FORMAT_NTSC } vhs_fm_format_t;
 typedef struct vhs_fm_decoder {
-    gui_rf_preview_worker_t *worker; // Borrowed from the channel/system pool.
-    int bound_channel, bound_system;
+    gui_rf_preview_worker_t *worker; // Borrowed from the channel/profile pool.
+    int bound_channel, bound_system, bound_profile;
     uint64_t displayed_frames, display_window_frames, display_window_ms, displayed_generation;
     double display_fps;
     uint8_t *rgba;
@@ -21,11 +21,14 @@ typedef struct vhs_fm_decoder {
     atomic_bool input_supported;
     vhs_fm_format_t format;
     struct {
-        Rectangle button_rect, format_rect, budget_rect;
+        Rectangle button_rect, format_rect, budget_rect, tape_rect, super_rect, hifi_rect;
         Rectangle stats_btn_rect, stats_opts_rect[3];
         Rectangle frame_rect;
         bool is_visible, dropdown_open, stats_dropdown_open;
         int selected_system;
+        int selected_tape;            // 0 = VHS, 1 = Betamax (NTSC only)
+        bool beta_super;              // Optional SuperBeta video mode; off by default
+        bool beta_hifi;               // Optional RF audio; Betamax also uses its Hi-Fi video profile
         int stats_view;               // 0 = All, 1 = Basic, 2 = Off
         int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
     } overlay;
@@ -43,6 +46,7 @@ void gui_vhs_fm_swap_buffers(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                              float width, float height, bool controls_hidden);
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select);
+gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder);
 // Frame display mode: 0 = Active (default), 1 = Full (VBI + burst with
 // decoded chroma). Persists across worker rebinds.
 void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select);

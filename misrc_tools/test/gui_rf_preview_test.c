@@ -17,7 +17,8 @@
 typedef struct {
     uint8_t *rgba;
     int width, height, frames;
-    uint64_t end_sample;
+    bool beta_display; /* Beta preserves its validated full-range active transfer. */
+    uint64_t end_sample, first_end_sample;
     gui_rf_decode_status_t status;
 } test_frames_t;
 
@@ -25,7 +26,9 @@ static void receive_frame(void *context, const uint8_t *rgba, int width, int hei
                           uint64_t end_sample, const gui_rf_decode_status_t *status) {
     test_frames_t *f=context;
     memcpy(f->rgba,rgba,(size_t)width*height*4u);
-    f->width=width; f->height=height; f->frames++;
+    f->width=width; f->height=height;
+    if(!f->frames) f->first_end_sample=end_sample;
+    f->frames++;
     assert(end_sample>=f->end_sample);
     f->end_sample=end_sample; f->status=*status;
 }
@@ -38,7 +41,7 @@ static double clamp_value(double value, double minimum, double maximum) {
     return value<minimum ? minimum : value>maximum ? maximum : value;
 }
 
-/* Studio-swing display contract shared with the renderer (rf_display_level in
+/* VHS studio-swing display contract shared with the renderer (rf_display_level in
  * gui_rf_preview.h: black lifted above the floor, white with headroom, sync
  * clamped at the floor). Physical 0..1 luminance targets are compared through
  * the same conversion, so the oracle stays exact while the rendered byte
@@ -64,15 +67,22 @@ typedef enum {
     TEST_V_NO_PRE_EQ, TEST_V_ONE_PRE_EQ, TEST_V_BAD_SPACING, TEST_V_PAST_HALF,
     TEST_V_SPLIT_SECOND_H, TEST_V_SPLIT_SHORT_FIRST, TEST_V_SHORT_INTERRUPTED,
     TEST_V_SPLIT_15P5_FIRST, TEST_V_SHORT_BELOW_MIN, TEST_V_SHORT_NO_PRE_EQ,
-    TEST_V_SHORT_SECOND_15P5, TEST_V_SPLIT_13P5_FIRST, TEST_V_SHORT_SECOND_13P5
+    TEST_V_SHORT_SECOND_15P5, TEST_V_SPLIT_13P5_FIRST, TEST_V_SHORT_SECOND_13P5,
+    TEST_V_H_ONLY
 } test_vertical_t;
 
-typedef enum { TEST_Q_GRAY, TEST_Q_COLOR_BARS, TEST_Q_FADE, TEST_Q_MID_BARS } test_quality_pattern_t;
+typedef enum { TEST_Q_GRAY, TEST_Q_COLOR_BARS, TEST_Q_FADE, TEST_Q_MID_BARS,
+               TEST_Q_LEVEL_BARS } test_quality_pattern_t;
 typedef struct {
     test_quality_pattern_t pattern;
     int fields;
     double window_noise_hz, carrier_offset_hz, speed_wander;
     uint64_t field_start_sample[17];
+    double beta_audio_amplitude;
+    int swap_tracks, switch_track_line;
+    int fm_change_field;
+    double fm_blank_hz, fm_sync_hz, fm_hz_per_ire;
+    double fm_blank_after_hz, fm_sync_after_hz, fm_hz_per_ire_after;
 } test_quality_t;
 
 /* Video values are a physical FM oracle: blank + 100*Hz/IRE*gray, not a
@@ -81,16 +91,27 @@ static double quality_gray(int field,test_quality_pattern_t pattern) {
     return pattern==TEST_Q_FADE ? fmax(0.0,.70-.10*field) : field&1 ? .25 : .65;
 }
 
-static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with_chroma,
+static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us, bool with_chroma,
                             double clock_scale, int damaged_field,
                             test_vertical_t vertical_case, test_quality_t *quality,
                             size_t *length) {
-    bool pal=format==GUI_RF_PAL;
+    bool pal=profile==GUI_RF_PROFILE_PAL_VHS;
+    bool superbeta=profile==GUI_RF_PROFILE_NTSC_SUPERBETA || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+    bool beta=profile==GUI_RF_PROFILE_NTSC_BETAMAX || profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || superbeta;
+    bool hifi=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI;
     double line_us=pal ? 64.0 : 63.55555555555556;
-    double carrier=pal ? 626953.0 : 629370.6293706294;
-    double blank=pal ? 4100000.0 : 3685714.2857142854;
-    double sync=pal ? 3800000.0 : 3400000.0;
-    double hz_ire=pal ? 7000.0 : 7142.857142857143;
+    /* Independent physical modulation constants; do not query decoder profiles. */
+    double carrier=beta ? 688374.125874126 : pal ? 626953.0 : 629370.6293706294;
+    double blank=beta ? (hifi ? 4200000.0 : 3942857.1428571427) : pal ? 4100000.0 : 3685714.2857142854;
+    double sync=beta ? (hifi ? 3800000.0 : 3600000.0) : pal ? 3800000.0 : 3400000.0;
+    double hz_ire=beta ? (hifi ? 10000.0 : 8571.42857142857) : pal ? 7000.0 : 7142.857142857143;
+    if(superbeta) {
+        /* Independent ordinary-SuperBeta physical endpoints: 4.4MHz at
+         * -40 IRE sync and 5.6MHz at 100 IRE white. Hi-Fi does not move them.
+         * Do not copy the distinct 4.75/6.15MHz .NET SUPERBETA profile. */
+        sync=4400000.0;double white=5600000.0;
+        hz_ire=(white-sync)/140.0;blank=sync+40.0*hz_ire;
+    }
     double burst_start=pal ? 5.6 : 5.3, burst_end=pal ? 7.85 : 7.8;
     double active_start=pal ? 10.5 : 9.45, active_end=pal ? 62.5 : 62.55555555555556;
     int eq_count=pal ? 5 : 6;
@@ -122,6 +143,19 @@ static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with
     double k=2.0*TEST_RATE, denom=1.0+k*tau_zero;
     double b0=(1.0+k*tau_pole)/denom, b1=(1.0-k*tau_pole)/denom;
     double a1=(1.0-k*tau_zero)/denom, previous_base=0.0, previous_pre=0.0;
+    double shelf[5]={0},previous2_base=0.0,previous2_pre=0.0;
+    if (beta) {
+        /* Physical record pre-emphasis at the RF sample rate, independent of
+         * the decoder's inverse shelf evaluated at its 5MHz working rate. */
+        double amplitude=pow(10.0,8.0/40.0),omega=2.0*TEST_PI*100000.0/TEST_RATE;
+        double cs=cos(omega),alpha=sin(omega),root=sqrt(amplitude);
+        double den=(amplitude+1.0)-(amplitude-1.0)*cs+2.0*root*alpha;
+        shelf[0]=amplitude*((amplitude+1.0)+(amplitude-1.0)*cs+2.0*root*alpha)/den;
+        shelf[1]=-2.0*amplitude*((amplitude-1.0)+(amplitude+1.0)*cs)/den;
+        shelf[2]=amplitude*((amplitude+1.0)+(amplitude-1.0)*cs-2.0*root*alpha)/den;
+        shelf[3]=2.0*((amplitude-1.0)-(amplitude+1.0)*cs)/den;
+        shelf[4]=((amplitude+1.0)-(amplitude-1.0)*cs-2.0*root*alpha)/den;
+    }
     for (size_t n=0; n<*length; ++n) {
         double real_us=n/20.0;
         while (half+1<half_lines && timeline[half+1]<=real_us) half++;
@@ -214,6 +248,8 @@ static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with
                                                                         : (pal ? 27.3 : 27.1));
             }
         }
+        /* An H-only tape interval carries no equalizing or broad V pulses. */
+        if(vertical_case==TEST_V_H_ONLY) sync_pulse=within<4.7;
         double r=0,g=0,b=0,u=0,v=0,luminance=0;
         bool active=local_us>=vertical_end && within>=active_start && within<active_end;
         if (active) {
@@ -230,10 +266,24 @@ static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with
                  * Otherwise RGB clipping can make recovered Y follow C. */
                 r=.3+.4*r;g=.3+.4*g;b=.3+.4*b;
             }
+            if (quality && quality->pattern==TEST_Q_LEVEL_BARS) {
+                const double levels[]={0.0,.025,.10,.25,.50,.65,.85,1.0};
+                r=g=b=levels[bar];
+            }
             luminance=.299*r+.587*g+.114*b;
             u=.492*(b-luminance); v=.877*(r-luminance);
         }
-        double frequency=sync_pulse ? sync : blank+100.0*hz_ire*luminance;
+        double physical_blank=blank,physical_sync=sync,physical_hz_ire=hz_ire;
+        if(quality && quality->fm_hz_per_ire>0) {
+            physical_blank=quality->fm_blank_hz;physical_sync=quality->fm_sync_hz;
+            physical_hz_ire=quality->fm_hz_per_ire;
+        }
+        if(quality && quality->fm_change_field>0 && field>=quality->fm_change_field) {
+            physical_blank=quality->fm_blank_after_hz;
+            physical_sync=quality->fm_sync_after_hz;
+            physical_hz_ire=quality->fm_hz_per_ire_after;
+        }
+        double frequency=sync_pulse ? physical_sync : physical_blank+100.0*physical_hz_ire*luminance;
         if (quality) {
             /* Only ordinary-line sync-tip/back-porch windows are corrupted.
              * Active gray/bars, burst and the entire V cadence remain intact.
@@ -250,14 +300,18 @@ static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with
                 if (!sync_pulse && within>=8.0 && within<9.1) frequency+=porch_error;
                 if (sync_pulse && within>=1.7 && within<3.5) frequency+=tip_error;
             }
-            /* Carrier-only offset is intentionally distinct from speed drift:
-             * with unchanged H timing a fixed FM profile must not erase it. */
+            /* Carrier-only offset is intentionally distinct from speed drift.
+             * Legacy fixed profiles retain it; acquisition-calibrated
+             * SuperBeta levels may remove the initial recording offset. */
             frequency+=quality->carrier_offset_hz;
         }
-        double base=frequency-blank;
-        double pre=b0*base+b1*previous_base-a1*previous_pre;
+        double base=frequency-physical_blank;
+        double pre=beta ? shelf[0]*base+shelf[1]*previous_base+shelf[2]*previous2_base
+            -shelf[3]*previous_pre-shelf[4]*previous2_pre
+            : b0*base+b1*previous_base-a1*previous_pre;
+        previous2_base=previous_base;previous2_pre=previous_pre;
         previous_base=base; previous_pre=pre;
-        frequency=clamp_value(blank+pre,2400000.0,6800000.0);
+        frequency=clamp_value(physical_blank+pre,2400000.0,6800000.0);
         fm_phase+=2.0*TEST_PI*frequency*(ideal_us-previous_ideal_us)*1e-6;
         previous_ideal_us=ideal_us;
         if (fm_phase>2.0*TEST_PI) fm_phase=fmod(fm_phase,2.0*TEST_PI);
@@ -266,17 +320,41 @@ static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with
             u=pal ? -(150.0/700.0)/sqrt(2.0) : -(150.0/700.0);
             v=pal ? (150.0/700.0)/sqrt(2.0) : 0.0;
         }
-        double track_step=pal ? (parity ? -TEST_PI*.5 : 0.0)
-                              : (parity ? TEST_PI*.5 : -TEST_PI*.5);
+        int track=parity^(quality ? quality->swap_tracks : 0);
+        if (quality && quality->switch_track_line>0 && line>=quality->switch_track_line) track^=1;
+        double track_step=beta ? (track ? 0.0 : TEST_PI)
+            : pal ? (track ? -TEST_PI*.5 : 0.0)
+            : (track ? TEST_PI*.5 : -TEST_PI*.5);
         double chroma_phase=2.0*TEST_PI*carrier*ideal_us*1e-6+track_step*line+.37;
         /* NTSC color-under records U*cos+V*sin: the sum-frequency VHS
          * playback heterodyne conjugates this quadrature. PAL uses a swinging
          * burst with its V switch; do not copy the decoder IQ sign as an oracle. */
         double color=u*cos(chroma_phase)+(pal ? -vswitch : 1)*v*sin(chroma_phase);
-        rf[n]=(float)(.72*cos(fm_phase)+(with_chroma ? .20*color : 0.0));
+        double audio=0.0;
+        if (quality && quality->beta_audio_amplitude>0.0) {
+            /* Two simultaneous FM carriers per recorded head. RF is shared by
+             * video and Beta Hi-Fi; these are not decoded PCM injections. */
+            static const double ratios[4]={87.75,97.25,106.75,116.25};
+            for (int branch=track;branch<4;branch+=2) {
+                double carrier_hz=ratios[branch]*(15750000.0/1001.0);
+                double tone_hz=branch<2 ? 700.0 : 1900.0;
+                double angle=2.0*TEST_PI*carrier_hz*ideal_us*1e-6
+                    +(25000.0/tone_hz)*sin(2.0*TEST_PI*tone_hz*ideal_us*1e-6);
+                audio+=quality->beta_audio_amplitude*cos(angle);
+            }
+        }
+        rf[n]=(float)(.72*cos(fm_phase)+(with_chroma ? .20*color : 0.0)+audio);
     }
     free(timeline);
     return rf;
+}
+
+static float *make_rf_signal(gui_rf_format_t format, double jitter_us, bool with_chroma,
+                            double clock_scale, int damaged_field,
+                            test_vertical_t vertical_case, test_quality_t *quality,
+                            size_t *length) {
+    return make_rf_signal_profile(format==GUI_RF_PAL ? GUI_RF_PROFILE_PAL_VHS : GUI_RF_PROFILE_NTSC_VHS,
+                                  jitter_us,with_chroma,clock_scale,damaged_field,vertical_case,quality,length);
 }
 
 static float *make_rf_vertical(gui_rf_format_t format, double jitter_us, bool with_chroma,
@@ -330,7 +408,7 @@ static void check_bars(const test_frames_t *f, double maximum_error) {
     for (int bar=1; bar<8; ++bar) for (int parity=0; parity<2; ++parity)
         for (int c=0; c<3; ++c) {
             double actual=plane_mean(f,bar,parity,c);
-            double expected=display_bar_channel(bar,c);
+            double expected=f->beta_display ? bars[bar][c] : display_bar_channel(bar,c);
             double error=fabs(actual-expected);
             if (error>largest_error) largest_error=error;
             if (error>maximum_error) {
@@ -462,7 +540,8 @@ static void check_quality_gray(const test_frames_t *f,const char *name,
            (unsigned long long)f->status.reject_parity,(unsigned long long)f->status.reject_line_map);
     fflush(stdout);
     for (int parity=0; parity<2; ++parity) {
-        double expected=display_level(quality_gray(parity,TEST_Q_GRAY)+offset);
+        double physical=quality_gray(parity,TEST_Q_GRAY)+offset;
+        double expected=f->beta_display ? clamp_value(physical,0.0,1.0) : display_level(physical);
         quality_rows_t rows=quality_rows(f,parity,-1,1,expected);
         printf("%s field %d: gray %.6f expected %.6f, row RMS %.6f, max error %.6f\n",
                name,parity,rows.mean,expected,rows.row_rms,rows.maximum_error);
@@ -471,10 +550,10 @@ static void check_quality_gray(const test_frames_t *f,const char *name,
         assert(rows.row_rms<=row_limit && rows.maximum_error<=outlier_limit);
     }
     /* Adjacent rows still contain two different original fields. Studio
-     * swing compresses separations by 219/255: the physical .40 gray gap
-     * between the woven fields renders as .344. */
-    double first=quality_rows(f,0,-1,1,display_level(.65+offset)).mean;
-    double second=quality_rows(f,1,-1,1,display_level(.25+offset)).mean;
+     * swing compresses the physical .40 gray gap; Beta retains the full-range
+     * separation. Both must preserve the original alternating fields. */
+    double first=quality_rows(f,0,-1,1,f->beta_display ? .65+offset : display_level(.65+offset)).mean;
+    double second=quality_rows(f,1,-1,1,f->beta_display ? .25+offset : display_level(.25+offset)).mean;
     assert(first-second>.33);
 }
 
@@ -893,15 +972,16 @@ static double row_region_extreme(const test_frames_t *f,int row,bool maximum) {
  * lands on its own row parity. The generator encodes the exact geometry:
  * the vertical interval is lines 0..7 (PAL) / 0..9 (NTSC), and bar 0 carries
  * per-parity gray levels as a physical field marker. */
-static void run_full_frame_format(gui_rf_format_t format) {
-    const bool pal=format==GUI_RF_PAL;
-    gui_rf_decoder_t *decoder=gui_rf_decoder_create(format);assert(decoder);
+static void run_full_frame_format(gui_rf_profile_t profile) {
+    const bool pal=profile==GUI_RF_PROFILE_PAL_VHS;
+    const bool beta=profile>=GUI_RF_PROFILE_NTSC_BETAMAX;
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profile);assert(decoder);
     gui_rf_decoder_set_frame_mode(decoder,true);
-    test_frames_t frames={0};
+    test_frames_t frames={.beta_display=beta};
     frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
     assert(frames.rgba);
     size_t length;
-    float *rf=make_rf(format,0.0,true,1.0,-1,&length);
+    float *rf=make_rf_signal_profile(profile,0.0,true,1.0,-1,TEST_V_NORMAL,NULL,&length);
     process_fixture(decoder,rf,length,0,&frames);
     assert(frames.frames>=2);
     assert(frames.status.h_locked && frames.status.v_locked && frames.status.color_locked);
@@ -940,8 +1020,9 @@ static void run_full_frame_format(gui_rf_format_t format) {
     for (int bar=1; bar<8; ++bar) for (int parity=0; parity<2; ++parity)
         for (int c=0; c<3; ++c) {
             double actual=plane_mean_window(&frames,bar,parity,c,x0,x1);
-            largest_error=fmax(largest_error,fabs(actual-display_bar_channel(bar,c)));
-            assert(fabs(actual-display_bar_channel(bar,c))<=.08);
+            double expected=beta ? bars[bar][c] : display_bar_channel(bar,c);
+            largest_error=fmax(largest_error,fabs(actual-expected));
+            assert(fabs(actual-expected)<=(beta ? .10 : .08));
         }
     /* No bottom crop: the last row each parity writes carries real bars. */
     const int last_row[2]={pal ? 622 : 524,pal ? 625 : 523};
@@ -970,13 +1051,13 @@ static void run_full_frame_format(gui_rf_format_t format) {
                -row_region_mean(&frames,row+1,center-4,center+5,1)));
     }
     assert(pairs>90);
-    assert(fabs(even_bright/pairs-display_level(.82))<=.06);
-    assert(fabs(odd_bright/pairs-display_level(.22))<=.06);
+    assert(fabs(even_bright/pairs-(beta ? .82 : display_level(.82)))<=.06);
+    assert(fabs(odd_bright/pairs-(beta ? .22 : display_level(.22)))<=.06);
     assert(registration<=.08);
 
     /* Display levels on one woven active row (row 200 = line 100, parity 0):
      * the sync tip at the floor, back porch at the hybrid background level,
-     * and active black lifted to the studio-swing floor on the SAME row. */
+     * and the selected profile's active black on the SAME row. */
     const int porch_x0=pal ? 100 : 82,porch_x1=pal ? 120 : 92;
     double sync=row_region_mean(&frames,200,16,pal ? 48 : 44,1);
     double porch=row_region_mean(&frames,200,porch_x0,porch_x1,1);
@@ -984,17 +1065,25 @@ static void run_full_frame_format(gui_rf_format_t format) {
     double black=row_region_mean(&frames,200,black_bar-4,black_bar+5,1);
     assert(sync<=.06);
     assert(fabs(porch-(pal ? 38.7543/174.147 : 44.1843/197.680))<=.06);
-    assert(fabs(black-display_level(0.0))<=.04);
+    assert(fabs(black-(beta ? 0.0 : display_level(0.0)))<=.04);
     printf("%s full frame: %dx%d, %d frames, bars max error %.3f, porch %.3f, sync %.3f, black %.3f, registration %.3f\n",
-           pal ? "PAL" : "NTSC",frames.width,frames.height,frames.frames,
+           gui_rf_profile_name(profile),frames.width,frames.height,frames.frames,
            largest_error,porch,sync,black,registration);
     fflush(stdout);
+    /* The same profile returns to its original Active geometry/transfer,
+     * including after a decoder reset; no Full-mode field may leak across. */
+    gui_rf_decoder_set_frame_mode(decoder,false);
+    gui_rf_decoder_reset_profile(decoder,profile);
+    frames.frames=0;frames.end_sample=0;
+    process_fixture(decoder,rf,length,0,&frames);
+    assert(frames.height==(pal ? 576 : 480));
+    check_bars(&frames,beta ? .10 : .08);
     free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
 static void run_full_frame_contracts(void) {
-    run_full_frame_format(GUI_RF_PAL);
-    run_full_frame_format(GUI_RF_NTSC);
+    for (int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile)
+        run_full_frame_format((gui_rf_profile_t)profile);
 }
 
 /* Optional external-media regression for the exact 20 MHz mono s16le excerpt
@@ -1052,7 +1141,7 @@ static void run_real_ntsc_bars(const char *path) {
  * and its share of one core — the measured input for queue-drop budget
  * decisions, never an assumption. */
 static void run_bench(gui_rf_format_t format, double seconds) {
-    test_quality_t quality={TEST_Q_GRAY,16,0,0,0,{0}};
+    test_quality_t quality={.pattern=TEST_Q_GRAY,.fields=16};
     size_t length;
     float *rf=make_rf_signal(format,0.0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
     assert(rf && length>0);
@@ -1090,7 +1179,522 @@ static void run_bench(gui_rf_format_t format, double seconds) {
     free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
+
+/* Betamax video contracts use raw RF from the physical modulator above. They
+ * cover both head hypotheses, profile isolation, color loss and gain scaling;
+ * they do not qualify real Beta I/II/III tapes or hardware. */
+static void run_beta_contracts(void) {
+    assert(!gui_rf_decoder_create_profile((gui_rf_profile_t)-1));
+    assert(!gui_rf_decoder_create_profile(GUI_RF_PROFILE_COUNT));
+    assert(gui_rf_profile_format(GUI_RF_PROFILE_PAL_VHS)==GUI_RF_PAL);
+    assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_BETAMAX)==GUI_RF_NTSC);
+    float coefficients[5];
+    assert(gui_rf_deemph_coefficients(TEST_RATE/4.0,8.0,100000.0,.5,
+                                      coefficients,coefficients+1,coefficients+2,coefficients+3,coefficients+4));
+    assert(fabs(transfer_magnitude(coefficients,0)-1.0)<2e-5);
+    assert(fabs(transfer_magnitude(coefficients,TEST_PI)-pow(10,-8.0/20.0))<2e-5);
+    assert(fabs(transfer_magnitude(coefficients,2.0*TEST_PI*100000.0/(TEST_RATE/4.0))
+                -pow(10,-8.0/40.0))<2e-5);
+    const double bad_parameters[][3]={{-1,100000,.5},{INFINITY,100000,.5},
+        {8,0,.5},{8,NAN,.5},{8,100000,0},{8,100000,1e-320}};
+    for(size_t n=0;n<sizeof(bad_parameters)/sizeof(bad_parameters[0]);++n) {
+        const float sentinel[5]={17,-23,31,-43,59};memcpy(coefficients,sentinel,sizeof(sentinel));
+        assert(!gui_rf_deemph_coefficients(TEST_RATE/4.0,bad_parameters[n][0],
+            bad_parameters[n][1],bad_parameters[n][2],coefficients,coefficients+1,
+            coefficients+2,coefficients+3,coefficients+4));
+        assert(memcmp(coefficients,sentinel,sizeof(sentinel))==0);
+    }
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_BETAMAX);assert(decoder);
+    test_frames_t frames={.beta_display=true};frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(frames.rgba);
+    for (int profile=GUI_RF_PROFILE_NTSC_BETAMAX;profile<=GUI_RF_PROFILE_NTSC_BETAMAX_HIFI;++profile) {
+        for (int swap=0;swap<2;++swap) {
+            test_quality_t signal={.pattern=TEST_Q_COLOR_BARS,.fields=8,.swap_tracks=swap,
+                .beta_audio_amplitude=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ? .12 : 0.0};
+            size_t length;float *rf=make_rf_signal_profile((gui_rf_profile_t)profile,.14,true,1.001,-1,
+                                                         TEST_V_NORMAL,&signal,&length);
+            gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+            process_fixture(decoder,rf,length,0,&frames);
+            printf("%s head order %d: ",gui_rf_profile_name((gui_rf_profile_t)profile),swap);
+            check_bars(&frames,.10);
+            gui_rf_decode_status_t before_invalid,after_invalid;
+            gui_rf_decoder_get_status(decoder,&before_invalid);
+            gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_COUNT);
+            gui_rf_decoder_get_status(decoder,&after_invalid);
+            assert(memcmp(&before_invalid,&after_invalid,sizeof(before_invalid))==0);
+            size_t pixels=(size_t)frames.width*frames.height*4u;
+            uint8_t *reference=malloc(pixels);assert(reference);memcpy(reference,frames.rgba,pixels);
+            for (size_t n=0;n<length;++n) rf[n]*=1.0f/16.0f;
+            gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.end_sample=0;
+            process_fixture(decoder,rf,length,0,&frames);check_bars(&frames,.10);
+            double difference=0;for(size_t n=0;n<pixels;++n) difference+=abs((int)frames.rgba[n]-reference[n]);
+            assert(difference/pixels<.12);free(reference);free(rf);
+            /* A gap must reset filters/partial fields without reverting to VHS. */
+            float silence[4096]={0};uint64_t origin=UINT64_C(9000000000);
+            gui_rf_decoder_process(decoder,silence,4096,origin,receive_frame,&frames);
+            gui_rf_decode_status_t state;gui_rf_decoder_get_status(decoder,&state);
+            assert(!state.h_locked && !state.v_locked && !state.color_locked && state.frames_decoded==0);
+            assert(strstr(state.reason,"Betamax") || strstr(state.reason,"Beta Hi-Fi") || strstr(state.reason,"RF gap"));
+            rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,1.0,-1,TEST_V_NORMAL,&signal,&length);
+            int before=frames.frames;process_fixture(decoder,rf,length,origin+4096,&frames);
+            assert(frames.frames>=before+2);check_bars(&frames,.10);
+            uint64_t continuation=origin+4096+length;free(rf);
+            rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,false,1.0,-1,TEST_V_NORMAL,&signal,&length);
+            process_fixture(decoder,rf,length,continuation,&frames);
+            assert(frames.status.h_locked && frames.status.v_locked && !frames.status.color_locked);
+            for (int bar=1;bar<8;++bar) {
+                double red=plane_mean(&frames,bar,0,0),green=plane_mean(&frames,bar,0,1),blue=plane_mean(&frames,bar,0,2);
+                assert(fabs(red-green)<.01 && fabs(red-blue)<.01);
+            }
+            free(rf);
+        }
+        /* Independent gray levels expose a wrong blank/Hz-per-IRE profile. */
+        test_quality_t gray={.pattern=TEST_Q_GRAY,.fields=8,.window_noise_hz=40000};
+        size_t length;float *rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,1.0,-1,TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        check_quality_gray(&frames,gui_rf_profile_name((gui_rf_profile_t)profile),0,.035,.015,.06);
+        free(rf);
+        gray.pattern=TEST_Q_MID_BARS;gray.window_noise_hz=0;gray.switch_track_line=247;
+        rf=make_rf_signal_profile((gui_rf_profile_t)profile,.12,true,1.001,-1,TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        assert(frames.frames>=2 && frames.status.color_locked);
+        check_bar_registration(&frames);free(rf);
+    }
+    free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+
+/* Acquisition checks use only physical RF and public lock/frame observations.
+ * The ordinary Beta video API has no PCM sink: audio-off routing/zero audio
+ * work belongs to the worker integration/real-RF probes, not this DSP fixture. */
+typedef struct {
+    uint64_t transition_sample,last_unlocked_sample;
+    int frames_at_loss;
+    bool locked_before_change,lost_after_change,recovered_after_change;
+} test_beta_acquire_observation_t;
+
+static void process_beta_acquire_chunks(gui_rf_decoder_t *decoder,const float *rf,
+                                        size_t length,uint64_t offset,bool varied,
+                                        test_frames_t *frames,
+                                        test_beta_acquire_observation_t *observation) {
+    static const size_t chunks[]={1u,4093u,8191u,257u};
+    size_t position=0,block=0;
+    while(position<length) {
+        size_t count=varied ? chunks[block++%4u] : 8192u;
+        if(count>length-position) count=length-position;
+        gui_rf_decoder_process(decoder,rf+position,count,offset+position,receive_frame,frames);
+        position+=count;
+        if(observation) {
+            gui_rf_decode_status_t status;gui_rf_decoder_get_status(decoder,&status);
+            uint64_t end=offset+position;
+            bool locked=status.h_locked && status.v_locked;
+            if(!locked) observation->last_unlocked_sample=end;
+            if(end<=observation->transition_sample && locked && frames->frames>0)
+                observation->locked_before_change=true;
+            if(end>observation->transition_sample && observation->locked_before_change) {
+                if(!locked && !observation->lost_after_change) {
+                    observation->lost_after_change=true;
+                    observation->frames_at_loss=frames->frames;
+                }
+                if(observation->lost_after_change && locked &&
+                   frames->frames>observation->frames_at_loss)
+                    observation->recovered_after_change=true;
+            }
+        }
+    }
+}
+
+static void check_beta_acquired(gui_rf_decoder_t *decoder,const test_frames_t *frames,
+                                 const char *label) {
+    gui_rf_decode_status_t status;gui_rf_decoder_get_status(decoder,&status);
+    printf("%s: frames=%d H=%d V=%d C=%d rejects=%llu\n",label,frames->frames,
+        status.h_locked,status.v_locked,status.color_locked,
+        (unsigned long long)status.fields_rejected);
+    fflush(stdout);
+    assert(frames->frames>=2 && status.h_locked && status.v_locked);
+    assert(frames->width>=64 && frames->height>=160);
+    double low=1.0,high=0.0;
+    for(int parity=0;parity<2;parity++) for(int bar=1;bar<8;bar++) {
+        double y=.299*plane_mean(frames,bar,parity,0)
+                +.587*plane_mean(frames,bar,parity,1)
+                +.114*plane_mean(frames,bar,parity,2);
+        low=fmin(low,y);high=fmax(high,y);
+    }
+    /* Publishing uniformly black/white pixels is not a recovered picture.
+     * A broad contrast floor permits the deliberately mismatched FM profile. */
+    printf("  active picture Y span %.4f\n",high-low);fflush(stdout);
+    assert(high-low>.04);
+}
+
+static void beta_invalid_rf(gui_rf_decoder_t *decoder,bool noise,size_t length,
+                            uint64_t offset,test_frames_t *frames) {
+    float samples[4096];uint32_t random=0x5188e4c3u;
+    double phase=.73,step=2.0*TEST_PI*4250000.0/TEST_RATE;
+    size_t position=0;
+    while(position<length) {
+        size_t count=length-position;if(count>4096u) count=4096u;
+        for(size_t n=0;n<count;n++) {
+            if(noise) {
+                random=random*1664525u+1013904223u;
+                samples[n]=(float)(.72*((double)(random>>8)/8388608.0-1.0));
+            } else {
+                samples[n]=(float)(.72*cos(phase));phase+=step;
+                if(phase>2.0*TEST_PI) phase-=2.0*TEST_PI;
+            }
+        }
+        gui_rf_decoder_process(decoder,samples,count,offset+position,receive_frame,frames);
+        position+=count;
+    }
+}
+
+static void run_beta_acquire_contracts(void) {
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_BETAMAX);
+    assert(decoder);
+    test_frames_t frames={.beta_display=true};
+    frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(frames.rgba);
+    test_quality_t hifi={.pattern=TEST_Q_COLOR_BARS,.fields=10,.beta_audio_amplitude=.12};
+    size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_BETAMAX_HIFI,.08,true,
+        1.0,-1,TEST_V_NORMAL,&hifi,&length);
+    for(int varied=0;varied<2;varied++) {
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_BETAMAX);
+        frames.frames=0;frames.end_sample=0;
+        test_beta_acquire_observation_t observation={.transition_sample=UINT64_MAX};
+        process_beta_acquire_chunks(decoder,rf,length,0,varied!=0,&frames,&observation);
+        check_beta_acquired(decoder,&frames,varied ? "HiFi RF / Beta Off irregular blocks" : "HiFi RF / Beta Off 8192 blocks");
+        /* A frame pair must keep arriving after acquisition, not just a stale
+         * H/V flag or an isolated frame before a later loss. Wrong-profile RGB
+         * calibration is intentionally not equated with HiFi-profile quality. */
+        assert(length-observation.last_unlocked_sample>=(uint64_t)(TEST_RATE*.035));
+    }
+    free(rf);
+
+    /* Continuous oscillator phase and sample positions, with an actual change
+     * of recorded FM levels after six ordinary-Beta fields. The later sync and
+     * blank are HiFi nominal plus 250kHz; neither ADC gain nor decoder state is
+     * patched. A gray source keeps the luma RF inside the ordinary passband. */
+    test_quality_t changing={.pattern=TEST_Q_GRAY,.fields=16,.fm_change_field=6,
+        .fm_blank_after_hz=4450000.0,.fm_sync_after_hz=4050000.0,
+        .fm_hz_per_ire_after=10000.0};
+    rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_BETAMAX,0,true,1.0,-1,
+        TEST_V_NORMAL,&changing,&length);
+    gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_BETAMAX);
+    frames.frames=0;frames.end_sample=0;
+    test_beta_acquire_observation_t changed={.transition_sample=changing.field_start_sample[6]};
+    process_beta_acquire_chunks(decoder,rf,length,0,true,&frames,&changed);
+    check_beta_acquired(decoder,&frames,"Continuous Beta FM level change");
+    assert(changed.locked_before_change && changed.lost_after_change && changed.recovered_after_change);
+    assert(frames.frames>=changed.frames_at_loss+2);
+    assert(length-changed.last_unlocked_sample>=(uint64_t)(TEST_RATE*.035));
+    free(rf);
+
+    /* Neither a high-energy unmodulated carrier nor random RF supplies V/EQ
+     * cadence. Observe V and frame publication explicitly, not only H lock. */
+    for(int noise=0;noise<2;noise++) {
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_BETAMAX);
+        frames.frames=0;frames.end_sample=0;
+        beta_invalid_rf(decoder,noise!=0,(size_t)(TEST_RATE*.12),0,&frames);
+        gui_rf_decode_status_t status;gui_rf_decoder_get_status(decoder,&status);
+        printf("Beta %s negative: frames=%d H=%d V=%d\n",noise ? "random RF" : "carrier-only",
+            frames.frames,status.h_locked,status.v_locked);fflush(stdout);
+        assert(!status.v_locked && !status.color_locked && frames.frames==0);
+        if(!noise) assert(!status.h_locked);
+    }
+
+    /* A previously locked decoder can retain believable H pulses while V is
+     * missing. New RF must still be discoverable after that stale-H interval. */
+    test_quality_t ordinary={.pattern=TEST_Q_GRAY,.fields=6};
+    rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_BETAMAX,0,true,1.0,-1,
+        TEST_V_NORMAL,&ordinary,&length);
+    gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_BETAMAX);
+    frames.frames=0;frames.end_sample=0;
+    process_beta_acquire_chunks(decoder,rf,length,0,true,&frames,NULL);
+    check_beta_acquired(decoder,&frames,"Beta before H-only interval");
+    uint64_t offset=length;free(rf);
+    test_quality_t h_only={.pattern=TEST_Q_GRAY,.fields=8};
+    rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_BETAMAX,0,false,1.0,-1,
+        TEST_V_H_ONLY,&h_only,&length);
+    size_t settling=(size_t)h_only.field_start_sample[2];
+    process_beta_acquire_chunks(decoder,rf,settling,offset,true,&frames,NULL);
+    int before=frames.frames;
+    process_beta_acquire_chunks(decoder,rf+settling,length-settling,offset+settling,true,&frames,NULL);
+    gui_rf_decode_status_t missing_v;gui_rf_decoder_get_status(decoder,&missing_v);
+    assert(frames.frames==before && !missing_v.v_locked);
+    offset+=length;free(rf);
+    test_quality_t shifted={.pattern=TEST_Q_GRAY,.fields=10,.carrier_offset_hz=250000.0,
+        .beta_audio_amplitude=.12};
+    rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_BETAMAX_HIFI,0,true,1.0,-1,
+        TEST_V_NORMAL,&shifted,&length);
+    frames.frames=0;
+    size_t two_fields=(size_t)shifted.field_start_sample[2];
+    process_beta_acquire_chunks(decoder,rf,two_fields,offset,true,&frames,NULL);
+    /* Old scan-window samples/partial fields must not become a rendered frame. */
+    assert(frames.frames==0);
+    process_beta_acquire_chunks(decoder,rf+two_fields,length-two_fields,offset+two_fields,true,&frames,NULL);
+    check_beta_acquired(decoder,&frames,"HiFi FM offset after stale H-only interval");
+    assert(frames.first_end_sample>=offset+two_fields);
+    free(rf);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* Check three distinct nonzero Y/C steps. A small profile-local calibration
+ * must hold across the tape clock, line jitter and both original fields,
+ * rather than aligning only one favorable synthetic red/blue transition. */
+static void check_superbeta_edges(const test_frames_t *f,double clock,double jitter) {
+    int largest_separation=0;double largest_centroid=0;
+    for(int edge=4;edge<=6;++edge) for(int parity=0;parity<2;++parity) {
+        int center=f->width*edge/8,radius=f->width/32;
+        double previous_y=0,previous_u=0,previous_v=0,y_gradient=0,c_gradient=0;
+        double y_sum=0,c_sum=0,y_moment=0,c_moment=0;int y_edge=0,c_edge=0;
+        for(int x=center-radius;x<=center+radius;++x) {
+            double rgb[3]={0};int count=0;
+            for(int row=120+parity;row<160;row+=2) {
+                for(int channel=0;channel<3;++channel)
+                    rgb[channel]+=f->rgba[((size_t)row*f->width+x)*4u+channel]/255.0;
+                count++;
+            }
+            for(int channel=0;channel<3;++channel) rgb[channel]/=count;
+            double y=.299*rgb[0]+.587*rgb[1]+.114*rgb[2];
+            double u=.492*(rgb[2]-y),v=.877*(rgb[0]-y);
+            if(x>center-radius) {
+                double dy=fabs(y-previous_y),dc=hypot(u-previous_u,v-previous_v);
+                if(dy>y_gradient) {y_gradient=dy;y_edge=x;}
+                if(dc>c_gradient) {c_gradient=dc;c_edge=x;}
+                y_sum+=dy;c_sum+=dc;y_moment+=x*dy;c_moment+=x*dc;
+            }
+            previous_y=y;previous_u=u;previous_v=v;
+        }
+        int separation=abs(y_edge-c_edge);
+        if(separation>largest_separation) largest_separation=separation;
+        assert(y_gradient>.005 && c_gradient>.01 && separation<=5);
+        double centroid=fabs(c_moment/c_sum-y_moment/y_sum);
+        if(centroid>largest_centroid) largest_centroid=centroid;
+    }
+    printf("SuperBeta midtone registration clock %.3f jitter %.2fus: max edge %dpx, centroid %.3fpx\n",
+        clock,jitter,largest_separation,largest_centroid);
+}
+
+/* These ordinary-SuperBeta fixtures exercise the independent 4.4/5.6MHz
+ * modulator. They qualify the reduced-bandwidth preview on synthetic RF only. */
+static void run_superbeta_contracts(void) {
+    _Static_assert(GUI_RF_PROFILE_PAL_VHS==0 && GUI_RF_PROFILE_NTSC_VHS==1 &&
+                   GUI_RF_PROFILE_NTSC_BETAMAX==2 && GUI_RF_PROFILE_NTSC_BETAMAX_HIFI==3,
+                   "Existing persisted RF profile IDs must not move");
+    assert(!gui_rf_profile_has_hifi((gui_rf_profile_t)-1));
+    assert(!gui_rf_profile_has_hifi(GUI_RF_PROFILE_COUNT));
+    assert(!gui_rf_profile_has_hifi((gui_rf_profile_t)1000));
+    for(int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile) {
+        bool expected=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
+                      profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+        assert(gui_rf_profile_has_hifi((gui_rf_profile_t)profile)==expected);
+    }
+    assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_SUPERBETA)==GUI_RF_NTSC);
+    assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI)==GUI_RF_NTSC);
+    assert(strcmp(gui_rf_profile_name(GUI_RF_PROFILE_NTSC_SUPERBETA),"NTSC SuperBeta")==0);
+    assert(strcmp(gui_rf_profile_name(GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI),"NTSC SuperBeta Hi-Fi")==0);
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_SUPERBETA);assert(decoder);
+    test_frames_t frames={.beta_display=true};
+    size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    frames.rgba=malloc(capacity);uint8_t *reference=malloc(capacity);assert(frames.rgba && reference);
+    for(int swap=0;swap<2;++swap) {
+        test_quality_t signal={.pattern=TEST_Q_COLOR_BARS,.fields=8,.swap_tracks=swap,
+            .beta_audio_amplitude=swap ? .12 : 0.0};
+        size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_SUPERBETA,.14,true,
+            1.001,-1,TEST_V_NORMAL,&signal,&length);
+        int reference_frames=0;uint64_t reference_end=0;
+        for(int profile=GUI_RF_PROFILE_NTSC_SUPERBETA;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile) {
+            gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+            process_fixture(decoder,rf,length,0,&frames);
+            printf("%s head order %d audio RF %.2f: ",gui_rf_profile_name((gui_rf_profile_t)profile),swap,
+                signal.beta_audio_amplitude);check_bars(&frames,.10);
+            assert(frames.width==640 && frames.height==480);
+            size_t pixels=(size_t)frames.width*frames.height*4u;
+            if(profile==GUI_RF_PROFILE_NTSC_SUPERBETA) {
+                memcpy(reference,frames.rgba,pixels);reference_frames=frames.frames;reference_end=frames.end_sample;
+            } else {
+                assert(frames.frames==reference_frames && frames.end_sample==reference_end);
+                assert(memcmp(reference,frames.rgba,pixels)==0);
+            }
+            gui_rf_decode_status_t before,after;gui_rf_decoder_get_status(decoder,&before);
+            gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)-1);gui_rf_decoder_get_status(decoder,&after);
+            assert(memcmp(&before,&after,sizeof(before))==0);
+        }
+        for(size_t n=0;n<length;++n) rf[n]*=1.0f/16.0f;
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_SUPERBETA);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);check_bars(&frames,.10);
+        size_t pixels=(size_t)frames.width*frames.height*4u;
+        double difference=0;for(size_t n=0;n<pixels;++n) difference+=abs((int)frames.rgba[n]-reference[n]);
+        assert(difference/pixels<.12);free(rf);
+    }
+    for(int profile=GUI_RF_PROFILE_NTSC_SUPERBETA;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile) {
+        test_quality_t gray={.pattern=TEST_Q_GRAY,.fields=8,.window_noise_hz=40000};
+        size_t length;float *rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,1.0,-1,
+            TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        check_quality_gray(&frames,gui_rf_profile_name((gui_rf_profile_t)profile),0,.035,.015,.06);free(rf);
+        gray.pattern=TEST_Q_MID_BARS;gray.window_noise_hz=0;gray.switch_track_line=247;
+        rf=make_rf_signal_profile((gui_rf_profile_t)profile,.12,true,1.001,-1,TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        assert(frames.frames>=2 && frames.status.color_locked);check_bar_registration(&frames);free(rf);
+        uint64_t offset=length;
+        rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,false,1.0,-1,TEST_V_NORMAL,&gray,&length);
+        process_fixture(decoder,rf,length,offset,&frames);
+        gui_rf_decode_status_t status;gui_rf_decoder_get_status(decoder,&status);
+        assert(status.h_locked && status.v_locked && !status.color_locked && status.color_losses>0);
+        for(int bar=1;bar<8;++bar) for(int parity=0;parity<2;++parity) {
+            double r=plane_mean(&frames,bar,parity,0),g=plane_mean(&frames,bar,parity,1),b=plane_mean(&frames,bar,parity,2);
+            assert(fabs(r-g)<.01 && fabs(r-b)<.01);
+        }
+        free(rf);
+    }
+    const double clocks[]={.999,1.0,1.001};
+    for(int clock=0;clock<3;++clock) for(int jitter=0;jitter<2;++jitter) {
+        test_quality_t signal={.pattern=TEST_Q_MID_BARS,.fields=6,
+            .beta_audio_amplitude=.12,.switch_track_line=247};
+        size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_SUPERBETA,jitter*.12,
+            true,clocks[clock],-1,TEST_V_NORMAL,&signal,&length);
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_SUPERBETA);frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        assert(frames.frames>=2 && frames.status.h_locked && frames.status.v_locked && frames.status.color_locked);
+        check_superbeta_edges(&frames,clocks[clock],jitter*.12);free(rf);
+    }
+    free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+static void run_superbeta_acquire_contracts(void) {
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_SUPERBETA);assert(decoder);
+    test_frames_t frames={.beta_display=true};
+    frames.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(frames.rgba);
+    for(int profile=GUI_RF_PROFILE_NTSC_SUPERBETA;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile) {
+        /* Real FM shift above the initial sync slicer, with a shared tape time
+         * axis. Acquisition must come from RF, not injected decoder levels. */
+        test_quality_t shifted={.pattern=TEST_Q_GRAY,.fields=10,.carrier_offset_hz=250000.0,
+            .beta_audio_amplitude=.12};
+        size_t length;float *rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,1.0,-1,
+            TEST_V_NORMAL,&shifted,&length);
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        test_beta_acquire_observation_t observation={.transition_sample=UINT64_MAX};
+        process_beta_acquire_chunks(decoder,rf,length,0,true,&frames,&observation);
+        check_beta_acquired(decoder,&frames,"SuperBeta +250kHz cold acquisition");
+        assert(length-observation.last_unlocked_sample>=(uint64_t)(TEST_RATE*.035));
+        uint64_t offset=length;free(rf);
+        test_quality_t h_only={.pattern=TEST_Q_GRAY,.fields=8};
+        rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,false,1.0,-1,TEST_V_H_ONLY,&h_only,&length);
+        size_t settling=(size_t)h_only.field_start_sample[2];
+        process_beta_acquire_chunks(decoder,rf,settling,offset,true,&frames,NULL);int before=frames.frames;
+        process_beta_acquire_chunks(decoder,rf+settling,length-settling,offset+settling,true,&frames,NULL);
+        gui_rf_decode_status_t missing;gui_rf_decoder_get_status(decoder,&missing);
+        assert(frames.frames==before && !missing.v_locked);offset+=length;free(rf);
+        rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,1.0,-1,TEST_V_NORMAL,&shifted,&length);
+        frames.frames=0;size_t two_fields=(size_t)shifted.field_start_sample[2];
+        process_beta_acquire_chunks(decoder,rf,two_fields,offset,true,&frames,NULL);assert(frames.frames==0);
+        process_beta_acquire_chunks(decoder,rf+two_fields,length-two_fields,offset+two_fields,true,&frames,NULL);
+        check_beta_acquired(decoder,&frames,"SuperBeta after stale H-only interval");
+        assert(frames.first_end_sample>=offset+two_fields);free(rf);
+        for(int noise=0;noise<2;++noise) {
+            gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+            beta_invalid_rf(decoder,noise!=0,(size_t)(TEST_RATE*.12),0,&frames);
+            gui_rf_decode_status_t status;gui_rf_decoder_get_status(decoder,&status);
+            assert(!status.v_locked && !status.color_locked && frames.frames==0);
+            if(!noise) assert(!status.h_locked);
+        }
+    }
+    free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+static void check_superbeta_level_bars(const test_frames_t *frames,double offset) {
+    const double expected[]={0.0,.025,.10,.25,.50,.65,.85,1.0};
+    assert(frames->frames>0 && frames->status.h_locked && frames->status.v_locked);
+    double largest_error=0,largest_rms=0;
+    for(int parity=0;parity<2;++parity) for(int bar=0;bar<8;++bar) {
+        double target=clamp_value(expected[bar]+offset,0,1);
+        quality_rows_t rows=quality_rows(frames,parity,bar,1,target);
+        largest_error=fmax(largest_error,rows.maximum_error);
+        largest_rms=fmax(largest_rms,rows.row_rms);
+        assert(fabs(rows.mean-target)<.025 && rows.maximum_error<.04 && rows.row_rms<.012);
+    }
+    printf("SuperBeta calibrated level bars: offset %.5f, max error %.5f, row RMS %.5f\n",
+           offset,largest_error,largest_rms);fflush(stdout);
+}
+
+/* Recording FM offset/span are independent of ADC amplitude and tape timing.
+ * Gray steps from black through white must retain their physical values even
+ * when valid sync locks before the older 50ms acquisition fallback can run.
+ * A later small, healthy level change deliberately remains visible: this
+ * proves that the accepted display mapping is frozen rather than recomputed
+ * every field. A genuine H loss must then permit a new recording calibration. */
+static void run_superbeta_display_level_contracts(void) {
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_SUPERBETA);assert(decoder);
+    test_frames_t frames={.beta_display=true};
+    size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    frames.rgba=malloc(capacity);uint8_t *reference=malloc(capacity);assert(frames.rgba && reference);
+    test_quality_t signal={.pattern=TEST_Q_LEVEL_BARS,.fields=16,.beta_audio_amplitude=.12,
+        .window_noise_hz=40000,.fm_blank_hz=4730000,.fm_sync_hz=4340000,.fm_hz_per_ire=9750,
+        .fm_change_field=6,.fm_blank_after_hz=4755000,.fm_sync_after_hz=4365000,
+        .fm_hz_per_ire_after=9750};
+    size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_SUPERBETA,0,true,1.0,-1,
+        TEST_V_NORMAL,&signal,&length);
+    int reference_frames=0;uint64_t reference_end=0;
+    for(int profile=GUI_RF_PROFILE_NTSC_SUPERBETA;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile) {
+        gui_rf_decoder_reset_profile(decoder,(gui_rf_profile_t)profile);frames.frames=0;frames.end_sample=0;
+        size_t first=(size_t)signal.field_start_sample[4];
+        process_fixture(decoder,rf,first,0,&frames);check_superbeta_level_bars(&frames,0);
+        gui_rf_decode_status_t before,after;gui_rf_decoder_get_status(decoder,&before);
+        process_fixture(decoder,rf+first,length-first,first,&frames);
+        check_superbeta_level_bars(&frames,25000.0/975000.0);
+        gui_rf_decoder_get_status(decoder,&after);
+        assert(after.fields_rejected==before.fields_rejected);
+        size_t pixels=(size_t)frames.width*frames.height*4u;
+        if(profile==GUI_RF_PROFILE_NTSC_SUPERBETA) {
+            memcpy(reference,frames.rgba,pixels);reference_frames=frames.frames;reference_end=frames.end_sample;
+        } else {
+            assert(frames.frames==reference_frames && frames.end_sample==reference_end);
+            assert(memcmp(reference,frames.rgba,pixels)==0);
+        }
+        uint64_t offset=length;size_t outage=(size_t)(TEST_RATE*.06);
+        beta_invalid_rf(decoder,false,outage,offset,&frames);offset+=outage;
+        gui_rf_decoder_get_status(decoder,&after);assert(!after.h_locked && !after.v_locked);
+        test_quality_t restored={.pattern=TEST_Q_LEVEL_BARS,.fields=8,.beta_audio_amplitude=.12,
+            .window_noise_hz=40000,.fm_blank_hz=4850000,.fm_sync_hz=4490000,.fm_hz_per_ire=9000};
+        size_t restored_length;float *restored_rf=make_rf_signal_profile((gui_rf_profile_t)profile,0,true,
+            1.0,-1,TEST_V_NORMAL,&restored,&restored_length);
+        frames.frames=0;process_fixture(decoder,restored_rf,restored_length,offset,&frames);
+        check_superbeta_level_bars(&frames,0);free(restored_rf);
+    }
+    free(rf);
+    /* The display calibration is stored in the same speed-corrected units as
+     * rendered luma. Exercise actual RF/line-clock changes with non-nominal
+     * recording endpoints, independently of the edge registration matrix. */
+    const double clocks[]={.999,1.001};
+    signal.fields=8;signal.fm_change_field=0;signal.window_noise_hz=0;
+    for(int clock=0;clock<2;++clock) {
+        rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_SUPERBETA,.12,true,clocks[clock],-1,
+            TEST_V_NORMAL,&signal,&length);
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_SUPERBETA);
+        frames.frames=0;frames.end_sample=0;process_fixture(decoder,rf,length,0,&frames);
+        printf("SuperBeta shifted recording clock %.3f: ",clocks[clock]);
+        check_superbeta_level_bars(&frames,0);free(rf);
+    }
+    free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
 int main(int argc, char **argv) {
+    if (argc==2 && strcmp(argv[1],"--superbeta-levels-only")==0) {
+        run_superbeta_display_level_contracts();puts("NTSC SuperBeta cached display level contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--superbeta-acquire-only")==0) {
+        run_superbeta_acquire_contracts();puts("NTSC SuperBeta adaptive acquisition contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--superbeta-only")==0) {
+        run_superbeta_contracts();puts("NTSC SuperBeta RF video contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--beta-acquire-only")==0) {
+        run_beta_acquire_contracts();puts("NTSC Betamax adaptive acquisition contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--beta-only")==0) {
+        run_beta_contracts();puts("NTSC Betamax RF video contracts passed");return 0;
+    }
     if ((argc==2||argc==3) && strcmp(argv[1],"--bench")==0) {
         double seconds=argc==3 ? atof(argv[2]) : 5.0;
         if (!(seconds>=0.5)) seconds=5.0;
@@ -1146,6 +1750,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     run_deemphasis_contract();
+    run_beta_contracts();
+    run_beta_acquire_contracts();
+    run_superbeta_contracts();
+    run_superbeta_acquire_contracts();
+    run_superbeta_display_level_contracts();
     run_registration_contract();
     run_quality_contracts();
     run_stop_resume();

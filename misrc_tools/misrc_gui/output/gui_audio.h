@@ -26,15 +26,33 @@ void gui_audio_update_playback(gui_app_t *app);
 // The user must enable Audio Mon to hear it (mirrors device-audio monitoring).
 void gui_audio_push_demod(const int16_t *stereo_48k, size_t frames);
 
-// Push drag-and-drop playback audio (stereo int16 @ 48k) into the SAME live
-// monitor queue. The position-synced feed runs on the playback thread
-// (gui_playback.c); the producers are mutually exclusive (capture audio
-// thread / demod render path / playback feed). Same contract: Audio Mon
-// gates audibility, drop-oldest on overflow.
+// Push drag-and-drop playback audio (stereo int16 @ 48k) into the ordinary
+// monitor queue. Runs on the playback thread, requires Audio Mon and an active
+// session, drops the oldest PCM on overflow, and is ignored while HiFi is selected.
 void gui_audio_push_playback(const int16_t *stereo_48k, size_t frames);
 
-// Drop everything currently queued in the monitor queue (called by the
-// playback audio feed on a seek/loop jump so stale audio never plays).
+// Invalidate ordinary-monitor PCM after a playback seek/loop. Nonblocking;
+// the main pump flushes the device stream before playing the new generation.
+// A sidecar reset cannot invalidate the selected HiFi input.
 void gui_audio_reset_playback_queue(void);
+
+// Select one RF HiFi worker as the live monitor input; NULL restores ordinary
+// device/demod monitoring. Call on the main thread. Source tokens must remain
+// unique until the previous producer has stopped. Source selection flushes
+// queued PCM and the existing output stream on the next playback update.
+void gui_audio_set_hifi_source(const void *source);
+const void *gui_audio_get_hifi_source(void);
+
+// Interleaved stereo float PCM at exactly 48 kHz, nominal range [-1, +1].
+// Nonblocking and allocation-free; stale/unselected sources are ignored.
+// Audio Mon and an active capture monitoring session are required. The main
+// playback pump opens each session after discarding old PCM; pushes made while
+// capture is stopped or before its first pump are ignored.
+// Overflow keeps the newest 85 ms; NaN/Inf mute.
+void gui_audio_push_hifi(const void *source, const float *stereo_48k, size_t frames);
+
+// Notify a selected producer discontinuity. Safe on the worker thread; device
+// flushing happens later on the main thread. Other producers cannot reset it.
+void gui_audio_reset_hifi(const void *source);
 
 #endif // GUI_AUDIO_H
