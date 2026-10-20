@@ -625,6 +625,10 @@ int main(int argc, char **argv) {
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
+    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM) into
+    // the video panel decoders: every created panel starts in the user's
+    // last-selected system instead of hardcoded PAL.
+    gui_cvbs_set_default_system(app.settings.video_system);
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;

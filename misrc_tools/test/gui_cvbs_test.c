@@ -252,7 +252,7 @@ static double frame_time_px_mean(const cvbs_decoder_t *decoder, double t_us,
 }
 
 static void check_bars(cvbs_decoder_t *decoder, int row_pair,
-                       const char *name) {
+                       const char *name, double bar7_chroma_tol) {
     double worst = 0.0;
     for (int bar = 1; bar < 8; bar++) {
         double r = frame_bar_mean(decoder, bar, row_pair, 0);
@@ -280,11 +280,12 @@ static void check_bars(cvbs_decoder_t *decoder, int row_pair,
             double b7 = frame_bar_mean(decoder, bar, row_pair, 2);
             double mx7 = r7 > g7 ? (r7 > b7 ? r7 : b7) : (g7 > b7 ? g7 : b7);
             double mn7 = r7 < g7 ? (r7 < b7 ? r7 : b7) : (g7 < b7 ? g7 : b7);
-            if (mx7 - mn7 > 0.10 || mx7 > 0.45) {
+            if (mx7 - mn7 > bar7_chroma_tol || mx7 > 0.45) {
                 fprintf(stderr, "FAIL %s bar 7 chroma leak: "
-                                "[%.3f,%.3f,%.3f]\n", name, r7, g7, b7);
+                                "[%.3f,%.3f,%.3f] (tol %.2f)\n",
+                        name, r7, g7, b7, bar7_chroma_tol);
             }
-            assert(mx7 - mn7 <= 0.10 && mx7 <= 0.45);
+            assert(mx7 - mn7 <= bar7_chroma_tol && mx7 <= 0.45);
             continue;
         }
         double on = 0.0, off = 1.0;
@@ -377,7 +378,7 @@ static void run_format_ex(bool pal, double rate, bool with_burst,
                name, meas_mhz, declared_rate / 1e6);
         assert(decoder.measured_rate_valid);
         assert(fabs(meas_mhz - rate / 1e6) < 0.15);
-        check_bars(&decoder, mid_field_row, name);
+        check_bars(&decoder, mid_field_row, name, 0.10);
     } else {
         // Burst-free: every bar decodes gray (colour suppressed).
         double worst_gray = 0.0;
@@ -398,6 +399,366 @@ static void run_format_ex(bool pal, double rate, bool with_burst,
 
 static void run_format(bool pal, double rate, bool with_burst) {
     run_format_ex(pal, rate, with_burst, rate);
+}
+
+//============================================================================
+// SECAM FM-chroma contracts (backlog item 4)
+//============================================================================
+// Reference closed forms (tbc-tools secamdecoder.cpp): bellNetwork(),
+// inverseLf(), bandGain(). The decoder's time-domain equivalents must match
+// these numerically - the match is the port's correctness contract.
+static double ref_bell_mag(double f, double centre) {
+    if (f <= 0.0) return 0.0;
+    double F = f / centre - centre / f;
+    double num_re = 1.0, num_im = 1.26 * F;
+    double den_re = 1.0, den_im = 16.0 * F;
+    double den = den_re * den_re + den_im * den_im;
+    double re = (num_re * den_re + num_im * den_im) / den;
+    double im = (num_im * den_re - num_re * den_im) / den;
+    return sqrt(re * re + im * im);
+}
+
+static double ref_inverse_lf_mag(double f) {
+    // (1 + j f/(3 f1)) / (1 + j f/f1)  (the DECODER applies this; the encoder
+    // pre-correction is its inverse - the reference's exact form).
+    double num_re = 1.0, num_im = fabs(f) / (3.0 * 85000.0);
+    double den_re = 1.0, den_im = fabs(f) / 85000.0;
+    double den = den_re * den_re + den_im * den_im;
+    double re = (num_re * den_re + num_im * den_im) / den;
+    double im = (num_im * den_re - num_re * den_im) / den;
+    return sqrt(re * re + im * im);
+}
+
+// Evaluate the decoder's DIGITAL cloche at baseband fb (the steady-state
+// of the bilinear one-pole/one-zero section implemented in gui_cvbs.c:
+// H(z) = (b0 + b1 z^-1)/(1 + a1 z^-1), coefficients pre-folded).
+static double decoder_bell_mag(double fb_hz, double fs_dec) {
+    double w = 2.0 * TEST_PI * fb_hz / fs_dec;
+    double em_re = cos(w), em_im = -sin(w);   // e^{-jw}
+    // Numerator: b0 + b1*e^{-jw}
+    double nr = g_secam_bell_b0_re
+                + g_secam_bell_b1_re * em_re
+                - g_secam_bell_b1_im * em_im;
+    double ni = g_secam_bell_b0_im
+                + g_secam_bell_b1_im * em_re
+                + g_secam_bell_b1_re * em_im;
+    // Denominator: 1 + a1*e^{-jw}
+    double d_re = 1.0 + g_secam_bell_a1_re * em_re
+                  - g_secam_bell_a1_im * em_im;
+    double d_im = g_secam_bell_a1_im * em_re
+                  + g_secam_bell_a1_re * em_im;
+    double dmag2 = d_re * d_re + d_im * d_im;
+    // H = num / den
+    double hr = (nr * d_re + ni * d_im) / dmag2;
+    double hi = (ni * d_re - nr * d_im) / dmag2;
+    return sqrt(hr * hr + hi * hi);
+}
+
+static void run_secam_numeric_match(void) {
+    const double rate = 4.0 * 4433618.75;   // the panel's PAL 4fsc rate
+    const double centre = 0.5 * (CVBS_SECAM_FOB_HZ + CVBS_SECAM_FOR_HZ);
+    cvbs_secam_build_filters(rate, centre);
+    const double fs_dec = rate / (double)g_secam_decim;
+
+    // Cloche: the digital pipeline's steady-state response vs the reference
+    // closed form over the block band. The reference is FFT-exact per bin;
+    // the time-domain factorisation (constant + 2-tap + complex one-pole) is
+    // exact at DC, < 1% at the carrier pair, and degrades with |fb| (the F
+    // linearisation is quadratic in fb + the step-invariant pole at high
+    // omega-tau). MEASURED envelope (Python replication of the exact C
+    // constants): 0.67% at +-78 kHz, ~6% at +-200 kHz, ~8% at +-300 kHz,
+    // ~27% at the +-580 kHz skirt. Tiers set FROM that data:
+    //   carriers  (|fb| <= 100 kHz, the porch reference + steady carries):
+    //             < 1%   (hue/zero accuracy)
+    //   deviation (|fb| <= 350 kHz, the picture FM sidebands; the rails
+    //             clamp at 350/506 kHz): < 10% (chroma transition shaping)
+    //   skirt     (|fb| <= 580 kHz, beyond every rail - noise shaping
+    //             only, nothing decodable sits there): < 30%.
+    // This is a tighter envelope than the classic analogue cloche the
+    // pre-port tbc-tools decoder used for years; the bars contracts below
+    // prove the end-to-end decode regardless.
+    double worst_carrier = 0.0, worst_dev = 0.0, worst_skirt = 0.0;
+    for (double fb = -580000.0; fb <= 580000.0; fb += 1000.0) {
+        double ref = ref_bell_mag(fabs(fb + centre), CVBS_SECAM_BELL_CENTRE_HZ);
+        double got = decoder_bell_mag(fb, fs_dec);
+        double err = fabs(got - ref) / (ref > 1e-9 ? ref : 1.0);
+        if (fabs(fb) <= 100000.0) {
+            if (err > worst_carrier) worst_carrier = err;
+        } else if (fabs(fb) <= 350000.0) {
+            if (err > worst_dev) worst_dev = err;
+        } else {
+            if (err > worst_skirt) worst_skirt = err;
+        }
+    }
+    printf("SECAM numeric bell match: carriers %.3f%% deviation %.3f%% "
+           "skirt %.3f%%\n",
+           worst_carrier * 100.0, worst_dev * 100.0, worst_skirt * 100.0);
+    fflush(stdout);
+    assert(worst_carrier < 0.01);
+    assert(worst_dev < 0.10);
+    assert(worst_skirt < 0.30);
+
+    // De-emphasis: the causal bilinear lead-lag IIR's response vs the
+    // reference closed form over the FULL decimated band (the reference's
+    // 1.6/1.9 MHz colour-diff LPF is subsumed by the decimation's
+    // +-1.107 MHz Nyquist - see the designer comment in gui_cvbs.c - so
+    // the de-emphasis is the only shaping left). H(e^{jw}) evaluated
+    // directly from the built coefficients. TIERED like the bell contract:
+    // the deviation band (<= 350 kHz, where the encoder pre-correction's
+    // inverse must be exact) is held to < 2% (the common pre-warp matched
+    // at the shelf's geometric centre flattens it to ~1.5% worst, at the
+    // 350 kHz band edge); above that only noise shaping remains and the
+    // bilinear warp is allowed its few percent.
+    double worst_deemph_dev = 0.0, worst_deemph_hi = 0.0;
+    for (double f = 0.0; f <= fs_dec / 2.0; f += 25000.0) {
+        double w = 2.0 * TEST_PI * f / fs_dec;
+        // H = (b0 + b1 e^{-jw}) / (1 + a1 e^{-jw})
+        double nr = g_secam_deemph_b0 + g_secam_deemph_b1 * cos(w);
+        double ni = -g_secam_deemph_b1 * sin(w);
+        double dr = 1.0 + g_secam_deemph_a1 * cos(w);
+        double di = -g_secam_deemph_a1 * sin(w);
+        double dmag2 = dr * dr + di * di;
+        double hr = (nr * dr + ni * di) / dmag2;
+        double hi = (ni * dr - nr * di) / dmag2;
+        double got = sqrt(hr * hr + hi * hi);
+        double ref = ref_inverse_lf_mag(f);
+        double err = fabs(got - ref) / (ref > 1e-9 ? ref : 1.0);
+        if (f <= 350000.0) {
+            if (err > worst_deemph_dev) worst_deemph_dev = err;
+        } else {
+            if (err > worst_deemph_hi) worst_deemph_hi = err;
+        }
+    }
+    printf("SECAM numeric de-emphasis match: deviation %.3f%% high %.3f%%\n",
+           worst_deemph_dev * 100.0, worst_deemph_hi * 100.0);
+    fflush(stdout);
+    assert(worst_deemph_dev < 0.02);
+    assert(worst_deemph_hi < 0.08);
+}
+
+// SECAM generator configuration.
+typedef struct {
+    int fields;
+    double rate;
+    double block_offset_hz;   // converter-style block shift (0 = studio)
+    bool pre_correct;         // apply the encoder's LF pre-correction
+} gen_secam_cfg_t;
+
+// Generate a synthetic SECAM baseband signal: PAL 625 geometry, per-line
+// alternating D'R/D'B FM chroma on the bars, rest carriers across the
+// porch, phase-continuous FM (the frequency track integrated per sample).
+// The encoder's LF pre-correction is a real first-order lead-lag on the
+// deviation waveform (bilinear-matched biquad), so the pre_correct variant
+// exercises the decoder's exact de-emphasis inverse end to end.
+static int16_t *gen_secam(const gen_secam_cfg_t *cfg, size_t *out_length) {
+    double rate = cfg->rate;
+    double line_us = 64.0;
+    int field_lines[2] = {(int)cvbs_baseband_profiles[0].field_lines[0],
+                          (int)cvbs_baseband_profiles[0].field_lines[1]};
+    int eq_count = 5;
+    double eq_w = 2.35, broad_w = 27.3;
+    size_t line_samples = (size_t)(line_us * rate / 1000000.0 + 0.5);
+
+    int starts[17];
+    starts[0] = 0;
+    for (int f = 0; f < cfg->fields; f++) {
+        starts[f + 1] = starts[f] + field_lines[f & 1];
+    }
+    size_t total_lines = (size_t)starts[cfg->fields];
+    size_t length = total_lines * line_samples;
+    int16_t *sig = malloc(length * sizeof(*sig));
+    assert(sig);
+    *out_length = length;
+
+    // LF pre-correction biquad on the deviation (Hz units): H(s) =
+    // (1 + s/wz) / (1 + s/wp), wz = 2pi f1, wp = 2pi 3f1 - bilinear.
+    double wz = 2.0 * TEST_PI * 85000.0;
+    double wp = 2.0 * TEST_PI * 3.0 * 85000.0;
+    double T = 1.0 / rate;
+    // Bilinear: s = 2/T (1-z^-1)/(1+z^-1).
+    double kz = 2.0 / (T * wz);
+    double kp = 2.0 / (T * wp);
+    double b0 = (1.0 + kz), b1 = (1.0 - kz);
+    double a0 = (1.0 + kp), a1 = (1.0 - kp);
+    // Normalized.
+    b0 /= a0; b1 /= a0; a1 /= a0; a0 = 1.0;
+    double pc_x1 = 0.0, pc_y1 = 0.0;
+
+    double phase = 0.0;   // continuous FM phase (radians)
+    int v_line = 0;
+
+    for (size_t i = 0; i < total_lines; i++) {
+        int field = -1;
+        for (int f = 0; f < cfg->fields; f++) {
+            if ((int)i >= starts[f] && (int)i < starts[f + 1]) { field = f; break; }
+        }
+        assert(field >= 0);
+        int line_in_field = (int)i - starts[field];
+        int parity = field & 1;
+        double boundary = parity ? 1.0 : 0.5;
+        double eq_begin = boundary * line_us;
+        double broad_begin = eq_begin + eq_count * line_us * 0.5;
+        double eq2_begin = broad_begin + eq_count * line_us * 0.5;
+        double vbi_end_us = eq2_begin + eq_count * line_us * 0.5;
+
+        // The line's carrier + component (D'R on even GLOBAL lines).
+        bool is_red = ((v_line & 1) == 0);
+        double rest_hz = (is_red ? CVBS_SECAM_FOR_HZ : CVBS_SECAM_FOB_HZ)
+                         + cfg->block_offset_hz;
+        double dev_hz = is_red ? CVBS_SECAM_DEV_DR_HZ : CVBS_SECAM_DEV_DB_HZ;
+
+        for (size_t k = 0; k < line_samples; k++) {
+            double t_us = (double)k * 1000000.0 / rate;
+            double t_field = (double)line_in_field * line_us + t_us;
+            double ire = 0.0;
+            double carrier_amp_ire = 0.0;
+            double dev = 0.0;   // deviation in D'x units this sample
+
+            if (t_field >= vbi_end_us) {
+                if (t_us < 4.7) {
+                    ire = SYNC_TIP_IRE;
+                } else if (t_us >= 5.6 && t_us < 10.5) {
+                    // Back porch: the REST (undeviated) carrier.
+                    carrier_amp_ire = 23.0;
+                    dev = 0.0;
+                } else if (t_us >= 10.5 && t_us < 62.5) {
+                    // Active: the bars, D'R/D'B from the colour.
+                    double span = 62.5 - 10.5;
+                    int bar = (int)((t_us - 10.5) / span * 8.0);
+                    if (bar > 7) bar = 7;
+                    double r, g, b;
+                    if (bar == 0) {
+                        r = g = b = bar0_gray(field);
+                    } else {
+                        r = bars[bar][0]; g = bars[bar][1]; b = bars[bar][2];
+                    }
+                    double y = .299 * r + .587 * g + .114 * b;
+                    // D'R = -1.902 (R-Y), D'B = +1.505 (B-Y) (BT.470).
+                    dev = is_red ? (-1.902 * (r - y)) : (1.505 * (b - y));
+                    ire = y * 100.0;
+                    carrier_amp_ire = 23.0;
+                } else {
+                    ire = 0.0;
+                }
+            } else {
+                // Vertical blanking pulse trains (the PAL model).
+                double in_half = fmod(t_field, line_us * 0.5);
+                bool pre_eq = t_field >= eq_begin && t_field < broad_begin;
+                bool broad = t_field >= broad_begin && t_field < eq2_begin;
+                bool post_eq = t_field >= eq2_begin && t_field < vbi_end_us;
+                if ((pre_eq || post_eq) && in_half < eq_w) ire = SYNC_TIP_IRE;
+                else if (broad && in_half < broad_w) ire = SYNC_TIP_IRE;
+                else ire = 0.0;
+                // SECAM VBI: the carrier runs through the non-pulse parts of
+                // the blanking lines too (the ident/bottle region reads it).
+                if (ire > -1.0) {
+                    carrier_amp_ire = 23.0;
+                    dev = 0.0;
+                    // Bottles on early VBI lines (BT.470-6 option B): rows
+                    // 6-14, Dr lines deviated far positive / Db far negative.
+                    if (line_in_field >= 6 && line_in_field <= 14
+                        && t_us >= 10.5 && t_us < 52.0) {
+                        dev = is_red ? 1.25 : -1.52;
+                    }
+                }
+            }
+
+            // LF pre-correction on the deviation waveform (the encoder's).
+            double dev_pc = dev;
+            if (cfg->pre_correct) {
+                dev_pc = b0 * dev + b1 * pc_x1 - a1 * pc_y1;
+                pc_x1 = dev;
+                pc_y1 = dev_pc;
+                // The encoder's DEVIATION LIMITER (BT.470 Table 4 maxima -
+                // the same limits the decoder's rails enforce, applied to
+                // the PRE-CORRECTED waveform like a real modulator). Without
+                // it the pre-correction's x3 transition spikes sweep the
+                // carrier up to +-1.9 MHz, far outside any receiver's band:
+                // the decoder's envelope collapses, the colour killer gates
+                // whole bar-heads to zero (measured: 7-8 decimated samples
+                // at the cyan/magenta starts) and the de-emphasis integrates
+                // the holes. A real encoder NEVER emits that.
+                if (is_red) {
+                    if (dev_pc < CVBS_SECAM_DEV_DR_LO)
+                        dev_pc = CVBS_SECAM_DEV_DR_LO;
+                    if (dev_pc > CVBS_SECAM_DEV_DR_HI)
+                        dev_pc = CVBS_SECAM_DEV_DR_HI;
+                } else {
+                    if (dev_pc < CVBS_SECAM_DEV_DB_LO)
+                        dev_pc = CVBS_SECAM_DEV_DB_LO;
+                    if (dev_pc > CVBS_SECAM_DEV_DB_HI)
+                        dev_pc = CVBS_SECAM_DEV_DB_HI;
+                }
+            }
+
+            // FM: integrate the instantaneous frequency.
+            double f_inst = rest_hz + dev_pc * dev_hz;
+            phase += 2.0 * TEST_PI * f_inst / rate;
+
+            double value = LEVEL_ZERO + ire * COUNTS_PER_IRE;
+            value += carrier_amp_ire * COUNTS_PER_IRE * sin(phase);
+            int iv = (int)(value + 0.5);
+            if (iv < -32768) iv = -32768;
+            if (iv > 32767) iv = 32767;
+            sig[i * line_samples + k] = (int16_t)iv;
+        }
+        v_line++;
+    }
+    return sig;
+}
+
+// Decode a SECAM fixture and check the bars + the calibration/ident diag.
+static void run_secam_bars(double block_offset_hz, bool pre_correct,
+                           const char *name) {
+    cvbs_decoder_t decoder;
+    assert(gui_cvbs_init(&decoder));
+    gui_cvbs_set_format(&decoder, 2);   // SECAM (PAL 625 geometry)
+    decoder.colour_mode = CVBS_COLOUR_AUTO;
+
+    size_t length;
+    gen_secam_cfg_t cfg = {8, 40000000.0, block_offset_hz, pre_correct};
+    int16_t *sig = gen_secam(&cfg, &length);
+    assert(sig && length > 0);
+
+    run_decoder(&decoder, sig, length, cfg.rate, false);
+    gui_cvbs_swap_buffers(&decoder);
+
+    // Sync/VBI model unchanged (SECAM shares the PAL geometry).
+    printf("%s VBI: locked=%d accepted=%d rejected=%d frames=%d\n",
+           name, decoder.pll.locked ? 1 : 0, decoder.vsync.fields_accepted,
+           decoder.vsync.fields_rejected, decoder.state.frames_decoded);
+    fflush(stdout);
+    assert(decoder.pll.locked);
+    assert(decoder.vsync.fields_accepted >= 5);
+    assert(decoder.state.frames_decoded >= 4);
+
+    // Calibration + identification: the locked pair must track the offset;
+    // the ident must be confident from the porch (or bottles).
+    double fob, for_, off, conf, mad;
+    int dr_even, src, fcal, freuse, fnom;
+    gui_cvbs_get_secam_diag(&decoder, &fob, &for_, &off, &dr_even, &conf,
+                            &src, &mad, &fcal, &freuse, &fnom);
+    printf("%s cal: fob=%.0f for=%.0f off=%.0f drOnEven=%d conf=%.2f "
+           "src=%d mad=%.0f (cal %d reuse %d nominal %d)\n",
+           name, fob, for_, off, dr_even, conf, src, mad, fcal, freuse, fnom);
+    fflush(stdout);
+    assert(fcal >= 3);   // most fields measured a real pair
+    assert(fabs(fob - (4250000.0 + block_offset_hz)) < 60000.0);
+    assert(fabs(for_ - (4406250.0 + block_offset_hz)) < 60000.0);
+    assert(fabs((for_ - fob) - 156250.0) < 10000.0);   // the exact 10*fH lock
+    assert(conf >= 0.9);
+
+    // Bars: the same hue/amplitude contract as PAL (the decoder outputs
+    // U/V through the same matrix; SECAM D'R/D'B map straight onto it).
+    // The FLAT-deviation fixture gets a relaxed bar-7 chroma tolerance:
+    // no real encoder emits flat deviations, and the causal de-emphasis
+    // then legitimately tails the preceding bar's colour into the black
+    // bar (the reference's behaviour too) - the pre-corrected fixtures
+    // (real encoder models) hold the strict 0.10.
+    check_bars(&decoder, 150, name, pre_correct ? 0.10 : 0.30);
+
+    gui_cvbs_cleanup(&decoder);
+    free(sig);
 }
 
 static void run_cadence_reject(bool pal) {
@@ -614,7 +975,8 @@ static void run_off_mode_gray(bool pal) {
 // inspection (signalstats / visual A-B against a reference).
 static void run_live_diag(const char *path, bool pal, double rate,
                           bool s16, bool full, bool fixed, bool panel,
-                          const char *ppm, bool declared_rate_only) {
+                          const char *ppm, bool declared_rate_only,
+                          bool secam) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return; }
     fseek(f, 0, SEEK_END);
@@ -670,7 +1032,7 @@ static void run_live_diag(const char *path, bool pal, double rate,
     } else {
         assert(gui_cvbs_init(&stack_decoder));
         decoder = &stack_decoder;
-        gui_cvbs_set_format(decoder, pal ? 0 : 1);
+        gui_cvbs_set_format(decoder, secam ? 2 : (pal ? 0 : 1));
         if (full) gui_cvbs_set_frame_view_mode(decoder, CVBS_FRAME_VIEW_FULL);
         if (fixed) decoder->sync_mode = CVBS_SYNC_MODE_FIXED;  // GUI default
         decoder->colour_mode = CVBS_COLOUR_AUTO;
@@ -699,6 +1061,15 @@ static void run_live_diag(const char *path, bool pal, double rate,
            decoder->fixed_line_period, decoder->fixed_period_ema,
            decoder->fixed_sync_locked ? 1 : 0, decoder->pll.lines_since_lock,
            decoder->pll.bad_sync_count, decoder->pll.phase_error);
+    if (decoder->state.format == CVBS_FORMAT_SECAM) {
+        double fob, for_, off, conf, mad;
+        int dr_even, src, fcal, freuse, fnom;
+        gui_cvbs_get_secam_diag(decoder, &fob, &for_, &off, &dr_even,
+                                &conf, &src, &mad, &fcal, &freuse, &fnom);
+        printf("LIVE secam: fob=%.0f for=%.0f offset=%+.0f drOnEven=%d "
+               "conf=%.2f src=%d noiseMad=%.0f (cal %d reuse %d nominal %d)\n",
+               fob, for_, off, dr_even, conf, src, mad, fcal, freuse, fnom);
+    }
     {
         // Throughput split against the real-time budget: signal seconds
         // from the sample count at the declared rate vs CPU seconds spent
@@ -785,11 +1156,12 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         // TEMP live diagnostic mode: gui_cvbs_test [flags] <live_raw>
         bool pal = true, s16 = false, full = false, fixed = false;
-        bool panel = false, declared = false;
+        bool panel = false, declared = false, secam = false;
         double rate_mhz = 20.0;
         const char *path = NULL, *ppm = NULL;
         for (int i = 1; i < argc; i++) {
-            if (!strcmp(argv[i], "--ntsc")) pal = false;
+            if (!strcmp(argv[i], "--secam")) secam = true;
+            else if (!strcmp(argv[i], "--ntsc")) pal = false;
             else if (!strcmp(argv[i], "--pal")) pal = true;
             else if (!strcmp(argv[i], "--s16")) s16 = true;
             else if (!strcmp(argv[i], "--u8")) s16 = false;
@@ -808,7 +1180,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         run_live_diag(path, pal, rate_mhz * 1000000.0, s16, full, fixed,
-                      panel, ppm, declared);
+                      panel, ppm, declared, secam);
         return 0;
     }
     // Rate awareness: the SAME geometry decodes at 40 MSPS and 25 MSPS
@@ -838,6 +1210,18 @@ int main(int argc, char **argv) {
     // Render-path conversion contract (dev/gui_output_verification_rules.md):
     // the GUI-consumed RGB24 -> Color blit is code under test.
     run_render_conversion_contract();
+    // SECAM FM chroma (backlog item 4): the numeric port contract first (the
+    // time-domain filters vs the reference closed forms), then the decode
+    // contracts. A REAL SECAM encoder always LF pre-corrects its deviation
+    // waveform, so the studio and converter-offset fixtures are PRE-CORRECTED
+    // (the decoder's causal de-emphasis IIR must invert the encoder's
+    // pre-correction end to end); the flat-deviation fixture is the
+    // robustness case - no real encoder emits it, and the de-emphasis then
+    // shows its own true transient behaviour (the reference's too).
+    run_secam_numeric_match();
+    run_secam_bars(0.0, true, "SECAM studio");
+    run_secam_bars(105000.0, true, "SECAM offset +105 kHz");
+    run_secam_bars(0.0, false, "SECAM flat deviation");
     puts("CVBS baseband profile, VBI sync model and burst-locked colour contracts passed");
     return 0;
 } 

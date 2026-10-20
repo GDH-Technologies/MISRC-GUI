@@ -52,6 +52,18 @@ typedef struct channel_panel_config {
     void *right_state;             // View-specific state for right panel
     Rectangle left_bounds;         // Cached bounds from last render (for click handling)
     Rectangle right_bounds;        // Cached bounds for right panel
+    // One-slot view-state cache per side: switching views PARKS the live
+    // state here instead of destroying it, so switching back restores the
+    // live state - the video panel keeps its decoder sync lock and system
+    // selection, the waveform keeps its zoom - instead of re-creating and
+    // re-acquiring from scratch (user report 2026-10-20: switching panel
+    // modes lost sync and reset the system to PAL). A switch to a different
+    // view evicts the parked state. Managed by gui_panel.c; cached_state
+    // NULL means the slot is empty.
+    panel_view_type_t left_cached_view;
+    void *left_cached_state;
+    panel_view_type_t right_cached_view;
+    void *right_cached_state;
 } channel_panel_config_t;
 
 // Display buffer size (samples per channel for oscilloscope)
@@ -351,6 +363,13 @@ typedef struct {
     float   demod_squelch;                // 0.0-1.0 squelch level (0 = open)
     float   demod_volume;                 // 0.0-2.0 output volume (1.0 = unity)
     int     demod_output_pair;            // 0 = CH1/2, 1 = CH3/4 (audio monitor output pair)
+
+    // Video panel: the CVBS System selector's persisted pick
+    // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).
+    // Applied to every CVBS panel decoder at create; the System dropdown
+    // writes the user's selection back here (saved with the normal
+    // exit-time settings save).
+    int     video_system;
 
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback

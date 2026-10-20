@@ -1,5 +1,28 @@
 # MISRC GUI development notes
 
+## 2026-10-20 SECAM FM-chroma decoder shipped (colour user-verified; one open follow-up)
+
+- The tbc-tools secamdecoder pipeline ported to the streaming per-line decode
+  (backlog item 4): bell-free picture demod (the cloche's phase bias measured
+  at -19.5 kHz/+10 kHz on the belled carriers), porch calibration with the
+  exact 10*fH pair lock + ident ladder, rails/concealment, and a CAUSAL
+  pre-warped de-emphasis IIR carrying state across lines - the reference's
+  COMPLEX inverseLf mask, not a magnitude-only FIR (the first port's zero-phase
+  FIR bled bars into their neighbours by up to 26%; measured).
+- Harness: physically-correct fixtures (pre-corrected + the encoder's deviation
+  limiter - without it the pre-correction spikes sweep +-1.9 MHz out of band
+  and the colour killer gates whole bar-heads to zero). All bars asserts pass;
+  saturated-bar prints are the real limiter clamps.
+- UI: SECAM in the System dropdown (+ persisted `video_system` setting), OSD
+  SECAM diag line, VHS FM overlay as a vertical stack, and a ONE-SLOT panel
+  view-state cache so switching Waveform<->Video no longer destroys the
+  decoders (that was the "switching panel modes resets to PAL / loses sync"
+  report). The frame-view toggle no longer resets either (render-time crop).
+- Verified: 43/43 guards, build + smoke, meson 34/34; user real-GUI: colour
+  decodes on a real SECAM capture. OPEN: vertical rolling on that capture
+  while the H-PLL holds - needs the OSD VBI counters + a 20 s raw excerpt
+  (same ask as backlog item 3). Contracts + rules: `secam_fm_chroma_decoder.md`.
+
 ## 2026-10-20 Windows move/resize freeze fixed (user-confirmed)
 
 - Root cause: a title-bar/edge drag enters the MODAL LOOP inside DefWindowProc

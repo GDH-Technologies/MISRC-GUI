@@ -2074,6 +2074,92 @@ def check_windows_modal_resize_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_secam_mode_contract(repo_root: Path) -> int:
+    """The SECAM FM-chroma mode (2026-10-20, backlog item 4): the tbc-tools
+    secamdecoder pipeline (libchromadec v0.1.0 parameters) ported to the
+    streaming real-time per-line decode.
+
+    - Parameters VERBATIM from the reference (pinned below): the nominal
+      carriers (272/282 fH), deviations, scales, bell centre, LF break,
+      combined band, calibration gates, the exact 10*fH pair split, the
+      deviation rails, the killer ratio, the colour-diff LPF.
+    - The pipeline stages + the field-commit + the ident ladder + the
+      concealment are wired in gui_cvbs.c; the mode is user-selectable
+      through the CVBS System dropdown's SECAM entry (2026-10-20, the
+      same 0/1/2 value space as gui_cvbs_set_format) and the dormant
+      tape-format selection, gated on colour AUTO + PLL lock.
+    - The harness carries the numeric port contract (the time-domain
+      filters vs the reference closed forms) + synthetic SECAM decode
+      contracts (studio block, converter offset, LF pre-correction).
+    """
+    cvbs_c = read_text(repo_root / "misrc_tools/misrc_gui/signal/gui_cvbs.c")
+    verbatim = [
+        ("4250000.0", "the D'b rest carrier (272 fH)"),
+        ("4406250.0", "the D'r rest carrier (282 fH)"),
+        ("230000.0", "the D'B deviation"),
+        ("280000.0", "the D'R deviation"),
+        ("1.505", "the D'B scale"),
+        ("-1.902", "the D'R scale"),
+        ("4286000.0", "the bell centre"),
+        ("85000.0", "the LF pre-correction break"),
+        ("450000.0", "the combined band flat"),
+        ("580000.0", "the combined band stop"),
+        ("78125.0", "the exact 10*fH pair split"),
+        ("90000.0", "the calibration min separation"),
+        ("230000.0", "the calibration max separation"),
+        ("350000.0", "the calibration max carrier offset"),
+        ("10000.0", "the recentre threshold"),
+        ("0.25", "the colour killer ratio"),
+        ("1600000.0", "the colour-diff LPF pass"),
+        ("1950000.0", "the colour-diff LPF stop"),
+        ("4.0/5.0", "the discriminator tap 4/5"),
+        ("-1.0/280.0", "the discriminator tap -1/280"),
+        ("2.032062", "the D'B->U matrix constant"),
+        ("1.139883", "the D'R->V matrix constant"),
+    ]
+    for value, label in verbatim:
+        if value not in cvbs_c:
+            return fail(f"gui_cvbs.c SECAM parameters: missing {label} ({value})")
+    wiring = [
+        ("cvbs_secam_decode_line(", "the per-line FM decode"),
+        ("cvbs_secam_field_commit(decoder)", "the field-boundary commit"),
+        ("cvbs_secam_bell_apply", "the cloche application"),
+        ("cvbs_secam_build_filters", "the filter builder"),
+        ("g_secam_diff_taps", "the discriminator taps"),
+        ("CVBS_FORMAT_SECAM", "the SECAM format gate"),
+        ("dr_on_even", "the identification state"),
+        ("bottle", "the bottles ident cross-check"),
+        ("noise_mad", "the concealment noise term"),
+        ("one-line hold", "the causal hold"),
+        ("\"PAL\", \"NTSC\", \"SECAM\"", "the System selector options"),
+        ("gui_cvbs_set_format(decoder, sys_values[i])", "the System dropdown click wiring"),
+        ("gui_cvbs_get_secam_diag(decoder", "the OSD Stats SECAM diag readout"),
+    ]
+    for snippet, label in wiring:
+        if snippet.lower() not in cvbs_c.lower():
+            return fail(f"gui_cvbs.c SECAM wiring: missing {label} ({snippet})")
+    cvbs_h = read_text(repo_root / "misrc_tools/misrc_gui/signal/gui_cvbs.h")
+    if "cvbs_secam_state_t" not in cvbs_h:
+        return fail("gui_cvbs.h must declare the SECAM state struct")
+    if "gui_cvbs_get_secam_diag" not in cvbs_h:
+        return fail("gui_cvbs.h must declare gui_cvbs_get_secam_diag")
+    if "system_options_rect[3]" not in cvbs_h:
+        return fail("gui_cvbs.h must size the System selector dropdown for the three PAL/NTSC/SECAM options")
+    test_c = read_text(repo_root / "misrc_tools/test/gui_cvbs_test.c")
+    for snippet, label in [
+        ("ref_bell_mag", "the reference bell closed form"),
+        ("ref_inverse_lf_mag", "the reference de-emphasis closed form"),
+        ("run_secam_numeric_match", "the numeric port contract"),
+        ("run_secam_bars", "the synthetic decode contracts"),
+        ("gen_secam(", "the synthetic SECAM generator"),
+        ("105000.0", "the converter-offset variant"),
+        ("pre_correct", "the LF pre-correction variant"),
+    ]:
+        if snippet not in test_c:
+            return fail(f"gui_cvbs_test.c SECAM harness: missing {label} ({snippet})")
+    return 0
+
+
 def func_body_from(source: str, signature: str) -> str:
     """Return the text of the function whose definition starts at
     `signature`, from the signature up to the next column-0 closing brace.
@@ -2768,6 +2854,7 @@ def main() -> int:
         ("local CI guard gate contract", lambda: check_local_guard_gate_contract(repo_root)),
         ("playback drag-and-drop contract", lambda: check_playback_drag_drop_contract(repo_root)),
         ("Windows modal move/size render contract", lambda: check_windows_modal_resize_contract(repo_root)),
+        ("SECAM FM-chroma mode contract", lambda: check_secam_mode_contract(repo_root)),
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),

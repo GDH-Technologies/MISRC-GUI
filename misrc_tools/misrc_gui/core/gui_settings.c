@@ -615,6 +615,10 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->demod_volume = 1.0f;              // 1.0 = unity gain
     settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
 
+    // Video panel default system: PAL unless the user's persisted pick
+    // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
+    settings->video_system = 0;
+
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
     settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
@@ -772,6 +776,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
     fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
     fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
+    fprintf(f, "  \"video_system\": %d,\n", settings->video_system);
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
     fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
@@ -1498,6 +1503,12 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "demod_output_pair")) != NULL) {
         settings->demod_output_pair = atoi(value);
+    }
+    // Video panel: the CVBS System selector's persisted pick; an invalid
+    // saved value keeps the PAL default.
+    if ((value = find_value(content, "video_system")) != NULL) {
+        int sys = atoi(value);
+        if (sys >= 0 && sys <= 2) settings->video_system = sys;
     }
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).

@@ -141,6 +141,14 @@ session log `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`.
    level/threshold interaction with high-contrast content and large luma swings next
    to the sync (front-porch clamp window, tip tracking during whites), plus
    head-switching/tape sources needing the RF decoder's split-broad recovery ported.
-4. Separate SECAM CVBS mode based on the current tbc-tools implementation (FM chroma
-   demod on the two alternating subcarriers, line identification), as its own decoder
-   mode instead of the present "PAL timing, colour suppressed" SECAM behaviour.
+4. SHIPPED (2026-10-20, colour user-verified on a real capture): the SECAM FM-chroma
+   decoder - the tbc-tools secamdecoder pipeline ported to the streaming per-line
+   decode (bell-free picture demod, causal pre-warped de-emphasis IIR, porch
+   calibration + ident ladder, rails/concealment, one-line hold), a SECAM entry in
+   the CVBS System dropdown (+ the persisted `video_system` setting + a one-slot
+   panel view-state cache so view switches keep the decoders alive), the OSD SECAM
+   diag line, and physically-correct harness fixtures. OPEN follow-up: vertical
+   rolling on the same real capture while the H-PLL holds - needs the Stats OSD
+   VBI counters + a 20 s raw excerpt through the Verification procedure (same ask
+   as item 3); see `secam_fm_chroma_decoder.md` +
+   `prompt_logs/2026-10-20_secam-fm-chroma-port_README.md`.

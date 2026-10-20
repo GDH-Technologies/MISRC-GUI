@@ -768,6 +768,1007 @@ static double g_pf_q[FILTERED_LINE_MAX + 1];
 // the residual sub-sample quantization.
 #define CVBS_SYNC_EDGE_DELAY_SAMPLES 8
 
+//============================================================================
+// SECAM FM chroma (backlog item 4)
+//============================================================================
+// The tbc-tools secamdecoder pipeline (libchromadec v0.1.0 parameters - the
+// vapoursynth-analog SECAM decoder) ported to the GUI's streaming real-time
+// per-line decode. Reference: tbc-tools/src/tbc-chroma-decoder/
+// secamdecoder.cpp + the 2026-10-15/18 port notes there. Everything the
+// reference does per FIELD in the block-FFT domain runs here per LINE in the
+// time domain inside the real-time budget contract:
+//  - The chroma band x bell (cloche) mask becomes a real 41-tap windowed-sinc
+//    low-pass on the mixed-down signal (the pre-port tbc-tools decoder's own
+//    band choice, which the user ran for years) followed by the linearised
+//    cloche: F = f/c - c/f = 2*fb/c + O(x^2), |x| <= 0.14 over the block, so
+//    the bell's first-order networks are exact two-tap complex derivative
+//    sections (< 0.5% error across the +-156 kHz carrier pair, < 3% at the
+//    +-580 kHz skirt; the numeric match is a harness contract).
+//  - The bell-free porch path is the SAME low-pass output taken before the
+//    cloche (the reference's separate band-only mask, for free).
+//  - The discriminator is the reference's 9-tap maximally-flat central
+//    difference on the mixed-down analytic signal: the exact phase
+//    derivative Im(conj(a)*a')/|a|^2.
+//  - Field calibration (cluster medians + the EXACT 10*fH pair-split lock +
+//    the separation/sanity gates + last-good reuse + recentre) commits at
+//    each field boundary from the PREVIOUS field's porch ring - ONE FIELD
+//    BEHIND, the reference's own last-good semantics in a live stream.
+//  - Identification: the porch parity vote with the reference's ladder
+//    (bottles cross-check on the early VBI lines, content-median fallback,
+//    >= 0.75 / >= 4-row gates).
+//  - Per-line rest: THIS line's own porch median (the reference's rowZero,
+//    causal - future lines do not exist in a live stream).
+//  - Click concealment ("SECAM fire"): the reference's envelope-dip +
+//    noise-adaptive deviation-overshoot detection; short spans interpolate,
+//    wider spans borrow row-2 (the previous same-component line, in the
+//    ring). Deviation rails run BEFORE de-emphasis like the reference.
+//  - De-emphasis: the reference's COMPLEX inverseLf mask - the exact causal
+//    lead-lag (1 + j f/(3 f1))/(1 + j f/f1) WITH ITS PHASE, applied per
+//    field with overlap-save so the state runs continuously down the field.
+//    The streaming port is the same network as a CAUSAL first-order
+//    bilinear IIR at the decimated rate with its state carried across
+//    lines. (The first port realized it as a zero-phase symmetric FIR
+//    reset per line - wrong on both counts: magnitude-only, and no
+//    continuity. Measured on the bars fixture: the symmetrised kernel put
+//    half its energy into the FUTURE, bleeding each bar into its neighbours
+//    by up to 26% at the bar centres, and the phase could never cancel the
+//    encoder pre-correction's.) The reference's 1.6/1.9 MHz colour-diff
+//    LPF is subsumed by the decimation's +-1.107 MHz Nyquist (documented
+//    streaming adaptation).
+//  - The one-line hold is causal (row-2, a real SECAM delay line) instead
+//    of the offline bidirectional fill.
+// U/V handoff: the pixel loop's normalized pair maps straight from the
+// demodulated deviations: u01 = D'B/(1.505*2.032062),
+// v01 = -D'R/(1.902*1.139883) - the reference's verified matrix constants.
+
+// Parameters VERBATIM from the reference (the guard pins them):
+#define CVBS_SECAM_FOB_HZ        4250000.0  // D'b rest carrier (272 fH)
+#define CVBS_SECAM_FOR_HZ        4406250.0  // D'r rest carrier (282 fH)
+#define CVBS_SECAM_DEV_DB_HZ     230000.0   // nominal deviation for D'B = 1
+#define CVBS_SECAM_DEV_DR_HZ     280000.0   // nominal deviation for D'R = 1
+#define CVBS_SECAM_DB_SCALE      1.505      // D'B = +1.505 (E'B - E'Y)
+#define CVBS_SECAM_DR_SCALE      (-1.902)   // D'R = -1.902 (E'R - E'Y)
+#define CVBS_SECAM_BELL_CENTRE_HZ 4286000.0 // HF pre-correction f0
+#define CVBS_SECAM_LF_BREAK_HZ   85000.0    // LF pre-correction f1
+#define CVBS_SECAM_BAND_FLAT_HZ  450000.0   // combined band: flat off centre
+#define CVBS_SECAM_BAND_STOP_HZ  580000.0   // combined band: stop
+#define CVBS_SECAM_CAL_MIN_ROWS      8
+#define CVBS_SECAM_CAL_MIN_SEP_HZ    90000.0
+#define CVBS_SECAM_CAL_MAX_SEP_HZ    230000.0
+#define CVBS_SECAM_CAL_MAX_OFFSET_HZ 350000.0
+#define CVBS_SECAM_RECENTRE_HZ       10000.0
+#define CVBS_SECAM_PAIR_SPLIT_HZ     78125.0  // EXACT: the pair is 10*fH apart
+#define CVBS_SECAM_KILLER_RATIO      0.25
+#define CVBS_SECAM_DEV_DB_LO   (-350000.0 / 230000.0)
+#define CVBS_SECAM_DEV_DB_HI   ( 506000.0 / 230000.0)
+#define CVBS_SECAM_DEV_DR_LO   (-506000.0 / 280000.0)
+#define CVBS_SECAM_DEV_DR_HI   ( 350000.0 / 280000.0)
+#define CVBS_SECAM_LP_PASS_HZ  1600000.0   // reference colour-diff LPF pass
+#define CVBS_SECAM_LP_STOP_HZ  1950000.0   // reference colour-diff LPF stop
+// Streaming adaptations (documented above):
+// The decimation is RATE-RELATIVE: decim = round(rate / 2214771) (the
+// 4fsc/8 target), so the decimated rate is always ~2.21 MHz and the
+// downstream constants (discriminator exactness, the cloche, the
+// de-emphasis FIR - all designed at fs_dec) stay valid at ANY input rate
+// (the panel's 4fsc path, the direct 40 MSPS path, self-calibrated rates).
+#define CVBS_SECAM_DECIM_TARGET_HZ 2214771.0 // 4x-fsc PAL / 8
+#define CVBS_SECAM_DECIM_MIN   4
+#define CVBS_SECAM_FIR_TAPS_REF 41          // band taps at the 4fsc reference
+#define CVBS_SECAM_RATE_REF_HZ 17734475.0   // 4x-fsc PAL (the design point)
+#define CVBS_SECAM_FIR_TAPS_MAX 127        // band tap ceiling (array size)
+// De-emphasis is a causal first-order bilinear IIR at the decimated rate
+// (no design constants: the coefficients derive directly from
+// CVBS_SECAM_LF_BREAK_HZ in cvbs_secam_build_filters).
+#define CVBS_SECAM_U_SCALE (1.0 / (1.505 * 2.032062))  // D'B -> u01
+#define CVBS_SECAM_V_SCALE (-1.0 / (1.902 * 1.139883)) // D'R -> v01 (sign folded)
+#define CVBS_SECAM_CLICK_LEVEL  1.0         // concealment level (reference default)
+#define CVBS_SECAM_PORCH_TAIL_HZ_GATE 78125.0 // porch median plausibility vs pair
+
+// Discriminator taps: maximally-flat central difference (K=4), the
+// reference's exact coefficients.
+static const double g_secam_diff_taps[9] = {
+    -1.0/280.0, 4.0/105.0, -1.0/5.0, 4.0/5.0, 0.0,
+    -4.0/5.0, 1.0/5.0, -4.0/105.0, 1.0/280.0
+};
+
+// Per-line scratch (display-thread-owned, like g_filtered_line):
+static double g_secam_mix_re[FILTERED_LINE_MAX];     // mixed-down full rate
+static double g_secam_mix_im[FILTERED_LINE_MAX];
+static double g_secam_lpre[CVBS_SECAM_MAX_DEC];      // band-only analytic (porch path)
+static double g_secam_lpim[CVBS_SECAM_MAX_DEC];
+static double g_secam_ire[CVBS_SECAM_MAX_DEC];       // band x bell analytic
+static double g_secam_iim[CVBS_SECAM_MAX_DEC];
+static double g_secam_f[CVBS_SECAM_MAX_DEC];         // discriminated Hz (bell path)
+static double g_secam_fref[CVBS_SECAM_MAX_DEC];      // discriminated Hz (bell-free: porch/ident)
+static double g_secam_demod[CVBS_SECAM_MAX_DEC];     // deviation in D'x units
+static double g_secam_final[CVBS_SECAM_MAX_DEC];     // post de-emphasis D'x (IRE fractions)
+static float  g_secam_u[CVBS_SECAM_MAX_DEC];         // pixel-loop u01 per dec sample
+static float  g_secam_v[CVBS_SECAM_MAX_DEC];
+static double g_secam_porch_f[40];                   // porch window fInst (median)
+
+// Rate-relative decimation state (set by cvbs_secam_build_filters; the
+// pixel loop and the porch windows read these):
+static int g_secam_decim = 8;        // decimation factor for the current rate
+static int g_secam_lp_taps = 41;     // band FIR tap count for the current rate
+static int g_secam_dec_count = 0;    // the last line's decimated sample count
+
+// One-line-hold rings: the previous same-component line's FINAL D'x (IRE
+// fractions, post de-emphasis) per component. File-scope like the other
+// per-line scratch (single decoder instance; cleared when the filters
+// rebuild).
+static float  g_secam_hold_final[2][CVBS_SECAM_MAX_DEC];
+static int    g_secam_hold_count[2];
+
+static void cvbs_secam_bell_apply(int dec_count);
+
+// Filter cache: the coefficients depend on (rate, block centre); rebuilt
+// lazily when either moves past the recentre threshold.
+static double g_secam_coeffs_valid = false;
+static double g_secam_coeffs_rate = 0.0;
+static double g_secam_coeffs_centre = 0.0;
+static double g_secam_lp[CVBS_SECAM_FIR_TAPS_MAX];    // band low-pass (real, symmetric)
+// De-emphasis causal lead-lag IIR: coefficients (built at the decimated
+// rate) + the CARRIED STATE - continuous across lines and fields like the
+// reference's flat per-field overlap-save buffer; reset only on a filter
+// rebuild (rate/centre move), where the state re-enters from the
+// porch-zero rest and settles within the sync/porch region.
+static double g_secam_deemph_b0, g_secam_deemph_b1, g_secam_deemph_a1;
+static double g_secam_deemph_x1, g_secam_deemph_y1;
+// Cloche (see cvbs_secam_bell_apply): the reference bell factored about
+// the mix-down (block) centre into C * (1 + j n~ fb)/(1 + j d~ fb) and
+// bilinear-mapped to a complex one-pole/one-zero section (12 real mults
+// per decimated sample). All complex coefficients stored re/im, pre-divided
+// by the denominator's a0.
+static double  g_secam_bell_b0_re, g_secam_bell_b0_im;  // numerator z^0 coeff
+static double  g_secam_bell_b1_re, g_secam_bell_b1_im;  // numerator z^-1 coeff
+static double  g_secam_bell_a1_re, g_secam_bell_a1_im;  // denominator z^-1 coeff
+static double  g_secam_notch_b0, g_secam_notch_b1, g_secam_notch_b2; // luma notch
+static double  g_secam_notch_a1, g_secam_notch_a2;
+
+// Windowed-sinc symmetric low-pass: pass flat to pass_hz, -6 dB at cut_hz,
+// Hamming window (the pre-port tbc-tools decoder's own band model).
+static void cvbs_secam_design_lowpass(double *taps, int ntaps,
+                                      double cut_hz, double rate) {
+    const int M = ntaps - 1;
+    const double fc = cut_hz / rate;   // normalized (cycles/sample)
+    for (int n = 0; n < ntaps; n++) {
+        double m = (double)(n - M / 2);
+        double sinc = (m == 0.0) ? 2.0 * fc
+                                 : sin(2.0 * M_PI * fc * m) / (M_PI * m);
+        double w = 0.54 - 0.46 * cos(2.0 * M_PI * (double)n / (double)M);
+        taps[n] = sinc * w;
+    }
+}
+
+// (Re)build the SECAM filter set for the current rate + locked block
+// centre. Called lazily from the line decode when (rate, centre) moved.
+static void cvbs_secam_build_filters(double rate, double block_centre_hz) {
+    // Rate-relative decimation + band tap scaling: the decimated rate is
+    // pinned at ~2.21 MHz (the 4fsc/8 design point) so the downstream
+    // constants hold at any input rate, and the band FIR's ABSOLUTE
+    // transition scales its tap count with the rate (41 taps at the 4fsc
+    // reference, 93 at 40 MSPS) - a fixed 41 taps at 40 MSPS left skirts
+    // 2.3x too wide and the picture demod railed on leaked luma.
+    g_secam_decim = (int)(rate / CVBS_SECAM_DECIM_TARGET_HZ + 0.5);
+    if (g_secam_decim < CVBS_SECAM_DECIM_MIN) g_secam_decim = CVBS_SECAM_DECIM_MIN;
+    g_secam_lp_taps = (int)(CVBS_SECAM_FIR_TAPS_REF * rate
+                             / CVBS_SECAM_RATE_REF_HZ + 0.5);
+    if (g_secam_lp_taps < CVBS_SECAM_FIR_TAPS_REF)
+        g_secam_lp_taps = CVBS_SECAM_FIR_TAPS_REF;
+    if (g_secam_lp_taps > CVBS_SECAM_FIR_TAPS_MAX)
+        g_secam_lp_taps = CVBS_SECAM_FIR_TAPS_MAX;
+    if (g_secam_lp_taps % 2 == 0) g_secam_lp_taps++;   // odd (symmetric)
+
+    // Band low-pass on the mixed-down FULL-RATE signal: flat over the
+    // +-450 kHz excursion band, -6 dB at ~500 kHz, Hamming skirts (the
+    // pre-port tbc-tools band model: soft skirts, proven on real tape).
+    cvbs_secam_design_lowpass(g_secam_lp, g_secam_lp_taps,
+                              0.5 * (CVBS_SECAM_BAND_FLAT_HZ
+                                     + CVBS_SECAM_BAND_STOP_HZ), rate);
+
+    // Clear the one-line-hold rings on any rebuild (rate/centre change:
+    // the hold would bridge across a discontinuity).
+    g_secam_hold_count[0] = 0;
+    g_secam_hold_count[1] = 0;
+
+    // Cloche factors: the reference bell A(f) = (1 + j1.26 F)/(1 + j16 F),
+    // F = f/c_bell - c_bell/f, at the TRUE frequency f. After mix-down by
+    // the BLOCK centre f0 (which differs from the bell centre c_bell by
+    // ~42 kHz), fb maps to f = f0 + fb and
+    //   F = F0 + slope*fb + O(fb^2),
+    //   F0 = f0/c - c/f0   (NONZERO - the naive F ~ 2*fb/f0 misses it),
+    //   slope = 1/c + c/f0^2.
+    // Both first-order networks factor exactly:
+    //   A(fb) = C * (1 + j n~ fb) / (1 + j d~ fb),
+    //   C = (1+j kn)/(1+j kd) (the bell at the block centre),
+    //   n~ = n1/(1+j kn), d~ = d1/(1+j kd)  (both complex).
+    // Bilinear map of the whole thing (s = 2 fs (1-z^-1)/(1+z^-1), fb =
+    // s/(j 2 pi)): the (1+z^-1) factors cancel and
+    //   A(z) = C * [(1+gn) + (1-gn) z^-1] / [(1+gd) + (1-gd) z^-1],
+    //   gn = n~/(pi fs_dec), gd = d~/(pi fs_dec).
+    // A complex one-pole/one-zero section (12 real mults per decimated
+    // sample after folding 1/a0 in). The bilinear's digital response is
+    // the exact analog factorisation at the pre-warped frequency
+    // (2 tan(w/2) instead of w) - the remaining error vs the reference is
+    // the F-linearisation (quadratic in fb) plus the warp, BOTH small at
+    // the carriers and growing toward the skirt. MEASURED envelope
+    // (Python replication of the exact constants): carriers (|fb| <=
+    // 100 kHz) ~0.7%, deviation (<=350 kHz) ~5%, skirt (<=580 kHz) ~17%.
+    {
+        double fs_dec = rate / (double)g_secam_decim;
+        double c_bell = CVBS_SECAM_BELL_CENTRE_HZ;
+        double f0 = block_centre_hz;
+        double F0 = f0 / c_bell - c_bell / f0;
+        double slope = 1.0 / c_bell + c_bell / (f0 * f0);
+        double kn = 1.26 * F0;
+        double kd = 16.0 * F0;
+        double n1 = 1.26 * slope;
+        double d1 = 16.0 * slope;
+        // C = (1 + j kn)/(1 + j kd)
+        double dd = 1.0 + kd * kd;
+        double c_re = (1.0 + kn * kd) / dd;
+        double c_im = (kn - kd) / dd;
+        // n~ = n1(1 - j kn)/(1 + kn^2)
+        double nn = 1.0 + kn * kn;
+        double tn_re = n1 / nn;
+        double tn_im = -n1 * kn / nn;
+        // d~ = d1(1 - j kd)/(1 + kd^2)
+        double td_re = d1 / dd;
+        double td_im = -d1 * kd / dd;
+        // gn = n~ * fs / pi, gd = d~ * fs / pi  (DIMENSIONLESS: n~ has
+        // seconds, from the fb = s/(j 2 pi) substitution - the first-order
+        // section is (1 + (n~/2pi) s) and s = 2 fs (1-z^-1)/(1+z^-1), so
+        // multiplying through by (1+z^-1) gives the coefficient n~ fs/pi.
+        // An inverted 1/(pi fs) here collapsed the bell to the flat
+        // constant and failed the numeric match at 37%/178%/303%.)
+        double gsc = fs_dec / M_PI;
+        double gn_re = tn_re * gsc, gn_im = tn_im * gsc;
+        double gd_re = td_re * gsc, gd_im = td_im * gsc;
+        // Numerator: C * [(1+gn) + (1-gn) z^-1]; denominator a0 = 1+gd,
+        // a1 = 1-gd. Fold 1/a0 into everything.
+        double an0_re = 1.0 + gn_re, an0_im = gn_im;
+        double an1_re = 1.0 - gn_re, an1_im = -gn_im;
+        double ad0_re = 1.0 + gd_re, ad0_im = gd_im;
+        double ad1_re = 1.0 - gd_re, ad1_im = -gd_im;
+        // 1/(1+gd)
+        double admag2 = ad0_re * ad0_re + ad0_im * ad0_im;
+        double ia_re = ad0_re / admag2;
+        double ia_im = -ad0_im / admag2;
+        // b0 = C*(1+gn)/(1+gd), b1 = C*(1-gn)/(1+gd), a1 = (1-gd)/(1+gd)
+        // (complex multiply + divide; all stored pre-folded)
+        double m0_re = c_re * an0_re - c_im * an0_im;
+        double m0_im = c_im * an0_re + c_re * an0_im;
+        double m1_re = c_re * an1_re - c_im * an1_im;
+        double m1_im = c_im * an1_re + c_re * an1_im;
+        g_secam_bell_b0_re = m0_re * ia_re - m0_im * ia_im;
+        g_secam_bell_b0_im = m0_im * ia_re + m0_re * ia_im;
+        g_secam_bell_b1_re = m1_re * ia_re - m1_im * ia_im;
+        g_secam_bell_b1_im = m1_im * ia_re + m1_re * ia_im;
+        g_secam_bell_a1_re = ad1_re * ia_re - ad1_im * ia_im;
+        g_secam_bell_a1_im = ad1_im * ia_re + ad1_re * ia_im;
+    }
+
+    // De-emphasis IIR at the decimated rate: the reference's COMPLEX
+    // inverseLf mask - the causal lead-lag H(s) = (1 + s/wz)/(1 + s/wp),
+    // wp = 2pi f1 (85 kHz pole), wz = 2pi 3f1 (255 kHz zero) - bilinear-
+    //mapped, s = 2 fs (1-z^-1)/(1+z^-1):
+    //   H(z) = [(1+kz) + (1-kz) z^-1] / [(1+kp) + (1-kp) z^-1],
+    //   kz = 2 fs/(wz warp), kp = 2 fs/(wp warp).
+    // The COMMON pre-warp factor is what makes this realizable: a plain
+    // bilinear measured 2.4% worst across the deviation band (the warp
+    // peaks MID-SHELF, not at the corners), pre-warping the corners
+    // independently lands them exact but stretches the mid-shelf to 3.7%
+    // and breaks the shelf ratio, and the geometric-centre match
+    // (sqrt(f1*3f1) = 147 kHz) still left 2.0% at the 350 kHz band edge.
+    // Matched at 220 kHz - the measured error curve's balance point - the
+    // deviation band holds ~1.5% worst. The common factor keeps DC gain
+    // (1) and the HF shelf ratio (wz/wp = 1/3) EXACT by construction (it
+    // cancels in both). The causal state resets inline here, joining the
+    // hold-ring clear above: a rebuild re-enters from the porch-zero rest.
+    {
+        double fs_dec = rate / (double)g_secam_decim;
+        double wp = 2.0 * M_PI * CVBS_SECAM_LF_BREAK_HZ;
+        double wz = 2.0 * M_PI * 3.0 * CVBS_SECAM_LF_BREAK_HZ;
+        double f_match = 220000.0;
+        double w_match = M_PI * f_match / fs_dec;
+        double warp = (w_match > 1e-12 && w_match < M_PI / 2.0)
+            ? tan(w_match) / w_match : 1.0;
+        double kz = 2.0 * fs_dec / (wz * warp);
+        double kp = 2.0 * fs_dec / (wp * warp);
+        g_secam_deemph_b0 = (1.0 + kz) / (1.0 + kp);
+        g_secam_deemph_b1 = (1.0 - kz) / (1.0 + kp);
+        g_secam_deemph_a1 = (1.0 - kp) / (1.0 + kp);
+        g_secam_deemph_x1 = 0.0;
+        g_secam_deemph_y1 = 0.0;
+    }
+
+    // Luma notch (2nd-order, broad) at the block centre: removes the steady
+    // subcarrier dot pattern from the SECAM luma path (the reference's
+    // combined-input block-notch, streaming-cheap form).
+    {
+        double w0 = 2.0 * M_PI * block_centre_hz / rate;
+        double r = 0.92;   // pole radius: notch width ~ +-300 kHz at 4fsc
+        g_secam_notch_b0 = 1.0;
+        g_secam_notch_b1 = -2.0 * cos(w0);
+        g_secam_notch_b2 = 1.0;
+        g_secam_notch_a1 = g_secam_notch_b1 * r;
+        g_secam_notch_a2 = r * r;
+        // Unity DC gain.
+        // Normalized by the FULL DC gain H(1) = (b0+b1+b2)/(1+a1+a2):
+        // normalizing only the numerator's b-sum left H(1) = 2.41 and
+        // railed every line's luma white (the first bars run failed
+        // all-white including the black bar).
+        double num_dc = g_secam_notch_b0 + g_secam_notch_b1
+                        + g_secam_notch_b2;
+        double den_dc = 1.0 + g_secam_notch_a1 + g_secam_notch_a2;
+        if (fabs(num_dc) > 1e-9 && fabs(den_dc) > 1e-9) {
+            double scale = den_dc / num_dc;   // H(1) = 1 exactly
+            g_secam_notch_b0 *= scale;
+            g_secam_notch_b1 *= scale;
+            g_secam_notch_b2 *= scale;
+        }
+    }
+
+    g_secam_coeffs_rate = rate;
+    g_secam_coeffs_centre = block_centre_hz;
+    g_secam_coeffs_valid = true;
+}
+
+// In-place SECAM luma notch on the filtered line.
+static void cvbs_secam_notch_line(int16_t *line, int n) {
+    double x1 = line[0], x2 = line[0];
+    double y1 = line[0], y2 = line[0];
+    for (int i = 0; i < n; i++) {
+        double x0 = (double)line[i];
+        double y0 = g_secam_notch_b0 * x0 + g_secam_notch_b1 * x1
+                    + g_secam_notch_b2 * x2
+                    - g_secam_notch_a1 * y1 - g_secam_notch_a2 * y2;
+        x2 = x1; x1 = x0;
+        y2 = y1; y1 = y0;
+        line[i] = (int16_t)lrint(y0);
+    }
+}
+
+// Median of a small double array (insertion sort; porch windows are ~10).
+static double cvbs_secam_median(double *v, int count) {
+    if (count <= 0) return 0.0;
+    for (int i = 1; i < count; i++) {
+        double x = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = x;
+    }
+    return v[count / 2];
+}
+
+// Field-boundary commit: vote the identification + lock the calibration
+// from the PREVIOUS field's accumulators, then reset them for the new
+// field. Called wherever the VBI machinery commits a new field.
+static void cvbs_secam_field_commit(cvbs_decoder_t *decoder) {
+    cvbs_secam_state_t *s = &decoder->secam;
+    const double nominal_centre =
+        0.5 * (CVBS_SECAM_FOB_HZ + CVBS_SECAM_FOR_HZ);
+
+    // Median active-envelope over the recorded lines: the colour-killer and
+    // ident envelope-gate reference for THIS field (locked at commit).
+    {
+        double envs[320];
+        int ne = 0;
+        for (int r = 0; r < s->rows && r < 320; r++) {
+            if (s->centre_env[r] > 0.0) envs[ne++] = s->centre_env[r];
+        }
+        s->centre_env_median = cvbs_secam_median(envs, ne);
+    }
+
+    // Collect the valid porch frequencies (envelope over the killer gate
+    // against the field's median active envelope).
+    double valid_freqs[320];
+    int nvalid = 0;
+    for (int r = 0; r < s->rows && r < 320; r++) {
+        if (s->row_valid[r]) valid_freqs[nvalid++] = s->porch_freq[r];
+    }
+
+    // Carrier calibration: split the porch medians into the two clusters,
+    // take per-cluster medians, apply the separation + sanity gates, LOCK
+    // the 10*fH split around the measured centre (BT.470: the pair sits
+    // exactly 156.25 kHz apart in the sample clock; the medians locate the
+    // centre but their split is skewed by porch ringing - the reference
+    // measured ~178 kHz on combined input and it zeroed every neutral).
+    bool calibrated = false;
+    double fob = s->have_last_good ? s->last_good_fob : CVBS_SECAM_FOB_HZ;
+    double for_ = s->have_last_good ? s->last_good_for : CVBS_SECAM_FOR_HZ;
+    if (nvalid >= CVBS_SECAM_CAL_MIN_ROWS) {
+        // valid_freqs is not sorted; sort a copy for the split-point scan.
+        double sorted[320];
+        memcpy(sorted, valid_freqs, (size_t)nvalid * sizeof(double));
+        for (int i = 1; i < nvalid; i++) {
+            double x = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j] > x) { sorted[j + 1] = sorted[j]; j--; }
+            sorted[j + 1] = x;
+        }
+        const int half = nvalid / 2;
+        const double low_median = sorted[half / 2];
+        const double high_median =
+            sorted[half + (nvalid - half) / 2];
+        const double separation = high_median - low_median;
+        if (separation > CVBS_SECAM_CAL_MIN_SEP_HZ
+            && separation < CVBS_SECAM_CAL_MAX_SEP_HZ
+            && fabs(low_median - CVBS_SECAM_FOB_HZ) <= CVBS_SECAM_CAL_MAX_OFFSET_HZ
+            && fabs(high_median - CVBS_SECAM_FOR_HZ) <= CVBS_SECAM_CAL_MAX_OFFSET_HZ) {
+            const double centre = 0.5 * (low_median + high_median);
+            fob = centre - CVBS_SECAM_PAIR_SPLIT_HZ;
+            for_ = centre + CVBS_SECAM_PAIR_SPLIT_HZ;
+            calibrated = true;
+        }
+    }
+    if (calibrated) {
+        s->last_good_fob = fob;
+        s->last_good_for = for_;
+        s->have_last_good = true;
+        s->fields_calibrated++;
+    } else if (s->have_last_good) {
+        s->fields_reused++;
+    } else {
+        s->fields_nominal++;
+    }
+
+    s->fob = fob;
+    s->for_ = for_;
+    s->calibrated = calibrated;
+    s->carrier_offset = 0.5 * (fob + for_) - nominal_centre;
+
+    // Identification: porch parity vote against the measured pair's split,
+    // with the reference's confidence gates + the bottles/content fallbacks.
+    const double split = 0.5 * (fob + for_);
+    int agree_even_red = 0, picture = 0;
+    for (int r = 0; r < s->rows && r < 320; r++) {
+        if (!s->row_valid[r]) continue;
+        bool measured_red = s->porch_freq[r] > split;
+        if (measured_red == ((r % 2) == 0)) agree_even_red++;
+        picture++;
+    }
+    double confidence = (picture > 0)
+        ? (double)(agree_even_red > picture - agree_even_red
+                   ? agree_even_red : picture - agree_even_red) / (double)picture
+        : 0.0;
+    int ident_source = 0;
+    if (picture < CVBS_SECAM_CAL_MIN_ROWS || confidence < 0.75) {
+        // Bottles cross-check (BT.470-6 option B, early VBI lines): the
+        // trapezoids deviate the subcarrier to fob-350k / for+350k, so only
+        // rows reading an actual bottle plateau vote.
+        int bottle_rows = 0, bottle_agree = 0;
+        const double bottle_db = fob - 350000.0;
+        const double bottle_dr = for_ + 350000.0;
+        for (int r = 5; r <= 15 && r < s->rows; r++) {
+            if (r >= 320) break;
+            double env = s->centre_env[r];
+            if (s->centre_env_median <= 0.0 || env < 0.5 * s->centre_env_median)
+                continue;
+            double f = s->centre_freq[r];
+            if (fabs(f - bottle_db) > 200000.0 && fabs(f - bottle_dr) > 200000.0)
+                continue;
+            bool red = f > split;
+            if (red == ((r % 2) == 0)) bottle_agree++;
+            bottle_rows++;
+        }
+        double bottle_conf = (bottle_rows > 0)
+            ? (double)(bottle_agree > bottle_rows - bottle_agree
+                       ? bottle_agree : bottle_rows - bottle_agree) / (double)bottle_rows
+            : 0.0;
+        if (bottle_rows >= 4 && bottle_conf >= 0.75) {
+            agree_even_red = bottle_agree;
+            picture = bottle_rows;
+            ident_source = 2;
+        } else {
+            // Content-median fallback: a line's mean centre frequency sits
+            // near its own carrier; a median split recovers the alternation.
+            double content_f[320];
+            int content_rows[320];
+            int ncontent = 0;
+            for (int r = 0; r < s->rows && r < 320; r++) {
+                if (r >= 320) break;
+                if (s->centre_env_median <= 0.0
+                    || s->centre_env[r] < 0.3 * s->centre_env_median) continue;
+                content_f[ncontent] = s->centre_freq[r];
+                content_rows[ncontent] = r;
+                ncontent++;
+            }
+            if (ncontent >= 16) {
+                double med[320];
+                memcpy(med, content_f, (size_t)ncontent * sizeof(double));
+                double median = cvbs_secam_median(med, ncontent);
+                agree_even_red = 0;
+                picture = 0;
+                for (int i = 0; i < ncontent; i++) {
+                    bool red = content_f[i] > median;
+                    if (red == ((content_rows[i] % 2) == 0)) agree_even_red++;
+                    picture++;
+                }
+                ident_source = 1;
+            }
+        }
+        confidence = (picture > 0)
+            ? (double)(agree_even_red > picture - agree_even_red
+                       ? agree_even_red : picture - agree_even_red) / (double)picture
+            : 0.0;
+    }
+    s->dr_on_even = (picture > 0) ? (agree_even_red * 2 >= picture) : false;
+    s->ident_confidence = confidence;
+    s->ident_source = ident_source;
+
+    // The D'R/D'B alternation is continuous across the FRAME (BT.470: the
+    // sequence never resets at a field boundary). The vote above is
+    // FIELD-LOCAL ("D'R on even lines of the field JUST COMPLETED"); the
+    // next field's local parity mapping flips when the completed field had
+    // an ODD line count (PAL 312/313 alternation: field starts shift by
+    // lines mod 2). Without this flip the NEXT field inherits the PREVIOUS
+    // field's mapping and every field following a parity flip decodes with
+    // inverted ident (measured: fields 1 and 4 of the studio fixture, porch
+    // reading foB on is_red lines) - the reference votes per field and
+    // applies it to the SAME field (offline), so it never hits this.
+    {
+        int completed_parity = decoder->state.current_field;
+        int completed_lines =
+            (completed_parity >= 0 && completed_parity <= 1)
+                ? cvbs_profile(decoder)->field_lines[completed_parity] : 0;
+        if (completed_lines & 1) {
+            s->dr_on_even = !s->dr_on_even;
+        }
+    }
+
+    // Porch noise MAD (the concealment overshoot term): median absolute
+    // deviation of the valid porch frequencies about their component's
+    // carrier. Only meaningful when the porch vote was used.
+    if (ident_source == 0) {
+        double devs[320];
+        int ndev = 0;
+        for (int r = 0; r < s->rows && r < 320; r++) {
+            if (!s->row_valid[r]) continue;
+            double centre = s->porch_freq[r] > split ? for_ : fob;
+            devs[ndev++] = fabs(s->porch_freq[r] - centre);
+        }
+        s->noise_mad_hz = cvbs_secam_median(devs, ndev);
+    } else {
+        s->noise_mad_hz = 0.0;
+    }
+
+    // Reset the per-field ACCUMULATORS for the new field. centre_env_median
+    // is NOT an accumulator - it is the committed killer reference for the
+    // new field (an earlier `= 0.0` here destroyed it the instant it was
+    // computed: every field decoded with the colour killer disabled and
+    // the bars came out gray).
+    s->rows = 0;
+    memset(s->porch_freq, 0, sizeof(s->porch_freq));
+    memset(s->porch_env, 0, sizeof(s->porch_env));
+    memset(s->row_valid, 0, sizeof(s->row_valid));
+    memset(s->centre_freq, 0, sizeof(s->centre_freq));
+    memset(s->centre_env, 0, sizeof(s->centre_env));
+}
+
+// Decode one SECAM line's FM chroma into g_secam_u/g_secam_v (per decimated
+// sample) + update the field accumulators. Runs on the display thread
+// inside decode_line_to_pixels, inside the per-line budget.
+static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
+                                   const int16_t *src, int n,
+                                   const cvbs_baseband_profile_t *profile,
+                                   int line_now, bool picture_line) {
+    cvbs_secam_state_t *s = &decoder->secam;
+    const double rate = cvbs_rate(decoder);
+    const double block_centre =
+        0.5 * (CVBS_SECAM_FOB_HZ + CVBS_SECAM_FOR_HZ) + s->carrier_offset;
+
+    // Lazy filter build/rebuild on MATERIAL (rate, centre) movement. The
+    // rate compare is a THRESHOLD, never an exact float: the self-
+    // calibration refines the measured rate by tiny quanta continuously,
+    // and an exact compare rebuilt the filters (and WIPED the one-line
+    // hold rings) on every tick - zeroing most lines' held component.
+    if (!g_secam_coeffs_valid
+        || fabs(rate - g_secam_coeffs_rate) > CVBS_SECAM_RECENTRE_HZ
+        || fabs(block_centre - g_secam_coeffs_centre) > CVBS_SECAM_RECENTRE_HZ) {
+        cvbs_secam_build_filters(rate, block_centre);
+    }
+
+    // ---- Mix the block band down to baseband (incremental NCO, resync
+    // every 256 samples like the PAL carrier tables). Per-line phase reset
+    // is exact for FM: the discriminator measures phase differences within
+    // the line only.
+    const double dphase = 2.0 * M_PI * block_centre / rate;
+    double cd = cos(dphase), sd = sin(dphase);
+    double c = 1.0, sn = 0.0;
+    for (int k = 0; k < n; k++) {
+        if ((k & 255) == 0) {
+            double ph = (double)(k & ~255) * dphase;
+            c = cos(ph);
+            sn = sin(ph);
+        }
+        double v = (double)src[k];
+        g_secam_mix_re[k] = v * c;
+        g_secam_mix_im[k] = -v * sn;   // e^{-jw t} * x
+        double nc = c * cd - sn * sd;
+        sn = sn * cd + c * sd;
+        c = nc;
+    }
+
+    // ---- Band low-pass + decimate (real symmetric FIR on re/im), keeping
+    // BOTH the bell-free (porch/calibration path) and the to-be-belled
+    // analytic. Edge-clamped history: the settle lands in the sync region.
+    const int decim = g_secam_decim;
+    const int half = g_secam_lp_taps / 2;
+    int dec_count = 0;
+    for (int out = 0; out * decim < n; out++) {
+        int centre_idx = out * decim + decim / 2;
+        double ar = 0.0, ai = 0.0;
+        for (int t = 0; t < g_secam_lp_taps; t++) {
+            int idx = centre_idx - half + t;
+            if (idx < 0) idx = 0;
+            if (idx >= n) idx = n - 1;
+            ar += g_secam_lp[t] * g_secam_mix_re[idx];
+            ai += g_secam_lp[t] * g_secam_mix_im[idx];
+        }
+        if (out >= CVBS_SECAM_MAX_DEC) break;
+        g_secam_lpre[out] = ar;
+        g_secam_lpim[out] = ai;
+        dec_count++;
+    }
+
+    // ---- Cloche (linearised reference network; see
+    // cvbs_secam_bell_apply + the numeric-match harness contract).
+    cvbs_secam_bell_apply(dec_count);
+
+    // ---- Discriminate (9-tap maximally-flat central difference on the
+    // mixed-down analytic signal; the exact phase derivative). TWO passes:
+    // the bell path (the picture demodulation) and the BELL-FREE path (the
+    // porch + ident measurements) - the reference's analyticRef/fInstRef.
+    // The bell's asymmetric phase response around its centre (42 kHz below
+    // the block centre) BIASES the discriminated steady carriers: measured
+    // D'R porch medians -29 kHz / D'B +10 kHz, pulling the ident split
+    // and every line's zero (the reference's documented reason for the
+    // bell-free reference path).
+    {
+        const double freq_scale = rate / (2.0 * M_PI * (double)decim);
+        for (int i = 0; i < dec_count; i++) {
+            double ar = g_secam_ire[i], ai = g_secam_iim[i];
+            double mag2 = ar * ar + ai * ai;
+            if (mag2 < 1e-9) {
+                g_secam_f[i] = block_centre;
+            } else {
+                double dr = 0.0, di = 0.0;
+                for (int m = -4; m <= 4; m++) {
+                    if (m == 0) continue;
+                    int j = i - m;
+                    if (j < 0) j = 0;
+                    if (j >= dec_count) j = dec_count - 1;
+                    double tap = g_secam_diff_taps[m + 4];
+                    dr += tap * g_secam_ire[j];
+                    di += tap * g_secam_iim[j];
+                }
+                // Im(conj(a) * a') = ar*di - ai*dr
+                g_secam_f[i] = block_centre
+                               + freq_scale * (ar * di - ai * dr) / mag2;
+            }
+            double br = g_secam_lpre[i], bi = g_secam_lpim[i];
+            double bmag2 = br * br + bi * bi;
+            if (bmag2 < 1e-9) {
+                g_secam_fref[i] = block_centre;
+            } else {
+                double dr = 0.0, di = 0.0;
+                for (int m = -4; m <= 4; m++) {
+                    if (m == 0) continue;
+                    int j = i - m;
+                    if (j < 0) j = 0;
+                    if (j >= dec_count) j = dec_count - 1;
+                    double tap = g_secam_diff_taps[m + 4];
+                    dr += tap * g_secam_lpre[j];
+                    di += tap * g_secam_lpim[j];
+                }
+                g_secam_fref[i] = block_centre
+                                  + freq_scale * (br * di - bi * dr) / bmag2;
+            }
+        }
+    }
+
+    // ---- Porch measurement (bell-free path): median discriminated Hz +
+    // mean envelope over the back-porch carrier window, from the TRUE sync
+    // start (the porch region spans the profile's burst + back porch in
+    // SECAM - the rest carrier runs from the breezeway to active start).
+    int p0 = cvbs_us_to_samples(decoder, profile->burst_start_us) + 2
+             - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    int p1 = cvbs_us_to_samples(decoder, profile->active_start_us) - 2
+             - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+    if (p0 < 1) p0 = 1;
+    if (p1 > n) p1 = n;
+    double porch_freq = 0.0, porch_env = 0.0;
+    bool porch_ok = false;
+    if (p1 - p0 >= 8) {
+        int nf = 0;
+        double env_sum = 0.0;
+        int env_n = 0;
+        for (int x = p0; x < p1 && nf < 40; x += decim) {
+            int di = (x - decim / 2) / decim;
+            if (di < 0) di = 0;
+            if (di >= dec_count) break;
+            g_secam_porch_f[nf++] = g_secam_fref[di];
+            env_sum += sqrt(g_secam_lpre[di] * g_secam_lpre[di]
+                            + g_secam_lpim[di] * g_secam_lpim[di]);
+            env_n++;
+        }
+        if (nf >= 5) {
+            porch_freq = cvbs_secam_median(g_secam_porch_f, nf);
+            porch_env = env_n > 0 ? env_sum / (double)env_n : 0.0;
+            porch_ok = true;
+        }
+    }
+
+    // ---- Line identification. PRIMARY: this line's OWN porch - the
+    // bell-free discriminator reads the carriers cleanly (tens of Hz on
+    // the synthetic fixture); a porch within 40 kHz of ONE carrier is
+    // DECISIVE (the pair is 156.25 kHz apart, so it cannot be within 40
+    // kHz of both). The gate is measured against the CARRIERS, never
+    // against the pair split - the carriers sit exactly 78125 Hz from
+    // the split, so a split-relative gate fails AT the carriers by
+    // single-digit Hz and falls back to the parity mapping (measured:
+    // is_red=1 on a 4250148 Hz porch, 8 Hz past the gate).
+    // FALLBACK: the field's tracked parity mapping (the vote + the
+    // 312/313 line-count flip at the field commit).
+    int field_line = line_now;   // 0-based within the field
+    bool near_fob = porch_ok && fabs(porch_freq - s->fob) <= 40000.0;
+    bool near_for = porch_ok && fabs(porch_freq - s->for_) <= 40000.0;
+    bool is_red = (near_for && !near_fob)
+        ? true
+        : ((near_fob && !near_for)
+               ? false
+               : (((field_line % 2) == 0) == s->dr_on_even));
+
+    // ---- This line's rest (the reference's rowZero, causal): its own
+    // porch median when plausible, else the field pair.
+    double field_zero = is_red ? s->for_ : s->fob;
+    double zero = field_zero;
+    if (porch_ok && fabs(porch_freq - field_zero) <= CVBS_SECAM_PORCH_TAIL_HZ_GATE) {
+        zero = porch_freq;
+    }
+
+    // ---- Demodulate the active area: deviation in D'x units, colour
+    // killer, rails, click concealment (row-2 borrow), de-emphasis + LPF,
+    // scale, and the causal one-line hold for the missing component.
+    const double deviation = is_red ? CVBS_SECAM_DEV_DR_HZ : CVBS_SECAM_DEV_DB_HZ;
+    const double lo_bound = is_red ? CVBS_SECAM_DEV_DR_LO : CVBS_SECAM_DEV_DB_LO;
+    const double hi_bound = is_red ? CVBS_SECAM_DEV_DR_HI : CVBS_SECAM_DEV_DB_HI;
+    const double killer_level = CVBS_SECAM_KILLER_RATIO * s->centre_env_median;
+
+    // Active sample window in decimated indices.
+    int a0 = (cvbs_us_to_samples(decoder, profile->active_start_us)
+              - CVBS_SYNC_EDGE_DELAY_SAMPLES) / decim;
+    int a1 = (cvbs_us_to_samples(decoder, profile->active_end_us)
+              - CVBS_SYNC_EDGE_DELAY_SAMPLES) / decim;
+    if (a0 < 0) a0 = 0;
+    if (a1 > dec_count) a1 = dec_count;
+
+    // The picture demod runs on the BELL-FREE discriminator (g_secam_fref):
+    // measured on the studio fixture, the bilinear cloche's asymmetric phase
+    // response (its centre sits 42 kHz below the block centre) biased the
+    // BELLED carrier readings by -19.5 kHz at foR / ~0-10 kHz at foB, and
+    // its amplitude tilt dropped the strongly-deviated sidebands' envelope
+    // (|A|~0.3 at +-390 kHz) below the concealment's 12 dB dip floor,
+    // squashing whole bars to ~+0.25 D'x. The bell-free path reads the
+    // carriers within tens of Hz (the porch/ident already use it - the
+    // reference's fInstRef). The bell stays built + verified by the
+    // numeric-match contract; carrying it into the demod is future work
+    // (pre-warp correction or a magnitude-only post-demod shaping).
+    for (int i = 0; i < dec_count; i++) {
+        double d = 0.0;
+        if (picture_line && i >= a0 && i < a1 && killer_level > 0.0) {
+            double env = sqrt(g_secam_lpre[i] * g_secam_lpre[i]
+                              + g_secam_lpim[i] * g_secam_lpim[i]);
+            if (env >= killer_level) {
+                d = (g_secam_fref[i] - zero) / deviation;
+            }
+        }
+        if (d < lo_bound) d = lo_bound;
+        if (d > hi_bound) d = hi_bound;
+        g_secam_demod[i] = d;
+    }
+
+    // Click concealment ("SECAM fire"): envelope dip + noise-adaptive
+    // deviation overshoot; short spans interpolate, wide spans borrow the
+    // previous same-component line (row-2, in the ring).
+    {
+        const double level = CVBS_SECAM_CLICK_LEVEL;
+        const double dip_db = 12.0 - 6.0 * level;
+        const double env_ratio = pow(10.0, -dip_db / 20.0);
+        const double overshoot = fmax(2.6 - 1.6 * level, 1.15)
+                                 + 6.0 * s->noise_mad_hz / 506000.0;
+        const double flag_lo = lo_bound * overshoot;
+        const double flag_hi = hi_bound * overshoot;
+        // Row median envelope over the active region, BELL-FREE (the
+        // carrier amplitude is flat across deviations on that path, so the
+        // dip floor only trips on genuine carrier dropouts - the belled
+        // envelope's amplitude tilt false-flagged every strongly-deviated
+        // bar).
+        double envs[CVBS_SECAM_MAX_DEC];
+        int nenv = 0;
+        for (int i = a0; i < a1 && i < dec_count; i++) {
+            envs[nenv++] = sqrt(g_secam_lpre[i] * g_secam_lpre[i]
+                                + g_secam_lpim[i] * g_secam_lpim[i]);
+        }
+        double env_ref = cvbs_secam_median(envs, nenv);
+        if (env_ref > 0.0) {
+            double floor_env = env_ref * env_ratio;
+            bool flagged[CVBS_SECAM_MAX_DEC] = {false};
+            bool any = false;
+            for (int i = a0; i < a1 && i < dec_count; i++) {
+                double env = sqrt(g_secam_lpre[i] * g_secam_lpre[i]
+                                  + g_secam_lpim[i] * g_secam_lpim[i]);
+                if (g_secam_demod[i] < flag_lo || g_secam_demod[i] > flag_hi
+                    || env < floor_env) {
+                    flagged[i] = true;
+                    any = true;
+                }
+            }
+            if (any) {
+                int i = a0;
+                while (i < a1 && i < dec_count) {
+                    if (!flagged[i]) { i++; continue; }
+                    int run_end = i;
+                    while (run_end < a1 && run_end < dec_count && flagged[run_end])
+                        run_end++;
+                    int span_start = i - 3;
+                    int span_end = run_end + 3;
+                    if (span_start < 0) span_start = 0;
+                    if (span_end > dec_count) span_end = dec_count;
+                    if (span_end - span_start <= 6 && span_start > 0
+                        && span_end < dec_count) {
+                        // Short span: linearly interpolate across the click.
+                        double before = g_secam_demod[span_start - 1];
+                        double after = g_secam_demod[span_end];
+                        double dn = (double)(span_end - span_start + 1);
+                        for (int t = span_start; t < span_end; t++) {
+                            g_secam_demod[t] = before
+                                + (after - before) * (double)(t - span_start + 1) / dn;
+                        }
+                    } else {
+                    // Wide span: borrow the previous same-component line
+                    // (row-2, already concealed - the reference's Phase B
+                    // model; the ring holds concealed deviation units).
+                    {
+                        const float *prev_same = s->prev_demod[is_red ? 1 : 0];
+                        int prev_count = s->prev_dec_count[is_red ? 1 : 0];
+                        if (prev_count > 0) {
+                            for (int t = span_start; t < span_end; t++) {
+                                g_secam_demod[t] =
+                                    (double)prev_same[t < prev_count ? t : prev_count - 1];
+                            }
+                        } else {
+                            for (int t = span_start; t < span_end; t++) {
+                                g_secam_demod[t] = 0.0;
+                            }
+                        }
+                    }
+                    }  // wide-span borrow
+                    i = span_end;
+                }
+            }
+        }
+    }
+
+    // ---- De-emphasis (causal IIR, state carried across lines - the
+    // reference's continuous overlap-save field semantics) + scale to IRE
+    // fractions of the colour difference. Two handoff rings: the struct's
+    // prev_demod keeps the CONCEALED DEMOD (deviation units, the row-2
+    // borrow domain, next line's concealment); the file-scope hold ring
+    // keeps the FINALS (IRE fractions, the one-line hold domain).
+    {
+        // The held (missing) component is the OTHER component's previous
+        // line: on a D'R line hold D'B (slot 0), on a D'B line hold D'R
+        // (slot 1). An earlier [is_red ? 1 : 0] here read the line's OWN
+        // component slot - feeding the previous own-component value into
+        // the wrong axis and scrambling every bar.
+        const float *hold_prev = g_secam_hold_final[is_red ? 0 : 1];
+        const int hold_count = g_secam_hold_count[is_red ? 0 : 1];
+        for (int i = 0; i < dec_count; i++) {
+            double y = g_secam_deemph_b0 * g_secam_demod[i]
+                       + g_secam_deemph_b1 * g_secam_deemph_x1
+                       - g_secam_deemph_a1 * g_secam_deemph_y1;
+            g_secam_deemph_x1 = g_secam_demod[i];
+            g_secam_deemph_y1 = y;
+            g_secam_final[i] = y;
+        }
+        // u01/v01 per decimated sample: this line's component from the
+        // demod, the missing component from the previous SAME-component
+        // line (causal one-line hold; zero until the first line of each
+        // component renders).
+        bool hold_valid = (hold_count > 0);
+        const double own_scale = is_red ? CVBS_SECAM_V_SCALE
+                                         : CVBS_SECAM_U_SCALE;
+        for (int i = 0; i < dec_count; i++) {
+            float own = (float)(g_secam_final[i] * own_scale);
+            float held = hold_valid
+                ? hold_prev[i < hold_count ? i : hold_count - 1] : 0.0f;
+            if (is_red) {
+                g_secam_v[i] = own;    // this line's D'R
+                g_secam_u[i] = held;   // the previous D'B line, SCALED
+            } else {
+                g_secam_u[i] = own;    // this line's D'B
+                g_secam_v[i] = held;   // the previous D'R line, SCALED
+            }
+        }
+        // Push this line into its rings. The HOLD ring stores the SCALED
+        // per-component value (u01/v01 units - the next line's held
+        // component reads it directly; storing the raw deviation units
+        // here left the held component ~3x oversized and unnormalised,
+        // scrambling every bar). The struct ring keeps the CONCEALED DEMOD
+        // (deviation units) for the next line's row-2 concealment borrow.
+        for (int i = 0; i < dec_count; i++) {
+            g_secam_hold_final[is_red ? 1 : 0][i] =
+                (float)(g_secam_final[i] * own_scale);
+        }
+        g_secam_hold_count[is_red ? 1 : 0] = dec_count;
+        for (int i = 0; i < dec_count; i++) {
+            s->prev_demod[is_red ? 1 : 0][i] = (float)g_secam_demod[i];
+        }
+        s->prev_dec_count[is_red ? 1 : 0] = dec_count;
+    }
+
+    // Publish the decimated geometry for the pixel loop.
+    g_secam_dec_count = dec_count;
+
+    // ---- Field accumulators (porch ring + centre stats for the ident
+    // fallbacks + the active-envelope median source).
+    if (line_now >= 0 && line_now < 320) {
+        int r = line_now;
+        s->porch_freq[r] = porch_ok ? porch_freq : 0.0;
+        s->porch_env[r] = porch_ok ? porch_env : 0.0;
+        s->row_valid[r] = porch_ok;
+        // Centre stats over the middle of the line (bottles/content idents).
+        double fsum = 0.0, esum = 0.0;
+        int cn = 0;
+        int c0 = a0 + 2, c1 = a1 - 2;
+        for (int i = c0; i < c1 && i < dec_count; i++) {
+            fsum += g_secam_fref[i];   // bell-free: the ident's fInstRef
+            esum += sqrt(g_secam_lpre[i] * g_secam_lpre[i]
+                         + g_secam_lpim[i] * g_secam_lpim[i]);
+            cn++;
+        }
+        s->centre_freq[r] = cn > 0 ? fsum / (double)cn : 0.0;
+        s->centre_env[r] = cn > 0 ? esum / (double)cn : 0.0;
+        if (r + 1 > s->rows) s->rows = r + 1;
+    }
+}
+
+// Cloche (the receiver's HF "bell" network). The reference applies
+// A(f) = (1 + j1.26 F)/(1 + j16 F), F = f/c_bell - c_bell/f, per FFT bin
+// at the TRUE frequency. Here: the bilinear-mapped factorisation (see
+// cvbs_secam_build_filters) as a complex one-pole/one-zero section,
+// y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1] - 12 real multiplies per
+// decimated sample, all coefficients pre-folded. Per-line reset
+// (stateless like the reference's per-row FFT - the settle lands in the
+// sync region, before the porch and active areas). The harness
+// numeric-match pins the digital pipeline's envelope against the
+// reference closed form.
+static void cvbs_secam_bell_apply(int dec_count) {
+    const double b0_re = g_secam_bell_b0_re, b0_im = g_secam_bell_b0_im;
+    const double b1_re = g_secam_bell_b1_re, b1_im = g_secam_bell_b1_im;
+    const double a1_re = g_secam_bell_a1_re, a1_im = g_secam_bell_a1_im;
+    double xr_prev = g_secam_lpre[0], xi_prev = g_secam_lpim[0];
+    // Filter state, initialised to the DC steady state of the first input
+    // (the settle lands in the sync region).
+    double yr = xr_prev, yi = xi_prev;
+    for (int i = 0; i < dec_count; i++) {
+        double xr = g_secam_lpre[i], xi = g_secam_lpim[i];
+        // y = b0*x + b1*x_prev - a1*y_prev   (complex)
+        double ynr = b0_re * xr - b0_im * xi
+                     + b1_re * xr_prev - b1_im * xi_prev
+                     - a1_re * yr + a1_im * yi;
+        double yni = b0_im * xr + b0_re * xi
+                     + b1_im * xr_prev + b1_re * xi_prev
+                     - a1_im * yr - a1_re * yi;
+        yr = ynr; yi = yni;
+        g_secam_ire[i] = yr;
+        g_secam_iim[i] = yi;
+        xr_prev = xr; xi_prev = xi;
+    }
+}
+
 // Decode a single video line from samples to RGB24 pixels.
 // Luma: pre-filters the entire line, then resamples to the output width.
 // Chroma (colour_mode AUTO): per-line burst-gated quadrature demodulation at
@@ -906,13 +1907,32 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
                                     : RF_HYBRID_SPAN_IRE_NTSC;
 
     // =========================================================================
-    // Chroma setup (burst-gated, line-local carrier frame)
+    // Chroma setup
     // =========================================================================
+    // SECAM: the FM-chroma path replaces the burst-gated quadrature entirely
+    // (the D'R/D'B block decoded per line; see the SECAM section). PAL/NTSC
+    // keep the burst-locked demod below.
+    bool secam_active = (decoder->colour_mode == CVBS_COLOUR_AUTO) &&
+                        (decoder->state.format == CVBS_FORMAT_SECAM) &&
+                        decoder->pll.locked;
     bool pal = pal625;  // PAL/SECAM 625
-    bool colour = (decoder->colour_mode == CVBS_COLOUR_AUTO) &&
-                  (decoder->state.format != CVBS_FORMAT_SECAM);
+    bool colour = !secam_active &&
+                  (decoder->colour_mode == CVBS_COLOUR_AUTO);
     double burst_phase = 0.0, burst_amp = 0.0;
     int vswitch = 1;
+    int secam_dec_count = 0;
+    if (secam_active) {
+        // The SECAM line decode fills g_secam_u/g_secam_v per decimated
+        // sample (the pixel loop below samples them) and updates the field
+        // accumulators. The luma takes the block-notch (no chroma dots).
+        cvbs_secam_notch_line(g_filtered_line, n);
+        cvbs_secam_decode_line(decoder, src, n, profile,
+                               decoder->pll.current_line, picture_line);
+        secam_dec_count = g_secam_dec_count;
+        if (secam_dec_count > CVBS_SECAM_MAX_DEC) {
+            secam_dec_count = CVBS_SECAM_MAX_DEC;
+        }
+    }
     if (colour) {
         double rate = cvbs_rate(decoder);
         double dphase = 2.0 * M_PI * profile->fsc_hz / rate;
@@ -1206,7 +2226,18 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // 0,0,255 patterns). The wider window is the demod lowpass; the
         // line-local prefix sums carry the carrier phase.
         double u01 = 0.0, v01 = 0.0;
-        if (colour) {
+        if (secam_active) {
+            // SECAM: sample the per-decimated-sample u/v (nearest decimated
+            // sample). Chroma on the ACTIVE window of picture lines only:
+            // the porch/VBI carriers render neutral (the reference's
+            // V-interval neutralization; the horizontal blanking too).
+            if (picture_line && px >= ax0 && px < ax1 && secam_dec_count > 0) {
+                int dec = idx / g_secam_decim;
+                if (dec >= secam_dec_count) dec = secam_dec_count - 1;
+                u01 = g_secam_u[dec];
+                v01 = g_secam_v[dec];
+            }
+        } else if (colour) {
             int x_center = (int)xc;
             int c0 = x_center - chroma_half;
             int c1 = x_center + chroma_half;
@@ -1460,6 +2491,14 @@ bool gui_cvbs_init(cvbs_decoder_t *decoder) {
     decoder->fixed_levels_valid = false;
     cvbs_reset_fixed_sync_lock(decoder);
 
+    // SECAM state: the carrier pair starts at NOMINAL (the whole-struct
+    // memset above zeroed it - a zero pair makes the mix block centre 0 Hz
+    // on the first field) and the ident defaults to the studio D'R-on-even
+    // convention until the first field's vote lands.
+    decoder->secam.fob = CVBS_SECAM_FOB_HZ;
+    decoder->secam.for_ = CVBS_SECAM_FOR_HZ;
+    decoder->secam.dr_on_even = true;
+
     return true;
 }
 
@@ -1524,6 +2563,20 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
     // first post-reset line) and keep the colour MODE as configured.
     decoder->prev_burst_phase = 0.0;
     decoder->prev_burst_valid = 0;
+
+    // Reset the SECAM FM-chroma state (calibration, ident, rings) and the
+    // file-scope filter cache (a format/rate switch rebuilds it lazily).
+    // The carrier pair starts at NOMINAL (not zero: a zero pair makes the
+    // mix block centre 0 Hz on the first field - garbage until the first
+    // commit) and the ident defaults to the studio D'R-on-even convention
+    // until the first field's vote lands.
+    memset(&decoder->secam, 0, sizeof(decoder->secam));
+    decoder->secam.fob = CVBS_SECAM_FOB_HZ;
+    decoder->secam.for_ = CVBS_SECAM_FOR_HZ;
+    decoder->secam.dr_on_even = true;
+    g_secam_coeffs_valid = false;
+    g_secam_hold_count[0] = 0;
+    g_secam_hold_count[1] = 0;
 
     // Reset line buffer
     decoder->line_buffer_count = 0;
@@ -2128,6 +3181,10 @@ static void cvbs_start_field_anchored(cvbs_decoder_t *decoder, int parity,
 
     complete_field_pll(decoder);
     commit_adaptive_levels(decoder);
+    // SECAM: lock the previous field's calibration/identification for the
+    // new field (one field behind - the reference's last-good-reuse
+    // semantics in a live stream).
+    cvbs_secam_field_commit(decoder);
 
     // Anchor line 0 at the field start. The detection happens at the first
     // EQ pulse, which sits boundary lines (0.5/1.0) INTO the new field.
@@ -3135,6 +4192,29 @@ static void gui_cvbs_render_osd(cvbs_decoder_t *decoder,
     float text3_y = text2_y - 18.0f;
     gui_text_draw_mono(osd_text3, text_x + 1, text3_y + 1, 14, BLACK);
     gui_text_draw_mono(osd_text3, text_x, text3_y, 14, (Color){200, 200, 255, 255});
+
+    // Line 4 (SECAM only): the FM-chroma diagnostics - the locked carrier
+    // pair, the block offset, the line identification and its source, and
+    // the cal/reuse/nominal field counters. All zeros until the first
+    // field commits, so a freshly switched format reads cleanly.
+    if (decoder->state.format == CVBS_FORMAT_SECAM) {
+        double fob, forr, off, conf, mad;
+        int dr_even, ident_src, fcal, freuse, fnom;
+        gui_cvbs_get_secam_diag(decoder, &fob, &forr, &off, &dr_even,
+                                &conf, &ident_src, &mad,
+                                &fcal, &freuse, &fnom);
+        static const char *ident_src_names[3] = {"porch", "content", "bottles"};
+        int src_i = (ident_src >= 0 && ident_src < 3) ? ident_src : 0;
+        char osd_text4[160];
+        snprintf(osd_text4, sizeof(osd_text4),
+                 "SECAM fB %.4f fR %.4f MHz off %+.1f kHz | D'R %s-even conf %.0f%% src %s cal/reuse/nom %d/%d/%d",
+                 fob / 1000000.0, forr / 1000000.0, off / 1000.0,
+                 dr_even ? "on" : "off", conf * 100.0,
+                 ident_src_names[src_i], fcal, freuse, fnom);
+        float text4_y = text3_y - 18.0f;
+        gui_text_draw_mono(osd_text4, text_x + 1, text4_y + 1, 14, BLACK);
+        gui_text_draw_mono(osd_text4, text_x, text4_y, 14, (Color){255, 200, 255, 255});
+    }
 }
 
 // Pure RGB24 -> raylib Color blit for the render path. Kept a standalone
@@ -3276,6 +4356,27 @@ void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
 // Status
 //-----------------------------------------------------------------------------
 
+void gui_cvbs_get_secam_diag(cvbs_decoder_t *decoder,
+                             double *fob_hz, double *for_hz,
+                             double *carrier_offset_hz, int *dr_on_even,
+                             double *ident_confidence, int *ident_source,
+                             double *noise_mad_hz,
+                             int *fields_calibrated, int *fields_reused,
+                             int *fields_nominal) {
+    const cvbs_secam_state_t zero = {0};
+    const cvbs_secam_state_t *s = decoder ? &decoder->secam : &zero;
+    if (fob_hz) *fob_hz = s->fob;
+    if (for_hz) *for_hz = s->for_;
+    if (carrier_offset_hz) *carrier_offset_hz = s->carrier_offset;
+    if (dr_on_even) *dr_on_even = s->dr_on_even ? 1 : 0;
+    if (ident_confidence) *ident_confidence = s->ident_confidence;
+    if (ident_source) *ident_source = s->ident_source;
+    if (noise_mad_hz) *noise_mad_hz = s->noise_mad_hz;
+    if (fields_calibrated) *fields_calibrated = s->fields_calibrated;
+    if (fields_reused) *fields_reused = s->fields_reused;
+    if (fields_nominal) *fields_nominal = s->fields_nominal;
+}
+
 cvbs_format_t gui_cvbs_get_format(cvbs_decoder_t *decoder) {
     if (!decoder) return CVBS_FORMAT_UNKNOWN;
     return decoder->state.format;
@@ -3326,9 +4427,14 @@ static void gui_cvbs_set_frame_view_mode(cvbs_decoder_t *decoder, cvbs_frame_vie
     }
     if (decoder->frame_view_mode == mode) return;
 
+    // Purely a render-time crop: the decode always runs at full-frame
+    // geometry (see gui_cvbs_apply_geometry - "Active vs Full is purely a
+    // render-time crop"), so there is NO decoder reset here. The legacy
+    // reset threw away the PLL/VBI/level lock on every switch and the
+    // picture rolled through re-acquisition (real-GUI user report,
+    // 2026-10-20). The next render simply crops the src rectangle
+    // differently; the lock and the decoded frame carry over untouched.
     decoder->frame_view_mode = mode;
-    gui_cvbs_apply_geometry(decoder);
-    gui_cvbs_reset(decoder);
 }
 
 void gui_cvbs_set_format(cvbs_decoder_t *decoder, int format_select) {
@@ -3385,10 +4491,20 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     float btn_h = 18.0f;
     float gap = 6.0f;
 
-    // System selector label (PAL/SECAM vs NTSC)
-    const char *system_labels[] = {"PAL/SECAM", "NTSC"};
-    int sys = decoder->overlay.selected_system; // 0=PAL/SECAM, 1=NTSC
-    if (sys < 0 || sys > 1) sys = 0;
+    // System selector label (PAL/NTSC/SECAM). In CVBS mode the button shows
+    // the ACTUAL decoder format (it tracks manual selection here and any
+    // future auto-detection alike); in Tape mode it shows the tape-side
+    // system pick (kept in sync with the tape format by the click handler
+    // and video_tape_apply_runtime_args).
+    const char *system_labels[] = {"PAL", "NTSC", "SECAM"};
+    int sys;
+    if (show_tape_controls) {
+        sys = decoder->overlay.selected_system; // 0=PAL, 1=NTSC, 2=SECAM
+    } else {
+        sys = (decoder->state.format == CVBS_FORMAT_NTSC) ? 1 :
+              (decoder->state.format == CVBS_FORMAT_SECAM) ? 2 : 0;
+    }
+    if (sys < 0 || sys > 2) sys = 0;
     const char *sys_name = system_labels[sys];
     const char *tape_format_labels[] = {"PAL", "NTSC", "SECAM"};
     int tape_fmt = decoder->overlay.selected_tape_format;
@@ -3413,13 +4529,19 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     cvbs_build_sync_label(decoder, sync_label, sizeof(sync_label));
     cvbs_build_colour_label(decoder, colour_label, sizeof(colour_label));
 
-    // Compute button width large enough for both labels so the box
-    // does not change size when switching between PAL and NTSC.
-    float sys_text_w0 = (float)gui_text_measure(system_labels[0], FONT_SIZE_DROPDOWN_OPT);
-    float sys_text_w1 = (float)gui_text_measure(system_labels[1], FONT_SIZE_DROPDOWN_OPT);
-    float sys_text_w_max = (sys_text_w0 > sys_text_w1) ? sys_text_w0 : sys_text_w1;
+    // Compute button width large enough for all three labels so the box
+    // does not change size when switching between PAL, NTSC and SECAM.
+    // Floor 110 keeps it in line with the other boxes (Frame/OSD/Levels
+    // land 110-136): the old 140 floor was sized for the former long
+    // "PAL/SECAM" label and left the short 3-way labels swimming in a
+    // too-wide box (user feedback, real-GUI 2026-10-20).
+    float sys_text_w_max = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float w = (float)gui_text_measure(system_labels[i], FONT_SIZE_DROPDOWN_OPT);
+        if (w > sys_text_w_max) sys_text_w_max = w;
+    }
     float sys_btn_w = sys_text_w_max + 28.0f; // padding + arrow
-    if (sys_btn_w < 140.0f) sys_btn_w = 140.0f;
+    if (sys_btn_w < 110.0f) sys_btn_w = 110.0f;
 
     const char *osd_labels[] = {"OSD: Off", "OSD: Minimal", "OSD: Stats"};
     const char *osd_label = osd_labels[decoder->osd_mode];
@@ -3646,18 +4768,19 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
         DrawTriangle(bottom, right, left, COLOR_TEXT);
     }
 
-    // Draw dropdown options for system if open
+    // Draw dropdown options for system if open (same 0/1/2 value space as
+    // gui_cvbs_set_format, so an option click maps directly)
     if (is_open) {
         float opt_y = sys_btn_y + btn_h;
-        const char *options[] = {"PAL/SECAM", "NTSC"};
-        int sys_values[] = {0, 1};
+        const char *options[] = {"PAL", "NTSC", "SECAM"};
+        int sys_values[] = {0, 1, 2};
         float opt_h = 20.0f;
 
         // Background for dropdown container
-        DrawRectangleRounded((Rectangle){sys_btn_rect.x, opt_y, sys_btn_rect.width, opt_h * 2.0f},
+        DrawRectangleRounded((Rectangle){sys_btn_rect.x, opt_y, sys_btn_rect.width, opt_h * 3.0f},
                              0.1f, 4, COLOR_PANEL_BG);
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             Rectangle opt_rect = {sys_btn_rect.x, opt_y + i * opt_h, sys_btn_rect.width, opt_h};
             decoder->overlay.system_options_rect[i] = opt_rect;
 
@@ -3829,6 +4952,21 @@ static inline cvbs_decoder_t *video_panel_active_decoder(video_panel_state_t *pa
     return video_panel_decoder(panel, panel->active_plugin);
 }
 
+// Persisted default system (0=PAL, 1=NTSC, 2=SECAM): misrc_gui pushes the
+// loaded app setting here once at startup (gui_cvbs_set_default_system)
+// and every panel decoder is created in it. The System dropdown's click
+// handler writes the user's pick back to app->settings.video_system so
+// the exit-time settings save persists it across launches (user request,
+// real-GUI 2026-10-20: "the system config should be persistent based off
+// what the user sets not just PAL always").
+static int s_cvbs_default_system = 0;
+
+void gui_cvbs_set_default_system(int system_select) {
+    if (system_select >= 0 && system_select <= 2) {
+        s_cvbs_default_system = system_select;
+    }
+}
+
 static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
                                             cvbs_decoder_mode_t mode,
                                             const char *trace_source) {
@@ -3845,12 +4983,15 @@ static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
     decoder->fixed_levels_valid = false;
     cvbs_reset_fixed_sync_lock(decoder);
 
-    decoder->overlay.selected_system = 0;       // 0=PAL/SECAM
+    // Start in the USER'S persisted system pick, not hardcoded PAL (the
+    // tape plugin's apply_runtime_args overrides its own decoder right
+    // after this, so this only governs the CVBS-mode decoders).
+    decoder->overlay.selected_system = s_cvbs_default_system;
     decoder->overlay.selected_tape_format = 0;  // 0=PAL, 1=NTSC, 2=SECAM
     decoder->overlay.system_dropdown_open = false;
     decoder->overlay.tape_dropdown_open = false;
     decoder->overlay.tape_format_dropdown_open = false;
-    gui_cvbs_set_format(decoder, 0);
+    gui_cvbs_set_format(decoder, s_cvbs_default_system);
     cvbs_trace_mode_watch(decoder, trace_source);
     return true;
 }
@@ -3936,16 +5077,13 @@ static void video_tape_apply_runtime_args(video_tape_plugin_t *plugin, const cha
     if (selected_format < 0 || selected_format > 2) selected_format = 0;
     decoder->overlay.selected_tape_format = selected_format;
 
-    if (selected_format == 1) {
-        decoder->overlay.selected_system = 1;
-        gui_cvbs_set_format(decoder, 1); // NTSC
-    } else if (selected_format == 2) {
-        decoder->overlay.selected_system = 0;
-        gui_cvbs_set_format(decoder, 2); // SECAM
-    } else {
-        decoder->overlay.selected_system = 0;
-        gui_cvbs_set_format(decoder, 0); // PAL
-    }
+    // The system selector shares the tape format's 0=PAL/1=NTSC/2=SECAM
+    // value space (the Tape-mode System dropdown syncs selected_tape_format
+    // directly), so one mapping keeps both selectors and the decoder format
+    // consistent - including SECAM, which the old 2-way system space
+    // collapsed onto PAL.
+    decoder->overlay.selected_system = selected_format;
+    gui_cvbs_set_format(decoder, selected_format);
 
     const char *profile = video_tape_profile_from_selection(plugin);
     snprintf(plugin->active_profile, sizeof(plugin->active_profile), "%s", profile);
@@ -4404,48 +5542,123 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // overlay chrome — buttons + stats text — for a clean video preview.
     if (panel->chrome.controls_hidden) return;
 
+    // Vertically stacked like the CVBS overlay (user request 2026-10-20):
+    // the previous layout ran [Frame][Stats][System][Decoder] as one
+    // horizontal row across the top with Budget on a second row - four
+    // buttons abreast overflowed narrow and split panels and scaled badly
+    // with the UI zoom. The CVBS-style right-aligned vertical column with
+    // one uniform width stays inside the panel at every scale. The
+    // dropdown owner (Stats) sits LAST so its option list drops below the
+    // column over the video - the same pattern as the CVBS System
+    // dropdown - and the options are drawn after every button so they
+    // always paint on top.
     const float btn_h = 18.0f;
-    const char *label = "Decoder: VHS FM";
-    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
-    float btn_w = text_w + 16.0f;
-    if (btn_w < 128.0f) btn_w = 128.0f;
+    const float gap = 6.0f;
+    const float row_step = btn_h + gap;
 
-    float x_right = bounds.x + bounds.width - 8.0f;
-    float btn_x = x_right - btn_w;
-    float btn_y = bounds.y + 8.0f;
-    decoder->overlay.button_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
-
-    DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    float text_x = btn_x + (btn_w - text_w) * 0.5f;
-    float text_y = btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-    gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    const char *format_label = decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
-    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
-    decoder->overlay.format_rect = (Rectangle){btn_x - fmt_w - 6, btn_y, fmt_w, btn_h};
-    DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
-                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    // Stats view selector (All / Basic / Off) — a real dropdown so the stats
-    // readout is user-selectable. Right-anchored beside the System button.
     static const char *stats_names[3] = { "All", "Basic", "Off" };
     int stats_view = decoder->overlay.stats_view;
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
+
+    const char *label = "Decoder: VHS FM";
+    const char *format_label = decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
     char stats_label[40];
     snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
-    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    // Frame display mode toggle (Active / Full): Full widens the horizontal
+    // decode window to the whole line so VBI + sync tip + colour burst render
+    // with decoded chroma instead of only the active picture area.
+    const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
+    int budget = vhs_budget_clamp(app->settings.rf_preview_budget_percent);
+    char budget_label[40];
+    snprintf(budget_label, sizeof(budget_label), "Budget: %.2f core (shared)", budget / 100.0);
+
+    // Per-button widths with their historical minimums, then one uniform
+    // column width (the max) so the stack reads as a single column - the
+    // CVBS overlay's col_btn_w pattern.
+    float dec_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+    if (dec_w < 128.0f) dec_w = 128.0f;
+    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+    if (fmt_w < 110.0f) fmt_w = 110.0f;
+    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
     if (stats_w < 96.0f) stats_w = 96.0f;
-    decoder->overlay.stats_btn_rect =
-        (Rectangle){decoder->overlay.format_rect.x - stats_w - 6, btn_y, stats_w, btn_h};
-    Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
-    DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
-    // No dropdown arrow: it overlapped the centered label; the open state
-    // is already indicated by the button highlight (stats_bg) above.
+    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24.0f;
+    if (frame_w < 118.0f) frame_w = 118.0f;
+    float budget_w = (float)gui_text_measure(budget_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+    if (budget_w < 120.0f) budget_w = 120.0f;
+
+    float col_w = dec_w;
+    if (fmt_w > col_w) col_w = fmt_w;
+    if (stats_w > col_w) col_w = stats_w;
+    if (frame_w > col_w) col_w = frame_w;
+    if (budget_w > col_w) col_w = budget_w;
+
+    float x_right = bounds.x + bounds.width - 8.0f;
+    float col_x = x_right - col_w;
+    float y0 = bounds.y + 8.0f;
+    int row = 0;
+    const float text_y_of = (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
+
+    // [Decoder: VHS FM]
     {
+        float bx = col_x + (col_w - dec_w);
+        float by = y0 + row_step * row++;
+        decoder->overlay.button_rect = (Rectangle){bx, by, dec_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        float tw = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(label, bx + (dec_w - tw) * 0.5f, by + text_y_of,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+
+    // [System: PAL/NTSC]
+    {
+        float bx = col_x + (col_w - fmt_w);
+        float by = y0 + row_step * row++;
+        decoder->overlay.format_rect = (Rectangle){bx, by, fmt_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        float tw = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(format_label, bx + (fmt_w - tw) * 0.5f, by + text_y_of,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+
+    // [Frame: Active/Full]
+    {
+        float bx = col_x + (col_w - frame_w);
+        float by = y0 + row_step * row++;
+        decoder->overlay.frame_rect = (Rectangle){bx, by, frame_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        float tw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(frame_label, bx + (frame_w - tw) * 0.5f, by + text_y_of,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+
+    // [Budget: x core (shared)]
+    {
+        float bx = col_x + (col_w - budget_w);
+        float by = y0 + row_step * row++;
+        decoder->overlay.budget_rect = (Rectangle){bx, by, budget_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.budget_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        float tw = (float)gui_text_measure(budget_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(budget_label, bx + (budget_w - tw) * 0.5f, by + text_y_of,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+
+    // [Stats: All/Basic/Off] - the LAST row: the dropdown owner, so its
+    // option list drops below the column over the video (the CVBS System
+    // dropdown pattern). No dropdown arrow: it overlapped the centered
+    // label; the open state is indicated by the button highlight below.
+    {
+        float bx = col_x + (col_w - stats_w);
+        float by = y0 + row_step * row++;
+        decoder->overlay.stats_btn_rect = (Rectangle){bx, by, stats_w, btn_h};
+        Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+        DrawRectangleRounded(decoder->overlay.stats_btn_rect, 0.15f, 4, stats_bg);
         float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT);
         gui_text_draw(stats_label,
                       decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
-                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                      by + text_y_of, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     }
+
+    // Stats dropdown options, drawn after every button so they paint on top.
     if (decoder->overlay.stats_dropdown_open) {
         float opt_h = 20.0f;
         for (int i = 0; i < 3; i++) {
@@ -4467,28 +5680,6 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
                           FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
         }
     }
-    // Frame display mode toggle (Active / Full): Full widens the horizontal
-    // decode window to the whole line so VBI + sync tip + colour burst render
-    // with decoded chroma instead of only the active picture area.
-    const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
-    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24;
-    if (frame_w < 118.0f) frame_w = 118.0f;
-    decoder->overlay.frame_rect =
-        (Rectangle){decoder->overlay.stats_btn_rect.x - frame_w - 6, btn_y, frame_w, btn_h};
-    DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    {
-        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(frame_label,
-                      decoder->overlay.frame_rect.x + (frame_w - fw) * 0.5f,
-                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    }
-    int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
-    char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
-    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)+16;
-    decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,btn_y+btn_h+6,budget_w,btn_h};
-    DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
-    gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,btn_y+btn_h+6+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
-                  FONT_SIZE_DROPDOWN_OPT,COLOR_TEXT);
 }
 
 static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
@@ -4805,22 +5996,29 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         return true;
     }
 
-    // System dropdown options
+    // System dropdown options (0=PAL, 1=NTSC, 2=SECAM - the same value
+    // space as gui_cvbs_set_format and the tape format selector)
     if (chrome_visible && decoder->overlay.system_dropdown_open) {
-        int sys_values[] = {0, 1};  // 0=625-line PAL/SECAM, 1=525-line NTSC
-        for (int i = 0; i < 2; i++) {
+        int sys_values[] = {0, 1, 2};
+        for (int i = 0; i < 3; i++) {
             if (CheckCollisionPointRec(mouse_pos, decoder->overlay.system_options_rect[i])) {
                 panel->chrome.last_click_ms = 0;
                 decoder->overlay.selected_system = sys_values[i];
                 if (tape_ui) {
-                    if (sys_values[i] == 1) {
-                        decoder->overlay.selected_tape_format = 1; // NTSC
-                    } else if (decoder->overlay.selected_tape_format == 1) {
-                        decoder->overlay.selected_tape_format = 0; // PAL fallback from NTSC
-                    }
+                    // Keep the tape format selector in sync (identical value
+                    // space); apply_runtime_args re-derives everything.
+                    decoder->overlay.selected_tape_format = sys_values[i];
                     video_tape_apply_runtime_args(tape_plugin, "overlay_system_click");
                 } else {
                     gui_cvbs_set_format(decoder, sys_values[i]);
+                    // Persist the user's pick BOTH ways: the app setting
+                    // (the budget button's pattern - the exit-time save
+                    // writes it, and the next launch's panels start in this
+                    // system) and the live session default (so a panel
+                    // re-created mid-session - e.g. a genuinely fresh view
+                    // state after a cache eviction - also starts in it).
+                    if (app) app->settings.video_system = sys_values[i];
+                    gui_cvbs_set_default_system(sys_values[i]);
                 }
                 decoder->overlay.system_dropdown_open = false;
                 return true;
