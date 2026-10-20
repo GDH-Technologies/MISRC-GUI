@@ -1991,6 +1991,89 @@ def check_playback_drag_drop_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_windows_modal_resize_contract(repo_root: Path) -> int:
+    """The Windows modal move/size render driver (2026-10-20, backlog item
+    2: the window froze during move/resize because DefWindowProc's modal
+    loop blocked raylib's event poll for the whole drag).
+
+    - The Windows-only module subclasses the GLFW window proc, drives a
+      WM_TIMER render frame between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE,
+      and passes everything to the original proc (CallWindowProcW). The
+      module itself never polls events.
+    - misrc_gui.c registers the render-only modal frame + installs the
+      driver before the main loop and shuts it down before cleanup; the
+      modal frame body is the frame tail core WITHOUT event polling or the
+      normal frame tail (a nested PeekMessage inside DefWindowProc's modal
+      loop is reentrancy).
+    - meson compiles the module only on windows/cygwin; the header provides
+      no-op stubs for the other platforms (no modal loop there).
+    """
+    modal_c_path = repo_root / "misrc_tools/misrc_gui/core/gui_win32_modal.c"
+    modal_h_path = repo_root / "misrc_tools/misrc_gui/core/gui_win32_modal.h"
+    for path in (modal_c_path, modal_h_path):
+        if not path.exists():
+            return fail(f"Missing the Windows modal render driver file: {path}")
+    modal_c = read_text(modal_c_path)
+    for snippet, label in [
+        ("WM_ENTERSIZEMOVE", "the modal-loop entry"),
+        ("WM_EXITSIZEMOVE", "the modal-loop exit"),
+        ("WM_TIMER", "the timer-driven frame"),
+        ("SetTimer(", "the timer start"),
+        ("KillTimer(", "the timer stop"),
+        ("CallWindowProcW(", "the original-proc passthrough"),
+        ("SetWindowLongPtrW(", "the window-proc subclass"),
+        ("GetWindowHandle()", "the raylib window handle"),
+    ]:
+        if snippet not in modal_c:
+            return fail(f"gui_win32_modal.c is missing {label}: {snippet}")
+    if "PollInputEvents" in modal_c or "glfwPollEvents" in modal_c:
+        return fail(
+            "gui_win32_modal.c must never poll events itself (the modal frame "
+            "callback renders only - a nested PeekMessage inside DefWindowProc's "
+            "modal loop is reentrancy)"
+        )
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    for snippet, label in [
+        ("gui_win32_modal_set_frame(app_modal_frame", "the modal frame registration"),
+        ("gui_win32_modal_install()", "the driver install"),
+        ("gui_win32_modal_shutdown()", "the driver shutdown"),
+        ("app_build_render_commands(", "the shared Clay layout build"),
+    ]:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c modal-loop wiring is missing {label}: {snippet}")
+    frame_body = func_body_from(gui_c, "static void app_modal_frame(void *ctx)")
+    for snippet in [
+        "rlDrawRenderBatchActive()",
+        "SwapScreenBuffer()",
+        "Clay_SetLayoutDimensions",
+        "gui_audio_update_playback",
+        "app_build_render_commands",
+    ]:
+        if snippet not in frame_body:
+            return fail(
+                f"the modal frame body is missing {snippet} "
+                "(render core without polling)"
+            )
+    for forbidden in ["EndDrawing()", "PollInputEvents"]:
+        if forbidden in frame_body:
+            return fail(
+                f"the modal frame must NOT contain {forbidden} "
+                "(no event polling / FPS wait inside the modal loop)"
+            )
+    modal_h = read_text(modal_h_path)
+    if "static inline bool gui_win32_modal_install" not in modal_h:
+        return fail(
+            "gui_win32_modal.h must provide no-op stubs for non-Windows platforms"
+        )
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+    if "misrc_gui/core/gui_win32_modal.c" not in meson:
+        return fail(
+            "meson.build must compile gui_win32_modal.c on the windows/cygwin "
+            "source list"
+        )
+    return 0
+
+
 def func_body_from(source: str, signature: str) -> str:
     """Return the text of the function whose definition starts at
     `signature`, from the signature up to the next column-0 closing brace.
@@ -2684,6 +2767,7 @@ def main() -> int:
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
         ("local CI guard gate contract", lambda: check_local_guard_gate_contract(repo_root)),
         ("playback drag-and-drop contract", lambda: check_playback_drag_drop_contract(repo_root)),
+        ("Windows modal move/size render contract", lambda: check_windows_modal_resize_contract(repo_root)),
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),

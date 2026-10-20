@@ -132,10 +132,9 @@ session log `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`.
 1. DONE (2026-10-20): player-mode drag-and-drop of capture files - per-channel
    panel zones + audio-rate monitor source in one drop (user-confirmed); see
    `playback_drag_drop_audio.md`.
-2. Windows UX: the window freezes while being moved/resized (modal move/size loop
-   blocks the render thread; Linux/macOS unaffected). Needs the render/update to keep
-   running during WM_ENTERSIZEMOVE/WM_SIZING (timer-driven redraw or rendering off the
-   main thread while in the modal loop).
+2. DONE (2026-10-20): the Windows move/resize freeze - a subclassed window proc
+   drives render-only WM_TIMER frames inside DefWindowProc's modal loop
+   (user-confirmed); see `windows_modal_resize_render.md`.
 3. Sync robustness on real media: live decode still loses sync on some 4:3 material
    (e.g. anime with fast action) and trips a little on the Philips test pattern.
    Capture those as raw excerpts and run the Verification procedure on them; expect

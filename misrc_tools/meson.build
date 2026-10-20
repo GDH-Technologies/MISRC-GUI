@@ -547,6 +547,10 @@ if raylib_dep.found()
     gui_ldflags += ['-lws2_32']
     # simple_capture for device enumeration
     sources_gui += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'
+    # Windows modal move/size loop render driver (subclass + WM_TIMER
+    # frames; backlog item 2 - the window froze during move/resize because
+    # DefWindowProc's modal loop blocked raylib's event poll)
+    sources_gui += 'misrc_gui/core/gui_win32_modal.c'
     gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']

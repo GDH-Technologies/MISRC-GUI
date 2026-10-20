@@ -1,5 +1,25 @@
 # MISRC GUI development notes
 
+## 2026-10-20 Windows move/resize freeze fixed (user-confirmed)
+
+- Root cause: a title-bar/edge drag enters the MODAL LOOP inside DefWindowProc
+  (WM_ENTERSIZEMOVE); raylib drains OS events at the tail of each frame, the
+  caption mouse-down is dispatched inside that drain, and the render loop blocks
+  for the whole drag (no swaps, frozen panels, monitor stutter). Linux/macOS
+  have no modal loop.
+- Fix: `gui_win32_modal.c/.h` subclass the GLFW window proc + a 15 ms WM_TIMER
+  that calls a render-only frame (`app_modal_frame` in misrc_gui.c: audio pump
+  + Clay dims + the SHARED layout build + flush + swap, never event polling)
+  inside the loop; KillTimer + original-proc restore on exit/shutdown.
+  Windows-only TU (meson), no-op header stubs elsewhere.
+- Verified facts behind it (raylib/GLFW source): modal entry always lands after
+  the frame flush+swap (empty batch); the GL context stays current on the
+  render thread; raylib's WindowSizeCallback already runs SetupViewport inside
+  the loop; timeBeginPeriod(1) makes the 15 ms timer real.
+- Verified: 42/42 static guards (new `Windows modal move/size render
+  contract`), build + smoke OK, meson test 34/34; user real-GUI confirmation.
+  Contracts + limits: `windows_modal_resize_render.md`.
+
 ## 2026-10-20 Playback drag-and-drop: per-channel zones + audio (user-confirmed)
 
 - Feature: drop files onto the channel panels to load playback - RF files (mono
@@ -65,8 +85,9 @@
   user GUI confirmation ("dead stable", top shift gone).
 - HARD rules + mandatory verification procedure: `cvbs_decoder_realtime_sync_rules.md`.
 - Backlog recorded there: player-mode drag-and-drop (DONE 2026-10-20); Windows
-  move/resize freeze; sync robustness on real media (fast-action 4:3 anime,
-  Philips pattern); a separate SECAM CVBS mode from the tbc-tools implementation.
+  move/resize freeze (DONE 2026-10-20); sync robustness on real media
+  (fast-action 4:3 anime, Philips pattern); a separate SECAM CVBS mode from the
+  tbc-tools implementation.
 
 Recent capture regressions showed that small callback-gating changes can silently break GUI feeds. Keep the following constraints in mind when touching capture/parser/audio paths:
 

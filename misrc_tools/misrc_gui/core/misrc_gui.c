@@ -17,6 +17,8 @@
 #include "../ui/clay.h"
 
 #include "raylib.h"
+#include "rlgl.h"              // rlDrawRenderBatchActive (the modal frame flush)
+#include "gui_win32_modal.h"   // Windows modal move/size render driver (no-op elsewhere)
 #include "../assets/inter_font_data.h"
 #include "../assets/misrc_icon_png_data.h"
 #include "../assets/space_mono_font_data.h"
@@ -442,6 +444,47 @@ static void gui_enable_debug_console(void) {
 }
 #endif
 
+// Shared Clay layout build (the main loop + the Windows modal frames).
+// Extracted so the modal-loop render driver renders the SAME layout the
+// main loop renders, from one source of truth.
+static Clay_RenderCommandArray app_build_render_commands(gui_app_t *app)
+{
+    Clay_BeginLayout();
+    gui_video_update_rf_routes(app);
+    gui_render_layout(app);
+    return Clay_EndLayout();
+}
+
+// One render-only frame driven from INSIDE the Windows modal move/size loop
+// (WM_TIMER in the subclassed window proc; see gui_win32_modal.c). The
+// panels' data threads keep running during the drag, so re-rendering the
+// current state keeps the scopes (and the audio monitor) alive. This frame
+// must NEVER poll events and must not run the normal frame tail: a nested
+// PeekMessage inside DefWindowProc's modal loop is reentrancy, and the
+// timer already paces (no FPS wait). The flush + swap below is exactly the
+// normal tail's core minus its polling.
+static void app_modal_frame(void *ctx)
+{
+    gui_app_t *app = (gui_app_t *)ctx;
+
+    // Keep the audio monitor fed while the main loop is blocked
+    gui_audio_update_playback(app);
+
+    // Fresh layout dimensions (the window size changes live during a
+    // resize; raylib's WindowSizeCallback already ran SetupViewport on this
+    // thread, so frames render at the live size).
+    Clay_SetLayoutDimensions((Clay_Dimensions){
+        (float)gui_ui_get_layout_width(), (float)gui_ui_get_layout_height() });
+
+    Clay_RenderCommandArray render_commands = app_build_render_commands(app);
+
+    BeginDrawing();
+    ClearBackground(COLOR_BG);
+    Clay_Raylib_Render(render_commands, fonts);
+    rlDrawRenderBatchActive();
+    SwapScreenBuffer();
+}
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -828,6 +871,15 @@ int main(int argc, char **argv) {
     double last_thread_promotion_time = 0.0;
     const double thread_promotion_interval_s = 0.25;
 #endif
+
+    // Windows modal move/size render driver: keeps the window rendering
+    // while the user drags/resizes it (no-op on Linux/macOS - no modal loop
+    // there; see gui_win32_modal.c). Registered after the app exists; the
+    // frame callback renders only (never polls events).
+    gui_win32_modal_set_frame(app_modal_frame, &app);
+    if (!gui_win32_modal_install()) {
+        fprintf(stderr, "[WIN32] modal move/size render driver unavailable\n");
+    }
 
     // Main loop
     while (!WindowShouldClose() && !atomic_load(&do_exit)) {
@@ -1324,10 +1376,7 @@ int main(int argc, char **argv) {
         // Each panel type (waveform, histogram, FFT) receives raw samples via vtable->process()
 
         // Build UI layout
-        Clay_BeginLayout();
-        gui_video_update_rf_routes(&app);
-        gui_render_layout(&app);
-        Clay_RenderCommandArray render_commands = Clay_EndLayout();
+        Clay_RenderCommandArray render_commands = app_build_render_commands(&app);
 
         // Handle Clay interactions
         gui_handle_interactions(&app);
@@ -1359,6 +1408,9 @@ int main(int argc, char **argv) {
 
         EndDrawing();
     }
+
+    // Restore the original window proc (Windows modal move/size driver)
+    gui_win32_modal_shutdown();
 
     // Cleanup
     if (app.is_recording) {
