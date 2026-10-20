@@ -355,6 +355,11 @@ typedef struct {
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
     char playback_file_b[FILE_PATH_MAX];   // FLAC file for channel B playback
+    char playback_audio_file[FILE_PATH_MAX]; // Audio-rate file for the playback
+                                             // monitor (drag-and-drop; the
+                                             // position-synced feed in
+                                             // gui_playback.c plays it via
+                                             // Audio Mon)
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),

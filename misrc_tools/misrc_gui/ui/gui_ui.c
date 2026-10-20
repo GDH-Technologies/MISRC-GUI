@@ -1587,6 +1587,7 @@ static char stat_rec_duration[2][24];
 // Playback file display buffers
 static char playback_file_a_display[64];
 static char playback_file_b_display[64];
+static char playback_file_audio_display[64];
 static char playback_timeline_display_a[64];
 static char playback_timeline_display_b[64];
 static char playback_readout_display_a[32];
@@ -3904,7 +3905,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Playback files section
-                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC):"),
+                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC / drop onto a channel panel):"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
                     // Channel A playback file
@@ -3934,6 +3935,20 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(make_string(playback_file_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_file_b[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
                         }
                         CLAY(CLAY_ID("PlaybackFileClearB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                    }
+
+                    // Playback audio (drag-and-drop monitor source; loads with
+                    // the RF files in one drop - a full capture set)
+                    CLAY(CLAY_ID("PlaybackFileAudioRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
+                        CLAY_TEXT(CLAY_STRING("Audio:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        const char *file_audio = app->settings.playback_audio_file[0] ? app->settings.playback_audio_file : "(drop an audio file)";
+                        gui_ui_copy_path_tail(playback_file_audio_display, sizeof(playback_file_audio_display), file_audio);
+                        CLAY(CLAY_ID("PlaybackFileAudioPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(playback_file_audio_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_audio_file[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
+                        }
+                        CLAY(CLAY_ID("PlaybackFileClearAudio"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
                     }
@@ -10056,6 +10071,11 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("PlaybackFileClearB"))) {
                 app->settings.playback_file_b[0] = '\0';
+                gui_settings_save(&app->settings);
+                gui_ui_set_click_consumed();
+            }
+            if (Clay_PointerOver(CLAY_ID("PlaybackFileClearAudio"))) {
+                app->settings.playback_audio_file[0] = '\0';
                 gui_settings_save(&app->settings);
                 gui_ui_set_click_consumed();
             }

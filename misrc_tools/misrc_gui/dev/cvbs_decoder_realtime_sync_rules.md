@@ -129,7 +129,9 @@ session log `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`.
 
 ## Backlog (user-prioritised, 2026-10-19)
 
-1. Player mode: drag-and-drop of capture files onto the window (playback source).
+1. DONE (2026-10-20): player-mode drag-and-drop of capture files - per-channel
+   panel zones + audio-rate monitor source in one drop (user-confirmed); see
+   `playback_drag_drop_audio.md`.
 2. Windows UX: the window freezes while being moved/resized (modal move/size loop
    blocks the render thread; Linux/macOS unaffected). Needs the render/update to keep
    running during WM_ENTERSIZEMOVE/WM_SIZING (timer-driven redraw or rendering off the

@@ -16,6 +16,7 @@
 #endif
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
+#include "../output/gui_audio.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
 #include "../../common/threading.h"
@@ -109,6 +110,10 @@ typedef struct playback_ctx {
     FLAC__StreamDecoder *decoder_b;
     playback_io_t io_a;         // Per-channel IO layer (callbacks + patch state)
     playback_io_t io_b;
+    // Drag-and-drop audio source (settings.playback_audio_file): a private
+    // WAV reader or FLAC decoder feeding the 48 k stereo monitor queue,
+    // position-synced to the RF playhead (see the audio-feed section).
+    struct playback_audio_source *audio;
 #endif
     FILE *file_a;
     FILE *file_b;
@@ -1267,6 +1272,7 @@ static bool gui_playback_sniff_format(const char *filepath, playback_input_forma
 // WAVE_FORMAT_EXTENSIBLE (0xFFFE) are accepted, 8/16/24/32-bit mono.
 static bool gui_playback_parse_wav(FILE *file, uint64_t file_size,
                                    uint32_t *out_rate, uint32_t *out_bits,
+                                   uint16_t *out_channels,
                                    uint64_t *out_data_offset, uint64_t *out_data_bytes,
                                    char *err, size_t err_len) {
     uint8_t riff[12];
@@ -1277,6 +1283,7 @@ static bool gui_playback_parse_wav(FILE *file, uint64_t file_size,
     }
     bool have_fmt = false, have_data = false;
     uint32_t rate = 0, bits = 0;
+    uint16_t wav_channels = 0;   // fmt-branch value published to the tail
     uint64_t data_offset = 0, data_bytes = 0;
     uint64_t pos = 12;
     while (!have_fmt || !have_data) {
@@ -1307,12 +1314,22 @@ static bool gui_playback_parse_wav(FILE *file, uint64_t file_size,
                          bits, channels);
                 return false;
             }
-            if (channels != 1) {
+            if (out_channels) {
+                // Audio-slot caller (the drag-and-drop monitor source): the
+                // clockgen PCM1802 capture is 3/4-channel interleaved; the
+                // feed takes CH1/CH2 (mono duplicates to both ears).
+                if (channels == 0 || channels > 8) {
+                    snprintf(err, err_len,
+                             "WAV has %u channels - expected 1-8", channels);
+                    return false;
+                }
+            } else if (channels != 1) {
                 snprintf(err, err_len,
                          "WAV has %u channels (expected mono - one playback file per RF channel)",
                          channels);
                 return false;
             }
+            wav_channels = channels;
             have_fmt = true;
         } else if (memcmp(hdr, "data", 4) == 0) {
             uint64_t avail = file_size > body ? file_size - body : 0;
@@ -1341,6 +1358,7 @@ static bool gui_playback_parse_wav(FILE *file, uint64_t file_size,
     }
     *out_rate = rate;
     *out_bits = bits;
+    if (out_channels) *out_channels = wav_channels;
     *out_data_offset = data_offset;
     *out_data_bytes = data_bytes;
     return true;
@@ -1380,7 +1398,7 @@ static bool gui_playback_raw_open(playback_raw_reader_t *r, playback_file_info_t
 
     if (fmt == PLAYBACK_INPUT_WAV) {
         uint32_t rate = 0, bits = 0;
-        if (!gui_playback_parse_wav(file, r->file_size, &rate, &bits,
+        if (!gui_playback_parse_wav(file, r->file_size, &rate, &bits, NULL,
                                     &r->data_offset, &r->data_bytes, err, err_len)) {
             fclose(file);
             goto fail;
@@ -3829,6 +3847,683 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
 }
 
 //-----------------------------------------------------------------------------
+// Drag-and-drop: audio source + file loading (the full capture set)
+//-----------------------------------------------------------------------------
+// A complete capture set is RF A + RF B + clockgen audio. The drop handler
+// classifies every dropped file by CONTENT (audio-rate vs RF-domain) and
+// routes it: audio -> the playback monitor source (48 k stereo via the same
+// play_q the Demod panel feeds; Audio Mon gates audibility), RF -> the file
+// of the channel whose panel zone the drop landed on. The audio feed is
+// POSITION-DRIVEN (target = playhead seconds x audio rate), so seeks, loop
+// resets, speed changes and pause all follow the RF timeline; a jump flushes
+// the monitor queue so stale audio never plays after a scrub.
+
+#if LIBFLAC_ENABLED == 1
+
+#define PLAYBACK_AUDIO_CLASSIFY_MAX_HZ 400000u  // RF files resolve to MHz; audio <= 384 k
+#define PLAYBACK_AUDIO_FEED_LOOKAHEAD_MS 50     // feed ahead of the playhead (rides jitter)
+#define PLAYBACK_AUDIO_FEED_SPAN_MAX_FRAMES 2400 // <= 50 ms decoded per span call
+#define PLAYBACK_AUDIO_OUT48_CAP 65536           // push buffer (any rate >= 8k at 0.25x)
+
+typedef struct playback_audio_source {
+    FILE *file;                  // Owned FILE (WAV direct; FLAC via the IO layer)
+    bool is_wav;                 // WAV direct reads vs private FLAC decoder
+    uint32_t rate_hz;            // Resolved TRUE audio rate (Hz domain)
+    uint32_t channels;           // Source channels (the feed takes CH1/CH2; mono -> both)
+    uint8_t bits;                // Source bits per sample (8/16/24/32)
+    uint64_t total_frames;       // Audio frames in the span
+    uint64_t fed_frames;         // Frames already fed (position-synced cursor)
+    double out_pos;              // Fractional 48 k output cursor, in source frames
+    bool exhausted;              // Decoder/reader hit EOF mid-timeline
+    // WAV path
+    uint64_t data_offset;        // First audio byte (data chunk body)
+    uint64_t data_bytes;         // Audio bytes present
+    uint32_t frame_bytes;        // channels * bits/8
+    // FLAC path
+    FLAC__StreamDecoder *decoder; // Private decoder (analysis-worker pattern)
+    playback_io_t io;              // IO layer + owner back-pointer (no SI patch:
+                                   // audio STREAMINFO is honest)
+    uint64_t flac_next;           // Decoder position after the last span (skip
+                                   // the seek when the next span is contiguous)
+    // Staging + push buffers
+    int16_t *stage;               // Converted STEREO int16 frames per span
+    size_t stage_cap;              // Capacity in frames
+    size_t staged;                // Frames staged in the current span
+    size_t want;                  // Frames requested for the current span
+    int16_t *out48;               // Linear-resampled 48 k stereo push buffer
+    size_t out48_cap;              // Capacity in frames
+    size_t out48_used;             // Frames filled since the last push
+} playback_audio_source_t;
+
+static int16_t gui_playback_audio_to_i16(int32_t v, unsigned bits) {
+    switch (bits) {
+        case 8:  return (int16_t)(v << 8);   // caller pre-centres unsigned
+        case 16: return (int16_t)v;
+        case 24: return (int16_t)(v >> 8);
+        default: return (int16_t)(v >> 16); // 32
+    }
+}
+
+static FLAC__StreamDecoderWriteStatus gui_playback_audio_write_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
+    const FLAC__int32 *const buffer[], void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_audio_source_t *a = io ? (playback_audio_source_t *)io->owner : NULL;
+    if (!a || !frame || !buffer || !buffer[0] || !a->stage) {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+    const FLAC__int32 *ch0 = buffer[0];
+    const FLAC__int32 *ch1 = (a->channels > 1 && buffer[1]) ? buffer[1] : ch0;
+    int shift = (a->bits > 16) ? (int)a->bits - 16 : 0;
+    uint32_t n = frame->header.blocksize;
+    for (uint32_t i = 0; i < n; i++) {
+        if (a->staged >= a->want) break;
+        a->stage[2 * a->staged] = (int16_t)(ch0[i] >> shift);
+        a->stage[2 * a->staged + 1] = (int16_t)(ch1[i] >> shift);
+        a->staged++;
+    }
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void gui_playback_audio_meta_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata,
+    void *client_data)
+{
+    (void)decoder; (void)metadata; (void)client_data;
+}
+
+static void gui_playback_audio_error_cb(
+    const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status,
+    void *client_data)
+{
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_audio_source_t *a = io ? (playback_audio_source_t *)io->owner : NULL;
+    if (a && !a->exhausted) {
+        fprintf(stderr, "[PLAYBACK] Audio decoder error: %s\n",
+                FLAC__StreamDecoderErrorStatusString[status]);
+    }
+}
+
+static void gui_playback_audio_destroy(playback_audio_source_t **ap) {
+    if (!ap || !*ap) return;
+    playback_audio_source_t *a = *ap;
+    if (a->decoder) {
+        FLAC__stream_decoder_finish(a->decoder);
+        FLAC__stream_decoder_delete(a->decoder);
+    }
+    if (a->file) fclose(a->file);
+    free(a->stage);
+    free(a->out48);
+    free(a);
+    *ap = NULL;
+}
+
+// Open + resolve the monitor audio source. WAV (the clockgen PCM1802
+// captures, 1-8 ch) reads frames directly; native FLAC uses a private
+// decoder + the shared IO layer (seek_absolute + process_single, the
+// analysis-worker pattern). Ogg-FLAC audio is rejected (remux the RF way
+// is not worth it for monitor audio).
+static playback_audio_source_t *gui_playback_audio_open(const char *filepath,
+                                                          char *err, size_t err_len) {
+    playback_audio_source_t *a = NULL;
+    FILE *file = NULL;
+    if (err && err_len) err[0] = '\0';
+    if (!filepath || !filepath[0]) {
+        snprintf(err, err_len, "no audio file");
+        return NULL;
+    }
+    playback_input_format_t fmt = PLAYBACK_INPUT_FLAC;
+    uint8_t magic[4] = {0};
+    if (!gui_playback_sniff_format(filepath, &fmt, magic, err, err_len)) {
+        return NULL;
+    }
+    a = calloc(1, sizeof(*a));
+    if (!a) {
+        snprintf(err, err_len, "out of memory");
+        return NULL;
+    }
+
+    if (fmt == PLAYBACK_INPUT_WAV) {
+        uint64_t file_size = 0;
+        uint32_t rate = 0, bits = 0;
+        uint16_t channels = 0;
+        file = file_open_read_utf8(filepath);
+        if (!file ||
+            PLAYBACK_FSEEK(file, 0, SEEK_END) != 0 ||
+            !gui_playback_file_tell(file, &file_size) ||
+            !gui_playback_file_seek_abs(file, 0) ||
+            !gui_playback_parse_wav(file, file_size, &rate, &bits, &channels,
+                                     &a->data_offset, &a->data_bytes, err, err_len)) {
+            if (file) fclose(file);
+            goto fail;
+        }
+        // Same rate convention as the raw reader (FLAC-Chop's rule): a
+        // standard audio rate is real audio as-is; > 1 MHz is a true RF
+        // rate; anything else is the RF /1000 convention.
+        double real_hz = (gui_playback_is_audio_sample_rate(rate) || rate > 1000000u)
+                         ? (double)rate : (double)rate * 1000.0;
+        if (!gui_playback_is_audio_sample_rate((uint32_t)llround(real_hz))) {
+            snprintf(err, err_len, "WAV rate %u Hz is not an audio rate", rate);
+            fclose(file);
+            goto fail;
+        }
+        a->is_wav = true;
+        a->rate_hz = (uint32_t)llround(real_hz);
+        a->channels = channels;
+        a->bits = (uint8_t)bits;
+        a->frame_bytes = (uint32_t)channels * (bits / 8u);
+        a->total_frames = a->frame_bytes ? a->data_bytes / a->frame_bytes : 0;
+        if (a->total_frames == 0) {
+            snprintf(err, err_len, "WAV has no audio data: %s", filepath);
+            fclose(file);
+            goto fail;
+        }
+        if (!gui_playback_file_seek_abs(file, a->data_offset)) {
+            snprintf(err, err_len, "seek failed: %s", filepath);
+            fclose(file);
+            goto fail;
+        }
+        a->file = file;
+    } else if (fmt == PLAYBACK_INPUT_FLAC) {
+        FLAC__StreamMetadata si;
+        if (!FLAC__metadata_get_streaminfo(filepath, &si)) {
+            snprintf(err, err_len, "not a valid FLAC stream: %s", filepath);
+            goto fail;
+        }
+        double real_hz = gui_playback_resolve_real_rate_hz(
+            filepath, si.data.stream_info.sample_rate, NULL);
+        if (!gui_playback_is_audio_sample_rate((uint32_t)llround(real_hz))) {
+            snprintf(err, err_len,
+                     "FLAC rate %u Hz is not an audio rate (RF file?)",
+                     si.data.stream_info.sample_rate);
+            goto fail;
+        }
+        if (si.data.stream_info.total_samples == 0) {
+            snprintf(err, err_len, "audio FLAC has an unknown/zero length (streaming write?)");
+            goto fail;
+        }
+        if (si.data.stream_info.channels == 0 || si.data.stream_info.channels > 8) {
+            snprintf(err, err_len, "FLAC has %u channels (expected 1-8)",
+                     si.data.stream_info.channels);
+            goto fail;
+        }
+        if (si.data.stream_info.bits_per_sample < 8 ||
+            si.data.stream_info.bits_per_sample > 32) {
+            snprintf(err, err_len, "FLAC bit depth %u is not 8-32",
+                     si.data.stream_info.bits_per_sample);
+            goto fail;
+        }
+        file = file_open_read_utf8(filepath);
+        if (!file) {
+            snprintf(err, err_len, "open failed: %s", filepath);
+            goto fail;
+        }
+        a->rate_hz = (uint32_t)llround(real_hz);
+        a->channels = si.data.stream_info.channels;
+        a->bits = (uint8_t)si.data.stream_info.bits_per_sample;
+        a->total_frames = si.data.stream_info.total_samples;
+        // Audio STREAMINFO is honest (audio-rate domain, true total): no
+        // STREAMINFO patch (patch_total = 0 -> plain fread IO layer).
+        gui_playback_io_reset(&a->io, file, a, 0);
+        a->io.cancel = NULL;
+        a->decoder = FLAC__stream_decoder_new();
+        if (!a->decoder ||
+            FLAC__stream_decoder_init_stream(
+                a->decoder,
+                gui_playback_io_read_cb, gui_playback_io_seek_cb,
+                gui_playback_io_tell_cb, gui_playback_io_length_cb,
+                gui_playback_io_eof_cb,
+                gui_playback_audio_write_cb, gui_playback_audio_meta_cb,
+                gui_playback_audio_error_cb, &a->io) != FLAC__STREAM_DECODER_INIT_STATUS_OK ||
+            !FLAC__stream_decoder_process_until_end_of_metadata(a->decoder)) {
+            snprintf(err, err_len, "failed to init the audio decoder: %s", filepath);
+            if (a->decoder) {
+                FLAC__stream_decoder_finish(a->decoder);
+                FLAC__stream_decoder_delete(a->decoder);
+                a->decoder = NULL;
+            }
+            fclose(file);
+            goto fail;
+        }
+        a->file = file;  // owned here for the destroy path (IO layer reads it)
+    } else {
+        snprintf(err, err_len,
+                 "unsupported audio container (%s) - use WAV or native FLAC",
+                 gui_playback_input_format_name(fmt));
+        goto fail;
+    }
+
+    a->stage = malloc((size_t)PLAYBACK_AUDIO_FEED_SPAN_MAX_FRAMES * 2 * sizeof(int16_t));
+    a->out48 = malloc((size_t)PLAYBACK_AUDIO_OUT48_CAP * 2 * sizeof(int16_t));
+    if (!a->stage || !a->out48) {
+        snprintf(err, err_len, "out of memory for the audio feed buffers");
+        goto fail;
+    }
+    a->stage_cap = PLAYBACK_AUDIO_FEED_SPAN_MAX_FRAMES;
+    a->out48_cap = PLAYBACK_AUDIO_OUT48_CAP;
+    a->out48_used = 0;
+    a->fed_frames = 0;
+    a->out_pos = 0.0;
+    return a;
+
+fail:
+    // The pre-open failure paths fclosed `file` with a->file still NULL; the
+    // post-open failures (staging malloc) leave a->file owned by `a` - the
+    // destroy closes exactly the owned handle either way.
+    gui_playback_audio_destroy(&a);
+    return NULL;
+}
+
+// Decode the next `want` WAV frames at fed_frames into the stereo staging.
+static size_t gui_playback_audio_wav_span(playback_audio_source_t *a, size_t want) {
+    if (!a || !a->file || !a->stage || want == 0 || a->frame_bytes == 0) return 0;
+    if (a->fed_frames >= a->total_frames) return 0;
+    uint64_t remaining = a->total_frames - a->fed_frames;
+    if (want > remaining) want = (size_t)remaining;
+    if (want > a->stage_cap) want = a->stage_cap;
+    if (!gui_playback_file_seek_abs(a->file,
+            a->data_offset + a->fed_frames * (uint64_t)a->frame_bytes)) {
+        return 0;
+    }
+    size_t got = 0;
+    uint8_t buf[8192];
+    while (got < want) {
+        size_t frames = want - got;
+        if (frames > sizeof(buf) / a->frame_bytes) frames = sizeof(buf) / a->frame_bytes;
+        size_t items = fread(buf, a->frame_bytes, frames, a->file);
+        if (items == 0) break;
+        for (size_t i = 0; i < items; i++) {
+            const uint8_t *b = buf + i * a->frame_bytes;
+            int32_t l, r;
+            switch (a->bits) {
+                case 8: {
+                    l = (int32_t)b[0] - 128;
+                    r = (a->channels > 1) ? (int32_t)b[1] - 128 : l;
+                    break;
+                }
+                case 16: {
+                    l = (int32_t)(int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
+                    r = (a->channels > 1)
+                        ? (int32_t)(int16_t)((uint16_t)b[2] | ((uint16_t)b[3] << 8))
+                        : l;
+                    break;
+                }
+                case 24: {
+                    uint32_t ul = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
+                    if (ul & 0x800000u) ul |= 0xFF000000u;
+                    l = (int32_t)ul;
+                    if (a->channels > 1) {
+                        const uint8_t *c = b + 3;
+                        uint32_t ur = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16);
+                        if (ur & 0x800000u) ur |= 0xFF000000u;
+                        r = (int32_t)ur;
+                    } else {
+                        r = l;
+                    }
+                    break;
+                }
+                default: {  // 32
+                    uint32_t ul = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                                  ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+                    l = (ul & 0x80000000u)
+                        ? (int32_t)(ul - 0x80000000u) + INT32_MIN : (int32_t)ul;
+                    if (a->channels > 1) {
+                        const uint8_t *c = b + 4;
+                        uint32_t ur = (uint32_t)c[0] | ((uint32_t)c[1] << 8) |
+                                      ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+                        r = (ur & 0x80000000u)
+                            ? (int32_t)(ur - 0x80000000u) + INT32_MIN : (int32_t)ur;
+                    } else {
+                        r = l;
+                    }
+                    break;
+                }
+            }
+            a->stage[2 * got] = gui_playback_audio_to_i16(l, a->bits);
+            a->stage[2 * got + 1] = gui_playback_audio_to_i16(r, a->bits);
+            got++;
+        }
+    }
+    return got;
+}
+
+// Decode the next `want` FLAC frames at fed_frames into the stereo staging
+// (seek_absolute then process_single until the span is staged or EOF; the
+// contiguous case skips the seek).
+static size_t gui_playback_audio_flac_span(playback_audio_source_t *a, size_t want) {
+    if (!a || !a->decoder || !a->stage || want == 0) return 0;
+    if (a->fed_frames >= a->total_frames) return 0;
+    if (want > a->stage_cap) want = a->stage_cap;
+    if (a->fed_frames != a->flac_next) {
+        if (!FLAC__stream_decoder_seek_absolute(a->decoder, a->fed_frames)) {
+            return 0;
+        }
+    }
+    a->staged = 0;
+    a->want = want;
+    while (a->staged < a->want &&
+           FLAC__stream_decoder_get_state(a->decoder) != FLAC__STREAM_DECODER_END_OF_STREAM) {
+        if (!FLAC__stream_decoder_process_single(a->decoder)) break;
+    }
+    a->flac_next = a->fed_frames + a->staged;
+    return a->staged;
+}
+
+// Linear-resample the staged span [fed, fed+got) into the 48 k push buffer
+// and push it. The step folds in the CURRENT playback speed: the source
+// span covers got/(rate*mult) seconds of wall time, so producing exactly
+// 48000 * that many frames keeps the queue at 48 k frames/s at EVERY speed
+// (the pitch shifts with the speed, like a tape; slow motion plays pitched
+// down, 2x/4x plays pitched up - never gaps, never queue overflow).
+static void gui_playback_audio_push_span(playback_audio_source_t *a, size_t got,
+                                         float speed_mult) {
+    if (!a || !a->stage || !a->out48 || got == 0 || speed_mult <= 0.0f) return;
+    double out_per_src = 48000.0 / ((double)a->rate_hz * (double)speed_mult);
+    if (!(out_per_src > 0.0) || !isfinite(out_per_src)) return;
+    double end = (double)(a->fed_frames + got);
+    while (a->out_pos < end) {
+        if (a->out48_used >= a->out48_cap) {
+            gui_audio_push_playback(a->out48, a->out48_used);
+            a->out48_used = 0;
+        }
+        double p = a->out_pos - (double)a->fed_frames;
+        if (p < 0.0) p = 0.0;                 // re-anchor landed inside the span
+        size_t i0 = (size_t)p;
+        int16_t l, r;
+        if (i0 >= got) {
+            // Defensive: out_pos at/after the span end (rounding) - stop.
+            break;
+        }
+        double frac = p - (double)i0;
+        if (frac > 0.0 && i0 + 1 < got) {
+            l = (int16_t)((double)a->stage[2 * i0] * (1.0 - frac) +
+                          (double)a->stage[2 * (i0 + 1)] * frac);
+            r = (int16_t)((double)a->stage[2 * i0 + 1] * (1.0 - frac) +
+                          (double)a->stage[2 * (i0 + 1) + 1] * frac);
+        } else {
+            // Integral position or the span's last frame (the next sample
+            // arrives with the next span): exact copy / hold.
+            l = a->stage[2 * i0];
+            r = a->stage[2 * i0 + 1];
+        }
+        a->out48[2 * a->out48_used] = l;
+        a->out48[2 * a->out48_used + 1] = r;
+        a->out48_used++;
+        a->out_pos += out_per_src;
+    }
+    if (a->out48_used > 0) {
+        gui_audio_push_playback(a->out48, a->out48_used);
+        a->out48_used = 0;
+    }
+}
+
+// Position-driven feed (called from the playback thread after each paced
+// batch). target = playhead seconds x audio rate, so seeks/loops/speed/pause
+// all follow the RF timeline; a jump (seek back, loop reset, big forward
+// scrub) flushes the monitor queue and re-anchors the feed. Max speed skips
+// audio (the timeline runs free); every other speed feeds smoothly.
+static void gui_playback_audio_feed(playback_ctx_t *ctx) {
+    playback_audio_source_t *a = ctx->audio;
+    if (!a || a->exhausted || a->rate_hz == 0) return;
+    if (atomic_load(&ctx->state) != PLAYBACK_STATE_PLAYING) return;
+    playback_speed_t speed = (playback_speed_t)atomic_load(&ctx->speed);
+    float mult = speed_multipliers[speed];
+    if (mult <= 0.0f) return;  // Max: the timeline runs free; no audio
+    double rate = ctx->realtime_sample_rate_hz > 0.0 ? ctx->realtime_sample_rate_hz : 1.0;
+    double pos_s = (double)atomic_load(&ctx->current_sample) / rate;
+    uint64_t target = (uint64_t)(pos_s * (double)a->rate_hz);
+    if (target >= a->total_frames) return;  // audio shorter than the RF timeline
+    uint64_t slack_back = (uint64_t)a->rate_hz / 20u;   // 50 ms behind tolerance
+    uint64_t slack_fwd = (uint64_t)a->rate_hz * 4u;     // 4 s catch-up bound
+    if (a->fed_frames > target + slack_back || target > a->fed_frames + slack_fwd) {
+        // Seek/loop/speed jump: drop the stale queued audio, re-anchor. A
+        // loop restart (or a seek back before an exhausted EOF) resumes the
+        // audio from the new playhead.
+        gui_audio_reset_playback_queue();
+        a->fed_frames = target;
+        a->out_pos = (double)target;
+        a->exhausted = false;
+    }
+    uint64_t lookahead = (uint64_t)a->rate_hz * (uint64_t)PLAYBACK_AUDIO_FEED_LOOKAHEAD_MS / 1000u;
+    if (lookahead == 0) lookahead = 1;
+    if (target + lookahead > a->total_frames) lookahead = a->total_frames - target;
+    while (a->fed_frames < target + lookahead) {
+        uint64_t want64 = target + lookahead - a->fed_frames;
+        size_t want = want64 > (uint64_t)PLAYBACK_AUDIO_FEED_SPAN_MAX_FRAMES
+                    ? PLAYBACK_AUDIO_FEED_SPAN_MAX_FRAMES : (size_t)want64;
+        size_t got = a->is_wav ? gui_playback_audio_wav_span(a, want)
+                               : gui_playback_audio_flac_span(a, want);
+        gui_playback_audio_push_span(a, got, mult);
+        a->fed_frames += got;
+        if (got < want) {
+            // EOF (or a failed seek) mid-span: stop feeding for this session
+            // (the queue drains to silence; the RF timeline keeps playing).
+            a->exhausted = true;
+            break;
+        }
+    }
+}
+
+// The drop zone: the union of each channel's cached panel bounds (logical
+// coordinates, refreshed every render by render_channel_panels); a drop
+// outside the canvases (VU/stats/timeline rows) takes the vertically nearest
+// channel row.
+static Rectangle gui_playback_drop_zone_rect(const channel_panel_config_t *cfg) {
+    Rectangle r = cfg->left_bounds;
+    if (cfg->split) {
+        Rectangle rr = cfg->right_bounds;
+        if (rr.width > 0 && rr.height > 0) {
+            if (r.width <= 0 || r.height <= 0) {
+                r = rr;
+            } else {
+                float x0 = r.x < rr.x ? r.x : rr.x;
+                float y0 = r.y < rr.y ? r.y : rr.y;
+                float x1 = (r.x + r.width) > (rr.x + rr.width) ? (r.x + r.width) : (rr.x + rr.width);
+                float y1 = (r.y + r.height) > (rr.y + rr.height) ? (r.y + r.height) : (rr.y + rr.height);
+                r.x = x0; r.y = y0; r.width = x1 - x0; r.height = y1 - y0;
+            }
+        }
+    }
+    return r;
+}
+
+static int gui_playback_drop_zone(gui_app_t *app, Vector2 point) {
+    if (!app) return 0;
+    Rectangle ra = gui_playback_drop_zone_rect(&app->panel_config_a);
+    Rectangle rb = gui_playback_drop_zone_rect(&app->panel_config_b);
+    bool have_a = ra.width > 0 && ra.height > 0;
+    bool have_b = rb.width > 0 && rb.height > 0;
+    if (have_a && CheckCollisionPointRec(point, ra)) return 0;
+    if (have_b && CheckCollisionPointRec(point, rb)) return 1;
+    if (!have_a && !have_b) return 0;  // no rendered bounds yet (first frame)
+    if (!have_a) return 1;
+    if (!have_b) return 0;
+    float ca = ra.y + ra.height * 0.5f;
+    float cb = rb.y + rb.height * 0.5f;
+    float da = point.y - ca;
+    float db = point.y - cb;
+    return (da * da) <= (db * db) ? 0 : 1;
+}
+
+typedef enum {
+    PLAYBACK_DROP_REJECT = 0,
+    PLAYBACK_DROP_RF,
+    PLAYBACK_DROP_AUDIO,
+} playback_drop_kind_t;
+
+// Classify one dropped file by CONTENT. Audio-rate -> the monitor source
+// slot; RF-domain -> the zone channel; unsupported -> REJECT with the
+// sniffer/probe's specific reason. The rate domains are unambiguous (RF
+// files resolve to MHz via headers/tags/hints; audio <= 384 k).
+static playback_drop_kind_t gui_playback_classify_drop(const char *filepath,
+                                                       char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    playback_input_format_t fmt = PLAYBACK_INPUT_FLAC;
+    uint8_t magic[4] = {0};
+    if (!gui_playback_sniff_format(filepath, &fmt, magic, err, err_len)) {
+        return PLAYBACK_DROP_REJECT;
+    }
+    if (fmt == PLAYBACK_INPUT_WAV) {
+        FILE *file = file_open_read_utf8(filepath);
+        if (!file) {
+            snprintf(err, err_len, "open failed: %s", filepath);
+            return PLAYBACK_DROP_REJECT;
+        }
+        uint64_t file_size = 0, off = 0, span = 0;
+        uint32_t rate = 0, bits = 0;
+        uint16_t channels = 0;
+        bool ok = PLAYBACK_FSEEK(file, 0, SEEK_END) == 0 &&
+                  gui_playback_file_tell(file, &file_size) &&
+                  gui_playback_file_seek_abs(file, 0) &&
+                  gui_playback_parse_wav(file, file_size, &rate, &bits, &channels,
+                                         &off, &span, err, err_len) && span > 0;
+        fclose(file);
+        if (!ok) {
+            if (err && err[0] == '\0') {
+                snprintf(err, err_len, "WAV has no audio data: %s", filepath);
+            }
+            return PLAYBACK_DROP_REJECT;
+        }
+        double real_hz = (gui_playback_is_audio_sample_rate(rate) || rate > 1000000u)
+                         ? (double)rate : (double)rate * 1000.0;
+        return (real_hz > 0.0 && real_hz <= (double)PLAYBACK_AUDIO_CLASSIFY_MAX_HZ)
+                   ? PLAYBACK_DROP_AUDIO : PLAYBACK_DROP_RF;
+    }
+    if (fmt == PLAYBACK_INPUT_FLAC) {
+        FLAC__StreamMetadata si;
+        if (!FLAC__metadata_get_streaminfo(filepath, &si)) {
+            snprintf(err, err_len, "not a valid FLAC stream: %s", filepath);
+            return PLAYBACK_DROP_REJECT;
+        }
+        double real_hz = gui_playback_resolve_real_rate_hz(
+            filepath, si.data.stream_info.sample_rate, NULL);
+        if (real_hz > 0.0 && real_hz <= (double)PLAYBACK_AUDIO_CLASSIFY_MAX_HZ) {
+            if (si.data.stream_info.total_samples == 0) {
+                snprintf(err, err_len, "audio FLAC has an unknown/zero length: %s", filepath);
+                return PLAYBACK_DROP_REJECT;
+            }
+            if (si.data.stream_info.channels == 0 || si.data.stream_info.channels > 8) {
+                snprintf(err, err_len, "audio FLAC has %u channels (expected 1-8)",
+                         si.data.stream_info.channels);
+                return PLAYBACK_DROP_REJECT;
+            }
+            return PLAYBACK_DROP_AUDIO;
+        }
+        if (si.data.stream_info.channels != 1) {
+            snprintf(err, err_len,
+                     "FLAC has %u channels (RF playback needs mono)",
+                     si.data.stream_info.channels);
+            return PLAYBACK_DROP_REJECT;
+        }
+        return PLAYBACK_DROP_RF;
+    }
+    if (fmt == PLAYBACK_INPUT_OGG_FLAC) {
+        playback_file_info_t info = {0};
+        if (!gui_playback_ogg_probe(&info, filepath, err, err_len)) {
+            return PLAYBACK_DROP_REJECT;
+        }
+        if (info.real_sample_rate_hz > 0.0 &&
+            info.real_sample_rate_hz <= (double)PLAYBACK_AUDIO_CLASSIFY_MAX_HZ) {
+            snprintf(err, err_len,
+                     "Ogg FLAC audio is not supported as the audio source - use WAV or native FLAC");
+            return PLAYBACK_DROP_REJECT;
+        }
+        return PLAYBACK_DROP_RF;
+    }
+    // Headerless raw PCM widths + packed .lds: RF domain by definition.
+    return PLAYBACK_DROP_RF;
+}
+
+#endif // LIBFLAC_ENABLED
+
+bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
+                                       size_t count, float point_x, float point_y) {
+    if (!app || !paths || count == 0) return false;
+#if LIBFLAC_ENABLED == 1
+    if (gui_playback_is_starting(app)) {
+        gui_app_set_status(app, "Playback is still loading - wait for it to finish");
+        return false;
+    }
+    Vector2 point = { point_x, point_y };
+    int zone = gui_playback_drop_zone(app, point);
+    const char *rf_a = NULL, *rf_b = NULL, *audio_file = NULL;
+    size_t rejected = 0, extras = 0;
+    for (size_t i = 0; i < count; i++) {
+        const char *p = paths[i];
+        if (!p || !p[0]) continue;
+        char err[192] = {0};
+        playback_drop_kind_t kind = gui_playback_classify_drop(p, err, sizeof(err));
+        if (kind == PLAYBACK_DROP_AUDIO) {
+            if (!audio_file) audio_file = p;
+            else extras++;
+        } else if (kind == PLAYBACK_DROP_RF) {
+            if (zone == 0) {
+                if (!rf_a) rf_a = p;
+                else extras++;
+            } else {
+                if (!rf_b) rf_b = p;
+                else extras++;
+            }
+        } else {
+            rejected++;
+            fprintf(stderr, "[PLAYBACK] Drop rejected: %s (%s)\n",
+                    err[0] ? err : "unsupported file", p);
+        }
+    }
+    if (!rf_a && !rf_b && !audio_file) {
+        gui_app_set_status(app, "No playable files in the drop (see the log)");
+        return false;
+    }
+    // Only slots that received a file this drop change (a B-only drop keeps
+    // the loaded A; a set drop replaces both).
+    if (rf_a) snprintf(app->settings.playback_file_a, sizeof(app->settings.playback_file_a), "%s", rf_a);
+    if (rf_b) snprintf(app->settings.playback_file_b, sizeof(app->settings.playback_file_b), "%s", rf_b);
+    if (audio_file) {
+        snprintf(app->settings.playback_audio_file, sizeof(app->settings.playback_audio_file),
+                 "%s", audio_file);
+    }
+    gui_settings_save(&app->settings);
+    fprintf(stderr,
+            "[PLAYBACK] Drop: zone=%c A=%s B=%s audio=%s (%zu rejected, %zu extra)\n",
+            zone == 0 ? 'A' : 'B',
+            app->settings.playback_file_a[0] ? app->settings.playback_file_a : "(keep)",
+            app->settings.playback_file_b[0] ? app->settings.playback_file_b : "(keep)",
+            app->settings.playback_audio_file[0] ? app->settings.playback_audio_file : "(none)",
+            rejected, extras);
+    // Select the Playback device; stop anything running (capture or an
+    // earlier playback); (re)start through the normal start path.
+    int pb = -1;
+    for (int i = 0; i < app->device_count; i++) {
+        if (app->devices[i].type == DEVICE_TYPE_PLAYBACK) {
+            pb = i;
+            break;
+        }
+    }
+    if (pb < 0) {
+        gui_app_set_status(app, "No playback device available");
+        return false;
+    }
+    app->selected_device = pb;
+    if (app->is_capturing || gui_playback_is_running(app)) {
+        gui_app_stop_capture(app);
+    }
+    if (app->settings.playback_file_a[0] || app->settings.playback_file_b[0]) {
+        // start_async sets "Loading playback..."; the commit sets "Playback started".
+        return gui_app_start_capture(app) == 0;
+    }
+    gui_app_set_status(app, "Audio loaded - drop RF files on a channel panel to play");
+    return true;
+#else
+    (void)paths; (void)count; (void)point_x; (void)point_y;
+    gui_app_set_status(app, "Playback drag-and-drop needs FLAC support (not compiled in)");
+    return false;
+#endif
+}
+
+//-----------------------------------------------------------------------------
 // Playback Thread
 //-----------------------------------------------------------------------------
 
@@ -4331,6 +5026,13 @@ static int playback_thread_func(void *ctx_ptr) {
         }
         atomic_store(&app->last_callback_time_ms, get_time_ms());
 
+#if LIBFLAC_ENABLED == 1
+        // Position-synced monitor audio (the drag-and-drop source): follows
+        // the playhead through seeks/loops/speed changes; a jump flushes the
+        // monitor queue (see the drag-and-drop section above).
+        gui_playback_audio_feed(ctx);
+#endif
+
         batch_count++;
 
         // Accumulate an absolute source-sample clock. A fractional millisecond
@@ -4541,6 +5243,8 @@ static void gui_playback_release_context(playback_ctx_t *ctx) {
         FLAC__stream_decoder_delete(ctx->decoder_b);
         ctx->decoder_b = NULL;
     }
+    // Drag-and-drop audio source (NULL when none was set/loaded)
+    gui_playback_audio_destroy(&ctx->audio);
 #endif
     if (ctx->file_a && !ctx->decoder_owns_file_a) fclose(ctx->file_a);
     if (ctx->file_b && !ctx->decoder_owns_file_b) fclose(ctx->file_b);
@@ -4900,6 +5604,25 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
             ctx->channel_rate_hz[1] = gui_playback_apply_resolved_file_info(
                 &ctx->info_b, &ctx->stream_b, "File B", cancel,
                 ctx->loaded_key_valid[1] ? &ctx->loaded_key[1] : NULL, ctx->file_b);
+        }
+    }
+
+    // Drag-and-drop audio source (settings.playback_audio_file): opened
+    // off-thread with the channels. A failure is non-fatal (playback works
+    // without the monitor audio); the error names the file + reason.
+    if (app->settings.playback_audio_file[0]) {
+        char audio_err[192] = {0};
+        ctx->audio = gui_playback_audio_open(app->settings.playback_audio_file,
+                                             audio_err, sizeof(audio_err));
+        if (ctx->audio) {
+            fprintf(stderr,
+                    "[PLAYBACK] Audio source: %u Hz, %u ch, %u-bit, %" PRIu64 " frames (%s)\n",
+                    ctx->audio->rate_hz, ctx->audio->channels, ctx->audio->bits,
+                    ctx->audio->total_frames, app->settings.playback_audio_file);
+        } else {
+            fprintf(stderr, "[PLAYBACK] Audio source unavailable: %s (%s)\n",
+                    audio_err[0] ? audio_err : "open failed",
+                    app->settings.playback_audio_file);
         }
     }
 

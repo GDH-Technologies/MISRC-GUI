@@ -733,7 +733,8 @@ if raylib_dep.found()
     # is linked as well.
     if flac_dep.found() and fftw3f_dep.found()
       playback_resolve_test = executable('gui_playback_resolve_test',
-        ['test/gui_playback_resolve_harness.c', 'common/file_utils.c',
+        ['test/gui_playback_resolve_harness.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
@@ -780,7 +781,8 @@ if raylib_dep.found()
     )
     test('gui_cvbs_baseband', cvbs_baseband_test)
     capture_watchdog_test = executable('gui_capture_watchdog_test',
-      ['test/gui_capture_watchdog_test.c', 'common/file_utils.c'],
+      ['test/gui_capture_watchdog_test.c', 'common/file_utils.c',
+       'test/gui_playback_audio_stub.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -790,7 +792,8 @@ if raylib_dep.found()
     test('gui_capture_watchdog', capture_watchdog_test)
     if flac_dep.found()
       rf_seek_test = executable('gui_rf_playback_seek_test',
-        ['test/gui_rf_playback_seek_test.c', 'common/file_utils.c',
+        ['test/gui_rf_playback_seek_test.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
@@ -802,7 +805,8 @@ if raylib_dep.found()
       )
       test('gui_rf_playback_seek', rf_seek_test)
       rf_start_test = executable('gui_rf_playback_start_test',
-        ['test/gui_rf_playback_start_test.c', 'common/file_utils.c',
+        ['test/gui_rf_playback_start_test.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
@@ -817,7 +821,8 @@ if raylib_dep.found()
       # Manual exact-media integration: requires one second of 20 MHz NTSC
       # s16le RF and an output directory, so it is not a default CI test.
       rf_reconnect_sources = [
-        'test/gui_rf_playback_reconnect_test.c', 'common/file_utils.c',
+        'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
+        'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
         'misrc_gui/ui/gui_chrome_hide.c',

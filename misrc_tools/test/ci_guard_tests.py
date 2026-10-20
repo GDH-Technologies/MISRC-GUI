@@ -1917,6 +1917,80 @@ def check_local_guard_gate_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_playback_drag_drop_contract(repo_root: Path) -> int:
+    """The playback drag-and-drop wiring (2026-10-20, the full-capture-set
+    loading feature: RF per channel zone + clockgen audio in one drop).
+
+    - The main loop polls the raylib drop event exactly once and routes it
+      through the logical pointer wrapper (never a second raw
+      GetMousePosition call - the UI scale integration contract allows
+      exactly one call site, in gui_ui.c).
+    - gui_playback owns the drop handler + the position-synced audio feed
+      (the monitor queue push + the seek/loop flush + the prepare-time open
+      + the release).
+    - gui_audio implements the playback push/flush queue API.
+    - The audio file setting persists (save + load) and the settings panel
+      shows + clears it.
+    """
+    gui_c_path = repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"
+    gui_c = read_text(gui_c_path)
+    for snippet, label in [
+        ("IsFileDropped()", "the per-frame drop poll"),
+        ("LoadDroppedFiles()", "the dropped-files load"),
+        ("UnloadDroppedFiles(", "the dropped-files unload"),
+        ("gui_playback_handle_dropped_files(", "the drop handler call"),
+        ("gui_ui_get_mouse_position()", "the logical drop point (wrapper)"),
+    ]:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c drag-and-drop wiring is missing {label}: {snippet}")
+    if "GetMousePosition()" in gui_c:
+        return fail(
+            "misrc_gui.c must not call GetMousePosition() directly (the UI scale "
+            "integration contract allows exactly one call site, in gui_ui.c)"
+        )
+    pb_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.h")
+    if "gui_playback_handle_dropped_files" not in pb_h:
+        return fail("gui_playback.h must declare gui_playback_handle_dropped_files")
+    pb_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.c")
+    for snippet, label in [
+        ("gui_playback_audio_feed(", "the position-synced audio feed"),
+        ("gui_audio_push_playback(", "the monitor queue push"),
+        ("gui_audio_reset_playback_queue()", "the seek/loop queue flush"),
+        ("gui_playback_audio_open(", "the prepare-time audio source open"),
+        ("gui_playback_audio_destroy(", "the audio source release"),
+        ("PLAYBACK_AUDIO_FEED_LOOKAHEAD_MS", "the feed lookahead contract"),
+        ("gui_playback_drop_zone(", "the panel-zone mapping"),
+        ("gui_playback_classify_drop(", "the content classifier"),
+    ]:
+        if snippet not in pb_c:
+            return fail(f"gui_playback.c drag-and-drop is missing {label}: {snippet}")
+    audio_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.c")
+    audio_h = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.h")
+    if "gui_audio_push_playback" not in audio_h:
+        return fail("gui_audio.h must declare gui_audio_push_playback")
+    if "gui_audio_reset_playback_queue" not in audio_h:
+        return fail("gui_audio.h must declare gui_audio_reset_playback_queue")
+    if "void gui_audio_push_playback(" not in audio_c:
+        return fail("gui_audio.c must implement gui_audio_push_playback")
+    if "void gui_audio_reset_playback_queue(void)" not in audio_c:
+        return fail("gui_audio.c must implement gui_audio_reset_playback_queue")
+    app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    if "playback_audio_file[" not in app_h:
+        return fail("gui_app.h settings must carry playback_audio_file")
+    settings_c = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
+    if settings_c.count('"playback_audio_file"') != 2:
+        return fail(
+            "gui_settings.c must persist playback_audio_file in BOTH the save "
+            "and the load paths (found "
+            + str(settings_c.count('"playback_audio_file"'))
+            + " of 2 key references)"
+        )
+    ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    if "PlaybackFileClearAudio" not in ui_c:
+        return fail("gui_ui.c must show + clear the playback audio file row")
+    return 0
+
+
 def func_body_from(source: str, signature: str) -> str:
     """Return the text of the function whose definition starts at
     `signature`, from the signature up to the next column-0 closing brace.
@@ -2609,6 +2683,7 @@ def main() -> int:
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
         ("local CI guard gate contract", lambda: check_local_guard_gate_contract(repo_root)),
+        ("playback drag-and-drop contract", lambda: check_playback_drag_drop_contract(repo_root)),
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),

@@ -780,7 +780,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
     gui_settings_write_string(f, "net_client_port_str", settings->net_client_port_str, true);
     gui_settings_write_string(f, "playback_file_a", settings->playback_file_a, true);
-    gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, false);
+    gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, true);
+    gui_settings_write_string(f, "playback_audio_file", settings->playback_audio_file, false);
     fprintf(f, "}\n");
     
     fclose(f);
@@ -1458,6 +1459,9 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "playback_file_b")) != NULL) {
         gui_settings_load_string(settings->playback_file_b, sizeof(settings->playback_file_b), value);
+    }
+    if ((value = find_value(content, "playback_audio_file")) != NULL) {
+        gui_settings_load_string(settings->playback_audio_file, sizeof(settings->playback_audio_file), value);
     }
 
     // RTL-SDR settings

@@ -193,6 +193,19 @@ bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_f
 // Returns true if file is compatible with MISRC playback
 bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info);
 
+// Drag-and-drop loading (raylib drop event, render thread): classify every
+// dropped file by CONTENT - an audio-rate file (WAV or native FLAC, e.g. the
+// clockgen PCM1802 capture) becomes the playback monitor source; any RF
+// container (FLAC/Ogg-FLAC/raw/.lds) becomes the file for the channel whose
+// PANEL ZONE the drop landed on (point = the logical pointer position from
+// gui_ui_get_mouse_position; x/y instead of Vector2 keeps this header
+// raylib-free). Assigns the settings, selects the Playback device and
+// (re)starts playback through the normal start path. Returns true when any
+// file was accepted. Audio plays through the Audio Mon button (no
+// auto-enable, mirroring device-audio monitoring).
+bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
+                                       size_t count, float point_x, float point_y);
+
 // Loop mode: restart from beginning when EOF reached
 void gui_playback_set_loop(gui_app_t *app, bool loop);
 bool gui_playback_get_loop(gui_app_t *app);

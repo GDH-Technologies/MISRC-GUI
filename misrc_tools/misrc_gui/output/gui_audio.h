@@ -26,4 +26,15 @@ void gui_audio_update_playback(gui_app_t *app);
 // The user must enable Audio Mon to hear it (mirrors device-audio monitoring).
 void gui_audio_push_demod(const int16_t *stereo_48k, size_t frames);
 
+// Push drag-and-drop playback audio (stereo int16 @ 48k) into the SAME live
+// monitor queue. The position-synced feed runs on the playback thread
+// (gui_playback.c); the producers are mutually exclusive (capture audio
+// thread / demod render path / playback feed). Same contract: Audio Mon
+// gates audibility, drop-oldest on overflow.
+void gui_audio_push_playback(const int16_t *stereo_48k, size_t frames);
+
+// Drop everything currently queued in the monitor queue (called by the
+// playback audio feed on a seek/loop jump so stale audio never plays).
+void gui_audio_reset_playback_queue(void);
+
 #endif // GUI_AUDIO_H

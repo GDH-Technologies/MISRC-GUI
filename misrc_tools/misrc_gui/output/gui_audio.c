@@ -121,6 +121,22 @@ void gui_audio_push_demod(const int16_t *stereo_48k, size_t frames) {
     play_q_push_samples(stereo_48k, frames * 2);
 }
 
+// Drag-and-drop playback audio: same queue, same contract as the demod feed
+// (48 k stereo int16, drop-oldest on overflow; the producers are mutually
+// exclusive: capture audio thread / demod render path / playback feed).
+void gui_audio_push_playback(const int16_t *stereo_48k, size_t frames) {
+    if (!stereo_48k || frames == 0) return;
+    play_q_ensure_alloc();
+    play_q_push_samples(stereo_48k, frames * 2);
+}
+
+// Flush the monitor queue: move head to tail so nothing stale plays after a
+// playback seek/loop jump (the next pushed frame is the next thing heard).
+void gui_audio_reset_playback_queue(void) {
+    if (!s_play_q) return;
+    atomic_store(&s_play_q_head, atomic_load(&s_play_q_tail));
+}
+
 static size_t play_q_pop_samples(int16_t *out, size_t max_count) {
     if (!s_play_q || max_count == 0) return 0;
     size_t used = play_q_used_samples();

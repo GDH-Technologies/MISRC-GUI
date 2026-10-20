@@ -895,6 +895,23 @@ int main(int argc, char **argv) {
             gui_settings_save(&app.settings);
             ui_scale_save_pending = false;
         }
+
+        // Drag-and-drop onto the channel panels: load playback files (RF per
+        // channel zone by the drop point + audio-rate files as the monitor
+        // source) and start playback. raylib delivers UTF-8 paths; the drop
+        // point comes from the logical pointer wrapper (never a second
+        // GetMousePosition call - UI scale integration contract).
+        if (IsFileDropped()) {
+            FilePathList dropped_files = LoadDroppedFiles();
+            if (dropped_files.count > 0 && dropped_files.paths) {
+                Vector2 drop_point = gui_ui_get_mouse_position();
+                gui_playback_handle_dropped_files(&app,
+                    (const char *const *)dropped_files.paths,
+                    (size_t)dropped_files.count,
+                    drop_point.x, drop_point.y);
+            }
+            UnloadDroppedFiles(dropped_files);
+        }
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
         if (app.is_capturing) {
             double now = GetTime();

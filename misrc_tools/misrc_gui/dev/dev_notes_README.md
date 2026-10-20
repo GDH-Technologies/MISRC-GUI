@@ -1,5 +1,22 @@
 # MISRC GUI development notes
 
+## 2026-10-20 Playback drag-and-drop: per-channel zones + audio (user-confirmed)
+
+- Feature: drop files onto the channel panels to load playback - RF files (mono
+  FLAC / Ogg-FLAC / raw widths / .lds) land on the channel whose PANEL ZONE the
+  drop hit (nearest row vertically outside the canvases); an audio-rate file
+  (WAV 1-8 ch incl. the 46.875 kHz clockgen capture, or audio FLAC) becomes the
+  monitor source. One drop of a full capture set (RF A + RF B + audio) selects
+  the Playback device, stops anything running and starts playback. The audio
+  feed is position-synced to the RF playhead (seek/loop/speed/pause follow; a
+  jump flushes the queue) via the shared play_q; Audio Mon gates audibility
+  (no auto-enable). Speeds fold into pitch (tape semantics); Max is silent.
+  The audio file persists (settings.playback_audio_file + the Settings row).
+- Contracts + known limitations: `playback_drag_drop_audio.md`; guarded by
+  the `playback drag-and-drop contract` in ci_guard_tests.py.
+- Verified: 41/41 static guards, LIBFLAC_ENABLED=0 translation proof EXIT 0,
+  build-local.ps1 + smoke OK, meson test 34/34; user real-GUI confirmation.
+
 ## 2026-10-19 CI guard break on main + local build gate (HARD rules)
 
 - Symptom: a manual workflow_dispatch run launched to test failed in ~40 s at the
@@ -47,9 +64,9 @@
   EBU HackDAC capture: 999/0 fields, bars within 0.3 deg, rows aligned top to bottom;
   user GUI confirmation ("dead stable", top shift gone).
 - HARD rules + mandatory verification procedure: `cvbs_decoder_realtime_sync_rules.md`.
-- Backlog recorded there: player-mode drag-and-drop; Windows move/resize freeze;
-  sync robustness on real media (fast-action 4:3 anime, Philips pattern); a separate
-  SECAM CVBS mode from the tbc-tools implementation.
+- Backlog recorded there: player-mode drag-and-drop (DONE 2026-10-20); Windows
+  move/resize freeze; sync robustness on real media (fast-action 4:3 anime,
+  Philips pattern); a separate SECAM CVBS mode from the tbc-tools implementation.
 
 Recent capture regressions showed that small callback-gating changes can silently break GUI feeds. Keep the following constraints in mind when touching capture/parser/audio paths:
 
