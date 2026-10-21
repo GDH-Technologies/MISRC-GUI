@@ -147,8 +147,17 @@ session log `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`.
    calibration + ident ladder, rails/concealment, one-line hold), a SECAM entry in
    the CVBS System dropdown (+ the persisted `video_system` setting + a one-slot
    panel view-state cache so view switches keep the decoders alive), the OSD SECAM
-   diag line, and physically-correct harness fixtures. OPEN follow-up: vertical
-   rolling on the same real capture while the H-PLL holds - needs the Stats OSD
-   VBI counters + a 20 s raw excerpt through the Verification procedure (same ask
-   as item 3); see `secam_fm_chroma_decoder.md` +
+   diag line, and physically-correct harness fixtures. The reported vertical
+   rolling was FIXED (2026-10-21, headless on the user's real baseband EBU
+   SECAM capture): three root causes, all measured - the harness --panel
+   mode never applied --secam (decoded in PAL), the VBI classifier's width
+   bands break on the AC-coupling baseline sag through the vertical
+   blanking (sag-inflated EQs crossing the 3.5 us EQ/H edge; the 3rd+ broads
+   suppressed below the per-line threshold - fixed with cadence-assisted
+   reclassification + the 2-broad handshake), and the system soxr's INT16
+   output dithers with a run-varying seed (fixed: FLOAT32 output +
+   deterministic conversion). VERIFIED: 364 accepted fields, calibration
+   within 206 Hz, bars matching the EBU reference angles; the PAL control
+   stays 499/499. Full record: `secam_fm_chroma_decoder.md` (the baseband
+   rolling section) +
    `prompt_logs/2026-10-20_secam-fm-chroma-port_README.md`.

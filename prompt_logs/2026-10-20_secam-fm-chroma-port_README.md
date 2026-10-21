@@ -155,6 +155,102 @@ improvements later")
   diagnosis remain OPEN (need the excerpt).
 - Committed + pushed; CI (push trigger) must be green before close.
 
+## Continuation round (2026-10-21): the rolling DIAGNOSED
+
+User: "continue work". Instead of waiting on the excerpt, the loaded
+playback source was recovered from the saved settings (video_system=2
+persisted - the persistence fix is live - with playback_file_a still the
+Diamler-Chrysler NTSC SP Tape_03 RF capture).
+
+- FFprobe: 20 kHz header (the GUI FLACs store MSPS as kHz - same convention
+  as the PAL EBU captures; -t is in 1/1000 s units), 16-bit mono.
+- 10 real-second excerpt (`-ss 60000 -t 10000`), headless panel-path diag:
+  - CONTROL `--ntsc`: locked=0 accepted=0 rejected=0 meas_rate=0.00.
+  - `--secam`: identical - no lock in either system mode.
+  - `cvbs_vbi_probe.py`: "no broad pulse found".
+  - Per-line probe (scratch, $env:TEMP\secam-diag\probe.py): ~0.4
+    zero-crossings/sample (a ~4 MHz FM carrier), near_lo=0.00 (no sync-tip
+    plateaus), 10% midline smear - RF-domain (VHS video RF).
+- DIAGNOSIS: the rolling was the RF-domain VHS capture fed to the baseband
+  CVBS decoder - wrong domain, not a SECAM (or sync) defect. RF tapes
+  belong in the VHS FM decoder mode. SECAM needs a BASEBAND capture.
+- Fixed en route: the harness LIVE header labelled `--secam` runs "PAL"
+  (now "SECAM"); meson 1.10->1.11 update needed
+  `meson setup --reconfigure misrc_tools build-local` (source dir is
+  misrc_tools, NOT the repo root).
+- LIVE profile note: the SECAM-stage budget line on this capture is
+  INVALID (the stage is gated on pll.locked, which never engaged) - the
+  budget measurement still needs a real baseband SECAM capture.
+- Validated after the label fix: harness asserts green, guards 43/43.
+- Uncommitted: the label fix + these doc updates (awaiting the user's
+  commit word).
+
+## Continuation round 2 (2026-10-21, later): the baseband rolling FIXED
+
+User pointed at the HackDAC V2.5 capture set
+(Desktop\\EBU_HackDac2_MISRC_V2.5): PAL controls + a fresh 10 s baseband
+SECAM EBU bars capture (40 msps 12-bit FLAC + a capture log).
+
+The SECAM capture initially reproduced the rolling headlessly (locked H,
+0 accepted). Root causes (ALL measured - the classifier diag + per-chunk
+resampler checksums, see the dev note):
+
+1. The harness --panel mode never applied --secam to the plugin decoder
+   (persisted default = PAL) - all earlier panel runs decoded PAL format.
+2. The VBI classifier's fixed width bands break on the AC-coupling
+   baseline sag through the vertical blanking (+19-26 IRE; the DC-clamped
+   threshold rides 9-16 IRE above the pulse midpoint): the sag-inflated
+   train EQs (3.4-3.7 us) crossed the 3.5 EQ/H edge (eq_run reset -
+   zero candidates) and the 3rd+ broads read shallow/never crossed (the
+   3-broad handshake failed). Fixed with two cadence-assisted
+   reclassification rules (spacing is threshold-invariant) + firing the
+   candidate on the 2nd broad (the anchor math uses the pre-EQ train,
+   unchanged).
+3. The system soxr's INT16 output dithers with a run-varying seed -
+   identical input produced different resampled streams run-to-run
+   (measured per-chunk checksums; the outcome flipped 0 vs 282 accepted
+   between identical runs). Fixed: FLOAT32 output (normalized +-1.0,
+   rescaled x32768) + deterministic lrintf conversion; the decode is now
+   bit-identical run to run.
+
+The fix path was measured step by step: the A/B classifier diag (PAL
+control vs SECAM), the nondeterminism hunt (two-run diffs, per-chunk
+checksums), the raw-signal probes (baseline sag), and the train
+handshake traces (eq_run/v_run per pulse).
+
+En route also: the meson 1.10->1.11 version bump required a reconfigure
+- a MANUAL `meson setup --reconfigure` loses build-local.ps1's
+PKG_CONFIG_PATH (the system raylib won over the vendored one; every
+raylib-linking target failed with __imp_glfw* undefined). Fixed by
+re-running `pwsh -File scripts\\build-local.ps1` (wipe + correct env).
+The from-scratch rebuild then hit the machine's memory pressure
+(page-file exhaustion at default parallelism; transient CreateProcess
+failures) - completed at `ninja -j1/-j2`.
+
+FINAL VERIFIED (the real captures):
+- SECAM: locked=1 accepted=364 rejected=5 (acquisition-period cadence;
+  steady ~97% after ~2 s); calibration fob=4249794 for=4406044 (within
+  206 Hz, 490/491 fields, porch source); ident conf 0.96; bars: red
+  103.4 deg (PAL EBU ref 103.3), yellow 163.4, magenta 62.2, cyan 284.2,
+  green 238.2, blue 350.0, coherence 0.83-1.00; budget 19.0 us/line,
+  0.51x real time (SECAM stage +~6 us/line over PAL).
+- PAL control: 499/499 accepted, yellow 167.1/red 103.3 deg coherence
+  1.00 - no regression.
+- Static guards 43/43; full rebuild + smoke 0; meson test 34/34;
+  synthetic suite unchanged.
+
+Uncommitted (awaiting the user's word): the classifier rules, the FLOAT32
+resampler, the harness --secam panel fix, and these doc updates. STILL
+OPEN: the user's real-GUI confirmation on this capture (bars in correct
+colours, no rolling after the acquisition, the OSD SECAM line stable).
+
+## Confirmation round (2026-10-21, evening) - user-verified stable
+
+User rebuilt, tested the capture in the GUI and confirmed: "This is now
+stable commit and push." Per the standing rules: restore-point zip +
+commit + push (CI on the push). Backlog item 4's remaining open item
+(the real-GUI confirmation) is CLOSED.
+
 ## Pending (resumable, per the standing rules)
 
 - OPEN: vertical rolling on the user's real SECAM capture while the H-PLL

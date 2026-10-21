@@ -1015,6 +1015,14 @@ static void run_live_diag(const char *path, bool pal, double rate,
         memset(&plugin, 0, sizeof(plugin));
         assert(video_cvbs_plugin_init(&plugin));
         decoder = &plugin.decoder;
+        // Apply the requested SYSTEM to the plugin decoder: the plugin is
+        // created in the persisted default (PAL unless the settings push
+        // otherwise - which the harness never does), so WITHOUT this the
+        // --secam flag only changed the print label and every panel-mode
+        // run decoded in PAL format (measured 2026-10-21: the LIVE secam
+        // diag line never printed; the "garbage" bars were PAL's burst
+        // demod locking onto the SECAM rest carrier ~4.25/4.406 MHz).
+        gui_cvbs_set_format(decoder, secam ? 2 : (pal ? 0 : 1));
         if (full) gui_cvbs_set_frame_view_mode(decoder, CVBS_FRAME_VIEW_FULL);
         decoder->colour_mode = CVBS_COLOUR_AUTO;
         fprintf(stderr, "[panel] feed start\n");
@@ -1044,7 +1052,7 @@ static void run_live_diag(const char *path, bool pal, double rate,
 
     printf("LIVE %s (%s @ %.1f MSPS%s%s): locked=%d accepted=%d rejected=%d "
            "(cad %d par %d) frames=%d lines=%d reason='%s'\n",
-           path, pal ? "PAL" : "NTSC", rate / 1e6,
+           path, secam ? "SECAM" : (pal ? "PAL" : "NTSC"), rate / 1e6,
            full ? ", full view" : "", panel ? ", panel path" : "",
            decoder->pll.locked ? 1 : 0, decoder->vsync.fields_accepted,
            decoder->vsync.fields_rejected, decoder->vsync.reject_cadence,
@@ -1144,6 +1152,7 @@ static void run_live_diag(const char *path, bool pal, double rate,
 #if LIBSOXR_ENABLED
         if (plugin.resample) soxr_delete(plugin.resample);
         free(plugin.resample_scratch);
+        free(plugin.resample_f32);
 #endif
         gui_cvbs_cleanup(&plugin.decoder);
     } else {

@@ -3968,9 +3968,51 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                 : 0.0;
             bool half_line_cadence = vs->last_pulse_pos != 0 &&
                 fabs(spacing - effective_period * 0.5) < effective_period * 0.12;
+            // CADENCE-ASSISTED TRAIN RECLASSIFICATION (measured on the
+            // real HackDAC captures, 2026-10-21, the classifier diag): the
+            // AC-coupling baseline sag through the vertical blanking
+            // (+19-26 IRE over the train lines) lifts the DC-clamped
+            // slicing threshold 9-16 IRE above the pulse midpoint, so
+            // measured widths inflate/shrink and the fixed WIDTH bands
+            // misclassify train members:
+            //  - the 2.35 us EQs read 3.4-3.7 us, crossing the 3.5 EQ/H
+            //    edge (PAL survived by margin; the deeper-sagged SECAM
+            //    reset eq_run on every train EQ and produced ZERO field
+            //    candidates = permanent rolling);
+            //  - the LATER broads of the 5-broad train read 0.8-0.9 us
+            //    (the recovering baseline lifts their floors above the
+            //    per-line threshold; the 3-broad handshake never
+            //    completes; the second train died exactly here on both
+            //    measured runs).
+            // The SPACING is threshold-invariant (every pulse start shifts
+            // by the same flank ascent), so the cadence recovers the true
+            // classification:
+            //  1. Inside a building BROAD run (last_kind == broad,
+            //     v_run >= 1) a 0.6-8 us pulse at half-line cadence is a
+            //     sag-shallow BROAD, not an EQ/H: continue the run so the
+            //     handshake completes.
+            //  2. Inside a building PRE-EQ run (eq_run >= 1) an H-band
+            //     (3.5-8 us) pulse at half-line cadence is a sag-inflated
+            //     EQ, not an H sync: continue the run.
+            // Real H syncs sit at FULL-line cadence and arrive with
+            // eq_run 0 outside trains, so both gates stay tight; the
+            // first train EQ (measured at the settled pre-train
+            // threshold, 2.3-2.9 us) stays width-classified, so
+            // first_eq_pos and the parity math are unchanged. Rule 1
+            // covers the post-broad EQ train too (last_kind stays broad
+            // there): those EQs count as broad-run continuations, which
+            // only increments the already-fired v_run (benign) and the
+            // next field's pre-EQ train starts fresh off the picture Hs.
+            if (pulse_us >= 0.6 && pulse_us < 8.0 &&
+                vs->last_kind == 3 && vs->v_run >= 1 && half_line_cadence) {
+                pulse_us = 27.0;   // reclassified: a sag-shallow broad
+            } else if (pulse_us >= 3.5 && pulse_us < 8.0 &&
+                       vs->eq_run >= 1 && half_line_cadence) {
+                pulse_us = 2.5;   // reclassified: a sag-inflated train EQ
+            }
             if (pulse_us >= 0.6 && pulse_us < 3.5) {
                 // Equalizing pulse: part of a vertical-blanking train. The
-                // FIRST EQ after a normal H pulse starts a candidate train,
+                // FIRST Eq after a normal H pulse starts a candidate train,
                 // but it is not trusted until the expected broad-pulse cadence
                 // appears - mirroring the verified RF decoder path.
                 if (vs->last_kind == 1 && half_line_cadence) {
@@ -3998,7 +4040,23 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
             } else if (pulse_us >= 19.0 && pulse_us <= 36.0) {
                 // Broad pulses confirm a real VBI train only after a valid
                 // pre-EQ cadence. Trigger the field-boundary logic on the
-                // third broad pulse, matching the RF path.
+                // SECOND broad pulse. The RF path fires on the third, but
+                // the RF domain has no baseline sag; on the real BASEBAND
+                // captures (measured, the classifier diag 2026-10-21) the
+                // AC-coupling sag through the vertical blanking suppresses
+                // the third and later broads ENTIRELY below the per-line
+                // DC-clamped threshold on the deepest-sagged fields (the
+                // next threshold crossing is a picture H six lines later,
+                // halfcad=0 - no reclassification can recover it), so a
+                // 3-broad handshake never completes on those fields and
+                // the picture rolls permanently. Two broads at half-line
+                // cadence after a >=3-EQ pre-train is still a signature
+                // nothing outside the VBI produces (H syncs sit at
+                // full-line cadence), and the anchor math is unchanged:
+                // first_eq_pos (set at the pre-EQ train's FIRST EQ) and the
+                // parity derivation use the pre-EQ train, not the broad
+                // count. Exact-match == 2 fires once per train; later
+                // broads (when they cross) only increment past it.
                 if (vs->eq_run >= 3 && half_line_cadence) {
                     if (vs->last_kind == 3) {
                         vs->v_run++;
@@ -4007,7 +4065,7 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                     } else {
                         vs->v_run = 0;
                     }
-                    if (vs->v_run == 3) {
+                    if (vs->v_run == 2) {
                         decoder->line_buffer_count = line_buffer_count;
                         decoder->global_sample_pos = global_sample_pos;
                         decoder->last_filtered_above = is_above;
@@ -4881,6 +4939,14 @@ typedef struct {
     bool resample_failed;
     int16_t *resample_scratch;
     size_t resample_scratch_cap;
+    // FLOAT staging for the resampler output: soxr's INT16 output path
+    // is NONDETERMINISTIC (its dither differs run to run on identical
+    // input - measured on the MSYS2 build 2026-10-21, per-chunk checksums:
+    // the decode outcome flipped 0 vs 282 accepted fields between runs),
+    // so the resampler outputs FLOAT32 and the int16 conversion happens
+    // here, deterministically (cvbs_plugin_resample_block).
+    float *resample_f32;
+    size_t resample_f32_cap;
 } video_cvbs_plugin_t;
 
 typedef struct {
@@ -5344,6 +5410,9 @@ static void cvbs_vtable_destroy(void *state) {
     free(panel->cvbs.resample_scratch);
     panel->cvbs.resample_scratch = NULL;
     panel->cvbs.resample_scratch_cap = 0;
+    free(panel->cvbs.resample_f32);
+    panel->cvbs.resample_f32 = NULL;
+    panel->cvbs.resample_f32_cap = 0;
 #endif
     gui_cvbs_cleanup(&panel->cvbs.decoder);
     gui_cvbs_cleanup(&panel->tape_decode.decoder);
@@ -5395,10 +5464,12 @@ static bool cvbs_plugin_resampler_ensure(video_cvbs_plugin_t *plugin,
     plugin->resample_failed = false;
     plugin->resample_in_rate = in_rate;
     plugin->resample_out_rate = out_rate;
-    // int16 in/out keeps the panel path allocation-free; linear phase (50)
+    // int16 input keeps the panel path allocation-free; FLOAT32 output
+    // (converted to int16 deterministically in resample_block - soxr's
+    // INT16 output dithers with a run-varying seed); linear phase (50)
     // preserves the sync edges; passband 95% of the output Nyquist retains
     // the subcarrier (4.43/3.58 MHz) plus luma detail (up to ~8.5 MHz).
-    soxr_io_spec_t io = soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I);
+    soxr_io_spec_t io = soxr_io_spec(SOXR_INT16_I, SOXR_FLOAT32_I);
     soxr_quality_spec_t quality = soxr_quality_spec(SOXR_HQ, 0);
     quality.passband_end = 0.95;
     quality.stopband_begin = 1.0;
@@ -5415,14 +5486,25 @@ static bool cvbs_plugin_resampler_ensure(video_cvbs_plugin_t *plugin,
 }
 
 static bool cvbs_plugin_resample_grow(video_cvbs_plugin_t *plugin, size_t need) {
-    if (plugin->resample_scratch_cap >= need) return true;
+    if (plugin->resample_scratch_cap >= need &&
+        plugin->resample_f32_cap >= need) return true;
     size_t cap = plugin->resample_scratch_cap ? plugin->resample_scratch_cap : 4096;
     while (cap < need) cap *= 2;
     int16_t *grown = (int16_t *)realloc(plugin->resample_scratch,
                                         cap * sizeof(int16_t));
-    if (!grown) return false;
+    float *grown_f = (float *)realloc(plugin->resample_f32,
+                                      cap * sizeof(float));
+    if (!grown || !grown_f) {
+        // realloc leaves the original block (and the plugin pointer)
+        // intact on failure; free only what this call allocated.
+        free(grown);
+        free(grown_f);
+        return false;
+    }
     plugin->resample_scratch = grown;
     plugin->resample_scratch_cap = cap;
+    plugin->resample_f32 = grown_f;
+    plugin->resample_f32_cap = cap;
     return true;
 }
 
@@ -5435,14 +5517,28 @@ static bool cvbs_plugin_resample_block(video_cvbs_plugin_t *plugin,
         size_t in_done = 0, out_done = 0;
         soxr_error_t error = soxr_process(plugin->resample,
             (void *)(input + consumed), input_count - consumed, &in_done,
-            plugin->resample_scratch + produced,
-            plugin->resample_scratch_cap - produced, &out_done);
+            plugin->resample_f32 + produced,
+            plugin->resample_f32_cap - produced, &out_done);
         if (error || (!in_done && !out_done)) {
             plugin->resample_failed = true;
             return false;
         }
         consumed += in_done;
         produced += out_done;
+    }
+    // Deterministic float -> int16: soxr's INT16 output path dithers with
+    // a run-varying seed (measured 2026-10-21), which flipped VBI pulse
+    // classifications between runs on identical input. soxr's FLOAT32
+    // domain is NORMALIZED +-1.0 (measured: chunk absum 0.16/sample vs
+    // 8012 on the int16 path - the first FLOAT32 build rounded the whole
+    // stream to 0/+-1 and the decoder saw a dead signal), so the
+    // conversion rescales by 32768. lrintf (default round-to-nearest-even)
+    // + a range clamp is deterministic.
+    for (size_t k = 0; k < produced; k++) {
+        long v = lrintf(plugin->resample_f32[k] * 32768.0f);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        plugin->resample_scratch[k] = (int16_t)v;
     }
     *out_count = produced;
     return true;

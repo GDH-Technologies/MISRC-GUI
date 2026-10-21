@@ -89,15 +89,80 @@ verbatim + the dropdown/OSD wiring + system_options_rect[3]); build-local
 colour decodes on a real SECAM capture; System dropdown + width + view
 switching + persistence confirmed through two feedback rounds.
 
-## OPEN (do not close without data)
+## The baseband rolling (2026-10-21 continuation) - FIXED, root-caused
 
-Vertical rolling on the user's real SECAM capture while the H-PLL holds
-(colour keeps decoding). The sync machinery is untouched by this work and
-the synthetic locks 7/7 fields, so this is capture-specific. Needs: the
-Stats OSD `VBI rej (cad/par)` + reason line while rolling, and a 20 s raw
-excerpt (`ffmpeg.exe -t 20 -i <capture.flac> -f s16le -acodec pcm_s16le
-secam_excerpt.raw`) through `gui_cvbs_test.exe --secam --s16 --rate=<MHz>
-[--panel]` - the same ask as backlog item 3.
+The user's real baseband SECAM capture (HackDAC V2.5, EBU bars) initially
+reproduced the rolling headlessly (locked H, 0 accepted fields). Root
+causes, ALL measured (the classifier diag + per-chunk resampler checksums):
+
+1. HARNESS: `--panel` mode never applied `--secam` to the plugin decoder
+   (created in the persisted default = PAL) - every earlier panel run was
+   PAL-format (the LIVE secam diag line never printed). Fixed: the panel
+   branch now calls gui_cvbs_set_format from the flags.
+2. VBI CLASSIFIER: the AC-coupling baseline sag through the vertical
+   blanking (+19-26 IRE over the train lines, same on PAL/SECAM) lifts
+   the DC-clamped slicing threshold 9-16 IRE above the pulse midpoint:
+   - the 2.35 us train EQs read 3.4-3.7 us, crossing the 3.5 EQ/H band
+     edge - eq_run reset on EVERY train EQ - zero field candidates;
+   - the 3rd+ broads of the 5-broad train read 0.8-0.9 us (shallow) or
+     never cross at all (the recovering baseline lifts their floors above
+     the per-line threshold; the next crossing is a picture H six lines
+     later) - the 3-broad handshake never completed on those fields.
+   The SPACING is threshold-invariant, so two cadence-assisted
+   reclassification rules recover the true classification (sag-inflated
+   EQ; sag-shallow broad), and the handshake fires on the SECOND broad
+   (the anchor math - first_eq_pos + parity - uses the pre-EQ train, so
+   firing one broad earlier changes nothing). See the code comments at
+   the classifier.
+3. RESAMPLER NONDETERMINISM: the system soxr's INT16 output path dithers
+   with a run-varying seed - identical input produced different output
+   runs (per-chunk checksums), and the outcome flipped 0 vs 282 accepted
+   fields between identical runs. Fixed: the panel resampler outputs
+   FLOAT32 (normalized +-1.0 - rescale x32768) and the int16 conversion
+   is deterministic lrintf; the decode is now bit-identical run to run.
+
+The PAL capture survives the same sag by margin (its trains completed
+499/499 before and after - the rules only tighten the gates).
+
+## Verification record (2026-10-21, the real baseband capture)
+
+- SECAM (EBU bars, HackDAC V2.5, 40 msps 12-bit, 10 s): locked=1,
+  accepted=364 rejected=5 (cadence, acquisition period), steady ~97%
+  after ~2 s; calibration fob/for within 206 Hz of nominal (490/491
+  fields, porch source), ident conf 0.96; bars: red 103.4 deg (PAL EBU
+  ref 103.3), yellow 163.4, magenta 62.2, cyan 284.2, green 238.2,
+  blue 350.0, coherence 0.83-1.00, black-bar chroma ~0.
+- PAL control (same device): 499/499 accepted, yellow 167.1 deg / red
+  103.3 deg coherence 1.00 - unchanged.
+- Budget (SECAM stage ENGAGED): 19.0 us/line, 0.51x real time total
+  (PAL reference 13 us/0.40x - the SECAM stage adds ~6 us/line ≈ 1.9
+  ms/field, under the 4 ms/field plan line; the total is marginally
+  above the 0.5x target - record, optimize if it matters).
+- Determinism: identical per-chunk checksums + identical end-to-end
+  results across runs.
+- Static guards 43/43; full rebuild (see below) + smoke 0; meson test
+  34/34; the synthetic suite unchanged.
+
+## OPEN (resumable)
+
+- Real-GUI confirmation on this capture (the user plays it in the GUI:
+  bars in correct colours, the OSD SECAM line's calibration stable, no
+  rolling after the ~2 s acquisition).
+- The early-acquisition period (~2 s, only 8 candidates by frame 125)
+  and the 5 cadence rejects are acceptable but could be tightened later.
+
+## NOTE: the meson 1.10->1.11 reconfigure trap (2026-10-21)
+
+A manual `meson setup --reconfigure` after a meson version bump LOSES
+the environment `scripts/build-local.ps1` sets (PKG_CONFIG_PATH with
+.deps/install first) - `dependency('raylib')` then resolves to the SYSTEM
+MSYS2 raylib (built against the glfw DLL) and every raylib-linking target
+fails with `__imp_glfw*` undefined under -static. ALWAYS re-run
+`pwsh -File scripts\build-local.ps1` after a meson version change (it
+wipes and regenerates with the correct environment). Also: the machine
+was under memory pressure during the from-scratch rebuild (page-file
+exhaustion at default parallelism; transient CreateProcess failures) -
+`ninja -j1/-j2` completes fine.
 
 ## HARD rules
 
