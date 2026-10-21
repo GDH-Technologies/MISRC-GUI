@@ -29,6 +29,9 @@ static void rf_mutex_unlock(rf_mutex_t *m) { pthread_mutex_unlock(m); }
 #define RF_QUEUE_SLOTS 256u
 #define RF_BLOCK_SAMPLES 65536u
 #define RF_QUEUE_MAX_US 200000u
+#define RF_AUDIO_QUEUE_SLOTS 32u
+#define RF_AUDIO_BLOCK_SAMPLES 32768u
+#define RF_AUDIO_MAX_US 100000u
 /* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
  * 2x 40 MSPS dual-channel captures use two per-channel workers (each on the
  * 40 MSPS exact path); single-stream captures up to 200 MSPS are accepted. */
@@ -43,11 +46,29 @@ typedef struct {
     uint64_t duration_end_us;
     uint64_t control;
     uint64_t pause_control;
+    uint64_t audio_source_generation;
     int16_t samples[RF_BLOCK_SAMPLES];
 } rf_input_slot_t;
 
+typedef struct {
+    float samples[RF_AUDIO_BLOCK_SAMPLES];
+    size_t count;
+    uint64_t first_sample, generation, enqueue_us;
+} rf_audio_slot_t;
+
 struct gui_rf_preview_worker {
-    thrd_t thread;
+    thrd_t thread, audio_thread;
+    atomic_bool audio_ready, audio_enabled, audio_active, audio_budget_waiting, audio_callback_installed;
+    atomic_uint_fast64_t audio_generation, applied_audio_generation, audio_source_generation;
+    bool producer_audio_seen;
+    uint64_t producer_audio_epoch,producer_audio_next;
+    uint32_t producer_audio_rate;
+    atomic_uint_fast64_t audio_read, audio_write, audio_dropped;
+    rf_audio_slot_t *audio_queue;
+    uint64_t audio_processing_generation;
+    uint64_t audio_last_cpu_us, audio_last_completion_us;
+    bool audio_have_cpu_baseline;
+    uint64_t video_work_wall_us,video_accounted_cpu_us,audio_work_wall_us,audio_accounted_cpu_us;
     rf_mutex_t frame_mutex;
     atomic_bool stop;
     atomic_bool flush_requested;
@@ -62,16 +83,21 @@ struct gui_rf_preview_worker {
     atomic_uint_fast64_t applied_pause_control;
     atomic_bool budget_waiting;
     atomic_uint_fast64_t control;
-    atomic_int requested_format;
+    atomic_int requested_profile;
+    atomic_bool requested_full_frame;
+    bool applied_full_frame;
     uint64_t producer_duration_us;
     rf_input_slot_t *queue;
 
     gui_rf_decoder_t *decoder;
+    gui_beta_hifi_decoder_t *hifi;
+    gui_rf_preview_audio_callback_t audio_callback;
+    void *audio_context;
     gui_rf_resampler_t *resampler;
     float *output;
     size_t output_capacity;
-    gui_rf_format_t format;
-    uint64_t applied_control;
+    gui_rf_profile_t profile;
+    atomic_uint_fast64_t applied_control;
     uint64_t source_epoch;
     uint64_t expected_source_sample;
     uint32_t source_rate;
@@ -98,19 +124,20 @@ struct gui_rf_preview_worker {
     gui_rf_preview_stats_t stats;
 #ifdef _WIN32
     uint64_t timer_frequency;
-    HANDLE input_event;
+    HANDLE input_event, audio_event;
     HANDLE done_event;
 #endif
 };
 
 static atomic_flag rf_budget_lock = ATOMIC_FLAG_INIT;
 static gui_rf_preview_policy_t rf_budget = {
-    .cores_millionths = 1000000u,
+    .cores_millionths=1000000u,
 #ifdef _WIN32
-    /* GetThreadTimes may book CPU in ~15.6ms jumps. Keep at most one such
-     * quantum of already elapsed processing credit instead of charging that
-     * whole jump again from the newest block's wall start. */
-    .accounting_slack_cpu_us = 15625u,
+    /* GetThreadTimes can report many zero completions followed by 15.625ms
+     * already-spent CPU. Preserve at most one such quantum per live counter;
+     * the policy bounds the registry and cannot accumulate idle credit beyond
+     * that allowance plus the small normal token capacity. */
+    .accounting_quantum_cpu_us=15625u,
 #endif
 };
 
@@ -125,9 +152,27 @@ static void rf_budget_lock_blocking(void) {
 static void rf_budget_wake_waiters(void) {
 #ifdef _WIN32
     for (unsigned int i = 0; i < rf_budget.waiter_count; i++) {
-        gui_rf_preview_worker_t *waiting = (gui_rf_preview_worker_t *)rf_budget.waiters[i];
-        SetEvent(waiting->input_event);
+        uintptr_t owner=rf_budget.waiters[i];
+        gui_rf_preview_worker_t *waiting = (gui_rf_preview_worker_t *)(owner & ~(uintptr_t)1);
+        SetEvent((owner & 1u) ? waiting->audio_event : waiting->input_event);
     }
+#endif
+}
+
+/* Successful acquisition removes the old FIFO head. A successor can already
+ * have consumed its previous notification before that removal, so notify the
+ * new head while its owner is still protected by the policy lock. Only one
+ * request can become eligible at this step; leave it asleep when all permits
+ * or the current reservation credit have been consumed. */
+static void rf_budget_wake_head(void) {
+#ifdef _WIN32
+    if (!rf_budget.waiter_count || rf_budget.active_count >= GUI_RF_POLICY_MAX_ACTIVE) return;
+    if (rf_budget.cores_millionths &&
+        (rf_budget.active_count * 1000000u >= rf_budget.cores_millionths ||
+         rf_budget.credit_cpu_us < (int64_t)GUI_RF_POLICY_RESERVE_CPU_US)) return;
+    uintptr_t owner = rf_budget.waiters[0];
+    gui_rf_preview_worker_t *waiting = (gui_rf_preview_worker_t *)(owner & ~(uintptr_t)1);
+    SetEvent((owner & 1u) ? waiting->audio_event : waiting->input_event);
 #endif
 }
 
@@ -137,6 +182,39 @@ bool gui_rf_preview_worker_set_budget(double cores) {
     if (accepted) rf_budget_wake_waiters();
     atomic_flag_clear_explicit(&rf_budget_lock, memory_order_release);
     return accepted;
+}
+
+static bool rf_thread_cpu_us(uint64_t *cpu_us);
+static uint64_t rf_now_us(const gui_rf_preview_worker_t *w);
+
+static void rf_register_counter(gui_rf_preview_worker_t *w,bool audio) {
+    rf_budget_lock_blocking();
+    (void)gui_rf_preview_policy_register_counter(&rf_budget,(uintptr_t)w|(audio ? 1u : 0u));
+    atomic_flag_clear_explicit(&rf_budget_lock,memory_order_release);
+}
+static void rf_unregister_counter(gui_rf_preview_worker_t *w,bool audio) {
+    uint64_t now=rf_now_us(w),end_cpu=0;
+    uint64_t completed=audio ? w->audio_last_completion_us : w->last_budget_completion_us;
+    uint64_t previous=audio ? w->audio_last_cpu_us : w->last_cpu_us;
+    bool baseline=audio ? w->audio_have_cpu_baseline : w->have_cpu_baseline;
+    /* First pay any newly visible final quantum. As at ordinary acquisition,
+     * a genuinely quiet interval must not turn idle polling into fresh debt. */
+    uint64_t measured=baseline && now-completed<RF_QUEUE_MAX_US &&
+        rf_thread_cpu_us(&end_cpu) && end_cpu>=previous ? end_cpu-previous : 0;
+    if(audio) w->audio_accounted_cpu_us+=measured;else w->video_accounted_cpu_us+=measured;
+    rf_budget_lock_blocking();
+    uintptr_t owner=(uintptr_t)w|(audio ? 1u : 0u);
+    gui_rf_preview_policy_cancel(&rf_budget,owner);
+    uint64_t work=audio ? w->audio_work_wall_us : w->video_work_wall_us;
+    uint64_t accounted=audio ? w->audio_accounted_cpu_us : w->video_accounted_cpu_us;
+    /* A live coarse counter uses only measured deltas. At retirement its
+     * final sub-quantum work may never be posted; cover at most one quantum
+     * and no more than the processing wall not already CPU-accounted. Never
+     * report this conservative closing estimate as measured CPU in stats. */
+    uint64_t residual=work>accounted ? work-accounted : 0;
+    gui_rf_preview_policy_retire_counter(&rf_budget,owner,measured,residual);
+    rf_budget_wake_waiters();
+    atomic_flag_clear_explicit(&rf_budget_lock,memory_order_release);
 }
 
 static bool rf_lower_thread_priority(void) {
@@ -206,6 +284,9 @@ static uint64_t rf_scale_sample(uint64_t sample, uint32_t rate) {
 /* frame_mutex held. Sampling a real interval also reports zero after a quiet
  * interval; reset/pause never erases cumulative counters or its baseline. */
 static void rf_refresh_interval(gui_rf_preview_worker_t *w, uint64_t now) {
+    /* Another consumer/UI snapshot can advance the interval while this
+     * thread waits for frame_mutex. Never rewind or underflow that window. */
+    if(now<=w->interval_start_us) return;
     uint64_t elapsed = now - w->interval_start_us;
     if (elapsed < 1000000u) return;
     w->stats.fps = (double)(w->stats.total_frames - w->interval_frames) * 1000000.0 / elapsed;
@@ -256,12 +337,28 @@ static void rf_clear_frame(gui_rf_preview_worker_t *w, const char *reason, bool 
     w->work_since_frame_us = 0;
 }
 
+static void rf_audio_invalidate(gui_rf_preview_worker_t *w) {
+    atomic_fetch_add_explicit(&w->audio_generation,1,memory_order_acq_rel);
+#ifdef _WIN32
+    SetEvent(w->audio_event);
+#endif
+}
+
+/* Producer/control epochs exclude previously queued RF as well as PCM.
+ * Internal DSP resets leave this input identity intact, so an initial file
+ * batch is not accidentally discarded by its first stream-boundary reset. */
+static void rf_audio_cut_input(gui_rf_preview_worker_t *w) {
+    atomic_fetch_add_explicit(&w->audio_source_generation,1,memory_order_acq_rel);
+    rf_audio_invalidate(w);
+}
+
 static void rf_reset_decoder_preserve(gui_rf_preview_worker_t *w, const char *reason,
                                       bool preserve_frame) {
     gui_rf_decode_status_t status;
     gui_rf_decoder_get_status(w->decoder, &status);
     rf_accumulate_status(w, &status);
-    gui_rf_decoder_reset(w->decoder, w->format);
+    gui_rf_decoder_reset_profile(w->decoder, w->profile);
+    rf_audio_invalidate(w);
     memset(&w->last_status, 0, sizeof(w->last_status));
     if (w->resampler) gui_rf_resampler_reset(w->resampler);
     w->stream_valid = false;
@@ -400,6 +497,7 @@ static bool rf_acquire_budget(gui_rf_preview_worker_t *w, uint64_t control,
         uint64_t wait_us = 1000;
         if (!atomic_flag_test_and_set_explicit(&rf_budget_lock, memory_order_acquire)) {
             acquired = gui_rf_preview_policy_acquire(&rf_budget, (uintptr_t)w, rf_now_us(w), &wait_us);
+            if (acquired) rf_budget_wake_head();
             atomic_flag_clear_explicit(&rf_budget_lock, memory_order_release);
         }
         if (acquired) break;
@@ -414,9 +512,11 @@ static bool rf_acquire_budget(gui_rf_preview_worker_t *w, uint64_t control,
         atomic_flag_clear_explicit(&rf_budget_lock, memory_order_release);
     }
     atomic_store_explicit(&w->budget_waiting, false, memory_order_release);
-    rf_mutex_lock(&w->frame_mutex);
-    if (waited) w->stats.budget_wait_ms += (double)(rf_now_us(w) - begin) / 1000.0;
-    rf_mutex_unlock(&w->frame_mutex);
+    if (waited) {
+        rf_mutex_lock(&w->frame_mutex);
+        w->stats.budget_wait_ms += (double)(rf_now_us(w) - begin) / 1000.0;
+        rf_mutex_unlock(&w->frame_mutex);
+    }
     return acquired;
 }
 
@@ -432,8 +532,9 @@ static void rf_finish_budget(gui_rf_preview_worker_t *w, uint64_t begin_wall) {
     uint64_t cpu = actual_cpu ? end_cpu - w->last_cpu_us : wall;
     w->have_cpu_baseline = read_cpu;
     if (read_cpu) w->last_cpu_us = end_cpu;
+    w->video_work_wall_us+=wall;w->video_accounted_cpu_us+=cpu;
     rf_budget_lock_blocking();
-    gui_rf_preview_policy_finish(&rf_budget, cpu);
+    gui_rf_preview_policy_finish(&rf_budget,(uintptr_t)w,rf_now_us(w),cpu);
     /* A fast block can finish long before the next source block arrives.
      * Wake FIFO contenders immediately, preserving the shared debt deadline;
      * do not leave an idle permit waiting for a coarse Windows timeout. */
@@ -448,20 +549,189 @@ static void rf_finish_budget(gui_rf_preview_worker_t *w, uint64_t begin_wall) {
     w->last_budget_completion_us = rf_now_us(w);
 }
 
+static bool rf_audio_current(gui_rf_preview_worker_t *w,uint64_t generation) {
+    return !atomic_load_explicit(&w->stop,memory_order_acquire) &&
+        atomic_load_explicit(&w->audio_enabled,memory_order_acquire) &&
+        gui_rf_profile_has_hifi((gui_rf_profile_t)atomic_load_explicit(&w->requested_profile,memory_order_acquire)) &&
+        !(atomic_load_explicit(&w->pause_control,memory_order_acquire)&1u) &&
+        generation==atomic_load_explicit(&w->audio_generation,memory_order_acquire);
+}
+static void rf_audio_callback(void *context,const float *stereo,size_t frames,
+                              uint64_t end_sample,const gui_beta_hifi_status_t *status) {
+    gui_rf_preview_worker_t *w=context;
+    if(!rf_audio_current(w,w->audio_processing_generation)) return;
+    rf_mutex_lock(&w->frame_mutex);w->stats.hifi=*status;rf_mutex_unlock(&w->frame_mutex);
+    if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) &&
+       w->audio_callback && rf_audio_current(w,w->audio_processing_generation))
+        w->audio_callback(w->audio_context,stereo,frames,end_sample);
+}
+static void rf_audio_wait(gui_rf_preview_worker_t *w,uint64_t wait_us) {
+#ifdef _WIN32
+    DWORD ms=(DWORD)((wait_us+999u)/1000u);if(ms>10) ms=10;if(!ms) ms=1;
+    WaitForSingleObject(w->audio_event,ms);
+#else
+    (void)w;(void)wait_us;thrd_sleep_ms(1);
+#endif
+}
+static bool rf_audio_acquire_budget(gui_rf_preview_worker_t *w,uint64_t generation) {
+    const uintptr_t owner=(uintptr_t)w|1u;
+    uint64_t begin=rf_now_us(w);
+    if(begin-w->audio_last_completion_us>=RF_QUEUE_MAX_US)
+        w->audio_have_cpu_baseline=rf_thread_cpu_us(&w->audio_last_cpu_us);
+    bool acquired=false,waited=false;
+    while(rf_audio_current(w,generation)) {
+        uint64_t wait=1000;
+        if(!atomic_flag_test_and_set_explicit(&rf_budget_lock,memory_order_acquire)) {
+            acquired=gui_rf_preview_policy_acquire(&rf_budget,owner,rf_now_us(w),&wait);
+            if(acquired) rf_budget_wake_head();
+            atomic_flag_clear_explicit(&rf_budget_lock,memory_order_release);
+        }
+        if(acquired) break;
+        waited=true;atomic_store(&w->audio_budget_waiting,true);rf_audio_wait(w,wait);
+    }
+    if(!acquired) {
+        rf_budget_lock_blocking();gui_rf_preview_policy_cancel(&rf_budget,owner);
+        rf_budget_wake_waiters();atomic_flag_clear_explicit(&rf_budget_lock,memory_order_release);
+    }
+    atomic_store(&w->audio_budget_waiting,false);
+    if(waited) {
+        rf_mutex_lock(&w->frame_mutex);
+        w->stats.budget_wait_ms+=(double)(rf_now_us(w)-begin)/1000.0;
+        rf_mutex_unlock(&w->frame_mutex);
+    }
+    return acquired;
+}
+static void rf_audio_finish_budget(gui_rf_preview_worker_t *w,uint64_t begin) {
+    uint64_t now=rf_now_us(w),wall=now-begin,end_cpu=0;
+    bool read=rf_thread_cpu_us(&end_cpu);
+    bool measured=w->audio_have_cpu_baseline && read && end_cpu>=w->audio_last_cpu_us;
+    uint64_t cpu=measured ? end_cpu-w->audio_last_cpu_us : wall;
+    w->audio_have_cpu_baseline=read;if(read) w->audio_last_cpu_us=end_cpu;
+    w->audio_work_wall_us+=wall;w->audio_accounted_cpu_us+=cpu;
+    rf_budget_lock_blocking();
+    gui_rf_preview_policy_finish(&rf_budget,(uintptr_t)w|1u,now,cpu);
+    rf_budget_wake_waiters();atomic_flag_clear_explicit(&rf_budget_lock,memory_order_release);
+    rf_mutex_lock(&w->frame_mutex);
+    w->stats.audio_cpu_ms+=(double)cpu/1000.0;w->stats.audio_wall_ms+=(double)wall/1000.0;
+    w->stats.processing_cpu_ms+=(double)cpu/1000.0;
+    w->stats.processing_wall_ms+=(double)wall/1000.0;
+    w->stats.cpu_time_is_wall|=!measured;rf_refresh_interval(w,now);
+    rf_mutex_unlock(&w->frame_mutex);w->audio_last_completion_us=now;
+}
+static int rf_audio_thread(void *context) {
+    gui_rf_preview_worker_t *w=context;
+    rf_register_counter(w,true);
+    (void)rf_lower_thread_priority();
+    w->audio_have_cpu_baseline=rf_thread_cpu_us(&w->audio_last_cpu_us);
+    w->audio_last_completion_us=rf_now_us(w);
+    bool needs_reset=false;
+    while(!atomic_load_explicit(&w->stop,memory_order_acquire)) {
+        uint64_t generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
+        if(generation!=atomic_load_explicit(&w->applied_audio_generation,memory_order_relaxed)) {
+            atomic_store(&w->audio_active,true);
+            /* Flush is cheap and prompt even while muted/paused. Rebuilding
+             * DSP state is deferred into the next budgeted active block. */
+            needs_reset=true;
+            if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) && w->audio_callback)
+                w->audio_callback(w->audio_context,NULL,0,0);
+            rf_mutex_lock(&w->frame_mutex);memset(&w->stats.hifi,0,sizeof(w->stats.hifi));rf_mutex_unlock(&w->frame_mutex);
+            atomic_store_explicit(&w->applied_audio_generation,generation,memory_order_release);
+            atomic_store(&w->audio_active,false);
+#ifdef _WIN32
+            SetEvent(w->done_event);
+#endif
+        }
+        uint64_t read=atomic_load_explicit(&w->audio_read,memory_order_relaxed);
+        uint64_t write=atomic_load_explicit(&w->audio_write,memory_order_acquire);
+        if(read==write) {rf_audio_wait(w,10000);continue;}
+        rf_audio_slot_t *slot=&w->audio_queue[read%RF_AUDIO_QUEUE_SLOTS];
+        if(slot->generation!=generation || !rf_audio_current(w,generation)) goto audio_release;
+        if(rf_now_us(w)-slot->enqueue_us>RF_AUDIO_MAX_US) {
+            atomic_fetch_add(&w->audio_dropped,1);rf_audio_invalidate(w);goto audio_release;
+        }
+        if(!rf_audio_acquire_budget(w,generation)) continue;
+        uint64_t begin=rf_now_us(w);
+#ifndef _WIN32
+        /* Capture/record startup can renice existing Linux threads. Reassert
+         * this consumer's background request as the video worker does. */
+        (void)rf_lower_thread_priority();
+#endif
+        atomic_store_explicit(&w->audio_active,true,memory_order_release);
+        if(rf_audio_current(w,generation) && rf_now_us(w)-slot->enqueue_us<=RF_AUDIO_MAX_US) {
+            w->audio_processing_generation=generation;
+            if(needs_reset) {gui_beta_hifi_reset(w->hifi);needs_reset=false;}
+            gui_beta_hifi_process(w->hifi,slot->samples,slot->count,slot->first_sample,rf_audio_callback,w);
+        }
+        rf_audio_finish_budget(w,begin);
+        atomic_store_explicit(&w->audio_active,false,memory_order_release);
+audio_release:
+        atomic_store_explicit(&w->audio_read,read+1,memory_order_release);
+#ifdef _WIN32
+        SetEvent(w->done_event);
+#endif
+    }
+    rf_unregister_counter(w,true);
+    return 0;
+}
+static bool rf_audio_start(gui_rf_preview_worker_t *w) {
+    if(atomic_load_explicit(&w->audio_ready,memory_order_acquire)) return true;
+    w->audio_queue=calloc(RF_AUDIO_QUEUE_SLOTS,sizeof(*w->audio_queue));
+    w->hifi=gui_beta_hifi_create();
+    if(!w->audio_queue || !w->hifi) goto fail;
+    if(thrd_create_with_priority(&w->audio_thread,rf_audio_thread,w,THRD_PRIORITY_NORMAL)!=thrd_success) goto fail;
+    atomic_store_explicit(&w->audio_ready,true,memory_order_release);return true;
+fail:
+    free(w->audio_queue);w->audio_queue=NULL;gui_beta_hifi_destroy(w->hifi);w->hifi=NULL;return false;
+}
+static void rf_audio_enqueue(gui_rf_preview_worker_t *w,const float *samples,size_t count,uint64_t first,
+                             uint64_t generation,uint64_t source_generation,
+                             uint64_t control,uint64_t pause_control) {
+    if(!atomic_load_explicit(&w->audio_ready,memory_order_acquire) ||
+       !atomic_load_explicit(&w->audio_enabled,memory_order_acquire)) return;
+    if(!rf_audio_current(w,generation) ||
+       source_generation!=atomic_load_explicit(&w->audio_source_generation,memory_order_acquire) ||
+       atomic_load_explicit(&w->control,memory_order_acquire)!=control ||
+       atomic_load_explicit(&w->pause_control,memory_order_acquire)!=pause_control) return;
+    uint64_t write=atomic_load_explicit(&w->audio_write,memory_order_relaxed);
+    uint64_t read=atomic_load_explicit(&w->audio_read,memory_order_acquire);
+    size_t blocks=(count+RF_AUDIO_BLOCK_SAMPLES-1)/RF_AUDIO_BLOCK_SAMPLES;
+    if(blocks>RF_AUDIO_QUEUE_SLOTS-(write-read)) {
+        atomic_fetch_add(&w->audio_dropped,blocks);rf_audio_invalidate(w);return;
+    }
+    uint64_t now=rf_now_us(w);
+    while(count) {
+        size_t n=count<RF_AUDIO_BLOCK_SAMPLES ? count : RF_AUDIO_BLOCK_SAMPLES;
+        rf_audio_slot_t *slot=&w->audio_queue[write%RF_AUDIO_QUEUE_SLOTS];
+        slot->count=n;slot->first_sample=first;slot->generation=generation;slot->enqueue_us=now;
+        memcpy(slot->samples,samples,n*sizeof(*samples));write++;samples+=n;count-=n;first+=n;
+    }
+    atomic_store_explicit(&w->audio_write,write,memory_order_release);
+#ifdef _WIN32
+    SetEvent(w->audio_event);
+#endif
+}
+
 static int rf_worker_thread(void *context) {
     gui_rf_preview_worker_t *w = context;
+    rf_register_counter(w,false);
     rf_mutex_lock(&w->frame_mutex);
     w->stats.priority_lowered = rf_lower_thread_priority();
     rf_mutex_unlock(&w->frame_mutex);
     w->have_cpu_baseline = rf_thread_cpu_us(&w->last_cpu_us);
     w->last_budget_completion_us = rf_now_us(w);
     while (!atomic_load_explicit(&w->stop, memory_order_acquire)) {
+        bool full_frame = atomic_load_explicit(&w->requested_full_frame, memory_order_acquire);
+        if (full_frame != w->applied_full_frame) {
+            gui_rf_decoder_set_frame_mode(w->decoder, full_frame);
+            w->applied_full_frame = full_frame;
+        }
         uint64_t control = atomic_load_explicit(&w->control, memory_order_acquire);
         if (control != w->applied_control) {
-            w->format = (gui_rf_format_t)atomic_load_explicit(&w->requested_format, memory_order_relaxed);
-            w->applied_control = control;
-            /* A configuration request is also a new stream epoch. */
+            w->profile = (gui_rf_profile_t)atomic_load_explicit(&w->requested_profile, memory_order_relaxed);
+            if (gui_rf_profile_has_hifi(w->profile)) (void)rf_audio_start(w);
+            /* Publish completion only after reset and audio invalidation. */
             rf_reset_decoder(w, "RF preview reset; acquiring");
+            atomic_store_explicit(&w->applied_control,control,memory_order_release);
         }
         uint64_t pause_control = atomic_load_explicit(&w->pause_control, memory_order_acquire);
         if (pause_control != atomic_load_explicit(&w->applied_pause_control, memory_order_relaxed)) {
@@ -545,9 +815,14 @@ static int rf_worker_thread(void *context) {
                 w->block_source_end = w->expected_source_sample;
                 w->work_segment_us = rf_now_us(w);
                 size_t output_count = 0;
+                /* Never assign a fresh audio epoch to an old block that was
+                 * already resampling when mute/reset/seek changed controls. */
+                uint64_t audio_generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
                 if (gui_rf_resampler_process(w->resampler, slot->samples, slot->count,
                                              w->output, w->output_capacity, &output_count)) {
                     if (output_count) {
+                        if (gui_rf_profile_has_hifi(w->profile))
+                            rf_audio_enqueue(w,w->output,output_count,w->output_sample,audio_generation,slot->audio_source_generation,control,pause_control);
                         gui_rf_decoder_process(w->decoder, w->output, output_count,
                                                w->output_sample, rf_frame_callback, w);
                         w->output_sample += output_count;
@@ -571,11 +846,18 @@ release_slot:
         SetEvent(w->done_event);
 #endif
     }
+    rf_unregister_counter(w,false);
     return 0;
 }
 
 gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
     if (format != GUI_RF_PAL && format != GUI_RF_NTSC) return NULL;
+    return gui_rf_preview_worker_create_profile(format == GUI_RF_NTSC ?
+             GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
+}
+
+gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t profile) {
+    if ((unsigned)profile >= GUI_RF_PROFILE_COUNT) return NULL;
     gui_rf_preview_worker_t *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
     if (!rf_mutex_init(&w->frame_mutex)) { free(w); return NULL; }
@@ -583,9 +865,16 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
     LARGE_INTEGER frequency;
     if (QueryPerformanceFrequency(&frequency)) w->timer_frequency = (uint64_t)frequency.QuadPart;
     w->input_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    w->audio_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     w->done_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 #endif
     atomic_init(&w->stop, false);
+    atomic_init(&w->audio_ready,false);atomic_init(&w->audio_enabled,true);
+    atomic_init(&w->audio_callback_installed,false);
+    atomic_init(&w->audio_active,false);atomic_init(&w->audio_budget_waiting,false);
+    atomic_init(&w->audio_generation,1);atomic_init(&w->applied_audio_generation,1);
+    atomic_init(&w->audio_source_generation,1);
+    atomic_init(&w->audio_read,0);atomic_init(&w->audio_write,0);atomic_init(&w->audio_dropped,0);
     atomic_init(&w->flush_requested, false);
     atomic_init(&w->producer_gap, false);
     atomic_flag_clear(&w->producer_busy);
@@ -598,27 +887,39 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
     atomic_init(&w->applied_pause_control, 0);
     atomic_init(&w->budget_waiting, false);
     atomic_init(&w->control, 1);
-    atomic_init(&w->requested_format, format);
-    w->format = format;
-    w->applied_control = 1;
+    atomic_init(&w->requested_profile, profile);
+    atomic_init(&w->requested_full_frame, false);
+    w->profile = profile;
+    atomic_init(&w->applied_control,1);
     w->interval_start_us = rf_now_us(w);
     w->queue = calloc(RF_QUEUE_SLOTS, sizeof(*w->queue));
     w->frame = malloc(RF_FRAME_BYTES);
-    w->decoder = gui_rf_decoder_create(format);
+    w->decoder = gui_rf_decoder_create_profile(profile);
     if (!w->queue || !w->frame || !w->decoder) goto fail;
+    if (gui_rf_profile_has_hifi(profile) && !rf_audio_start(w)) goto fail;
 #ifdef _WIN32
-    if (!w->input_event || !w->done_event) goto fail;
+    if (!w->input_event || !w->audio_event || !w->done_event) goto fail;
 #endif
     snprintf(w->stats.decode.reason, sizeof(w->stats.decode.reason), "Waiting for RF");
     if (thrd_create_with_priority(&w->thread, rf_worker_thread, w, THRD_PRIORITY_NORMAL) != thrd_success) goto fail;
     return w;
 fail:
+    atomic_store(&w->stop,true);
+    if(atomic_load(&w->audio_ready)) {
+#ifdef _WIN32
+        SetEvent(w->audio_event);
+#endif
+        thrd_join(w->audio_thread,NULL);
+    }
+    free(w->audio_queue);
     gui_rf_decoder_destroy(w->decoder);
+    gui_beta_hifi_destroy(w->hifi);
     free(w->queue);
     free(w->frame);
     rf_mutex_destroy(&w->frame_mutex);
 #ifdef _WIN32
     if (w->input_event) CloseHandle(w->input_event);
+    if (w->audio_event) CloseHandle(w->audio_event);
     if (w->done_event) CloseHandle(w->done_event);
 #endif
     free(w);
@@ -630,25 +931,56 @@ void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *w) {
     atomic_store_explicit(&w->stop, true, memory_order_release);
 #ifdef _WIN32
     SetEvent(w->input_event);
+    SetEvent(w->audio_event);
 #endif
     thrd_join(w->thread, NULL);
+    if(atomic_load(&w->audio_ready)) thrd_join(w->audio_thread,NULL);
+    free(w->audio_queue);
     gui_rf_resampler_destroy(w->resampler);
     gui_rf_decoder_destroy(w->decoder);
+    gui_beta_hifi_destroy(w->hifi);
     free(w->output);
     free(w->queue);
     free(w->frame);
     rf_mutex_destroy(&w->frame_mutex);
 #ifdef _WIN32
     CloseHandle(w->input_event);
+    CloseHandle(w->audio_event);
     CloseHandle(w->done_event);
 #endif
     free(w);
 }
 
 void gui_rf_preview_worker_set_format(gui_rf_preview_worker_t *w, gui_rf_format_t format) {
-    if (!w || (format != GUI_RF_PAL && format != GUI_RF_NTSC)) return;
-    if (atomic_exchange_explicit(&w->requested_format, format, memory_order_relaxed) != (int)format)
+    if (format != GUI_RF_PAL && format != GUI_RF_NTSC) return;
+    gui_rf_preview_worker_set_profile(w, format == GUI_RF_NTSC ?
+              GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
+}
+
+void gui_rf_preview_worker_set_audio_callback(gui_rf_preview_worker_t *w,
+                                              gui_rf_preview_audio_callback_t callback,
+                                              void *context) {
+    if (!w) return;
+    /* Install exactly once. The audio thread already exists at creation;
+     * publishing this flag supplies the context/pointer happens-before edge. */
+    if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire)) return;
+    w->audio_callback = callback;
+    w->audio_context = context;
+    atomic_store_explicit(&w->audio_callback_installed,true,memory_order_release);
+}
+
+void gui_rf_preview_worker_set_audio_enabled(gui_rf_preview_worker_t *w,bool enabled) {
+    if(!w) return;
+    if(atomic_exchange_explicit(&w->audio_enabled,enabled,memory_order_acq_rel)!=enabled)
+        rf_audio_cut_input(w);
+}
+
+void gui_rf_preview_worker_set_profile(gui_rf_preview_worker_t *w, gui_rf_profile_t profile) {
+    if (!w || (unsigned)profile >= GUI_RF_PROFILE_COUNT) return;
+    if (atomic_exchange_explicit(&w->requested_profile, profile, memory_order_relaxed) != (int)profile) {
+        rf_audio_cut_input(w);
         atomic_fetch_add_explicit(&w->control, 1, memory_order_release);
+    }
 #ifdef _WIN32
     SetEvent(w->input_event);
 #endif
@@ -657,13 +989,12 @@ void gui_rf_preview_worker_set_format(gui_rf_preview_worker_t *w, gui_rf_format_
 void gui_rf_preview_worker_set_frame_mode(gui_rf_preview_worker_t *worker,
                                          bool full_frame) {
     if (!worker) return;
-    rf_mutex_lock(&worker->frame_mutex);
-    gui_rf_decoder_set_frame_mode(worker->decoder, full_frame);
-    rf_mutex_unlock(&worker->frame_mutex);
+    atomic_store_explicit(&worker->requested_full_frame, full_frame, memory_order_release);
 }
 
 void gui_rf_preview_worker_reset(gui_rf_preview_worker_t *w) {
     if (!w) return;
+    rf_audio_cut_input(w);
     atomic_fetch_add_explicit(&w->control, 1, memory_order_release);
 #ifdef _WIN32
     SetEvent(w->input_event);
@@ -680,6 +1011,7 @@ void gui_rf_preview_worker_set_paused(gui_rf_preview_worker_t *w, bool paused) {
                                                   memory_order_release, memory_order_relaxed)) break;
     }
     atomic_store_explicit(&w->producer_gap, true, memory_order_release);
+    rf_audio_cut_input(w);
 #ifdef _WIN32
     SetEvent(w->input_event);
 #endif
@@ -688,7 +1020,10 @@ void gui_rf_preview_worker_set_paused(gui_rf_preview_worker_t *w, bool paused) {
 static bool rf_reject_block(gui_rf_preview_worker_t *w, bool flush) {
     atomic_fetch_add_explicit(&w->dropped, 1, memory_order_relaxed);
     atomic_store_explicit(&w->producer_gap, true, memory_order_release);
-    if (flush) atomic_store_explicit(&w->flush_requested, true, memory_order_release);
+    if (flush) {
+        rf_audio_cut_input(w);
+        atomic_store_explicit(&w->flush_requested, true, memory_order_release);
+    }
     return false;
 }
 
@@ -726,6 +1061,13 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
     rf_input_slot_t *slot = &w->queue[write % RF_QUEUE_SLOTS];
     slot->info = *info;
     slot->info.discontinuity |= atomic_exchange_explicit(&w->producer_gap, false, memory_order_acq_rel);
+    bool audio_boundary=slot->info.discontinuity || (w->producer_audio_seen &&
+        (info->epoch!=w->producer_audio_epoch || info->sample_rate_hz!=w->producer_audio_rate ||
+         info->start_sample!=w->producer_audio_next));
+    if(audio_boundary) rf_audio_cut_input(w);
+    slot->audio_source_generation=atomic_load_explicit(&w->audio_source_generation,memory_order_acquire);
+    w->producer_audio_seen=true;w->producer_audio_epoch=info->epoch;
+    w->producer_audio_rate=info->sample_rate_hz;w->producer_audio_next=info->start_sample+count;
     slot->count = count;
     slot->enqueue_us = rf_now_us(w);
     slot->duration_end_us = end;
@@ -762,7 +1104,11 @@ bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,
         stats->blocks_dropped = atomic_load_explicit(&w->dropped, memory_order_relaxed);
         stats->pause_drops = atomic_load_explicit(&w->pause_drops, memory_order_relaxed);
         stats->paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
-        stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire);
+        stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire) ||
+            atomic_load_explicit(&w->audio_budget_waiting,memory_order_acquire);
+        stats->audio_active=atomic_load_explicit(&w->audio_active,memory_order_acquire);
+        stats->audio_enabled=atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
+        stats->audio_blocks_dropped=atomic_load_explicit(&w->audio_dropped,memory_order_relaxed);
     }
     rf_mutex_unlock(&w->frame_mutex);
     return copied;
@@ -776,7 +1122,11 @@ void gui_rf_preview_worker_get_stats(gui_rf_preview_worker_t *w, gui_rf_preview_
     stats->blocks_dropped = atomic_load_explicit(&w->dropped, memory_order_relaxed);
     stats->pause_drops = atomic_load_explicit(&w->pause_drops, memory_order_relaxed);
     stats->paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
-    stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire);
+    stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire) ||
+            atomic_load_explicit(&w->audio_budget_waiting,memory_order_acquire);
+        stats->audio_active=atomic_load_explicit(&w->audio_active,memory_order_acquire);
+        stats->audio_enabled=atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
+        stats->audio_blocks_dropped=atomic_load_explicit(&w->audio_dropped,memory_order_relaxed);
     rf_mutex_unlock(&w->frame_mutex);
 }
 
@@ -786,7 +1136,13 @@ bool gui_rf_preview_worker_wait_idle(gui_rf_preview_worker_t *w, uint32_t timeou
     for (;;) {
         uint64_t write = atomic_load_explicit(&w->write_index, memory_order_acquire);
         uint64_t read = atomic_load_explicit(&w->read_index, memory_order_acquire);
-        if (read == write && !atomic_load_explicit(&w->flush_requested, memory_order_acquire) &&
+        if (read == write &&
+            atomic_load_explicit(&w->applied_control,memory_order_acquire)==atomic_load_explicit(&w->control,memory_order_acquire) &&
+            (!atomic_load_explicit(&w->audio_ready,memory_order_acquire) ||
+             (atomic_load_explicit(&w->audio_read,memory_order_acquire)==atomic_load_explicit(&w->audio_write,memory_order_acquire) &&
+              !atomic_load_explicit(&w->audio_active,memory_order_acquire) &&
+              atomic_load_explicit(&w->applied_audio_generation,memory_order_acquire)==atomic_load_explicit(&w->audio_generation,memory_order_acquire))) &&
+            !atomic_load_explicit(&w->flush_requested, memory_order_acquire) &&
             atomic_load_explicit(&w->applied_pause_control, memory_order_acquire) ==
             atomic_load_explicit(&w->pause_control, memory_order_acquire))
             return true;

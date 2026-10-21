@@ -34,19 +34,21 @@ static inline bool gui_rf_deemph_finite(double value)
  * Outputs are untouched on failure. The monitor uses fs=5000000 Hz.
  * The finite upper bound avoids badly conditioned float-coefficient designs.
  * The unquantized transfer has exactly unity DC gain; float quantization at
- * 5MHz changes it by about -1.40ppm, not an intentional gain adjustment.
+ * 5MHz changes the VHS coefficients by about -1.40ppm.
  */
-static inline bool gui_rf_ntsc_deemph_coefficients(
-    double fs, float *b0, float *b1, float *b2, float *a1, float *a2)
+static inline bool gui_rf_deemph_coefficients(
+    double fs, double gain_db, double midpoint, double q,
+    float *b0, float *b1, float *b2, float *a1, float *a2)
 {
-    const double midpoint = 273755.82;
-    const double q = 0.462088186;
     const double tau = 6.283185307179586476925286766559;
     if (!b0 || !b1 || !b2 || !a1 || !a2 || !gui_rf_deemph_finite(fs)
+        || !gui_rf_deemph_finite(gain_db) || gain_db < 0.0 || gain_db > 40.0
+        || !gui_rf_deemph_finite(midpoint) || midpoint <= 0.0
+        || !gui_rf_deemph_finite(q) || q <= 0.0
         || fs <= 2.0*midpoint || fs > 80000000.0)
         return false;
 
-    const double gain = pow(10.0, 13.9794/40.0);
+    const double gain = pow(10.0, gain_db/40.0);
     const double omega = tau*midpoint/fs;
     const double cosine = cos(omega);
     const double alpha = sin(omega)/(2.0*q);
@@ -65,11 +67,23 @@ static inline bool gui_rf_ntsc_deemph_coefficients(
     const float ca1 = (float)(pre_b1/pre_b0);
     const float ca2 = (float)(pre_b2/pre_b0);
     /* Jury conditions for the quantized real second-order denominator. */
-    if (fabs((double)ca2) >= 1.0 || 1.0+(double)ca1+ca2 <= 0.0
+    if (!gui_rf_deemph_finite(cb0) || !gui_rf_deemph_finite(cb1)
+        || !gui_rf_deemph_finite(cb2) || !gui_rf_deemph_finite(ca1)
+        || !gui_rf_deemph_finite(ca2)
+        || fabs((double)ca2) >= 1.0 || 1.0+(double)ca1+ca2 <= 0.0
         || 1.0-(double)ca1+ca2 <= 0.0)
         return false;
     *b0=cb0; *b1=cb1; *b2=cb2; *a1=ca1; *a2=ca2;
     return true;
+}
+
+/* Preserve the NTSC VHS transfer exactly; Beta uses its own 8dB/100kHz/Q=.5
+ * profile from the current .NET snapshot and DecodeFilterSet's default Q. */
+static inline bool gui_rf_ntsc_deemph_coefficients(
+    double fs, float *b0, float *b1, float *b2, float *a1, float *a2)
+{
+    return gui_rf_deemph_coefficients(fs,13.9794,273755.82,0.462088186,
+                                      b0,b1,b2,a1,a2);
 }
 
 /* DC group delay of the actual float coefficients, in working-rate samples.
@@ -92,7 +106,8 @@ static inline double gui_rf_ntsc_deemph_dc_delay_samples(double fs)
  * input x0 is residual Hz = blank_hz-fm_center (not absolute carrier Hz).
  * y0 = x0*(b0+b1+b2)/(1+a1+a2);
  * z1 = y0-b0*x0; z2 = b2*x0-a2*y0.
- * Keep the legacy first-order filter + 500kHz LP on the sync branch.
+ * VHS keeps the legacy first-order filter + 500kHz LP on the sync branch;
+ * Beta sync uses its matched inverse shelf before that same low-pass.
  * Legacy sync delay retains its old first-order + low-pass contributions.
  * Do not add this isolated shelf DC delay to display/TBC sample positions.
  * Recording pre-emphasis, RF/FM processing and the selected sync reference

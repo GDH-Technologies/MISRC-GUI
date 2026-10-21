@@ -161,6 +161,16 @@ int main(int argc, char **argv) {
         check(debt_us > 300000u, "old idle interval becomes fresh processing debt");
         check(new_drops == 1 && new_frames == 0, "fresh input ages past 200ms while paying old idle CPU");
     }
+    /* Simulate a completion timestamp sampled before another thread moved
+     * the shared statistics interval forward while frame_mutex was busy. */
+    rf_mutex_lock(&worker->frame_mutex);
+    worker->interval_start_us=1000000;worker->interval_frames=7;worker->interval_cpu_ms=3;
+    worker->stats.fps=12;worker->stats.cpu_percent=34;
+    rf_refresh_interval(worker,999999);
+    check(worker->interval_start_us==1000000 && worker->interval_frames==7 &&
+          worker->interval_cpu_ms==3 && worker->stats.fps==12 && worker->stats.cpu_percent==34,
+          "stale cross-thread timestamp cannot rewind or underflow statistics interval");
+    rf_mutex_unlock(&worker->frame_mutex);
     gui_rf_preview_worker_destroy(worker);
     idle_probe_short_coarse_accounting();
     check(gui_rf_preview_worker_set_budget(1.0), "probe restores default shared budget");

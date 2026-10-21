@@ -10,8 +10,8 @@
 /* Full-frame mode weaves every field line: PAL needs 2x313 = 626 rows. */
 #define GUI_RF_FRAME_MAX_HEIGHT 640
 
-/* Studio-swing display mapping for the ACTIVE area (Active and Full modes
- * alike). tbc-tools' makeYuvRangeScale convention — black lifted above the
+/* VHS/CVBS studio-swing display mapping for the ACTIVE area (Active and Full
+ * modes alike). Beta profiles retain their validated full-range active mapping. tbc-tools' makeYuvRangeScale convention — black lifted above the
  * display floor like a production monitor, white with headroom, sync below
  * black clamped at the floor — punched up from the pure 16..235 transfer per
  * user GUI feedback (the picture read as washed out): blacks sit a little
@@ -48,6 +48,16 @@ static inline double rf_display_level(double y01) {
 #define RF_HYBRID_SPAN_IRE_NTSC  (197.680)
 
 typedef enum { GUI_RF_PAL = 0, GUI_RF_NTSC = 1 } gui_rf_format_t;
+/* Tape modulation profiles are independent of PAL/NTSC field geometry. */
+typedef enum {
+    GUI_RF_PROFILE_PAL_VHS = 0,
+    GUI_RF_PROFILE_NTSC_VHS,
+    GUI_RF_PROFILE_NTSC_BETAMAX,
+    GUI_RF_PROFILE_NTSC_BETAMAX_HIFI,
+    GUI_RF_PROFILE_NTSC_SUPERBETA,
+    GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI,
+    GUI_RF_PROFILE_COUNT
+} gui_rf_profile_t;
 typedef struct gui_rf_decoder gui_rf_decoder_t;
 
 typedef struct {
@@ -83,6 +93,14 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
                                       int width, int height, uint64_t end_sample,
                                       const gui_rf_decode_status_t *status);
 
+/* Invalid profiles are rejected; reset_profile leaves existing state intact. */
+gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile);
+void gui_rf_decoder_reset_profile(gui_rf_decoder_t *decoder, gui_rf_profile_t profile);
+gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile);
+const char *gui_rf_profile_name(gui_rf_profile_t profile);
+/* Only these profiles enable the separate Beta Hi-Fi audio path. */
+bool gui_rf_profile_has_hifi(gui_rf_profile_t profile);
+/* Compatibility entry points select the original VHS SP profiles. */
 gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format);
 void gui_rf_decoder_destroy(gui_rf_decoder_t *decoder);
 void gui_rf_decoder_reset(gui_rf_decoder_t *decoder, gui_rf_format_t format);

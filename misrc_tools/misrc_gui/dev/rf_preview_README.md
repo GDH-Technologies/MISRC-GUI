@@ -1,21 +1,35 @@
-# VHS RF preview
+# Tape RF preview
 
-The VHS FM panel provides continuous PAL/NTSC VHS SP video-RF preview. It
-weaves two original fields into alternating rows, without deinterlacing,
-field duplication or motion interpolation. Output is RGBA at 768x576 PAL
-or 640x480 NTSC, displayed at 4:3. Nominal output rates are 25 and 29.97 fps.
+The RF Preview panel provides PAL/NTSC VHS SP, NTSC Betamax and ordinary NTSC
+SuperBeta video-RF preview. It weaves two original fields into alternating
+rows, without deinterlacing, field duplication or motion interpolation.
+Output is RGBA at 768x576 PAL or 640x480 NTSC, displayed at 4:3. Nominal
+output rates are 25 and 29.97 fps.
 
 ## Operation
 
 1. Open a Video panel for the desired RF channel.
-2. Cycle Decoder to **VHS FM** and select PAL or NTSC.
+2. Cycle Decoder to **RF Preview**, choose **Tape: VHS** or **Tape: Betamax**,
+   and select the system. Betamax currently supports NTSC only. Under Betamax,
+   **SuperBeta** is an optional toggle, off by default; enable it for a
+   SuperBeta recording. **Beta Hi-Fi** is a separate, independent toggle:
+   turn it on for a Hi-Fi recording to enable stereo monitoring. With
+   SuperBeta off, Hi-Fi also selects the ordinary Betamax Hi-Fi video carriers;
+   SuperBeta uses the same video parameters with either Hi-Fi state.
+   **Audio Mon** can subsequently mute or unmute playback.
 3. Connect a capture device or select FLAC playback files and connect.
-4. The shared Budget button selects 1.00, 0.75 or 0.50 logical cores and is
-   saved with the existing application settings.
+4. The shared Budget button cycles 0.50, 0.75, 1.00, 1.50, 2.00 or 3.00
+   logical cores and is saved with the existing application settings. Its
+   default scales with the machine's logical processor count.
 
-Only VHS FM uses this RF pipeline. CVBS and Tape Decode retain their existing
+Only RF Preview uses this RF pipeline. CVBS and Tape Decode retain their existing
 processing paths. The system and tape speed are not detected automatically.
-The input must contain video RF; Hi-Fi audio RF does not produce a picture.
+The input must contain video RF. Beta Hi-Fi needs the four audio carriers on
+that same captured RF channel; a separate audio-only RF feed does not produce
+a picture. Linear tape audio is outside this preview. See
+[NTSC Betamax details](betamax_preview_README.md) and
+[ordinary NTSC SuperBeta details](superbeta_preview_README.md) for profile,
+parameter and audio limits.
 
 The OSD reports physical input rate, H/V/color lock, decoded/displayed fps,
 DSP time, worker age, vertical candidates, accepted/rejected fields, queue
@@ -60,14 +74,20 @@ queue -> rate normalization -> RF decoder -> newest RGBA -> UI`
 
 - Extraction submits every block independently of the waveform/display stride.
   It never waits for decoder, renderer, frame mutex, CPU permit or queue space.
-- Visible VHS FM panels subscribe to a worker keyed by channel and PAL/NTSC
-  system. Matching panels share decoding and one input submission. Workers are
+- Visible RF Preview panels subscribe to a worker keyed by channel and complete
+  tape/system/Hi-Fi profile. Matching panels share decoding and one input submission. Workers are
   created lazily and released after the last subscriber and in-flight copy.
 - Each worker has 256 slots of 65536 int16 samples, about 32 MiB. Queued input
   duration and age are capped at 200 ms. Overrun drops stale preview work and
   reacquires from the next accepted block.
 - Workers own resampler, filter, sync and color state. The UI owns textures and
   its frame copy; capture does not access Raylib textures.
+- Beta Hi-Fi audio has a separate consumer and fixed 32-slot queue of 32768
+  float RF samples per slot (about 4 MiB, 52.4 ms of RF). Enqueue never waits.
+  Audio overload invalidates audio history without resetting video. Both
+  consumers retain the same 20 MSPS sample positions and stream generations.
+  Only the selected Hi-Fi monitor source decodes audio while Audio Mon and
+  capture are active; muting retains the Hi-Fi video profile.
 
 The streaming decoder performs quadrature FM demodulation, luma deemphasis,
 independent color-under IQ recovery, horizontal/equalization/vertical sync,
@@ -81,8 +101,9 @@ when tape playback returns, without reconnecting or changing PAL/NTSC. Sample
 positions, DSP filters, diagnostic totals and the capture session stay intact.
 
 Luma uses fixed profile levels with bounded, slow timing correction rather
-than noisy per-line black/gain normalization. NTSC display deemphasis is
-independent of the sync plane. Chroma averaging uses neighbors from the same
+than noisy per-line black/gain normalization. NTSC VHS display deemphasis is
+independent of its sync plane; Beta synchronization uses its matched shelf.
+Chroma averaging uses neighbors from the same
 field and retains the original luma rows.
 
 The input-rate separation, field assembly and color-under concepts were
@@ -90,18 +111,27 @@ informed by vhs-decode-dotnet. The halfband coefficients originate from its
 `VHSDecode.Core/Rf/HalfRateSampleLoader.cs`; source attribution is retained in
 `gui_rf_resampler.c`. This preview does not implement the complete offline
 .NET TBC/color pipeline or promise output equivalence. SECAM, VHS LP/EP,
-S-VHS, Betamax, dropout repair and advanced comb filtering are not implemented.
+S-VHS, PAL Betamax, dropout repair and advanced comb filtering are not implemented.
 
 ## Capture protection
 
-All workers share a soft CPU-time budget, default one logical core, with FIFO
-arbitration and at most one active processing block. Budget waits occur only
-inside workers. Windows uses thread CPU time and requests below-normal
+All video and Hi-Fi consumers share a soft CPU-time budget, with a
+machine-scaled default and FIFO arbitration. The concurrent processing limit
+is the ceiling of the configured budget, capped at eight; one core or less
+retains a single active permit. Budget waits occur only inside consumers.
+Windows uses thread CPU time and requests below-normal
 priority; unavailable thread accounting falls back to processing wall time.
 
 This allowance covers preview processing, not the entire GUI or an OS-enforced
-quota. A block cannot be preempted; block size and coarse OS CPU accounting can
-produce short bursts above the selected rate.
+quota. The bounded CPU token balance includes reservations reconciled against
+measured cost, with refill retained for in-flight work rather than lost during
+long blocks. Idle time cannot accumulate an unbounded processing allowance.
+On Windows, the allowance also preserves a bounded accounting quantum per
+registered thread counter so delayed CPU-time reports do not charge already
+elapsed work a second time through unnecessary pacing waits. Valid zero CPU
+deltas stay zero; only an unavailable counter uses work wall time.
+A block cannot be preempted; active blocks and coarse per-thread OS CPU
+accounting can produce short bursts above the selected rate.
 
 Extraction monitors capture and selected recording buffers. Preview pauses
 at 85% fill or a new write drop, or after 150 ms continuously at 60% fill.
@@ -163,6 +193,8 @@ Windows executables have `.exe`:
 ```sh
 build/gui_rf_preview_file input.s16le 20000000 ntsc output.ppm --realtime
 build/gui_rf_preview_file input.s16le 40000000 pal output.ppm --max
+build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --max output.wav 6
+build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --realtime output.wav 32 1.5
 build/gui_rf_preview_record_load input.s16le 20000000 ntsc output-prefix 60 on 1 4 1.0
 ```
 
