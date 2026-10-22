@@ -27,6 +27,7 @@
 #include "../../common/flac_writer.h"
 #include "../../common/threading.h"
 #include "../../common/buffer.h"
+#include "../../common/file_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,11 +78,22 @@
 
 // Buffer sizes
 #define BUFFER_READ_SIZE 65536
+#define GUI_RECORD_PATH_MAX (FILE_PATH_MAX + MAX_FILENAME_LEN)
 // Use larger CLI-style writer chunks for record-path throughput stability.
 // CLI writer path uses 65536*32 byte blocks; GUI records int16 samples, so this
 // maps to 65536*32 bytes == 1048576 samples per channel per writer read.
 #define GUI_RECORD_WRITER_BLOCK_BYTES ((size_t)65536 * 32)
 #define GUI_RECORD_WRITER_BLOCK_SAMPLES (GUI_RECORD_WRITER_BLOCK_BYTES / sizeof(int16_t))
+// stdio buffer for capture output files. libFLAC emits one small fwrite() per
+// frame (often <1 KB); with the default 4 KB CRT buffer each flush becomes a
+// separate write, which is round-trip bound on SMB/NFS targets.
+#define GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES ((size_t)8 * 1024 * 1024)
+
+static void gui_record_set_output_buffer(FILE *fp) {
+    if (fp) {
+        (void)setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
+    }
+}
 
 // Format file size into human-readable string
 static void format_file_size_u64(uint64_t size, char *buf, size_t buf_size) {
@@ -397,9 +409,9 @@ static void gui_record_build_log_timestamp(char *dst, size_t dst_len) {
 // Finalize thread (one finalize in flight at most)
 static thrd_t s_finalize_thread;
 static atomic_bool s_finalize_thread_running = ATOMIC_VAR_INIT(false);
-static char s_record_path_video[600];
+static char s_record_path_video[GUI_RECORD_PATH_MAX];
 static char s_video_start_msg[480];
-static char s_record_path_cc[600];
+static char s_record_path_cc[GUI_RECORD_PATH_MAX];
 static char s_cc_start_msg[480];
 static atomic_bool s_record_stop_finalizing = ATOMIC_VAR_INIT(false);
 static atomic_bool s_record_stop_finalize_done = ATOMIC_VAR_INIT(false);
@@ -448,7 +460,7 @@ struct writer_ctx {
 
 typedef struct {
     FILE *fp;
-    char path[512];
+    char path[GUI_RECORD_PATH_MAX];
     atomic_uint_fast64_t write_offset;
     atomic_uint_fast64_t read_offset;
     atomic_uint_fast64_t last_backlog_log_mark;
@@ -477,12 +489,12 @@ struct gui_record_session {
     bool use_flac;
     bool capture_a, capture_b;
     bool video_started;
-    char path_video[600];
+    char path_video[GUI_RECORD_PATH_MAX];
     bool cc_started;
-    char path_cc[600];
+    char path_cc[GUI_RECORD_PATH_MAX];
 
     FILE *file_a, *file_b;
-    char path_a[512], path_b[512];
+    char path_a[GUI_RECORD_PATH_MAX], path_b[GUI_RECORD_PATH_MAX];
 #if LIBFLAC_ENABLED == 1
     flac_writer_t *flac_a, *flac_b;
     uint32_t sample_rate_a, sample_rate_b;
@@ -493,17 +505,17 @@ struct gui_record_session {
     writer_ctx_t ctx_a, ctx_b;
 
     FILE *log_file;
-    char log_path[640];
+    char log_path[GUI_RECORD_PATH_MAX + 64];
 
     /* Capture metadata, latched at start: an edit made after the start can
      * never reach this recording's log, sidecar or FLAC tags. ~10 KB. */
     gui_capture_meta_t meta;
-    char stem[600];              /* {output_path}/{base}_{dateTag}: log + sidecar */
-    char sidecar_path[640];
+    char stem[GUI_RECORD_PATH_MAX];  /* {output_path}/{base}_{dateTag}: log + sidecar */
+    char sidecar_path[GUI_RECORD_PATH_MAX + 64];
     char started_at[32];         /* UTC "YYYY-MM-DDTHH:MM:SSZ" */
     char ended_at[32];           /* set at stop */
     double start_mono_s, stop_mono_s;
-    char output_path[MAX_FILENAME_LEN];
+    char output_path[FILE_PATH_MAX];
     char base_name[MAX_FILENAME_LEN];
     char device_name[128];
     char device_type[32];
@@ -698,25 +710,7 @@ static void gui_record_reset_disk_guard_state(void) {
 }
 
 static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_bytes_out) {
-    if (!path || !path[0] || !free_bytes_out) {
-        return false;
-    }
-
-#if defined(_WIN32) || defined(_WIN64)
-    ULARGE_INTEGER free_bytes_available;
-    if (!GetDiskFreeSpaceExA(path, &free_bytes_available, NULL, NULL)) {
-        return false;
-    }
-    *free_bytes_out = (uint64_t)free_bytes_available.QuadPart;
-    return true;
-#else
-    struct statvfs fs_stats;
-    if (statvfs(path, &fs_stats) != 0) {
-        return false;
-    }
-    *free_bytes_out = (uint64_t)fs_stats.f_bavail * (uint64_t)fs_stats.f_frsize;
-    return true;
-#endif
+    return file_disk_free_space_utf8(path, free_bytes_out);
 }
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -737,9 +731,14 @@ static bool gui_record_spill_open_channel_in_dir(const char *base_dir,
         return false;
     }
 
-    char template_path[512];
-    snprintf(template_path, sizeof(template_path), "%s/.misrc_record_spill_%s_XXXXXX",
-             base_dir, gui_record_spill_channel_name(channel));
+    char template_path[GUI_RECORD_PATH_MAX];
+    int written = snprintf(template_path, sizeof(template_path), "%s/.misrc_record_spill_%s_XXXXXX",
+                           base_dir, gui_record_spill_channel_name(channel));
+    if (written < 0 || (size_t)written >= sizeof(template_path) ||
+        (size_t)written >= out_path_size) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
 
     int fd = mkstemp(template_path);
     if (fd < 0) {
@@ -771,7 +770,7 @@ static bool gui_record_spill_open_channel(gui_record_session_t *ses, gui_app_t *
     }
 
     FILE *fp = NULL;
-    char path_buf[512] = {0};
+    char path_buf[GUI_RECORD_PATH_MAX] = {0};
     const char *output_dir = NULL;
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -914,12 +913,10 @@ bool gui_record_get_live_output_bytes(uint64_t *out_a, uint64_t *out_b) {
     if (!ses) return false;
     bool any = false;
     if (out_a && ses->capture_a && ses->path_a[0]) {
-        struct stat st;
-        if (stat(ses->path_a, &st) == 0) { *out_a = (uint64_t)st.st_size; any = true; }
+        if (file_path_info_utf8(ses->path_a, out_a, NULL)) any = true;
     }
     if (out_b && ses->capture_b && ses->path_b[0]) {
-        struct stat st;
-        if (stat(ses->path_b, &st) == 0) { *out_b = (uint64_t)st.st_size; any = true; }
+        if (file_path_info_utf8(ses->path_b, out_b, NULL)) any = true;
     }
     return any;
 }
@@ -2212,24 +2209,24 @@ static void sanitize_tag(char *dst, size_t dst_len, const char *src) {
     dst[0] = '\0';
     if (!src || !src[0]) return;
 
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
-        char c = src[i];
-        // allow [A-Za-z0-9._-], map spaces to '-'
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
-            dst[j++] = c;
+    size_t i = 0, j = 0;
+    for (; src[i] && j + 1 < dst_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        // Preserve non-ASCII filename bytes; map spaces to '-'.
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c >= 0x80) {
+            dst[j++] = (char)c;
         } else if (c == ' ' || c == '\t') {
             dst[j++] = '-';
-        } else {
-            // skip other chars (slashes etc.)
         }
     }
-    dst[j] = '\0';
-
-    // Trim trailing '-'
-    while (j > 0 && dst[j - 1] == '-') {
-        dst[--j] = '\0';
+    // Do not split a UTF-8 sequence when shortening the capture-log base.
+    if (src[i] && ((unsigned char)src[i] & 0xc0) == 0x80) {
+        while (j > 0 && ((unsigned char)dst[j - 1] & 0xc0) == 0x80) j--;
+        if (j > 0 && (unsigned char)dst[j - 1] >= 0xc0) j--;
     }
+    while (j > 0 && dst[j - 1] == '-') j--;
+    dst[j] = '\0';
 }
 
 static bool gui_record_cvbs_preview_enabled_locked(const channel_panel_config_t *config) {
@@ -2485,7 +2482,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     atomic_flag_clear(&app->panel_config_lock);
 
     gui_record_log_lock();
-    s_active->log_file = fopen(s_active->log_path, "w");
+    s_active->log_file = file_open_utf8(s_active->log_path, "w");
     if (!s_active->log_file) {
         s_active->log_path[0] = '\0';
         gui_record_log_unlock();
@@ -2680,15 +2677,27 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     gui_record_log_unlock();
 }
 
-static void gui_record_apply_auto_names(gui_app_t *app) {
-    if (!app) return;
-    if (!app->settings.auto_names_enabled) return;
+static bool gui_record_format_name(char *dst, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(dst, MAX_FILENAME_LEN, format, args);
+    va_end(args);
+    if (written < 0 || written >= MAX_FILENAME_LEN) {
+        dst[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static bool gui_record_apply_auto_names(gui_app_t *app) {
+    if (!app) return false;
+    if (!app->settings.auto_names_enabled) return true;
 
     const char *base = app->settings.output_base_name[0] ? app->settings.output_base_name : "capture";
 
     // Optionally append system timestamp sampled at record-start.
     // This does not mutate output_base_name.
-    char base_with_ts[256];
+    char base_with_ts[MAX_FILENAME_LEN + 32];
     if (app->settings.append_timestamp_on_capture_start) {
         char timestamp_now[32];
         gui_record_build_system_timestamp(timestamp_now, sizeof(timestamp_now));
@@ -2712,22 +2721,22 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), app->settings.rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a) && app->settings.capture_a) return false;
         } else if (rf_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a) && app->settings.capture_a) return false;
         } else if (rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a) && app->settings.capture_a) return false;
         } else {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a) && app->settings.capture_a) return false;
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b) && app->settings.capture_b) return false;
         } else if (rf_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b) && app->settings.capture_b) return false;
         } else if (rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b) && app->settings.capture_b) return false;
         } else {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b) && app->settings.capture_b) return false;
         }
     } else {
         // RAW: 8/16 only. Extension is per-channel and named by content:
@@ -2751,22 +2760,22 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), app->settings.rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a) && app->settings.capture_a) return false;
         } else if (rf_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a) && app->settings.capture_a) return false;
         } else if (rate_tag_a[0]) {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a) && app->settings.capture_a) return false;
         } else {
-            snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
+            if (!gui_record_format_name(app->settings.output_filename_a, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a) && app->settings.capture_a) return false;
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b) && app->settings.capture_b) return false;
         } else if (rf_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b) && app->settings.capture_b) return false;
         } else if (rate_tag_b[0]) {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b) && app->settings.capture_b) return false;
         } else {
-            snprintf(app->settings.output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
+            if (!gui_record_format_name(app->settings.output_filename_b, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b) && app->settings.capture_b) return false;
         }
     }
 
@@ -2779,54 +2788,153 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
     sanitize_tag(audio_tag_34, sizeof(audio_tag_34), app->settings.audio_output_tags[2]);
 
     if (audio_tag_4ch[0]) {
-        snprintf(app->settings.audio_4ch_filename, MAX_FILENAME_LEN, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
+        if (!gui_record_format_name(app->settings.audio_4ch_filename, "%s_%s_quad_4ch.wav", base, audio_tag_4ch) && app->settings.enable_audio_4ch) return false;
     } else {
-        snprintf(app->settings.audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
+        if (!gui_record_format_name(app->settings.audio_4ch_filename, "%s_quad_4ch.wav", base) && app->settings.enable_audio_4ch) return false;
     }
 
-    /* Reference video -- must stay in lockstep with the same block in
-     * gui_settings_refresh_auto_names(). The only intended difference between
-     * the two functions is that base already carries the record-start
-     * timestamp here. */
+    /* Reference video -- must name the same file as the same block in
+     * gui_settings_refresh_auto_names(). The intended differences: base
+     * already carries the record-start timestamp here, and an enabled output
+     * whose name does not fit refuses the start instead of truncating, like
+     * the RF and audio names above. */
     char video_tag[40] = {0};
     sanitize_tag(video_tag, sizeof(video_tag), app->settings.video_output_tag);
     if (video_tag[0]) {
-        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_%s_video.mkv", base, video_tag);
+        if (!gui_record_format_name(app->settings.video_filename, "%s_%s_video.mkv", base, video_tag) && app->settings.video_record_enabled) return false;
     } else {
-        snprintf(app->settings.video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
+        if (!gui_record_format_name(app->settings.video_filename, "%s_video.mkv", base) && app->settings.video_record_enabled) return false;
     }
-    /* Closed captions. Must stay in lockstep with the same block in
-     * gui_settings_refresh_auto_names(); the only intended difference there is
-     * that base already carries the record-start timestamp. Keep the two
-     * blocks textually identical so a diff of them is empty. */
+    /* Closed captions. Same rule as the reference video: the same names as
+     * gui_settings_refresh_auto_names(), the record-start timestamp in base,
+     * and a refusal instead of a truncated name. */
     char cc_tag[40] = {0};
     sanitize_tag(cc_tag, sizeof(cc_tag), app->settings.usbref_cc_tag);
     if (cc_tag[0]) {
-        snprintf(app->settings.usbref_cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+        if (!gui_record_format_name(app->settings.usbref_cc_filename, "%s_%s_captions.scc", base, cc_tag) && app->settings.usbref_cc_enabled) return false;
     } else {
-        snprintf(app->settings.usbref_cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+        if (!gui_record_format_name(app->settings.usbref_cc_filename, "%s_captions.scc", base) && app->settings.usbref_cc_enabled) return false;
     }
 
     if (audio_tag_12[0]) {
-        snprintf(app->settings.audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
+        if (!gui_record_format_name(app->settings.audio_2ch_12_filename, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12) && app->settings.enable_audio_2ch_12) return false;
     } else {
-        snprintf(app->settings.audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_stereo_ch1_ch2.wav", base);
+        if (!gui_record_format_name(app->settings.audio_2ch_12_filename, "%s_stereo_ch1_ch2.wav", base) && app->settings.enable_audio_2ch_12) return false;
     }
     if (audio_tag_34[0]) {
-        snprintf(app->settings.audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
+        if (!gui_record_format_name(app->settings.audio_2ch_34_filename, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34) && app->settings.enable_audio_2ch_34) return false;
     } else {
-        snprintf(app->settings.audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_stereo_ch3_ch4.wav", base);
+        if (!gui_record_format_name(app->settings.audio_2ch_34_filename, "%s_stereo_ch3_ch4.wav", base) && app->settings.enable_audio_2ch_34) return false;
     }
 
     for (int i = 0; i < 4; i++) {
         char tag[40];
         sanitize_tag(tag, sizeof(tag), app->settings.audio_1ch_labels[i]);
         if (tag[0]) {
-            snprintf(app->settings.audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_%s_audio_ch%d.wav", base, tag, i + 1);
+            if (!gui_record_format_name(app->settings.audio_1ch_filenames[i], "%s_%s_audio_ch%d.wav", base, tag, i + 1) && app->settings.enable_audio_1ch[i]) return false;
         } else {
-            snprintf(app->settings.audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_audio_ch%d.wav", base, i + 1);
+            if (!gui_record_format_name(app->settings.audio_1ch_filenames[i], "%s_audio_ch%d.wav", base, i + 1) && app->settings.enable_audio_1ch[i]) return false;
         }
     }
+    return true;
+}
+
+// All recording outputs share one directory; require distinct filename components.
+static bool gui_record_valid_filename(const char *name) {
+    if (!name || !name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        strchr(name, '/')) return false;
+#if defined(_WIN32) || defined(_WIN64)
+    size_t len = strlen(name);
+    if (name[len - 1] == '.' || name[len - 1] == ' ') return false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p < 32 || strchr("\\:*?\"<>|", *p)) return false;
+    }
+    wchar_t wide[MAX_FILENAME_LEN];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1,
+                             wide, MAX_FILENAME_LEN)) return false;
+#endif
+    return true;
+}
+
+static bool gui_record_same_filename(const char *a, const char *b) {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t wa[MAX_FILENAME_LEN], wb[MAX_FILENAME_LEN];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, a, -1, wa, MAX_FILENAME_LEN) ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b, -1, wb, MAX_FILENAME_LEN)) return false;
+    return CompareStringOrdinal(wa, -1, wb, -1, TRUE) == CSTR_EQUAL;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
+static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_count,
+                                          char *message, size_t message_size) {
+    const char *names[] = {
+        app->settings.output_filename_a, app->settings.output_filename_b,
+        app->settings.audio_4ch_filename, app->settings.audio_2ch_12_filename,
+        app->settings.audio_2ch_34_filename, app->settings.audio_1ch_filenames[0],
+        app->settings.audio_1ch_filenames[1], app->settings.audio_1ch_filenames[2],
+        app->settings.audio_1ch_filenames[3],
+        /* The fork's reference video and captions share the directory too; an
+         * output missing from this set is an output silently clobbered. */
+        app->settings.video_filename, app->settings.usbref_cc_filename
+    };
+    const bool enabled[] = {
+        app->settings.capture_a, app->settings.capture_b,
+        app->settings.enable_audio_4ch, app->settings.enable_audio_2ch_12,
+        app->settings.enable_audio_2ch_34, app->settings.enable_audio_1ch[0],
+        app->settings.enable_audio_1ch[1], app->settings.enable_audio_1ch[2],
+        app->settings.enable_audio_1ch[3],
+        app->settings.video_record_enabled, app->settings.usbref_cc_enabled
+    };
+    const char *labels[] = { "RF A", "RF B", "Audio quad", "Audio 1/2", "Audio 3/4",
+                             "Audio 1", "Audio 2", "Audio 3", "Audio 4",
+                             "Video", "Captions" };
+    bool directory = false;
+    if (!file_path_info_utf8(app->settings.output_path, NULL, &directory) || !directory) {
+        gui_app_set_status(app, "Output directory does not exist or cannot be read");
+        return false;
+    }
+    unsigned count = 0;
+    if (message && message_size) message[0] = '\0';
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (!enabled[i]) continue;
+        if (!gui_record_valid_filename(names[i])) {
+            gui_app_set_status(app, "Output filename is empty or invalid");
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (enabled[j] && gui_record_same_filename(names[i], names[j])) {
+                gui_app_set_status(app, "Recording outputs must have different filenames");
+                return false;
+            }
+        }
+        char path[GUI_RECORD_PATH_MAX];
+        int written = snprintf(path, sizeof(path), "%s/%s", app->settings.output_path, names[i]);
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            gui_app_set_status(app, "Output path is too long");
+            return false;
+        }
+        uint64_t bytes = 0;
+        if (file_path_info_utf8(path, &bytes, &directory)) {
+            if (directory) {
+                gui_app_set_status(app, "Output filename refers to a directory");
+                return false;
+            }
+            count++;
+            if (message && message_size) {
+                char size_buf[32];
+                format_file_size_u64(bytes, size_buf, sizeof(size_buf));
+                size_t offset = strlen(message);
+                // snprintf returns the required size, not the bytes appended.
+                // Derive each next offset from the bounded destination instead.
+                snprintf(message + offset, message_size - offset,
+                         "%s: %s (%s)\n", labels[i], names[i], size_buf);
+            }
+        }
+    }
+    if (existing_count) *existing_count = count;
+    return true;
 }
 
 // Start recording - checks for file existence first
@@ -3710,37 +3818,32 @@ int gui_record_start(gui_app_t *app) {
         return RECORD_PENDING;
     }
 
-    // Apply auto naming (must happen before overwrite checks)
-    gui_record_apply_auto_names(app);
+    // Apply auto naming before any file can be opened or overwritten.
+    if (!gui_record_apply_auto_names(app)) {
+        gui_app_set_status(app, "Generated filename is too long; shorten the base name or tags");
+        return RECORD_ERROR;
+    }
 
-    // Build full output paths (output_path + filenames)
-    char path_a[512];
-    char path_b[512];
-    snprintf(path_a, sizeof(path_a), "%s/%s", app->settings.output_path, app->settings.output_filename_a);
-    snprintf(path_b, sizeof(path_b), "%s/%s", app->settings.output_path, app->settings.output_filename_b);
-
-    // Check if output files already exist
-    struct stat stat_a, stat_b, stat_v;
-    bool file_a_exists = app->settings.capture_a && (stat(path_a, &stat_a) == 0);
-    bool file_b_exists = app->settings.capture_b && (stat(path_b, &stat_b) == 0);
-    /* Without this the RF files prompt while the reference video is silently
-     * clobbered. */
-    char path_video[600];
-    snprintf(path_video, sizeof(path_video), "%s/%s",
-             app->settings.output_path, app->settings.video_filename);
-    bool file_v_exists = app->settings.video_record_enabled && (stat(path_video, &stat_v) == 0);
-    /* Same reasoning as the reference video above: an output missing from this
-     * set is an output silently clobbered. */
-    struct stat stat_cc;
-    char path_cc[600];
-    snprintf(path_cc, sizeof(path_cc), "%s/%s",
-             app->settings.output_path, app->settings.usbref_cc_filename);
-    bool file_cc_exists = app->settings.usbref_cc_enabled && (stat(path_cc, &stat_cc) == 0);
+    unsigned existing_count = 0;
+    char details[384];
+    if (!gui_record_check_output_paths(app, &existing_count, details, sizeof(details))) {
+        return RECORD_ERROR;
+    }
 
     /* A finalizing session still owns its output files; refuse to reuse them.
      * Unreachable while the finalize gate above holds -- kept as defence in
      * depth should that gate ever be relaxed again. */
     if (s_finalizing) {
+        char path_a[GUI_RECORD_PATH_MAX];
+        char path_b[GUI_RECORD_PATH_MAX];
+        char path_video[GUI_RECORD_PATH_MAX];
+        char path_cc[GUI_RECORD_PATH_MAX];
+        snprintf(path_a, sizeof(path_a), "%s/%s", app->settings.output_path, app->settings.output_filename_a);
+        snprintf(path_b, sizeof(path_b), "%s/%s", app->settings.output_path, app->settings.output_filename_b);
+        snprintf(path_video, sizeof(path_video), "%s/%s",
+                 app->settings.output_path, app->settings.video_filename);
+        snprintf(path_cc, sizeof(path_cc), "%s/%s",
+                 app->settings.output_path, app->settings.usbref_cc_filename);
         bool clash =
             (app->settings.capture_a && s_finalizing->path_a[0] &&
              strcmp(path_a, s_finalizing->path_a) == 0) ||
@@ -3758,46 +3861,13 @@ int gui_record_start(gui_app_t *app) {
 
     // The settings "Overwrite output files" toggle now means what it says:
     // with it on, existing files are overwritten without the confirmation
-    // popup. Required for unattended automated runs (--auto-record), where
+    // popup. Required for unattended automated runs (--headless-record), where
     // the popup would stall the run forever.
-    if ((file_a_exists || file_b_exists || file_v_exists || file_cc_exists) &&
-        !app->settings.overwrite_files) {
-        // Build detailed message with file info
+    if (existing_count && !app->settings.overwrite_files) {
         char message[512];
-        char size_buf[32];
-        int offset = 0;
-
-        offset += snprintf(message + offset, sizeof(message) - offset,
-            "The following files will be overwritten:\n\n");
-
-        if (file_a_exists) {
-            format_file_size_u64((uint64_t)stat_a.st_size, size_buf, sizeof(size_buf));
-            offset += snprintf(message + offset, sizeof(message) - offset,
-                "CH A: %s (%s)\n", path_a, size_buf);
-        }
-
-        if (file_b_exists) {
-            format_file_size_u64((uint64_t)stat_b.st_size, size_buf, sizeof(size_buf));
-            offset += snprintf(message + offset, sizeof(message) - offset,
-                "CH B: %s (%s)\n", path_b, size_buf);
-        }
-
-        /* The reference video was already counted above but never named, so
-         * the dialog could say "the following files will be overwritten" and
-         * then not list one of them. Naming both is the point of the prompt. */
-        if (file_v_exists) {
-            format_file_size_u64((uint64_t)stat_v.st_size, size_buf, sizeof(size_buf));
-            offset += snprintf(message + offset, sizeof(message) - offset,
-                "VIDEO: %s (%s)\n", path_video, size_buf);
-        }
-
-        if (file_cc_exists) {
-            format_file_size_u64((uint64_t)stat_cc.st_size, size_buf, sizeof(size_buf));
-            offset += snprintf(message + offset, sizeof(message) - offset,
-                "CAPTIONS: %s (%s)\n", path_cc, size_buf);
-        }
-
-        // Show confirmation popup with detailed info
+        snprintf(message, sizeof(message),
+                 "%u existing output file(s) will be overwritten:\n\n%s",
+                 existing_count, details);
         gui_popup_confirm("Overwrite Files?", message, "Overwrite", "Cancel", app);
         snprintf(s_overwrite_message, sizeof(s_overwrite_message), "%s", message);
         s_overwrite_pending = true;
@@ -3855,11 +3925,12 @@ void gui_record_resolve_pending(gui_app_t *app, bool confirm) {
 
 // Internal: Start recording after confirmation
 static int gui_record_start_confirmed(gui_app_t *app) {
+    if (!gui_record_check_output_paths(app, NULL, NULL, 0)) return RECORD_ERROR;
     gui_record_reset_disk_guard_state();
 
     // Build full output paths (output_path + filenames)
-    char path_a[512];
-    char path_b[512];
+    char path_a[GUI_RECORD_PATH_MAX];
+    char path_b[GUI_RECORD_PATH_MAX];
     snprintf(path_a, sizeof(path_a), "%s/%s", app->settings.output_path, app->settings.output_filename_a);
     snprintf(path_b, sizeof(path_b), "%s/%s", app->settings.output_path, app->settings.output_filename_b);
     // Check if using simulated device (doesn't use extraction thread)
@@ -4086,8 +4157,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     if (app->settings.use_flac) {
         ses->use_flac = true;
         // Open FLAC files (respect per-channel enable)
-        ses->file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
-        ses->file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, "wb") : NULL;
+        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, "wb") : NULL;
+        gui_record_set_output_buffer(ses->file_a);
+        gui_record_set_output_buffer(ses->file_b);
 
         if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
             gui_app_set_status(app, "Failed to open output files");
@@ -4365,8 +4438,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 #endif
     {
         // RAW recording (respect per-channel enable)
-        ses->file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
-        ses->file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, "wb") : NULL;
+        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, "wb") : NULL;
+        gui_record_set_output_buffer(ses->file_a);
+        gui_record_set_output_buffer(ses->file_b);
 
         if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
             gui_app_set_status(app, "Failed to open output files");

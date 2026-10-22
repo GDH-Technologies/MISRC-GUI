@@ -18,7 +18,14 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  # Direct pushes to main run the guard+build jobs too (regression e34dce9:
+  # a guard break was pushed straight to main and sat latent for a day until
+  # a manual workflow_dispatch run failed). The release job stays gated on
+  # refs/tags/* / workflow_dispatch create_release, so branch pushes build
+  # but never publish.
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 

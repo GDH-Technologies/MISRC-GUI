@@ -17,6 +17,8 @@
 #include "../ui/clay.h"
 
 #include "raylib.h"
+#include "rlgl.h"              // rlDrawRenderBatchActive (the modal frame flush)
+#include "gui_win32_modal.h"   // Windows modal move/size render driver (no-op elsewhere)
 #include "../assets/inter_font_data.h"
 #include "../assets/misrc_icon_png_data.h"
 #include "../assets/space_mono_font_data.h"
@@ -26,6 +28,7 @@
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
 #include "../ui/gui_ui.h"
+#include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
 #include "../input/gui_preview_v4l2.h"
@@ -34,6 +37,7 @@
 #include "../streaming/gui_mediamtx.h"
 #include "../streaming/gui_rtsp_stream.h"
 #include "../processing/gui_extract.h"
+#include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../ui/gui_dropdown.h"
 #include "../ui/gui_popup.h"
@@ -43,7 +47,9 @@
 #include "gui_session.h"
 #include "gui_capture_meta.h"
 #include "../../common/threading.h"
+#include "../../common/utf8_argv.h"
 #include "version.h"
+#include "gui_font.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -506,7 +512,49 @@ static void gui_install_window_icons(void) {
     UnloadImage(base);
 }
 
+// Shared Clay layout build (the main loop + the Windows modal frames).
+// Extracted so the modal-loop render driver renders the SAME layout the
+// main loop renders, from one source of truth.
+static Clay_RenderCommandArray app_build_render_commands(gui_app_t *app)
+{
+    Clay_BeginLayout();
+    gui_video_update_rf_routes(app);
+    gui_render_layout(app);
+    return Clay_EndLayout();
+}
+
+// One render-only frame driven from INSIDE the Windows modal move/size loop
+// (WM_TIMER in the subclassed window proc; see gui_win32_modal.c). The
+// panels' data threads keep running during the drag, so re-rendering the
+// current state keeps the scopes (and the audio monitor) alive. This frame
+// must NEVER poll events and must not run the normal frame tail: a nested
+// PeekMessage inside DefWindowProc's modal loop is reentrancy, and the
+// timer already paces (no FPS wait). The flush + swap below is exactly the
+// normal tail's core minus its polling.
+static void app_modal_frame(void *ctx)
+{
+    gui_app_t *app = (gui_app_t *)ctx;
+
+    // Keep the audio monitor fed while the main loop is blocked
+    gui_audio_update_playback(app);
+
+    // Fresh layout dimensions (the window size changes live during a
+    // resize; raylib's WindowSizeCallback already ran SetupViewport on this
+    // thread, so frames render at the live size).
+    Clay_SetLayoutDimensions((Clay_Dimensions){
+        (float)gui_ui_get_layout_width(), (float)gui_ui_get_layout_height() });
+
+    Clay_RenderCommandArray render_commands = app_build_render_commands(app);
+
+    BeginDrawing();
+    ClearBackground(COLOR_BG);
+    Clay_Raylib_Render(render_commands, fonts);
+    rlDrawRenderBatchActive();
+    SwapScreenBuffer();
+}
+
 int main(int argc, char **argv) {
+    if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
     bool show_help = false;
     bool show_version = false;
@@ -827,6 +875,10 @@ int main(int argc, char **argv) {
         }
     }
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
+    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM) into
+    // the video panel decoders: every created panel starts in the user's
+    // last-selected system instead of hardcoded PAL.
+    gui_cvbs_set_default_system(app.settings.video_system);
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;
@@ -1215,6 +1267,15 @@ int main(int argc, char **argv) {
     const double thread_promotion_interval_s = 0.25;
 #endif
 
+    // Windows modal move/size render driver: keeps the window rendering
+    // while the user drags/resizes it (no-op on Linux/macOS - no modal loop
+    // there; see gui_win32_modal.c). Registered after the app exists; the
+    // frame callback renders only (never polls events).
+    gui_win32_modal_set_frame(app_modal_frame, &app);
+    if (!gui_win32_modal_install()) {
+        fprintf(stderr, "[WIN32] modal move/size render driver unavailable\n");
+    }
+
     // Main loop
     while (!atomic_load(&do_exit)) {
         if (WindowShouldClose()) {
@@ -1229,6 +1290,7 @@ int main(int argc, char **argv) {
             }
         }
         bool was_capturing = app.is_capturing;
+        gui_app_poll_capture_start(&app);
         if (app.is_recording) {
             if (!recording_fps_throttle) {
                 SetTargetFPS(30);
@@ -1322,6 +1384,33 @@ int main(int argc, char **argv) {
         if (ui_scale_save_pending && GetTime() >= ui_scale_save_deadline) {
             gui_settings_save(&app.settings);
             ui_scale_save_pending = false;
+        }
+
+        // Drag-and-drop onto the channel panels: load playback files (RF per
+        // channel zone by the drop point + audio-rate files as the monitor
+        // source) and start playback. raylib delivers UTF-8 paths; the drop
+        // point comes from the logical pointer wrapper (never a second
+        // GetMousePosition call - UI scale integration contract).
+        if (IsFileDropped()) {
+            FilePathList dropped_files = LoadDroppedFiles();
+            // A drop stops whatever is running and starts playback, so it
+            // obeys the same locks as Disconnect: refused while this machine
+            // records or finalizes (tearing the capture down races the record
+            // finalize), and on a net client, where the stop would be
+            // forwarded to the server's capture.
+            if (dropped_files.count > 0 && dropped_files.paths &&
+                (app.is_recording || gui_record_is_finalizing())) {
+                gui_app_set_status(&app, "Stop recording before dropping playback files");
+            } else if (dropped_files.count > 0 && dropped_files.paths && gui_net_is_client(&app)) {
+                gui_app_set_status(&app, "Playback drag-and-drop works in Local or Server mode only");
+            } else if (dropped_files.count > 0 && dropped_files.paths) {
+                Vector2 drop_point = gui_ui_get_mouse_position();
+                gui_playback_handle_dropped_files(&app,
+                    (const char *const *)dropped_files.paths,
+                    (size_t)dropped_files.count,
+                    drop_point.x, drop_point.y);
+            }
+            UnloadDroppedFiles(dropped_files);
         }
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
         if (app.is_capturing) {
@@ -1443,7 +1532,24 @@ int main(int argc, char **argv) {
             // is set only by a local recording of the server's feed
             // (net_client_record_local; see gui_app_effective_recording).
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
-                if (gui_app_control_capturing(&app)) {
+                // Space = play/pause (DAW-style). In playback mode it toggles
+                // pause; for live capture devices (no pause concept for a
+                // live feed) it starts/stops the capture as before, still
+                // refusing to disconnect mid-recording (tearing capture down
+                // races the async record finalize and can corrupt the file).
+                bool playback_dev =
+                    app.selected_device >= 0 &&
+                    app.selected_device < app.device_count &&
+                    app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK;
+                if (gui_playback_is_starting(&app)) {
+                    gui_app_stop_capture(&app);
+                } else if (playback_dev && app.is_capturing && gui_playback_is_running(&app)) {
+                    gui_playback_toggle_pause(&app);
+                    gui_app_set_status(&app,
+                        gui_playback_get_state(&app) == PLAYBACK_STATE_PAUSED
+                            ? "Playback paused (space)"
+                            : "Playback playing (space)");
+                } else if (gui_app_control_capturing(&app)) {
                     // Refuse to disconnect via space-bar while recording:
                     // tearing capture down mid-recording races the async record
                     // finalize thread and can corrupt/truncate the capture file.
@@ -1668,7 +1774,8 @@ int main(int argc, char **argv) {
             }
 
             // Attempt reconnection if pending
-            if (app.reconnect_pending && !app.is_capturing) {
+            if (app.reconnect_pending && !app.is_capturing &&
+                !gui_playback_is_starting(&app)) {
 #if defined(__ANDROID__)
                 /* If a USB permission request is mid-flight, the per-frame
                  * poll in gui_handle_interactions completes the connect; just
@@ -1720,7 +1827,10 @@ int main(int argc, char **argv) {
                          * the render loop stays responsive; otherwise request
                          * async permission and let the per-frame poll complete
                          * the connect. */
-                        if (android_usb_has_fd()) {
+                        if (app.selected_device >= 0 && app.selected_device < app.device_count &&
+                            app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
+                            (void)gui_app_start_capture(&app);
+                        } else if (android_usb_has_fd()) {
                             gui_app_start_capture_async(&app);
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;
@@ -1733,7 +1843,7 @@ int main(int argc, char **argv) {
                         }
 #else
                         int reconnect_rc = gui_app_start_capture(&app);
-                        if (reconnect_rc == 0) {
+                        if (reconnect_rc == 0 && !gui_playback_is_starting(&app)) {
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;
                             app.reconnect_attempts = 0;
@@ -1767,9 +1877,7 @@ int main(int argc, char **argv) {
         // EndDrawing, because Clay draws text from pointers into it) swaps the
         // client's own back and sends what changed as /set requests.
         gui_net_client_view_begin(&app);
-        Clay_BeginLayout();
-        gui_render_layout(&app);
-        Clay_RenderCommandArray render_commands = Clay_EndLayout();
+        Clay_RenderCommandArray render_commands = app_build_render_commands(&app);
 
         // Handle Clay interactions
         gui_handle_interactions(&app);
@@ -1807,6 +1915,9 @@ int main(int argc, char **argv) {
         gui_app_service_local_record_request(&app);
     }
 
+    // Restore the original window proc (Windows modal move/size driver)
+    gui_win32_modal_shutdown();
+
     // Cleanup
     if (app.is_recording) {
         gui_app_stop_recording(&app);
@@ -1834,6 +1945,7 @@ int main(int argc, char **argv) {
     free(clay_memory);
 
     // Unload fonts if we loaded TTFs (not the default font)
+    gui_font_unload();
     if (fonts[0].texture.id != 0 && fonts[0].texture.id != GetFontDefault().texture.id) {
         UnloadFont(fonts[0]);
     }

@@ -9,6 +9,8 @@
 #include "gui_usbref_settings.h"
 #include "gui_capture_meta_panel.h"
 #include "gui_device_label.h"
+#include "gui_text_edit.h"
+#include "gui_font.h"
 #include "../visualization/gui_fft.h"
 #include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
@@ -35,6 +37,7 @@
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 #include "../../common/threading.h"
 #include <clay.h>
 #include <stdio.h>
@@ -1348,7 +1351,7 @@ static void record_limit_measure_char_widths(gui_app_t *app,
     float total = 0.0f;
     for (int i = 0; i < 8; i++) {
         char glyph[2] = { text[i], '\0' };
-        Vector2 m = MeasureTextEx(font, glyph, (float)font_size, 0.0f);
+        Vector2 m = gui_font_measure_text(font, glyph, (float)font_size, 0.0f);
         float w = m.x;
         if (w <= 0.0f) {
             w = (text[i] == ':') ? ((float)font_size * 0.35f) : ((float)font_size * 0.5f);
@@ -1430,56 +1433,262 @@ static void format_playback_timecode(char *dst, size_t dst_len, double seconds)
 }
 static bool gui_ui_playback_channel_timeline_info(gui_app_t *app, int channel_index,
                                                   uint64_t *out_total_samples,
-                                                  double *out_duration_seconds)
+                                                  double *out_duration_seconds,
+                                                  bool *out_provisional, bool *out_verification_failed)
 {
     if (out_total_samples) *out_total_samples = 0;
     if (out_duration_seconds) *out_duration_seconds = 0.0;
+    if (out_provisional) *out_provisional = false;
+    if (out_verification_failed) *out_verification_failed = false;
     if (!app) return false;
 
     playback_file_info_t info = {0};
-    (void)((channel_index == 0)
-        ? gui_playback_get_file_info_a(app, &info)
-        : gui_playback_get_file_info_b(app, &info));
+    // Live playback info while running; otherwise the file selected in
+    // settings (validated + cached per path) so timecodes show at idle too.
+    (void)gui_playback_get_selected_file_info(app, channel_index, &info);
 
-    if (info.total_samples == 0) return false;
+    if (!info.valid) return false;
     double duration_seconds = info.duration_seconds;
     if (!(duration_seconds > 0.0) || !isfinite(duration_seconds)) {
-        return false;
+        double rate_hz = gui_playback_get_channel_rate_hz(app, channel_index);
+        duration_seconds = rate_hz > 0.0 && isfinite(rate_hz)
+            ? (double)info.total_samples / rate_hz : 0.0;
     }
 
     if (out_total_samples) *out_total_samples = info.total_samples;
     if (out_duration_seconds) *out_duration_seconds = duration_seconds;
+    if (out_provisional) *out_provisional = info.length_provisional;
+    if (out_verification_failed) *out_verification_failed = info.length_verification_failed;
     return true;
 }
 static void gui_ui_format_playback_timeline(char *dst, size_t dst_len, int *out_fill_w, bool *out_has_file,
-                                            uint64_t current_sample, uint64_t total_samples,
-                                            double total_duration_seconds, int track_width_px)
+                                            bool loaded, bool provisional, uint64_t current_sample, uint64_t total_samples,
+                                            double total_duration_seconds, double source_rate_hz, int track_width_px)
 {
     if (!dst || dst_len == 0) return;
     if (out_fill_w) *out_fill_w = 0;
     if (out_has_file) *out_has_file = false;
-    if (total_samples == 0 || track_width_px <= 0 ||
-        !(total_duration_seconds > 0.0) || !isfinite(total_duration_seconds)) {
+    if (!loaded) {
         snprintf(dst, dst_len, "--:--:--/--:--:--");
         return;
     }
     if (out_has_file) *out_has_file = true;
+    if (total_samples == 0 || !(total_duration_seconds > 0.0) || !isfinite(total_duration_seconds)) {
+        char elapsed_tc[24];
+        if (source_rate_hz > 0.0 && isfinite(source_rate_hz)) {
+            format_playback_timecode(elapsed_tc, sizeof(elapsed_tc), (double)current_sample / source_rate_hz);
+        } else {
+            snprintf(elapsed_tc, sizeof(elapsed_tc), "--:--:--");
+        }
+        snprintf(dst, dst_len, "%s/Unknown", elapsed_tc);
+        return;
+    }
     uint64_t channel_sample = current_sample;
-    if (channel_sample >= total_samples) {
-        channel_sample %= total_samples;
+    if (!provisional && channel_sample >= total_samples) {
+        channel_sample = total_samples;
     }
     double t = (double)channel_sample / (double)total_samples;
-    double playback_pos_s = t * total_duration_seconds;
+    double playback_pos_s = source_rate_hz > 0.0 && isfinite(source_rate_hz)
+        ? (double)channel_sample / source_rate_hz : t * total_duration_seconds;
     double playback_total_s = total_duration_seconds;
-    char pos_tc[16];
-    char total_tc[16];
+    char pos_tc[24];
+    char total_tc[24];
     format_playback_timecode(pos_tc, sizeof(pos_tc), playback_pos_s);
     format_playback_timecode(total_tc, sizeof(total_tc), playback_total_s);
-    snprintf(dst, dst_len, "%s/%s", pos_tc, total_tc);
-    int fill_w = (int)round(t * (double)track_width_px);
+    snprintf(dst, dst_len, "%s/%s%s", pos_tc, provisional ? "~" : "", total_tc);
+    double fill_ratio = t > 1.0 ? 1.0 : t;
+    int fill_w = track_width_px > 0 ? (int)round(fill_ratio * (double)track_width_px) : 0;
     if (fill_w < 0) fill_w = 0;
-    if (fill_w > track_width_px) fill_w = track_width_px;
+    if (track_width_px > 0 && fill_w > track_width_px) fill_w = track_width_px;
     if (out_fill_w) *out_fill_w = fill_w;
+}
+// Format the per-channel playback file readout shown in-line with the scrub
+// slider bar: the ACTUAL bit depth and the resolved real sample rate of the
+// selected/playing FLAC file ("8-bit 20.0 MSPS", "16-bit 44.1 kHz"; compact
+// tier "8b 20.0M" on narrow layouts). RF captures resolve to their true RF
+// rate; genuine audio-rate files stay in kHz.
+static void gui_ui_format_playback_readout(gui_app_t *app, int channel,
+                                           char *dst, size_t dst_len, bool compact)
+{
+    if (!dst || dst_len == 0) return;
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.bits_per_sample == 0 ||
+        !(info.real_sample_rate_hz > 0.0) || !isfinite(info.real_sample_rate_hz)) {
+        snprintf(dst, dst_len, "--");
+        return;
+    }
+    double hz = info.real_sample_rate_hz;
+    if (hz >= 1.0e6) {
+        snprintf(dst, dst_len, compact ? "%u-bit %.1fM" : "%u-bit %.1f MSPS",
+                 (unsigned)info.bits_per_sample, hz / 1.0e6);
+    } else {
+        snprintf(dst, dst_len, compact ? "%u-bit %.1fk" : "%u-bit %.1f kHz",
+                 (unsigned)info.bits_per_sample, hz / 1.0e3);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Playback timeline: right-side FILE INFO (HARD DEV NOTE)
+//-----------------------------------------------------------------------------
+/* HARD DEV NOTE — playback timeline file info + wheel scrub (2026-10-12)
+ *
+ * Next to each playback scrub slider the row shows, from the ACTUAL selected
+ * /playing FLAC file (gui_playback_get_selected_file_info: live info while
+ * playing, else path-cached validation — never a guess):
+ *   1. basename (ellipsized slot),
+ *   2. "8-bit 20.0 MSPS" — actual bit depth + resolved real RF rate
+ *      (RF_SAMPLE_RATE tag > kHz-domain header x1000 > filename msps hint),
+ *   3. "RAW 838.8GiB FLAC 121.5GiB 6.9x" — RAW is the per-channel packed
+ *      u32 raw stream (total_samples x 4 bytes — the same accounting the
+ *      capture log's rawA/rawB uses); FLAC is the on-disk size (64-bit size
+ *      read, cached per path); ratio = raw / compressed.
+ * Slots use fixed representative widths per tier (full -> compact -> hidden)
+ * so value changes never reflow the row; stacked rows put the whole info line
+ * under the track. Data is cached per path — re-select the file to refresh
+ * sizes after it changes on disk.
+ *
+ * Mouse wheel over a playback timeline row scrubs that channel with 1-10 s
+ * acceleration: notches within 400 ms ramp the step (+0.75 s/notch, capped at
+ * 10 s); an idle gap resets to the 1 s base step. Wheel-up steps backward,
+ * wheel-down steps forward (swap the sign in gui_handle_interactions to
+ * flip). Seeks while paused push ONE preview batch (gui_playback.c
+ * preview_pending) so the waveform/spectrogram render the new position, then
+ * hold — the spectrogram freezes while paused (gui_spectrogram.c) like a DAW.
+ *---------------------------------------------------------------------------*/
+
+// 64-bit file size, portable across the POSIX/Win32 builds.
+static uint64_t gui_ui_file_size_64(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *f = file_open_read_utf8(path);
+    if (!f) return 0;
+    uint64_t size = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        __int64 end = _ftelli64(f);
+        if (end >= 0) size = (uint64_t)end;
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t end = ftello(f);
+        if (end >= 0) size = (uint64_t)end;
+    }
+#endif
+    fclose(f);
+    return size;
+}
+
+// Binary-unit size text ("838.8GiB"; compact tier "838.8G").
+static void gui_ui_format_size_u64(uint64_t bytes, char *dst, size_t dst_len, bool compact) {
+    if (!dst || dst_len == 0) return;
+    static const char *units_full[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    static const char *units_compact[] = {"B", "K", "M", "G", "T"};
+    double v = (double)bytes;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) {
+        v /= 1024.0;
+        u++;
+    }
+    if (bytes == 0) {
+        snprintf(dst, dst_len, "0B");
+        return;
+    }
+    if (u == 0) {
+        snprintf(dst, dst_len, "%uB", (unsigned)bytes);
+        return;
+    }
+    snprintf(dst, dst_len, compact ? "%.1f%s" : "%.1f%s", v,
+             compact ? units_compact[u] : units_full[u]);
+}
+
+// File info text: "RAW 838.8GiB FLAC 121.5GiB 6.9x" (compact "838.8G/121.5G").
+static void gui_ui_format_playback_fileinfo(gui_app_t *app, int channel,
+                                            char *dst, size_t dst_len, bool compact)
+{
+    if (!dst || dst_len == 0) return;
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.total_samples == 0 || info.filepath[0] == '\0') {
+        snprintf(dst, dst_len, "--");
+        return;
+    }
+    typedef struct {
+        char path[FILE_PATH_MAX];
+        uint64_t raw;
+        uint64_t flac;
+        bool valid;
+    } fileinfo_cache_t;
+    static fileinfo_cache_t s_fileinfo_cache[2];
+    fileinfo_cache_t *c = &s_fileinfo_cache[channel];
+    if (!c->valid || strncmp(c->path, info.filepath, sizeof(c->path)) != 0) {
+        snprintf(c->path, sizeof(c->path), "%s", info.filepath);
+        c->flac = gui_ui_file_size_64(c->path);
+        c->valid = true;
+    }
+    // Length discovery can refine total_samples while the path stays unchanged.
+    c->raw = info.total_samples * 4ULL;   // per-channel packed u32 stream
+    char raw_buf[20];
+    char flac_buf[20];
+    gui_ui_format_size_u64(c->raw, raw_buf, sizeof(raw_buf), compact);
+    gui_ui_format_size_u64(c->flac, flac_buf, sizeof(flac_buf), compact);
+    if (c->flac > 0) {
+        double ratio = (double)c->raw / (double)c->flac;
+        if (compact) {
+            snprintf(dst, dst_len, "%s/%s", raw_buf, flac_buf);
+        } else {
+            snprintf(dst, dst_len, "RAW %s FLAC %s %.1fx", raw_buf, flac_buf, ratio);
+        }
+    } else if (compact) {
+        snprintf(dst, dst_len, "%s", raw_buf);
+    } else {
+        snprintf(dst, dst_len, "RAW %s", raw_buf);
+    }
+}
+
+/* Display-only truncation must not turn a valid UTF-8 filename into invalid bytes. */
+static void gui_ui_copy_text_prefix(char *dst, size_t capacity, const char *text)
+{
+    if (!dst || capacity == 0) return;
+    size_t length = strlen(text);
+    if (length >= capacity) length = (size_t)gui_text_boundary(text, (int)capacity - 1);
+    memcpy(dst, text, length);
+    dst[length] = '\0';
+}
+
+static void gui_ui_copy_path_tail(char *dst, size_t capacity, const char *path)
+{
+    size_t length = strlen(path);
+    if (length <= 30) {
+        gui_ui_copy_text_prefix(dst, capacity, path);
+        return;
+    }
+    size_t start = length - 27;
+    while (((unsigned char)path[start] & 0xc0) == 0x80) ++start;
+    if (capacity < 4) {
+        gui_ui_copy_text_prefix(dst, capacity, "...");
+        return;
+    }
+    memcpy(dst, "...", 3);
+    gui_ui_copy_text_prefix(dst + 3, capacity - 3, path + start);
+}
+
+// File basename for the info line ("Tape_08_..._video_rf_8-bit_20msps.flac").
+static void gui_ui_playback_file_basename(gui_app_t *app, int channel,
+                                          char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) return;
+    dst[0] = '\0';
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    if (info.filepath[0] == '\0') return;
+    const char *slash = strrchr(info.filepath, '/');
+    const char *sep = slash;
+#ifdef _WIN32
+    const char *bslash = strrchr(info.filepath, '\\');
+    if (bslash && (!sep || bslash > sep)) sep = bslash;
+#endif
+    const char *base = sep ? (sep + 1) : info.filepath;
+    gui_ui_copy_text_prefix(dst, dst_len, base);
 }
 static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, float mouse_x)
 {
@@ -1490,7 +1699,9 @@ static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, flo
     if (track_width <= 1.0f) return false;
     uint64_t channel_total_samples = 0;
     double channel_duration_seconds = 0.0;
-    if (!gui_ui_playback_channel_timeline_info(app, track_index, &channel_total_samples, &channel_duration_seconds)) {
+    if (!gui_ui_playback_channel_timeline_info(app, track_index, &channel_total_samples, &channel_duration_seconds,
+                                              NULL, NULL) ||
+        channel_total_samples == 0 || !(channel_duration_seconds > 0.0) || !isfinite(channel_duration_seconds)) {
         return false;
     }
     float t = (mouse_x - track.boundingBox.x) / track_width;
@@ -1532,8 +1743,16 @@ static char stat_cx_level[2][16];
 // Playback file display buffers
 static char playback_file_a_display[64];
 static char playback_file_b_display[64];
-static char playback_timeline_display_a[48];
-static char playback_timeline_display_b[48];
+static char playback_file_audio_display[64];
+static char playback_timeline_display_a[64];
+static char playback_timeline_display_b[64];
+static char playback_readout_display_a[32];
+static char playback_readout_display_b[32];
+static char playback_name_display_a[64];
+static char playback_name_display_b[64];
+static char playback_fileinfo_display_a[48];
+static char playback_fileinfo_display_b[48];
+static char playback_index_display[2][96];
 static bool s_playback_scrub_active = false;
 static int s_playback_scrub_track_index = 0;
 
@@ -1607,6 +1826,13 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     if (cxadc_mode) {
         gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen);
     }
+    /* The Playback device is another fixed A/B mapping: file A IS channel A
+     * (the per-channel seek sliders scrub their own file), so the MISRC
+     * hardware-input swap must not apply there either — the leaked swap
+     * crossed the panel feeds against the sliders. Like cxadc, preserve the
+     * sticky settings.misrc_mode preference; only force the live flags. */
+    bool playback_device = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                           app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
     bool cxadc_has_channel_b = false;
     if (cxadc_mode && app->selected_device >= 0 && app->selected_device < app->device_count) {
         cxadc_has_channel_b = (app->devices[app->selected_device].index > 1);
@@ -1622,11 +1848,11 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
     bool is_clockgen_mode = cxadc_clockgen || misrc_clockgen || ddd_clockgen;
     bool single_channel_device = ddd_mode || fx3_mode || (cxadc_mode && !cxadc_has_channel_b);
     bool expected_mode = s_capture_mode_state_misrc;
-    if (cxadc_mode) {
+    if (cxadc_mode || playback_device) {
         expected_mode = false;
     }
     bool mismatch_user = (app->user_capture_mode_misrc != expected_mode);
-    bool mismatch_settings = (!cxadc_mode && app->settings.misrc_mode != expected_mode);
+    bool mismatch_settings = (!cxadc_mode && !playback_device && app->settings.misrc_mode != expected_mode);
     bool mismatch_runtime = (!app->is_recording && app->capture_mode_runtime_misrc != expected_mode);
     if (mismatch_user || mismatch_settings || mismatch_runtime) {
         TraceLog(LOG_INFO,
@@ -1638,7 +1864,7 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
                  app->is_recording ? 1 : 0);
     }
     app->user_capture_mode_misrc = expected_mode;
-    if (!cxadc_mode) {
+    if (!cxadc_mode && !playback_device) {
         app->settings.misrc_mode = expected_mode;
     }
     if (!app->is_recording) {
@@ -2154,7 +2380,7 @@ static int gui_ui_measure_button_width(const gui_app_t *app,
         font = GetFontDefault();
     }
     const char *safe_text = (text && text[0]) ? text : " ";
-    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    Vector2 m = gui_font_measure_text(font, safe_text, (float)font_size, 0.0f);
     int measured_width = (int)ceilf(m.x) + (horizontal_padding * 2) + extra_width;
     return gui_ui_clamp_int(measured_width, min_width, max_width);
 }
@@ -2178,7 +2404,7 @@ static int gui_ui_measure_text_width(const gui_app_t *app,
         font = GetFontDefault();
     }
     const char *safe_text = (text && text[0]) ? text : " ";
-    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    Vector2 m = gui_font_measure_text(font, safe_text, (float)font_size, 0.0f);
     return (int)ceilf(m.x);
 }
 
@@ -2203,7 +2429,7 @@ static void gui_ui_ellipsize_text(const gui_app_t *app,
     if (!font.glyphs) {
         font = GetFontDefault();
     }
-    if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+    if (gui_font_measure_text(font, text, (float)font_size, 0.0f).x <=
         (float)max_text_width) {
         return;
     }
@@ -2216,7 +2442,7 @@ static void gui_ui_ellipsize_text(const gui_app_t *app,
         }
         text[cut] = '\0';
         strncat(text, "...", text_capacity - strlen(text) - 1);
-        if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+        if (gui_font_measure_text(font, text, (float)font_size, 0.0f).x <=
             (float)max_text_width) {
             return;
         }
@@ -2445,7 +2671,7 @@ bool gui_ui_settings_locked(const gui_app_t *app)
         return app->is_recording || gui_net_client_peer_recording(app) ||
                !gui_net_client_peer_settings_valid(app);
     }
-    return app->is_recording;
+    return app->is_recording || gui_playback_is_starting((gui_app_t *)app);
 }
 
 bool gui_ui_text_edit_active(void)
@@ -2794,13 +3020,7 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Hostname or IP: allow printable ASCII except quote (JSON-safe).
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    if (ch < 32 || ch >= 127) {
-        return false;
-    }
-    if (field == UI_TEXT_FIELD_OUTPUT_PATH) {
-        return !(ch == '*' || ch == '?' || ch == '\"' || ch == '<' || ch == '>' || ch == '|');
-    }
-    return !(ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' || ch == '\"' || ch == '<' || ch == '>' || ch == '|');
+    return gui_text_path_char_allowed(ch, field == UI_TEXT_FIELD_OUTPUT_PATH);
 }
 
 static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)
@@ -2853,11 +3073,13 @@ static Font gui_ui_text_get_font(const gui_app_t *app, int font_id)
     return font;
 }
 
-static float gui_ui_text_char_width_px(const gui_app_t *app, int font_id, int font_size, unsigned char ch)
+static float gui_ui_text_char_width_px(const gui_app_t *app, int font_id, int font_size, const char *text, int count)
 {
     Font font = gui_ui_text_get_font(app, font_id);
-    char glyph[2] = { (char)ch, '\0' };
-    Vector2 m = MeasureTextEx(font, glyph, (float)font_size, 0.0f);
+    char glyph[5] = {0};
+    if (count > 4) count = 1;
+    memcpy(glyph, text, (size_t)count);
+    Vector2 m = gui_font_measure_text(font, glyph, (float)font_size, 0.0f);
     if (m.x <= 0.0f) {
         return (float)font_size * 0.5f;
     }
@@ -2888,13 +3110,14 @@ static int gui_ui_text_cursor_from_click(gui_app_t *app,
     gui_ui_text_field_font(field, &font_size, &font_id);
 
     float x = 0.0f;
-    for (int i = 0; i < (int)len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        float w = gui_ui_text_char_width_px(app, font_id, font_size, ch);
+    for (int i = 0; i < (int)len; ) {
+        int next = gui_text_next(text, i);
+        float w = gui_ui_text_char_width_px(app, font_id, font_size, text + i, next - i);
         if (local_x < x + (w * 0.5f)) {
             return i;
         }
         x += w;
+        i = next;
     }
     return (int)len;
 }
@@ -2904,9 +3127,11 @@ static void gui_ui_text_clamp_state(const char *dst)
     size_t len = dst ? strlen(dst) : 0;
     if (s_active_text_cursor < 0) s_active_text_cursor = 0;
     if ((size_t)s_active_text_cursor > len) s_active_text_cursor = (int)len;
+    s_active_text_cursor = gui_text_boundary(dst ? dst : "", s_active_text_cursor);
     if (s_active_text_selection_anchor >= 0) {
         if (s_active_text_selection_anchor < 0) s_active_text_selection_anchor = 0;
         if ((size_t)s_active_text_selection_anchor > len) s_active_text_selection_anchor = (int)len;
+        s_active_text_selection_anchor = gui_text_boundary(dst ? dst : "", s_active_text_selection_anchor);
         if (s_active_text_selection_anchor == s_active_text_cursor) {
             s_active_text_selection_anchor = -1;
         }
@@ -2947,6 +3172,7 @@ static void gui_ui_text_set_cursor_position(const char *dst, int new_cursor, boo
     size_t len = dst ? strlen(dst) : 0;
     if (new_cursor < 0) new_cursor = 0;
     if ((size_t)new_cursor > len) new_cursor = (int)len;
+    new_cursor = gui_text_boundary(dst ? dst : "", new_cursor);
     if (keep_selection) {
         if (s_active_text_selection_anchor < 0) {
             s_active_text_selection_anchor = s_active_text_cursor;
@@ -2959,28 +3185,57 @@ static void gui_ui_text_set_cursor_position(const char *dst, int new_cursor, boo
 
 static bool gui_ui_text_insert_char(char *dst, size_t cap, int ch)
 {
-    if (!dst || cap == 0) return false;
-    size_t len = strlen(dst);
-    if (len + 1 >= cap) return false;
-    if (s_active_text_cursor < 0) s_active_text_cursor = 0;
-    if ((size_t)s_active_text_cursor > len) s_active_text_cursor = (int)len;
-    memmove(dst + s_active_text_cursor + 1,
-            dst + s_active_text_cursor,
-            len - (size_t)s_active_text_cursor + 1);
-    dst[s_active_text_cursor] = (char)ch;
-    s_active_text_cursor++;
+    if (!dst || cap == 0 || ch <= 0 || ch > 0x10ffff ||
+        (ch >= 0xd800 && ch <= 0xdfff)) return false;
+    int count = 0;
+    const char *text = CodepointToUTF8(ch, &count);
+    int start = s_active_text_cursor, end = start;
+    gui_ui_text_get_selection_range(dst, &start, &end);
+    if (!gui_text_replace(dst, cap, &s_active_text_cursor, start, end, text, (size_t)count)) {
+        gui_popup_info("Text is too long", "The text was not changed because it exceeds this field's capacity.");
+        return false;
+    }
+    s_active_text_selection_anchor = -1;
     return true;
 }
 
 static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t cap, const char *src)
 {
-    if (!dst || !src) return false;
-    bool changed = false;
-    for (const unsigned char *p = (const unsigned char *)src; *p; ++p) {
-        int ch = (int)(*p);
-        if (!gui_ui_text_field_char_allowed(field, ch)) continue;
-        if (!gui_ui_text_insert_char(dst, cap, ch)) break;
-        changed = true;
+    if (!dst || !src || cap == 0) return false;
+    char *filtered = (char *)malloc(cap);
+    if (!filtered) return false;
+    size_t count = 0;
+    bool valid = true;
+    bool path_field = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
+                      field == UI_TEXT_FIELD_OUTPUT_PATH ||
+                      (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4);
+    for (const char *p = src; *p; ) {
+        int size = 0;
+        int ch = GetCodepointNext(p, &size);
+        int encoded_size = 0;
+        const char *encoded = CodepointToUTF8(ch, &encoded_size);
+        if (size <= 0 || size != encoded_size || memcmp(p, encoded, (size_t)size) != 0) {
+            valid = false;
+            break;
+        }
+        if (!gui_ui_text_field_char_allowed(field, ch)) {
+            if (path_field) { valid = false; break; }
+            p += size;
+            continue;
+        }
+        if ((size_t)size >= cap - count) { valid = false; break; }
+        memcpy(filtered + count, p, (size_t)size);
+        count += (size_t)size;
+        p += size;
+    }
+    int start = s_active_text_cursor, end = start;
+    gui_ui_text_get_selection_range(dst, &start, &end);
+    bool changed = valid && count > 0 &&
+                   gui_text_replace(dst, cap, &s_active_text_cursor, start, end, filtered, count);
+    free(filtered);
+    if (changed) s_active_text_selection_anchor = -1;
+    else if (!valid || count > 0) {
+        gui_popup_info("Cannot paste text", "The text was not changed. It is too long or contains characters this field cannot accept.");
     }
     return changed;
 }
@@ -3046,9 +3301,11 @@ void gui_ui_render_active_text(ui_text_field_t field,
     int cursor = s_active_text_cursor;
     if (cursor < 0) cursor = 0;
     if (cursor > len) cursor = len;
+    cursor = gui_text_boundary(text, cursor);
     int anchor = s_active_text_selection_anchor;
     if (anchor < 0) anchor = cursor;
     if (anchor > len) anchor = len;
+    anchor = gui_text_boundary(text, anchor);
     bool has_selection = (anchor != cursor);
     int sel_start = has_selection ? ((anchor < cursor) ? anchor : cursor) : cursor;
     int sel_end = has_selection ? ((anchor > cursor) ? anchor : cursor) : cursor;
@@ -3166,19 +3423,17 @@ static bool gui_ui_text_backspace(char *dst, int *cursor)
     if (!dst || !cursor) return false;
     size_t len = strlen(dst);
     if (len == 0 || *cursor <= 0) return false;
-    if ((size_t)*cursor > len) *cursor = (int)len;
-    memmove(dst + *cursor - 1, dst + *cursor, len - (size_t)(*cursor) + 1);
-    (*cursor)--;
-    return true;
+    *cursor = gui_text_boundary(dst, *cursor);
+    return gui_text_replace(dst, len + 1, cursor, gui_text_previous(dst, *cursor), *cursor, NULL, 0);
 }
 
 static bool gui_ui_text_delete(char *dst, int *cursor)
 {
     if (!dst || !cursor) return false;
     size_t len = strlen(dst);
+    *cursor = gui_text_boundary(dst, *cursor);
     if ((size_t)*cursor >= len) return false;
-    memmove(dst + *cursor, dst + *cursor + 1, len - (size_t)(*cursor));
-    return true;
+    return gui_text_replace(dst, len + 1, cursor, *cursor, gui_text_next(dst, *cursor), NULL, 0);
 }
 
 /* Persist an edit to the active field. Settings fields save the settings
@@ -3260,7 +3515,6 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     if (primary_mod_down && IsKeyPressed(KEY_V)) {
         const char *clip = GetClipboardText();
-        if (gui_ui_text_delete_selection(dst)) changed = true;
         if (clip && clip[0]) {
             if (gui_ui_text_insert_filtered(s_active_text_field, dst, cap, clip)) {
                 changed = true;
@@ -3273,8 +3527,11 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
         bool finish_edit_requested = false;
         if (android_len > 0) {
-            for (size_t i = 0; i < android_len; i++) {
-                unsigned char ach = (unsigned char)android_text[i];
+            for (size_t i = 0; i < android_len; ) {
+                int size = 0;
+                int ach = GetCodepointNext(android_text + i, &size);
+                if (size <= 0 || (size_t)size > android_len - i) break;
+                i += (size_t)size;
                 if (ach == '\0') break;
                 if (ach == '\r' || ach == '\n') {
                     finish_edit_requested = true;
@@ -3290,7 +3547,6 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
                 }
                 if (primary_mod_down) continue;
                 if (!gui_ui_text_field_char_allowed(s_active_text_field, (int)ach)) continue;
-                if (gui_ui_text_delete_selection(dst)) changed = true;
                 if (gui_ui_text_insert_char(dst, cap, (int)ach)) changed = true;
             }
         }
@@ -3305,17 +3561,16 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     int ch = GetCharPressed();
     while (ch > 0) {
         if (!primary_mod_down && gui_ui_text_field_char_allowed(s_active_text_field, ch)) {
-            if (gui_ui_text_delete_selection(dst)) changed = true;
             if (gui_ui_text_insert_char(dst, cap, ch)) changed = true;
         }
         ch = GetCharPressed();
     }
 
     if (IsKeyPressed(KEY_LEFT)) {
-        gui_ui_text_set_cursor_position(dst, s_active_text_cursor - 1, shift_down);
+        gui_ui_text_set_cursor_position(dst, gui_text_previous(dst, s_active_text_cursor), shift_down);
     }
     if (IsKeyPressed(KEY_RIGHT)) {
-        gui_ui_text_set_cursor_position(dst, s_active_text_cursor + 1, shift_down);
+        gui_ui_text_set_cursor_position(dst, gui_text_next(dst, s_active_text_cursor), shift_down);
     }
     if (IsKeyPressed(KEY_HOME)) {
         gui_ui_text_set_cursor_position(dst, 0, shift_down);
@@ -4099,7 +4354,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Playback files section
-                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC):"),
+                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC / drop onto a channel panel):"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
                     // Channel A playback file
@@ -4109,13 +4364,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                         // Show filename or "(none)"
                         const char *file_a = app->settings.playback_file_a[0] ? app->settings.playback_file_a : "(none)";
-                        // Truncate long paths for display
-                        size_t len_a = strlen(file_a);
-                        if (len_a > 30) {
-                            snprintf(playback_file_a_display, sizeof(playback_file_a_display), "...%s", file_a + len_a - 27);
-                        } else {
-                            snprintf(playback_file_a_display, sizeof(playback_file_a_display), "%s", file_a);
-                        }
+                        gui_ui_copy_path_tail(playback_file_a_display, sizeof(playback_file_a_display), file_a);
                         CLAY(CLAY_ID("PlaybackFileAPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(playback_file_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_file_a[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
                         }
@@ -4130,16 +4379,25 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(CLAY_STRING("Ch B..."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
                         const char *file_b = app->settings.playback_file_b[0] ? app->settings.playback_file_b : "(none)";
-                        size_t len_b = strlen(file_b);
-                        if (len_b > 30) {
-                            snprintf(playback_file_b_display, sizeof(playback_file_b_display), "...%s", file_b + len_b - 27);
-                        } else {
-                            snprintf(playback_file_b_display, sizeof(playback_file_b_display), "%s", file_b);
-                        }
+                        gui_ui_copy_path_tail(playback_file_b_display, sizeof(playback_file_b_display), file_b);
                         CLAY(CLAY_ID("PlaybackFileBPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(playback_file_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_file_b[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
                         }
                         CLAY(CLAY_ID("PlaybackFileClearB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
+                    }
+
+                    // Playback audio (drag-and-drop monitor source; loads with
+                    // the RF files in one drop - a full capture set)
+                    CLAY(CLAY_ID("PlaybackFileAudioRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
+                        CLAY_TEXT(CLAY_STRING("Audio:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        const char *file_audio = app->settings.playback_audio_file[0] ? app->settings.playback_audio_file : "(drop an audio file)";
+                        gui_ui_copy_path_tail(playback_file_audio_display, sizeof(playback_file_audio_display), file_audio);
+                        CLAY(CLAY_ID("PlaybackFileAudioPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(make_string(playback_file_audio_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_audio_file[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
+                        }
+                        CLAY(CLAY_ID("PlaybackFileClearAudio"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
                     }
@@ -4275,7 +4533,7 @@ static void render_record_limit_window(gui_app_t *app)
         Color timecode_fg = display_timecode_valid ? COLOR_TEXT : COLOR_CLIP_RED;
         int record_limit_timecode_font_size = record_limit_timecode_font_size_px();
         Font record_limit_font = record_limit_timecode_font(app);
-        Vector2 record_limit_timecode_text_size = MeasureTextEx(record_limit_font,
+        Vector2 record_limit_timecode_text_size = gui_font_measure_text(record_limit_font,
                                                                 "00:00:00",
                                                                 (float)record_limit_timecode_font_size,
                                                                 0.0f);
@@ -5398,6 +5656,7 @@ static int gui_ui_toolbar_connection_width(const gui_app_t *app, bool compact,
 }
 
 static void render_toolbar_connection_group(bool control_capturing,
+                                            bool control_starting,
                                             int toolbar_text_size,
                                             int toolbar_gap,
                                             int connect_button_width,
@@ -5414,8 +5673,8 @@ static void render_toolbar_connection_group(bool control_capturing,
             .childGap = toolbar_gap
         }
     }) {
-        Color connect_color = control_capturing ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
-        const char *connect_label = control_capturing ? "Disconnect" : "Connect";
+        Color connect_color = (control_capturing || control_starting) ? COLOR_CLIP_RED : COLOR_SYNC_GREEN;
+        const char *connect_label = control_starting ? "Cancel" : control_capturing ? "Disconnect" : "Connect";
         CLAY(CLAY_ID("ConnectButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(connect_button_width), CLAY_SIZING_FIXED(32) },
@@ -5438,13 +5697,13 @@ static void render_toolbar_connection_group(bool control_capturing,
                 .sizing = { CLAY_SIZING_FIXED(mode_toggle_width), CLAY_SIZING_FIXED(32) },
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             },
-            .backgroundColor = to_clay_color(mode_bg),
+            .backgroundColor = to_clay_color(control_starting ? COLOR_BUTTON : mode_bg),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
             CLAY_TEXT(make_string(mode_label),
                 CLAY_TEXT_CONFIG({
                     .fontSize = toolbar_text_size,
-                    .textColor = to_clay_color(mode_fg),
+                    .textColor = to_clay_color(control_starting ? COLOR_TEXT_DIM : mode_fg),
                     .wrapMode = CLAY_TEXT_WRAP_NONE
                 }));
         }
@@ -5666,6 +5925,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     // Use the same local/remote state for measuring and drawing this frame.
     bool control_capturing = gui_net_is_client(app)
         ? gui_net_client_peer_capturing(app) : app->is_capturing;
+    bool playback_starting = gui_playback_is_starting(app);
     const device_info_t *selected_device =
         app->selected_device >= 0 && app->selected_device < app->device_count
             ? &app->devices[app->selected_device] : NULL;
@@ -5961,7 +6221,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
 
         // Device dropdown button
         bool device_dropdown_open = gui_dropdown_is_open(DROPDOWN_DEVICE, 0);
-        Color dropdown_color = device_dropdown_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+        Color dropdown_color = !playback_starting && device_dropdown_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
         CLAY(CLAY_ID("DeviceDropdown"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(device_dropdown_width), CLAY_SIZING_FIXED(32) },
@@ -5974,13 +6234,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             CLAY_TEXT(make_string(device_dropdown_buf),
                 CLAY_TEXT_CONFIG({
                     .fontSize = toolbar_text_size,
-                    .textColor = to_clay_color(COLOR_TEXT),
+                    .textColor = to_clay_color(playback_starting ? COLOR_TEXT_DIM : COLOR_TEXT),
                     .wrapMode = CLAY_TEXT_WRAP_NONE
                 }));
         }
 
         if (!toolbar_two_rows) {
             render_toolbar_connection_group(control_capturing,
+                                            playback_starting,
                                             toolbar_text_size,
                                             toolbar_gap,
                                             connect_button_width,
@@ -6141,6 +6402,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                 }
             }) {
                 render_toolbar_connection_group(control_capturing,
+                                                playback_starting,
                                                 toolbar_text_size,
                                                 toolbar_gap,
                                                 connect_button_width,
@@ -6744,6 +7006,11 @@ static void render_channel_stats(gui_app_t *app, int channel,
 
 typedef struct {
     int left_padding, right_padding, label_width, track_width;
+    int readout_width;      // "8-bit 20.0 MSPS" slot; 0 = no horizontal room
+    int fileinfo_width;     // "RAW x FLAC y" slot; 0 = hidden
+    int name_width;         // filename slot; 0 = hidden
+    bool readout_compact;   // Compact text tier chosen for the readout
+    bool fileinfo_compact;  // Compact text tier chosen for the fileinfo
     bool stacked;
 } gui_playback_timeline_layout_t;
 
@@ -6757,33 +7024,130 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     int right_padding = screen_width < 900 ? 0 : 189;
     // Reserve a complete ordinary timecode with static font metrics. Long
     // hour counts may abbreviate inside this slot but never move the track.
-    int label_width = gui_ui_measure_text_width(app, "88:88:88/88:88:88", FONT_SIZE_STATUS, 1);
+    int label_width = gui_ui_measure_text_width(app, "88:88:88/~88:88:88", FONT_SIZE_STATUS, 1);
     int label_min = screen_width < 900 ? 120 : 150;
     if (label_width < label_min) label_width = label_min;
     int available = screen_width - spacing.horizontal_gap * 4 - left_padding - right_padding;
     if (available < 1) available = 1;
     int track_width = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
     bool stacked = available - label_width - 8 < 64;
-    int track_available = stacked ? available : available - label_width - 8;
+    // Right-side file info slots (see the HARD DEV NOTE above the helpers):
+    // fixed representative widths per tier so value changes never reflow the
+    // row; tiers degrade full -> compact-fileinfo -> name+readout -> readout
+    // only. Stacked rows fit the info line separately below the track.
+    int readout_full = gui_ui_measure_text_width(app, "16-bit 999.9 MSPS", FONT_SIZE_STATUS, 1);
+    int readout_compact_w = gui_ui_measure_text_width(app, "16-bit 999M", FONT_SIZE_STATUS, 1);
+    int fileinfo_full = gui_ui_measure_text_width(app, "RAW 9999.9GiB FLAC 9999.9GiB 99.9x", FONT_SIZE_STATUS, 1);
+    int fileinfo_compact_w = gui_ui_measure_text_width(app, "9999.9G/999.9G", FONT_SIZE_STATUS, 1);
+    int name_slot = gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
+    int readout_width = 0;
+    int fileinfo_width = 0;
+    int name_width = 0;
+    bool readout_compact = false;
+    bool fileinfo_compact = false;
+    {
+        int room = stacked ? available : available - label_width - 8 - 64 - 8;
+        int full_all = name_slot + 8 + readout_full + 8 + fileinfo_full;
+        int mid_all = name_slot + 8 + readout_full + 8 + fileinfo_compact_w;
+        int name_readout = name_slot + 8 + readout_full;
+        if (room >= full_all) {
+            name_width = name_slot;
+            readout_width = readout_full;
+            fileinfo_width = fileinfo_full;
+        } else if (room >= mid_all) {
+            name_width = name_slot;
+            readout_width = readout_full;
+            fileinfo_width = fileinfo_compact_w;
+            fileinfo_compact = true;
+        } else if (room >= name_readout) {
+            name_width = name_slot;
+            readout_width = readout_full;
+        } else if (room >= readout_compact_w) {
+            readout_width = readout_compact_w;
+            readout_compact = true;
+        }
+    }
+    int info_width = 0;
+    if (name_width > 0) info_width += name_width;
+    if (readout_width > 0) info_width += (info_width > 0 ? 8 : 0) + readout_width;
+    if (fileinfo_width > 0) info_width += (info_width > 0 ? 8 : 0) + fileinfo_width;
+    int track_available = stacked
+        ? available
+        : available - label_width - 8 - ((info_width > 0) ? info_width + 8 : 0);
     if (track_width > track_available) track_width = track_available;
     if (label_width > available) label_width = available;
     return (gui_playback_timeline_layout_t){left_padding, right_padding,
-                                           label_width, track_width, stacked};
+                                           label_width, track_width,
+                                           readout_width, fileinfo_width, name_width,
+                                           readout_compact, fileinfo_compact, stacked};
+}
+
+// Discovery and verification report file progress independently from playback.
+static void gui_ui_format_playback_index_progress(char *text, size_t size,
+                                                  const playback_index_progress_t *progress,
+                                                  bool compact, bool verifying) {
+    if (!text || size == 0) return;
+    text[0] = '\0';
+    if (!progress || !progress->active) return;
+    if (progress->queued) {
+        snprintf(text, size, "%s", verifying ? "Verification queued" : "Length scan queued");
+        return;
+    }
+    if (progress->total_bytes == 0) {
+        snprintf(text, size, "%s", verifying ? "Starting verification..." : "Starting length scan...");
+        return;
+    }
+    uint64_t scanned = progress->bytes_scanned;
+    if (scanned > progress->total_bytes) scanned = progress->total_bytes;
+    unsigned percent = (unsigned)((long double)scanned * 100.0L / progress->total_bytes);
+    const char *state = verifying
+        ? (progress->waiting ? "Verification waiting" : (compact ? "Verifying" : "Verifying length"))
+        : (progress->waiting ? "Scan waiting" : "Scanning length");
+    if (compact) {
+        snprintf(text, size, "%s: %u%%", state, percent);
+    } else {
+        snprintf(text, size, "%s: %u%% (%.1f/%.1f GB)", state, percent,
+                 scanned / 1000000000.0, progress->total_bytes / 1000000000.0);
+    }
 }
 
 // Render one playback timeline row (used for Channel A and Channel B in playback mode).
+// name_text / readout_text / fileinfo_text form the right-side file info line
+// (basename, "8-bit 20.0 MSPS", "RAW x FLAC y"); pass NULL / empty strings to
+// skip slots the layout hid. These buffers must live through frame rendering.
+// See the HARD DEV NOTE above the helpers.
 static void render_playback_timeline_row(gui_app_t *app, int channel_index, char *timeline_text,
-                                         int fill_w, bool enabled, gui_ui_channel_spacing_t spacing,
-                                         const gui_playback_timeline_layout_t *layout)
+                                         int fill_w, bool loaded, bool seekable, bool indexing,
+                                         bool provisional, bool verification_failed,
+                                         gui_ui_channel_spacing_t spacing,
+                                         const gui_playback_timeline_layout_t *layout,
+                                         char *name_text, char *readout_text,
+                                         char *fileinfo_text)
 {
-    Color timeline_text_color = enabled ? COLOR_TEXT : COLOR_TEXT_DIM;
-    Color timeline_track_color = enabled ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
-    Color timeline_fill_color = enabled ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM;
+    Color timeline_text_color = loaded ? COLOR_TEXT : COLOR_TEXT_DIM;
+    Color timeline_track_color = seekable ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
+    Color timeline_fill_color = seekable ? (provisional ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN) : COLOR_TEXT_DIM;
+    Color readout_color = loaded ? COLOR_TEXT_DIM : ui_disabled_color(COLOR_TEXT_DIM);
+    bool show_length_status = loaded && (provisional || verification_failed);
+    char *index_text = playback_index_display[channel_index == 1 ? 1 : 0];
+    if (show_length_status) {
+        if (verification_failed) {
+            snprintf(index_text, sizeof(playback_index_display[0]), "Length unavailable");
+        } else {
+            playback_index_progress_t progress = {0};
+            gui_playback_get_index_progress(app, channel_index, &progress);
+            gui_ui_format_playback_index_progress(index_text, sizeof(playback_index_display[0]),
+                                                  &progress, layout->track_width < 220, true);
+            if (!index_text[0]) snprintf(index_text, sizeof(playback_index_display[0]), "Length unconfirmed");
+        }
+        gui_ui_ellipsize_text(app, index_text, sizeof(playback_index_display[0]),
+                              9, 1, layout->track_width);
+    }
     gui_ui_ellipsize_text(app, timeline_text, sizeof(playback_timeline_display_a),
                           FONT_SIZE_STATUS, 1, layout->label_width);
     CLAY(CLAY_IDI("PlaybackTimelineRow", channel_index), {
         .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 40 : 24) },
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED((layout->stacked ? 56 : 24) + (show_length_status ? 14 : 0)) },
             .layoutDirection = CLAY_LEFT_TO_RIGHT,
             .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
             .childGap = spacing.horizontal_gap
@@ -6795,7 +7159,7 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
 
         CLAY(CLAY_IDI("PlaybackTimeline", channel_index), {
             .layout = {
-                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(layout->stacked ? 38 : 22) },
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED((layout->stacked ? 54 : 22) + (show_length_status ? 14 : 0)) },
                 .layoutDirection = layout->stacked ? CLAY_TOP_TO_BOTTOM : CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
                 .childGap = layout->stacked ? 4 : 8
@@ -6808,20 +7172,99 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(timeline_text_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
             }
 
-            CLAY(CLAY_IDI("PlaybackTimelineTrack", channel_index), {
+            CLAY(CLAY_IDI("PlaybackTimelineTrackColumn", channel_index), {
                 .layout = {
-                    .sizing = { CLAY_SIZING_FIXED(layout->track_width), CLAY_SIZING_FIXED(10) },
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT
-                },
-                .backgroundColor = to_clay_color(timeline_track_color),
-                .cornerRadius = CLAY_CORNER_RADIUS(5)
+                    .sizing = { CLAY_SIZING_FIXED(layout->track_width), CLAY_SIZING_FIXED(show_length_status ? 24 : 10) },
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .childGap = show_length_status ? 4 : 0
+                }
             }) {
-                if (fill_w > 0) {
-                    CLAY(CLAY_IDI("PlaybackTimelineFill", channel_index), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
-                        .backgroundColor = to_clay_color(timeline_fill_color),
-                        .cornerRadius = CLAY_CORNER_RADIUS(5)
-                    }) {}
+                if (show_length_status) {
+                    CLAY_TEXT(make_string(index_text),
+                        CLAY_TEXT_CONFIG({ .fontSize = 9, .fontId = 1,
+                            .textColor = to_clay_color(verification_failed ? COLOR_SYNC_RED : COLOR_METER_YELLOW),
+                            .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                }
+                CLAY(CLAY_IDI("PlaybackTimelineTrack", channel_index), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(layout->track_width), CLAY_SIZING_FIXED(10) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childAlignment = { .x = seekable ? CLAY_ALIGN_X_LEFT : CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(timeline_track_color),
+                    .cornerRadius = CLAY_CORNER_RADIUS(5)
+                }) {
+                    if (fill_w > 0) {
+                        CLAY(CLAY_IDI("PlaybackTimelineFill", channel_index), {
+                            .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
+                            .backgroundColor = to_clay_color(timeline_fill_color),
+                            .cornerRadius = CLAY_CORNER_RADIUS(5)
+                        }) {}
+                    } else if (loaded && !seekable && indexing) {
+                        playback_index_progress_t progress = {0};
+                        gui_playback_get_index_progress(app, channel_index, &progress);
+                        gui_ui_format_playback_index_progress(index_text, sizeof(playback_index_display[0]),
+                                                              &progress, layout->track_width < 220, false);
+                        gui_ui_ellipsize_text(app, index_text, sizeof(playback_index_display[0]),
+                                              9, 1, layout->track_width > 8 ? layout->track_width - 8 : 1);
+                        CLAY_TEXT(make_string(index_text),
+                            CLAY_TEXT_CONFIG({ .fontSize = 9, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                    }
+                }
+            }
+
+            // Right-side file info line: [basename][bit-depth + rate][RAW/FLAC]
+            // — flows after the scrub track horizontally / its own line stacked.
+            if (layout->name_width > 0 || layout->readout_width > 0 || layout->fileinfo_width > 0) {
+                CLAY(CLAY_IDI("PlaybackTimelineInfo", channel_index), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                        .childGap = 8
+                    }
+                }) {
+                    if (layout->name_width > 0 && name_text && name_text[0]) {
+                        gui_ui_ellipsize_text(app, name_text, sizeof(playback_name_display_a),
+                                              FONT_SIZE_STATUS, 1, layout->name_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineName", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->name_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(name_text),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(timeline_text_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+
+                    if (layout->readout_width > 0 && readout_text && readout_text[0]) {
+                        gui_ui_ellipsize_text(app, readout_text, sizeof(playback_readout_display_a),
+                                              FONT_SIZE_STATUS, 1, layout->readout_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineReadout", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->readout_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(readout_text),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(readout_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
+
+                    if (layout->fileinfo_width > 0 && fileinfo_text && fileinfo_text[0]) {
+                        gui_ui_ellipsize_text(app, fileinfo_text, sizeof(playback_fileinfo_display_a),
+                                              FONT_SIZE_STATUS, 1, layout->fileinfo_width);
+                        CLAY(CLAY_IDI("PlaybackTimelineFileInfo", channel_index), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(layout->fileinfo_width), CLAY_SIZING_FIT(0) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                            }
+                        }) {
+                            CLAY_TEXT(make_string(fileinfo_text),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATUS, .fontId = 1, .textColor = to_clay_color(readout_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        }
+                    }
                 }
             }
         }
@@ -7349,6 +7792,14 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
         int playback_fill_w_b = 0;
         bool playback_has_file_a = false;
         bool playback_has_file_b = false;
+        bool playback_seekable_a = false;
+        bool playback_seekable_b = false;
+        bool playback_indexing_a = false;
+        bool playback_indexing_b = false;
+        bool playback_provisional_a = false;
+        bool playback_provisional_b = false;
+        bool playback_verification_failed_a = false;
+        bool playback_verification_failed_b = false;
         snprintf(playback_timeline_display_a, sizeof(playback_timeline_display_a), "--:--:--/--:--:--");
         snprintf(playback_timeline_display_b, sizeof(playback_timeline_display_b), "--:--:--/--:--:--");
         if (playback_mode) {
@@ -7358,18 +7809,50 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             uint64_t total_samples_b = 0;
             double duration_seconds_a = 0.0;
             double duration_seconds_b = 0.0;
-            (void)gui_ui_playback_channel_timeline_info(app, 0, &total_samples_a, &duration_seconds_a);
-            (void)gui_ui_playback_channel_timeline_info(app, 1, &total_samples_b, &duration_seconds_b);
+            bool loaded_a = gui_ui_playback_channel_timeline_info(app, 0, &total_samples_a, &duration_seconds_a,
+                                                                 &playback_provisional_a, &playback_verification_failed_a);
+            bool loaded_b = gui_ui_playback_channel_timeline_info(app, 1, &total_samples_b, &duration_seconds_b,
+                                                                 &playback_provisional_b, &playback_verification_failed_b);
+            playback_seekable_a = loaded_a && total_samples_a > 0 && duration_seconds_a > 0.0;
+            playback_seekable_b = loaded_b && total_samples_b > 0 && duration_seconds_b > 0.0;
+            playback_indexing_a = gui_playback_is_indexing(app, 0);
+            playback_indexing_b = gui_playback_is_indexing(app, 1);
             gui_ui_format_playback_timeline(playback_timeline_display_a, sizeof(playback_timeline_display_a),
                                             &playback_fill_w_a, &playback_has_file_a,
-                                            current_sample_a, total_samples_a, duration_seconds_a, playback_track_width_px);
+                                            loaded_a, playback_provisional_a, current_sample_a, total_samples_a, duration_seconds_a,
+                                            gui_playback_get_channel_rate_hz(app, 0), playback_track_width_px);
             gui_ui_format_playback_timeline(playback_timeline_display_b, sizeof(playback_timeline_display_b),
                                             &playback_fill_w_b, &playback_has_file_b,
-                                            current_sample_b, total_samples_b, duration_seconds_b, playback_track_width_px);
+                                            loaded_b, playback_provisional_b, current_sample_b, total_samples_b, duration_seconds_b,
+                                            gui_playback_get_channel_rate_hz(app, 1), playback_track_width_px);
+
+            // Right-side file info per channel (HARD DEV NOTE above the
+            // helpers): basename + actual bit depth/resolved real rate +
+            // RAW/FLAC sizes, next to the scrub track on the same row.
+            gui_ui_playback_file_basename(app, 0, playback_name_display_a,
+                                          sizeof(playback_name_display_a));
+            gui_ui_playback_file_basename(app, 1, playback_name_display_b,
+                                          sizeof(playback_name_display_b));
+            gui_ui_format_playback_readout(app, 0, playback_readout_display_a,
+                                           sizeof(playback_readout_display_a),
+                                           timeline_layout.readout_compact);
+            gui_ui_format_playback_readout(app, 1, playback_readout_display_b,
+                                           sizeof(playback_readout_display_b),
+                                           timeline_layout.readout_compact);
+            gui_ui_format_playback_fileinfo(app, 0, playback_fileinfo_display_a,
+                                            sizeof(playback_fileinfo_display_a),
+                                            timeline_layout.fileinfo_compact);
+            gui_ui_format_playback_fileinfo(app, 1, playback_fileinfo_display_b,
+                                            sizeof(playback_fileinfo_display_b),
+                                            timeline_layout.fileinfo_compact);
 
             // Playback scrub row aligned with Channel A preview.
             render_playback_timeline_row(app, 0, playback_timeline_display_a, playback_fill_w_a,
-                                         playback_has_file_a, spacing, &timeline_layout);
+                                          playback_has_file_a, playback_seekable_a, playback_indexing_a,
+                                          playback_provisional_a, playback_verification_failed_a,
+                                          spacing, &timeline_layout,
+                                          playback_name_display_a, playback_readout_display_a,
+                                          playback_fileinfo_display_a);
         }
         // Channel A row: VU meter + waveform + stats
         CLAY(CLAY_ID("ChannelARow"), {
@@ -7402,7 +7885,11 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             if (playback_mode) {
                 // Second playback scrub row aligned with Channel B preview.
                 render_playback_timeline_row(app, 1, playback_timeline_display_b, playback_fill_w_b,
-                                             playback_has_file_b, spacing, &timeline_layout);
+                                              playback_has_file_b, playback_seekable_b, playback_indexing_b,
+                                              playback_provisional_b, playback_verification_failed_b,
+                                              spacing, &timeline_layout,
+                                              playback_name_display_b, playback_readout_display_b,
+                                              playback_fileinfo_display_b);
             }
             CLAY(CLAY_ID("ChannelBRow"), {
                 .layout = {
@@ -8117,7 +8604,7 @@ static bool render_main_panels(gui_app_t *app) {
         status_free_space_display[0] = '\0';
     }
     if (show_status_message) {
-        snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+        gui_ui_copy_text_prefix(status_message_display, sizeof(status_message_display), raw_status);
         if (status_message_width_budget < 24) {
             status_message_width_budget = 24;
         }
@@ -8684,7 +9171,7 @@ static void gui_ui_poll_android_results(gui_app_t *app)
     static int s_last_usb_present = -1;
     int usb_present_now = android_usb_device_present();
     if (usb_present_now != s_last_usb_present) {
-        if (!app->is_capturing && !gui_app_capture_busy()) {
+        if (!app->is_capturing && !gui_app_capture_busy() && !gui_playback_is_starting(app)) {
             int prev_selected_type = -1;
             if (app->selected_device >= 0 && app->selected_device < app->device_count) {
                 prev_selected_type = (int)app->devices[app->selected_device].type;
@@ -8707,11 +9194,13 @@ static void gui_ui_poll_android_results(gui_app_t *app)
 
     /* Picker results -> apply to settings. */
     int pkind = 0, pok = 0;
-    char ppath[512];
+    char ppath[FILE_PATH_MAX];
     if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
         fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
                 pkind, pok, ppath);
-        if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
+        if (gui_playback_is_starting(app)) {
+            gui_app_set_status(app, "File settings are locked while playback prepares");
+        } else if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
             if (pok && ppath[0]) {
                 snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", ppath);
                 gui_settings_save(&app->settings);
@@ -8751,7 +9240,9 @@ static void gui_ui_poll_android_results(gui_app_t *app)
     if (android_permission_pending()) {
         int granted = 0;
         if (android_poll_usb_permission_result(&granted)) {
-            if (granted && android_usb_has_fd()) {
+            if (gui_playback_is_starting(app)) {
+                // Consume the permission result without starting another source.
+            } else if (granted && android_usb_has_fd()) {
                 gui_app_set_status(app, "USB permission granted, starting capture...");
                 gui_app_start_capture_async(app);
             } else {
@@ -9092,6 +9583,10 @@ void gui_handle_interactions(gui_app_t *app) {
     gui_ui_poll_android_results(app);
 #endif
     gui_ui_sync_capture_mode_state(app);
+    if (gui_playback_is_starting(app)) {
+        if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0)) gui_dropdown_close_all();
+        gui_ui_clear_text_edit();
+    }
     gui_record_limit_runtime_tick(app);
     gui_ui_update_check_tick(app);
     // Re-default level-autostop Vpp when the active backend type changes so the
@@ -9114,6 +9609,60 @@ void gui_handle_interactions(gui_app_t *app) {
         if (!gui_ui_seek_playback_from_track(app, s_playback_scrub_track_index,
                                              gui_ui_get_mouse_position().x)) {
             s_playback_scrub_active = false;
+        }
+    }
+
+    // Playback timeline mouse-wheel scrubbing (HARD DEV NOTE above the file
+    // info helpers): wheel over a playback timeline row seeks that channel
+    // by 1-10 s of stream time with burst acceleration. Wheel-up steps back,
+    // wheel-down steps forward.
+    {
+        static double s_wheel_step_s = 1.0;
+        static double s_wheel_last_time = -1000.0;
+        if (playback_mode && app->is_capturing &&
+            !s_record_limit_window_open && !s_version_info_window_open &&
+            !gui_capture_meta_panel_is_open() && !app->settings_panel_open) {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f) {
+                int wheel_channel = -1;
+                for (int ch = 0; ch < 2; ch++) {
+                    if (Clay_PointerOver(CLAY_IDI("PlaybackTimelineRow", ch))) {
+                        wheel_channel = ch;
+                        break;
+                    }
+                }
+                if (wheel_channel >= 0) {
+                    double now = GetTime();
+                    double gap = now - s_wheel_last_time;
+                    s_wheel_last_time = now;
+                    // Acceleration: notches within 400 ms ramp the step
+                    // (+0.75 s per notch, 1 s .. 10 s); an idle gap resets to
+                    // the 1 s base step.
+                    if (gap > 0.4 || gap < 0.0) {
+                        s_wheel_step_s = 1.0;
+                    } else {
+                        s_wheel_step_s += fabs((double)wheel) * 0.75;
+                        if (s_wheel_step_s > 10.0) s_wheel_step_s = 10.0;
+                    }
+                    uint64_t total = 0;
+                    double duration = 0.0;
+                    if (gui_ui_playback_channel_timeline_info(app, wheel_channel,
+                                                               &total, &duration, NULL, NULL) &&
+                        total > 1 && duration > 0.0) {
+                        double rate_hz = (double)total / duration;
+                        uint64_t step = (uint64_t)(s_wheel_step_s * rate_hz);
+                        if (step == 0) step = 1;
+                        uint64_t pos = gui_playback_get_position_samples_channel(app, wheel_channel);
+                        uint64_t target;
+                        if (wheel > 0.0f) {
+                            target = (pos > step) ? (pos - step) : 0;
+                        } else {
+                            target = (total - 1 > pos + step) ? (pos + step) : (total - 1);
+                        }
+                        gui_playback_seek_sample_channel(app, wheel_channel, target);
+                    }
+                }
+            }
         }
     }
 
@@ -9580,6 +10129,11 @@ void gui_handle_interactions(gui_app_t *app) {
             // Clicking the lit button is a no-op (no re-apply, no re-save).
             for (int m = GUI_NET_MODE_LOCAL; m <= GUI_NET_MODE_CLIENT; m++) {
                 if (!Clay_PointerOver(CLAY_IDI("VersionInfoNetModeBtn", m))) continue;
+                if (gui_playback_is_starting(app)) {
+                    gui_app_set_status(app, "Network mode is locked while playback prepares");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
                 int cur = app->settings.net_mode;
                 if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
                 if (m != cur) {
@@ -9861,7 +10415,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
-                gui_app_set_status(app, "No playback file loaded for CH A");
+                gui_app_set_status(app, gui_ui_playback_channel_timeline_info(app, 0, NULL, NULL, NULL, NULL)
+                    ? "CH A length is unknown; seeking unavailable"
+                    : "No playback file loaded for CH A");
             }
             gui_ui_set_click_consumed();
             return;
@@ -9875,7 +10431,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_playback_scrub_active = true;
             } else {
                 s_playback_scrub_active = false;
-                gui_app_set_status(app, "No playback file loaded for CH B");
+                gui_app_set_status(app, gui_ui_playback_channel_timeline_info(app, 1, NULL, NULL, NULL, NULL)
+                    ? "CH B length is unknown; seeking unavailable"
+                    : "No playback file loaded for CH B");
             }
             gui_ui_set_click_consumed();
             return;
@@ -9908,6 +10466,11 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
+            if (gui_playback_is_starting(app)) {
+                gui_app_stop_capture(app);
+                gui_ui_set_click_consumed();
+                return;
+            }
             bool control_capturing = app->is_capturing;
             if (gui_net_is_client(app)) {
                 control_capturing = gui_net_client_peer_capturing(app);
@@ -9935,6 +10498,13 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
+            } else if (gui_ui_selected_device_is_playback(app) && !gui_net_is_client(app)) {
+                // File preparation is asynchronous; the per-frame poll commits it.
+                (void)gui_app_start_capture(app);
+                gui_dropdown_close_all();
+                gui_ui_clear_text_edit();
+                gui_ui_set_click_consumed();
+                return;
             } else {
 #if defined(__ANDROID__)
                 /* Async USB permission: never block the render thread on the
@@ -9969,7 +10539,9 @@ void gui_handle_interactions(gui_app_t *app) {
             }
         }
         if (mode_toggle_hit) {
-            if (mode_toggle_is_misrc_clockgen) {
+            if (gui_playback_is_starting(app)) {
+                gui_app_set_status(app, "Capture mode is locked while playback prepares");
+            } else if (mode_toggle_is_misrc_clockgen) {
                 gui_app_set_status(app, "MISRC Clockgen mode is selected from the device list");
             } else if (mode_toggle_is_cxadc) {
                 if (mode_toggle_cxadc_clockgen) {
@@ -10046,7 +10618,9 @@ void gui_handle_interactions(gui_app_t *app) {
             Clay_PointerOver(CLAY_ID("SettingsPanel"))) {
             gui_ui_clear_text_edit();
             if (!gui_net_is_client(app)) {
-                gui_app_set_status(app, "Settings are locked while recording is active");
+                gui_app_set_status(app, gui_playback_is_starting(app)
+                    ? "Settings are locked while playback prepares"
+                    : "Settings are locked while recording is active");
             } else if (gui_net_client_peer_recording(app)) {
                 gui_app_set_status(app, "Settings are locked while the server is recording");
             } else if (gui_net_client_server_settings_support(app) == 0) {
@@ -10728,13 +11302,22 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_settings_save(&app->settings);
                 gui_ui_set_click_consumed();
             }
+            if (Clay_PointerOver(CLAY_ID("PlaybackFileClearAudio"))) {
+                app->settings.playback_audio_file[0] = '\0';
+                gui_settings_save(&app->settings);
+                gui_ui_set_click_consumed();
+            }
         }
 
         // Note: CVBS enable/disable is now handled automatically when selecting
         // CVBS view via ensure_cvbs_enabled_for_channel() in gui_dropdown.c
 
         // Handle all dropdown interactions via centralized handler
-        if (!s_ui_consumed_click && gui_dropdown_handle_click(app)) {
+        if (!s_ui_consumed_click && gui_playback_is_starting(app) &&
+            Clay_PointerOver(CLAY_ID("DeviceDropdown"))) {
+            gui_app_set_status(app, "Device selection is locked while playback prepares");
+            s_ui_consumed_click = true;
+        } else if (!s_ui_consumed_click && gui_dropdown_handle_click(app)) {
             s_ui_consumed_click = true;
         }
     }

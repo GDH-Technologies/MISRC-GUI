@@ -8,6 +8,7 @@
  */
 
 #include "gui_extract.h"
+#include "gui_rf_stream_marks.h"
 #include "../core/gui_app.h"
 #include "../output/gui_record.h"
 #include "../visualization/gui_oscilloscope.h"
@@ -52,6 +53,7 @@ static int32_t *s_tmp32_b = NULL;
 // Extraction thread state
 static thrd_t s_extract_thread;
 static bool s_extract_thread_running = false;
+static atomic_bool s_extract_stop_requested = false;
 static gui_app_t *s_extract_app = NULL;
 // Note: s_capture_rb removed - now using app->buffers (buffer_manager)
 
@@ -90,6 +92,77 @@ static bool s_events_initialized = false;
 // Log every ~2 seconds = 1220 frames
 #define BUFMGR_LOG_INTERVAL 1220
 
+// Sideband stamps stay aligned with the playback RF FIFO across seek, loop,
+// padding and queue drops. 8192 blocks exceed the maximum 1 GiB RF FIFO.
+#define RF_STAMP_CAPACITY 8192u
+typedef struct { gui_rf_block_info_t info[2]; size_t counts[2]; } rf_input_stamp_t;
+static rf_input_stamp_t s_rf_stamps[RF_STAMP_CAPACITY];
+static atomic_uint_fast64_t s_stamp_write, s_stamp_read;
+static bool s_tagged_input;
+bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2]) {
+    uint64_t write = atomic_load_explicit(&s_stamp_write, memory_order_relaxed);
+    uint64_t read = atomic_load_explicit(&s_stamp_read, memory_order_acquire);
+    if (!s_tagged_input || write-read >= RF_STAMP_CAPACITY) return false;
+    rf_input_stamp_t *stamp = &s_rf_stamps[write % RF_STAMP_CAPACITY];
+    memcpy(stamp->info, info, sizeof(stamp->info));
+    memcpy(stamp->counts, counts, sizeof(stamp->counts));
+    atomic_store_explicit(&s_stamp_write, write+1, memory_order_release);
+    return true;
+}
+static bool read_rf_stamp(rf_input_stamp_t *stamp) {
+    uint64_t read = atomic_load_explicit(&s_stamp_read, memory_order_relaxed);
+    if (read == atomic_load_explicit(&s_stamp_write, memory_order_acquire)) return false;
+    *stamp = s_rf_stamps[read % RF_STAMP_CAPACITY];
+    atomic_store_explicit(&s_stamp_read, read+1, memory_order_release);
+    return true;
+}
+static gui_rf_stream_marks_t *s_rf_marks;
+static bool s_rf_observer_seen, s_rf_seen_b;
+static uint32_t s_rf_seen_parser, s_rf_seen_missed, s_rf_seen_drops;
+static uint64_t s_rf_seen_epoch;
+static void observe_rf_write(void *context, uint64_t byte_position, size_t bytes) {
+    gui_app_t *app = context;
+    if (!app || !s_rf_marks) return;
+    uint32_t parser = atomic_load(&app->parser_error_count);
+    uint32_t missed = atomic_load(&app->missed_frame_count);
+    uint32_t drops = atomic_load(&app->buffers.stats[BUF_CAPTURE_RF].write_drops);
+    uint64_t epoch = atomic_load(&app->rf_stream_epoch);
+    bool has_b = app->capture_has_channel_b;
+    bool gap = !s_rf_observer_seen || (has_b != s_rf_seen_b || parser != s_rf_seen_parser || missed != s_rf_seen_missed ||
+                                    drops != s_rf_seen_drops || epoch != s_rf_seen_epoch);
+    if (gap && epoch == s_rf_seen_epoch) epoch = atomic_fetch_add(&app->rf_stream_epoch,1)+1;
+    gui_rf_block_info_t info[2] = {{0}};
+    uint32_t shared_rate = atomic_load(&app->sample_rate);
+    for (int ch=0; ch<2; ++ch) {
+        info[ch].sample_rate_hz = atomic_load(&app->rf_source_rate_hz[ch]);
+        if (!info[ch].sample_rate_hz) info[ch].sample_rate_hz = shared_rate;
+        info[ch].epoch = epoch;
+    }
+    if (!has_b) info[1].sample_rate_hz = 0;
+    // A parser may compact valid payload around an unknown position in this
+    // write. Exclude that entire write from preview; recording is untouched.
+    gui_rf_stream_marks_observe(s_rf_marks,byte_position,bytes,info,gap);
+    s_rf_observer_seen = true; s_rf_seen_b = has_b;
+    s_rf_seen_parser = parser; s_rf_seen_missed = missed; s_rf_seen_drops = drops; s_rf_seen_epoch = epoch;
+}
+void gui_extract_prepare_stream(gui_app_t *app) {
+    if (!app || app->is_capturing || s_extract_thread_running) return;
+    bufmgr_reset(&app->buffers,BUF_CAPTURE_RF);
+    bufmgr_reset(&app->buffers,BUF_DISPLAY);
+    atomic_store(&s_stamp_write,0); atomic_store(&s_stamp_read,0);
+    if (!s_rf_marks) s_rf_marks = gui_rf_stream_marks_create();
+    gui_rf_stream_marks_reset(s_rf_marks);
+    s_rf_observer_seen = false;
+    atomic_fetch_add(&app->rf_stream_epoch,1);
+    atomic_store(&app->rf_source_rate_hz[0],0); atomic_store(&app->rf_source_rate_hz[1],0);
+    atomic_store(&app->rf_preview_input_supported,true);
+    // No extraction producer is running here. Clear pressure from the prior
+    // session so a new capture does not inherit its frozen-preview state.
+    const gui_rf_block_info_t empty_info[2] = {{0}};
+    gui_video_submit_rf(app,NULL,NULL,0,0,empty_info,true);
+    app->buffers.rf_write_observer = observe_rf_write;
+    app->buffers.rf_write_observer_context = app;
+}
 // Extraction thread - runs continuously from capture start to stop
 // Always updates display/stats, conditionally writes to record ringbuffers
 static int extraction_thread(void *ctx) {
@@ -98,6 +171,8 @@ static int extraction_thread(void *ctx) {
     size_t clip[2] = {0, 0};
     uint16_t peak[2] = {0, 0};
     uint32_t frame_count = 0;
+    uint64_t source_offset = 0;
+    bool have_mapping = false, previous_swap = false, previous_b = false;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
     /* Best-effort I/O level 0: this thread writes the record spill file when
      * the writers fall behind. */
@@ -107,7 +182,7 @@ static int extraction_thread(void *ctx) {
 
     while (1) {
         // Check for exit
-        if (atomic_load(&do_exit)) {
+        if (atomic_load(&s_extract_stop_requested) || atomic_load(&do_exit)) {
             break;
         }
         const int16_t *mapped_a = NULL;
@@ -126,21 +201,40 @@ static int extraction_thread(void *ctx) {
             continue;
         }
 
+        rf_input_stamp_t stamp = {0};
+        bool preview_safe;
+        bool block_has_b = s_extract_app->capture_has_channel_b;
+        if (s_tagged_input) {
+            preview_safe = read_rf_stamp(&stamp);
+            if (preview_safe) block_has_b = stamp.counts[1] != 0;
+        } else {
+            preview_safe = gui_rf_stream_marks_read(s_rf_marks,source_offset*4,read_size,stamp.info);
+            // An unsafe RF range can still carry known channel mapping. With
+            // no metadata, preserve capture capability for raw recording.
+            if (stamp.info[0].sample_rate_hz || stamp.info[1].sample_rate_hz)
+                block_has_b = stamp.info[1].sample_rate_hz != 0;
+            stamp.counts[0] = stamp.counts[1] = BUFFER_READ_SIZE;
+        }
+        if (!preview_safe) {
+            stamp.counts[0] = stamp.counts[1] = 0;
+            stamp.info[0].discontinuity = stamp.info[1].discontinuity = true;
+        }
         // Extract samples (always - this is the core work)
-        // Re-read capture_has_channel_b each iteration so upstream dual-ADC
-        // auto-detection (sets flag on first stream_id=1 callback) is picked
-        // up without restarting the extraction thread.
         // Channel B can join or leave mid-run (RF B toggled on a connected
-        // two-card CXADC rig), so follow the flag with the unpack function.
+        // two-card CXADC rig, upstream dual-ADC auto-detection on the first
+        // stream_id=1 callback), so follow the flag with the unpack function.
         // The upstream backend always unpacks A+B. An A-only function never
         // fills s_buf_b, so B is present only when the function unpacks it.
+        // Prefer known per-block presence over the producer's newest flag, but
+        // preview-only metadata failures must not silence the recorded B data.
         bool want_ab = s_extract_app &&
-                       (s_extract_app->capture_has_channel_b || s_extract_app->capture_backend_upstream);
+                       (block_has_b || s_extract_app->capture_has_channel_b ||
+                        s_extract_app->capture_backend_upstream);
         if (want_ab != s_extract_fn_ab) {
             s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, want_ab ? (void*)1 : NULL);
             s_extract_fn_ab = want_ab;
         }
-        s_b_present = s_extract_fn_ab && s_extract_app && s_extract_app->capture_has_channel_b;
+        s_b_present = s_extract_fn_ab && block_has_b;
         s_extract_fn((uint32_t*)buf, BUFFER_READ_SIZE, clip, s_buf_aux, s_buf_a, s_buf_b, peak);
         if (!s_b_present && s_extract_fn_ab) {
             // Prevent stale/uninitialized data from driving CH-B meters/display.
@@ -163,6 +257,8 @@ static int extraction_thread(void *ctx) {
                 swap_channels = false;
             }
         }
+        bool mapping_gap = have_mapping && (previous_swap != swap_channels || previous_b != s_b_present);
+        have_mapping = true; previous_swap = swap_channels; previous_b = s_b_present;
         if (s_b_present && swap_channels) {
             mapped_a = s_buf_b;
             mapped_b = s_buf_a;
@@ -375,6 +471,19 @@ static int extraction_thread(void *ctx) {
             // If display buffer full, frame is silently dropped (lossy buffer policy)
         }
 
+        // RF bypasses the lossy display stride. Only bounded copies happen here;
+        // a full preview queue causes a source-position gap.
+        if (s_b_present && swap_channels) {
+            gui_rf_block_info_t info_tmp = stamp.info[0];
+            stamp.info[0] = stamp.info[1]; stamp.info[1] = info_tmp;
+            size_t count_tmp = stamp.counts[0];
+            stamp.counts[0] = stamp.counts[1]; stamp.counts[1] = count_tmp;
+        }
+        stamp.info[0].discontinuity |= mapping_gap;
+        stamp.info[1].discontinuity |= mapping_gap;
+        gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
+                              stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
+        source_offset += BUFFER_READ_SIZE;
         // Update expensive UI stats at the same dynamic stride used for display.
         if ((frame_count % ui_stride) == 0) {
             //gui_extract_update_stats(s_extract_app, s_buf_a, s_buf_b, BUFFER_READ_SIZE);
@@ -444,6 +553,8 @@ void gui_extract_init(void) {
 void gui_extract_cleanup(void) {
     // Stop extraction thread if running
     gui_extract_stop();
+    gui_rf_stream_marks_destroy(s_rf_marks);
+    s_rf_marks = NULL;
 
     // Note: Record buffers now managed by buffer manager (cleanup via bufmgr_cleanup)
 
@@ -488,7 +599,7 @@ void gui_extract_cleanup(void) {
     }
 }
 
-int gui_extract_start(gui_app_t *app) {
+static int extract_start_internal(gui_app_t *app, bool tagged) {
     if (s_extract_thread_running) {
         return 0;  // Already running
     }
@@ -513,8 +624,13 @@ int gui_extract_start(gui_app_t *app) {
 
     // Store context (uses app->buffers for capture ringbuffer via buffer manager)
     s_extract_app = app;
+    s_tagged_input = tagged;
+    atomic_store(&s_stamp_write, 0);
+    atomic_store(&s_stamp_read, 0);
+
     atomic_store(&s_recording_enabled, false);
     atomic_store(&s_use_flac, false);
+    atomic_store(&s_extract_stop_requested, false);
 
     // Ensure buffers are initialized in buffer manager
     if (bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF) < 0) {
@@ -536,6 +652,9 @@ int gui_extract_start(gui_app_t *app) {
     return 0;
 }
 
+int gui_extract_start(gui_app_t *app) { return extract_start_internal(app, false); }
+int gui_extract_start_tagged(gui_app_t *app) { return extract_start_internal(app, true); }
+
 void gui_extract_stop(void) {
     if (!s_extract_thread_running) {
         return;
@@ -543,6 +662,9 @@ void gui_extract_stop(void) {
 
     // Disable recording first
     atomic_store(&s_recording_enabled, false);
+    // Stop also works during startup failure, when is_capturing is still true,
+    // and with a producer that continuously keeps the input FIFO nonempty.
+    atomic_store(&s_extract_stop_requested, true);
 
     // Wait for thread to exit
     thrd_join(s_extract_thread, NULL);

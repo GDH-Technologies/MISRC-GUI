@@ -758,6 +758,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
 
     switch (result) {
         case FRAME_SYNC_LOST:
+            atomic_fetch_add(&app->rf_stream_epoch, 1);
             if (was_synced && misrc_debug_enabled()) {
                 fprintf(stderr, "[CB] Lost sync to HDMI input stream\n");
             }
@@ -770,6 +771,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
             s_capture_missed_burst_reported = false;
             break;
         case FRAME_SYNC_MISSED:
+            atomic_fetch_add(&app->rf_stream_epoch, 1);
             if (misrc_debug_enabled()) {
                 // Match CLI usefulness: include framecounter. Note expected counter isn't directly
                 // available here because frame_process() already updated last_frame_cnt.
@@ -1156,6 +1158,9 @@ void gui_app_init(gui_app_t *app) {
 
     // Initialize sample rate to default (will be updated when device connects)
     atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    atomic_store(&app->rf_source_rate_hz[0], 0);
+    atomic_store(&app->rf_source_rate_hz[1], 0);
+    atomic_store(&app->rf_preview_input_supported, true);
     atomic_store(&app->audio_sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
     atomic_store(&app->dropout_stop_requested, false);
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
@@ -1239,6 +1244,8 @@ void gui_app_init(gui_app_t *app) {
                 (unsigned)app->settings.memory_budget_gb);
     }
 
+    gui_extract_prepare_stream(app);
+
     // Initialize display thread (allocated, started on capture start)
     app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
@@ -1288,6 +1295,10 @@ void gui_app_init(gui_app_t *app) {
 
 // Cleanup application
 void gui_app_cleanup(gui_app_t *app) {
+    // A pending FLAC preparation owns file resources until its worker exits.
+    // Join it before releasing any application, buffer or panel state.
+    gui_playback_finish_start(app);
+
     // Stop any active server/client networking first (joins worker/pump threads).
     gui_net_stop(app);
     gui_net_cleanup_globals();
@@ -1373,6 +1384,7 @@ void gui_app_cleanup(gui_app_t *app) {
 
 // Enumerate available capture devices
 void gui_app_enumerate_devices(gui_app_t *app) {
+    if (!app || gui_playback_is_starting(app)) return;
     app->device_count = 0;
     fprintf(stderr, "[GUI] enumerate_devices: count=%d\n", app->device_count); //debugging
     // Use shared device enumeration (hsdaoh + simple_capture + optionally FX3)
@@ -1643,7 +1655,7 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
     gui_capture_promote_callback_priority_once();
 
     gui_app_t *app = (gui_app_t *)data_info->ctx;
-    if (!app || !data_info->buf || data_info->len == 0) return;
+    if (!app || !app->is_capturing || !data_info->buf || data_info->len == 0) return;
 
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
@@ -1742,6 +1754,10 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
             return;
         }
 
+        if (data_info->srate > 0) {
+            uint32_t source_hz = gui_capture_normalize_sample_rate_hz(data_info->srate);
+            if (source_hz) atomic_store(&app->sample_rate, source_hz);
+        }
         // Single-ADC: write A-only immediately (no B expected)
         size_t packed_bytes = sample_count * sizeof(uint32_t);
         uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, packed_bytes, &s_capture_rf_write_policy);
@@ -1890,6 +1906,10 @@ int gui_app_start_capture(gui_app_t *app) {
 static int gui_app_start_capture_inner(gui_app_t *app) {
     fprintf(stderr, "[GUI] gui_app_start_capture called\n");
 
+    if (!app || gui_playback_is_starting(app)) {
+        return -1;
+    }
+
     // Client mode (network slave): forward the request to the server instead
     // of opening local hardware. The worker thread drains the flag and sends
     // GET /start; the client ingest then mirrors the server's capture state.
@@ -1911,6 +1931,8 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
     }
 
     device_info_t *dev = &app->devices[app->selected_device];
+    // FLAC preparation commits and resets its stream only after it succeeds.
+    if (dev->type != DEVICE_TYPE_PLAYBACK) gui_extract_prepare_stream(app);
     bool use_upstream_backend = (dev->type == DEVICE_TYPE_HSDAOH) && (!app->user_capture_mode_misrc);
     fprintf(stderr, "[GUI] Selected device: %s (type %d, index %d)\n", dev->name, dev->type, dev->index);
 
@@ -1960,11 +1982,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
             gui_app_set_status(app, "No playback files selected");
             return -1;
         }
-        int playback_rc = gui_playback_start(app, file_a, file_b);
-        if (playback_rc == 0) {
-            gui_capture_hold_power_assertions();
-        }
-        return playback_rc;
+        return gui_playback_start_async(app, file_a, file_b);
     }
 
     if (dev->type == DEVICE_TYPE_CXADC) {
@@ -2216,6 +2234,9 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
     atomic_store(&app->sample_rate, DEFAULT_SAMPLE_RATE);
+    atomic_store(&app->rf_source_rate_hz[0], 0);
+    atomic_store(&app->rf_source_rate_hz[1], 0);
+    atomic_store(&app->rf_preview_input_supported, true);
     atomic_store(&app->audio_sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     atomic_store(&app->dropout_stop_requested, false);
@@ -2270,6 +2291,54 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
         app->capture_backend_upstream = false;
         app->capture_has_channel_b = true;
     } else {
+#if defined(_WIN32)
+        /* Windows hsdaoh RP2350 fix: route the MS2130 VIDEO STREAM through the
+         * Media Foundation (simple_capture) backend — the kernel usbvideo.sys
+         * path that works for FPGA-based MISRC — instead of libuvc (userspace
+         * WinUSB/libusbK), which produces black frames because the MS2130's
+         * HDMI receiver doesn't recover the RP2350's TMDS data through the
+         * libuvc userspace negotiation.
+         *
+         * The HID transparent-mode CONTROL still uses hsdaoh_open on MI_04
+         * (libusbK) below — the MS2130 still gets configured for passthrough.
+         * Only the video stream is rerouted to MF. This mirrors the MISRC
+         * mentality: kernel UVC driver for video, libusb for HID control. */
+        fprintf(stderr, "[GUI] Windows: trying Media Foundation (kernel usbvideo) for hsdaoh video stream...\n");
+        {
+            sc_capture_dev_t *sc_devs = NULL;
+            size_t sc_count = sc_get_devices(&sc_devs);
+            const char *mf_device_id = NULL;
+            /* Match the MS2130 by name ("MS2130" / "USB3.0 UHD") */
+            for (size_t i = 0; i < sc_count; i++) {
+                if (strstr(sc_devs[i].name, "MS2130") || strstr(sc_devs[i].name, "USB3.0") ||
+                    strstr(sc_devs[i].name, "UHD") || strstr(sc_devs[i].name, "2130")) {
+                    mf_device_id = sc_devs[i].device_id;
+                    fprintf(stderr, "[GUI] Windows: found MS2130 via MF: %s (%s)\n",
+                            sc_devs[i].name, sc_devs[i].device_id);
+                    break;
+                }
+            }
+            if (mf_device_id) {
+                proc_set_priority(PROC_PRIORITY_ABOVE);
+                thrd_set_priority(THRD_PRIORITY_CRITICAL);
+                r = sc_start_capture(mf_device_id, 1920, 1080, SC_CODEC_YUYV, 60, 1,
+                                     gui_simple_capture_callback, app, &app->sc_dev);
+                if (r == 0 && app->sc_dev) {
+                    fprintf(stderr, "[GUI] Windows: MF backend capture started (kernel usbvideo path)\n");
+                    app->capture_backend_upstream = false;
+                    app->capture_has_channel_b = true;
+                    /* Still open hsdaoh for HID transparent-mode control on MI_04,
+                     * then jump past the libuvc video-start. */
+                    goto windows_mf_open_hid;
+                }
+                fprintf(stderr, "[GUI] Windows: MF sc_start_capture failed (%d), falling back to libuvc\n", r);
+                app->sc_dev = NULL;
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+            } else {
+                fprintf(stderr, "[GUI] Windows: no MS2130 found via MF (it may be on libusbK); falling back to libuvc\n");
+            }
+        }
+#endif /* _WIN32 */
         fprintf(stderr, "[GUI] Opening hsdaoh device (backend=%s)...\n",
                 use_upstream_backend ? "upstream" : "raw-parser");
 #if !defined(__ANDROID__)
@@ -2343,6 +2412,15 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
         hsdaoh_read_cb_t stream_cb = use_upstream_backend
                          ? (hsdaoh_read_cb_t)gui_capture_upstream_callback
                          : (hsdaoh_read_cb_t)gui_capture_callback;
+#if defined(_WIN32)
+        if (app->sc_dev) {
+            /* Windows MF path already started the video stream above; skip the
+             * libuvc hsdaoh_start_stream and go straight to the connected
+             * state. hs_dev is open for HID transparent-mode control only. */
+            fprintf(stderr, "[GUI] Windows: skipping libuvc video start (MF backend active)\n");
+            goto windows_mf_connected;
+        }
+#endif
         r = MISRC_HSDAOH_START_STREAM(app->hs_dev, stream_cb, app);
 
         if (r < 0) {
@@ -2364,6 +2442,13 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
                 use_upstream_backend ? "upstream" : "raw-parser",
                 use_upstream_backend ? "A (B auto-detect)" : "A+B");
     }
+
+#if defined(_WIN32)
+windows_mf_connected:
+windows_mf_open_hid:
+    /* Windows: MF video backend is active (or hsdaoh HID open completed).
+     * Both labels land here to skip the libuvc video-start path. */
+#endif
 
     // Capture lifecycle boundary: keep parser setup/reset work after stream
     // startup succeeds, not on pre-open or failed-start paths.
@@ -2475,6 +2560,15 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
     return 0;
 }
 
+void gui_app_poll_capture_start(gui_app_t *app) {
+    if (!app) return;
+    if (gui_playback_poll_start(app) == 1) {
+        gui_capture_hold_power_assertions();
+        app->reconnect_pending = false;
+        app->reconnect_attempts = 0;
+    }
+}
+
 #if defined(__ANDROID__)
 /* Offload gui_app_start_capture() to a worker thread so the render loop stays
  * responsive. hsdaoh_open + start_stream + extraction/display thread spawns can
@@ -2497,6 +2591,14 @@ static void *capture_start_thread(void *arg)
 void gui_app_start_capture_async(gui_app_t *app)
 {
     if (!app) return;
+    if (gui_playback_is_starting(app)) return;
+    if (atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping)) return;
+    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK) {
+        // FLAC preparation already has its own worker and UI-thread commit.
+        (void)gui_app_start_capture(app);
+        return;
+    }
     if (atomic_load(&s_capture_stopping)) {
         /* stop still in flight; don't start on top of it */
         return;
@@ -2531,6 +2633,11 @@ static void *capture_stop_thread(void *arg)
 void gui_app_stop_capture_async(gui_app_t *app)
 {
     if (!app) return;
+    if (gui_playback_is_starting(app) || gui_playback_is_running(app)) {
+        // Active FLAC context publication and retirement belong to the UI.
+        gui_app_stop_capture(app);
+        return;
+    }
     if (atomic_load(&s_capture_starting)) {
         /* start still in flight; let it finish first (watchdog will retry) */
         return;
@@ -2555,6 +2662,14 @@ int gui_app_capture_busy(void)
 
 // Stop capture
 void gui_app_stop_capture(gui_app_t *app) {
+    if (!app) return;
+    if (gui_playback_is_starting(app)) {
+        gui_playback_cancel_start(app);
+        app->reconnect_pending = false;
+        app->reconnect_attempts = 0;
+        return;
+    }
+
     // Client mode: forward stop to the server. The client ingest stops itself
     // when the server reports idle, so we do not tear down locally here.
     if (gui_net_is_client(app)) {
@@ -2814,10 +2929,9 @@ static device_type_t gui_capture_active_device_type(const gui_app_t *app)
 //   all normalize peaks into the 12-bit signed container (max magnitude 2048).
 // - DdD stores native 10-bit magnitude (max 512) directly into the peak
 //   atomics (gui_ddd.c), so its full scale is 512.
-// - 8-bit FLAC playback stays in the 8-bit range (max 128); 12/16-bit playback
-//   normalizes to the 12-bit container (2048). The bps is read from the FLAC
-//   STREAMINFO via gui_playback_get_file_info_a(); if unavailable (e.g. no
-//   file loaded yet / LIBFLAC disabled), fall back to 2048.
+// - playback normalizes EVERY FLAC bit depth (8/12/16-bit) back into the
+//   12-bit container on decode (see gui_playback.c write callbacks), so its
+//   full scale is 2048 like the live MISRC paths.
 uint16_t gui_app_level_autostop_full_scale(const gui_app_t *app)
 {
     if (!app) return 2048;
@@ -2825,13 +2939,7 @@ uint16_t gui_app_level_autostop_full_scale(const gui_app_t *app)
 #ifdef ENABLE_DDD
     if (t == DEVICE_TYPE_DDD) return 512;
 #endif
-    if (t == DEVICE_TYPE_PLAYBACK) {
-        playback_file_info_t info;
-        if (gui_playback_get_file_info_a((gui_app_t *)app, &info) && info.valid) {
-            if (info.bits_per_sample == 8) return 128;
-        }
-        return 2048;
-    }
+    (void)t;
     return 2048;
 }
 
@@ -3013,6 +3121,10 @@ void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 // Check if device has timed out (no callbacks for too long)
 bool gui_capture_device_timeout(gui_app_t *app, uint32_t timeout_ms) {
     if (!app->is_capturing) return false;
+
+    // File playback may intentionally produce no callbacks while paused or at
+    // EOF. Consult its active context, not the device currently selected by UI.
+    if (gui_playback_is_running(app)) return false;
 
     uint64_t last_cb = atomic_load(&app->last_callback_time_ms);
     uint64_t now = get_time_ms();

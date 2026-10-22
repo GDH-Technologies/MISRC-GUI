@@ -9,6 +9,7 @@
 #include "../core/gui_app.h"
 #include "../ui/gui_ui.h"
 #include "../ui/gui_dropdown.h"
+#include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "gui_text.h"
 #include <math.h>
 #include <stdio.h>
@@ -39,6 +40,11 @@ typedef struct {
     Rectangle button_rect;
     Rectangle options_rect[7];      // Must match s_num_bin_options
     bool dropdown_open;
+
+    // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
+    // ALL overlay chrome (the Bins dropdown + label); the histogram bars and
+    // their axis labels (drawn by the data render) keep rendering.
+    gui_chrome_hide_t chrome_hide;
 
     // Menu items for vtable interface
     panel_menu_item_t menu_items[7];
@@ -292,6 +298,12 @@ static void histogram_vtable_render_overlay(void *state_ptr, Rectangle bounds) {
 
     if (!hist->initialized) return;
 
+    // Double-click on the panel (histogram_vtable_handle_click) toggles ALL
+    // the overlay chrome — the Bins dropdown + its label — for a clean view;
+    // the histogram bars + axis labels (drawn by the data render path) keep
+    // rendering.
+    if (gui_chrome_hide_hidden(&state->chrome_hide)) return;
+
     // Format current bin count
     char bins_str[16];
     snprintf(bins_str, sizeof(bins_str), "%d", hist->num_bins);
@@ -372,14 +384,10 @@ static void histogram_vtable_render_overlay(void *state_ptr, Rectangle bounds) {
 // Interaction Functions
 //-----------------------------------------------------------------------------
 
-static bool histogram_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
-                                          Vector2 click, Rectangle bounds) {
-    (void)app;
-    (void)channel;
-    (void)bounds;
-
-    if (!state_ptr) return false;
-    histogram_panel_state_t *state = (histogram_panel_state_t *)state_ptr;
+// Bins dropdown clicks. Returns true when a control consumed the click
+// (button hit or an open dropdown's option); false otherwise (an open
+// dropdown's close-outside click just closes it and reports not consumed).
+static bool histogram_handle_bins_click(histogram_panel_state_t *state, Vector2 click) {
 
     // Check button click
     if (CheckCollisionPointRec(click, state->button_rect)) {
@@ -400,6 +408,38 @@ static bool histogram_vtable_handle_click(void *state_ptr, gui_app_t *app, int c
         state->dropdown_open = false;
     }
 
+    return false;
+}
+
+static bool histogram_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
+                                          Vector2 click, Rectangle bounds) {
+    (void)app;
+    (void)channel;
+
+    if (!state_ptr) return false;
+    histogram_panel_state_t *state = (histogram_panel_state_t *)state_ptr;
+
+    // Click outside the panel resets double-click tracking.
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return false;
+    }
+
+    // Bins dropdown clicks only while the overlay is shown (its rectangles
+    // are stale while hidden); a consumed control click resets the tracker
+    // so a double-click ON the dropdown never toggles the chrome.
+    if (!gui_chrome_hide_hidden(&state->chrome_hide) &&
+        histogram_handle_bins_click(state, click)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return true;
+    }
+
+    // Double-click anywhere else on the panel toggles ALL overlay chrome
+    // (the Bins dropdown + label) for a clean histogram view.
+    if (gui_chrome_hide_feed_click(&state->chrome_hide, click)) {
+        state->dropdown_open = false;
+        return true;
+    }
     return false;
 }
 

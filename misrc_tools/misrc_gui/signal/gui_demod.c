@@ -22,6 +22,7 @@
 #include "../visualization/gui_text.h"
 #include "../ui/gui_ui.h"
 #include "../ui/gui_dropdown.h"  // gui_dropdown_option_color()
+#include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "../input/gui_capture.h"  // gui_app_set_sdr_frequency() (generic SDR retune)
 
 #include <stdlib.h>
@@ -121,6 +122,11 @@ typedef struct {
         // Frequency field local edit state (SDR live-tune field)
         bool freq_editing;
         int  freq_cursor;           // char index into s_demod_freq_str
+
+        // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h):
+        // toggles ALL overlay controls (freq field, mode/bw/out dropdowns,
+        // SQL/VOL steppers); the demod waveform keeps rendering.
+        gui_chrome_hide_t chrome_hide;
     } overlay;
 } demod_state_t;
 
@@ -498,7 +504,14 @@ static void demod_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 //-----------------------------------------------------------------------------
 
 static void demod_render_overlay(demod_state_t *s, gui_app_t *app, Rectangle bounds) {
-    s->overlay.is_visible = true;
+    // Double-click on the panel (demod_vtable_handle_click) toggles ALL the
+    // overlay chrome — freq field, mode/bw/out dropdowns, SQL/VOL steppers
+    // — for a clean demod waveform view. is_visible mirrors the flag so
+    // clicks only reach controls that are actually drawn (while hidden the
+    // control rectangles are stale and ignored).
+    s->overlay.is_visible = !gui_chrome_hide_hidden(&s->overlay.chrome_hide);
+    if (!s->overlay.is_visible) return;
+
     const float btn_h = 18.0f;
     const float gap = 4.0f;
     const float row_step = btn_h + gap;
@@ -762,13 +775,13 @@ static void demod_render_overlay(demod_state_t *s, gui_app_t *app, Rectangle bou
 //-----------------------------------------------------------------------------
 // Overlay click handling
 //-----------------------------------------------------------------------------
-static bool demod_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
-                                      Vector2 click, Rectangle bounds) {
-    (void)channel;
-    (void)bounds;
-    if (!state_ptr || !app) return false;
-    demod_state_t *s = (demod_state_t *)state_ptr;
-    if (!s->overlay.is_visible) return false;
+
+// Overlay control clicks (freq field, Mode/BW/Out dropdowns, SQL/VOL
+// steppers). Returns true when a control consumed the click; false when no
+// control was hit, so the caller can offer the click to the double-click
+// chrome-hide tracker. Assumes the overlay is visible (is_visible).
+static bool demod_handle_control_click(demod_state_t *s, gui_app_t *app,
+                                       Vector2 click) {
 
     // Frequency field (SDR only): click starts editing; Enter/Esc commits.
     if (s->overlay.is_sdr && CheckCollisionPointRec(click, s->overlay.freq_btn_rect)) {
@@ -896,6 +909,48 @@ static bool demod_vtable_handle_click(void *state_ptr, gui_app_t *app, int chann
             }
         }
         s->overlay.out_dropdown_open = false;
+    }
+    return false;
+}
+
+static bool demod_vtable_handle_click(void *state_ptr, gui_app_t *app, int channel,
+                                      Vector2 click, Rectangle bounds) {
+    (void)channel;
+    if (!state_ptr || !app) return false;
+    demod_state_t *s = (demod_state_t *)state_ptr;
+
+    // Click outside the panel resets double-click tracking.
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&s->overlay.chrome_hide);
+        return false;
+    }
+
+    // Controls only while the overlay is shown: while hidden the control
+    // rectangles are stale (the overlay is not drawn), so ignore them
+    // entirely; only the double-click restores the overlay. A consumed
+    // control click also resets the tracker so a double-click ON a control
+    // never toggles the chrome.
+    if (s->overlay.is_visible &&
+        demod_handle_control_click(s, app, click)) {
+        gui_chrome_hide_reset(&s->overlay.chrome_hide);
+        return true;
+    }
+
+    // Double-click anywhere else on the panel toggles ALL overlay chrome
+    // (freq field, mode/bw/out dropdowns, SQL/VOL steppers) for a clean
+    // demod waveform view.
+    if (gui_chrome_hide_feed_click(&s->overlay.chrome_hide, click)) {
+        s->overlay.mode_dropdown_open = false;
+        s->overlay.bw_dropdown_open = false;
+        s->overlay.out_dropdown_open = false;
+        // Cancel a pending frequency edit without retuning: restore the
+        // field text from the persisted setting.
+        if (s->overlay.freq_editing) {
+            s->overlay.freq_editing = false;
+            snprintf(s_demod_freq_str, sizeof(s_demod_freq_str), "%llu",
+                     (unsigned long long)app->settings.rtlsdr_freq_hz);
+        }
+        return true;
     }
     return false;
 }

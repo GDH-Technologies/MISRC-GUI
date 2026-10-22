@@ -12,6 +12,9 @@
 #include "../core/gui_app.h"
 #include "gui_phosphor_rt.h"
 #include "../ui/gui_ui.h"
+#include "../ui/gui_chrome_hide.h"  // double-click annotation toggle (panel wrapper below)
+#include "gui_text.h"               // Scale-button text (Lin/Log frequency axis toggle)
+#include "../../common/threading.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +30,68 @@
 #if LIBFFTW_ENABLED
 #include <fftw3.h>
 #endif
+
+// FFTW shares planner state across all channels and display workers. Keep
+// every non-execute operation serialized; distinct plans still execute in parallel.
+#if LIBFFTW_ENABLED
+static atomic_flag s_fftw_lock = ATOMIC_FLAG_INIT;
+
+static void gui_fft_library_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&s_fftw_lock, memory_order_acquire)) {
+        thrd_sleep_ms(1);
+    }
+}
+
+static void gui_fft_library_unlock(void) {
+    atomic_flag_clear_explicit(&s_fftw_lock, memory_order_release);
+}
+#endif
+
+void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags) {
+#if LIBFFTW_ENABLED
+    if (size <= 0 || !input || !output) return NULL;
+    gui_fft_library_lock();
+    fftwf_plan plan = fftwf_plan_dft_r2c_1d(size, input, (fftwf_complex *)output, flags);
+    gui_fft_library_unlock();
+    return plan;
+#else
+    (void)size; (void)input; (void)output; (void)flags;
+    return NULL;
+#endif
+}
+
+void gui_fft_plan_destroy(void *plan) {
+#if LIBFFTW_ENABLED
+    if (!plan) return;
+    gui_fft_library_lock();
+    fftwf_destroy_plan((fftwf_plan)plan);
+    gui_fft_library_unlock();
+#else
+    (void)plan;
+#endif
+}
+
+void *gui_fft_alloc(size_t bytes) {
+#if LIBFFTW_ENABLED
+    gui_fft_library_lock();
+    void *memory = fftwf_malloc(bytes);
+    gui_fft_library_unlock();
+    return memory;
+#else
+    return malloc(bytes);
+#endif
+}
+
+void gui_fft_free(void *memory) {
+#if LIBFFTW_ENABLED
+    if (!memory) return;
+    gui_fft_library_lock();
+    fftwf_free(memory);
+    gui_fft_library_unlock();
+#else
+    free(memory);
+#endif
+}
 
 //-----------------------------------------------------------------------------
 // Availability Check
@@ -75,15 +140,15 @@ static bool fft_resize(fft_state_t *state, int new_size) {
 
     // Free old resources
     if (state->fftw_plan) {
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
+        gui_fft_plan_destroy(state->fftw_plan);
         state->fftw_plan = NULL;
     }
     if (state->fftw_input) {
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
     }
     if (state->fftw_output) {
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_output);
         state->fftw_output = NULL;
     }
     if (state->window) {
@@ -106,28 +171,27 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     }
 
     // Allocate new buffers
-    state->fftw_input = (float *)fftwf_malloc(sizeof(float) * new_size);
+    state->fftw_input = (float *)gui_fft_alloc(sizeof(float) * new_size);
     if (!state->fftw_input) {
         fprintf(stderr, "[FFT] Failed to allocate FFTW input buffer (%d)\n", new_size);
         return false;
     }
 
-    state->fftw_output = fftwf_malloc(sizeof(fftwf_complex) * new_bins);
+    state->fftw_output = gui_fft_alloc(sizeof(fftwf_complex) * new_bins);
     if (!state->fftw_output) {
         fprintf(stderr, "[FFT] Failed to allocate FFTW output buffer (%d bins)\n", new_bins);
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
         return false;
     }
 
     // Create new FFTW plan
-    state->fftw_plan = fftwf_plan_dft_r2c_1d(new_size, state->fftw_input,
-                                              (fftwf_complex *)state->fftw_output,
-                                              FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
+    state->fftw_plan = gui_fft_plan_create_r2c(new_size, state->fftw_input,
+                                               state->fftw_output, FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
     if (!state->fftw_plan) {
         fprintf(stderr, "[FFT] Failed to create FFTW plan for size %d\n", new_size);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         state->fftw_input = NULL;
         state->fftw_output = NULL;
         return false;
@@ -137,9 +201,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->window = (float *)malloc(sizeof(float) * new_size);
     if (!state->window) {
         fprintf(stderr, "[FFT] Failed to allocate window buffer (%d)\n", new_size);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         state->fftw_plan = NULL;
         state->fftw_input = NULL;
         state->fftw_output = NULL;
@@ -156,9 +220,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->magnitude_back = (float *)malloc(sizeof(float) * new_bins);
     if (!state->magnitude_front || !state->magnitude_back) {
         fprintf(stderr, "[FFT] Failed to allocate magnitude buffers (%d bins)\n", new_bins);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         free(state->window);
         free(state->magnitude_front);
         free(state->magnitude_back);
@@ -178,9 +242,9 @@ static bool fft_resize(fft_state_t *state, int new_size) {
     state->peak_hold = (float *)malloc(sizeof(float) * new_bins);
     if (!state->peak_hold) {
         fprintf(stderr, "[FFT] Failed to allocate peak_hold buffer (%d bins)\n", new_bins);
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
-        fftwf_free(state->fftw_input);
-        fftwf_free(state->fftw_output);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
         free(state->window);
         free(state->magnitude_front);
         free(state->magnitude_back);
@@ -293,17 +357,17 @@ void gui_fft_cleanup(fft_state_t *state) {
 
 #if LIBFFTW_ENABLED
     if (state->fftw_plan) {
-        fftwf_destroy_plan((fftwf_plan)state->fftw_plan);
+        gui_fft_plan_destroy(state->fftw_plan);
         state->fftw_plan = NULL;
     }
 
     if (state->fftw_input) {
-        fftwf_free(state->fftw_input);
+        gui_fft_free(state->fftw_input);
         state->fftw_input = NULL;
     }
 
     if (state->fftw_output) {
-        fftwf_free(state->fftw_output);
+        gui_fft_free(state->fftw_output);
         state->fftw_output = NULL;
     }
 
@@ -583,6 +647,51 @@ static double fft_snap_to_125(double value) {
     return snapped * magnitude;
 }
 
+// Toggleable frequency-axis scale: Linear (the STOCK original mode and
+// the default - the panel starts exactly as it did before the toggle
+// existed) and Log via the panel's Scale button. The transform works in
+// normalized axis space, so the existing zoom/pan (which operate on
+// normalized screen coordinates) are unchanged in both modes. Log cannot
+// place DC: the axis starts at the first non-zero bin (one bin width above
+// 0), so bin 1 sits at axis 0 and the DC bin is excluded from the trace on
+// the log axis.
+static float fft_freq_norm_to_axis(float freq_norm, bool log_scale, int fft_bins) {
+    if (!log_scale || fft_bins < 3) return freq_norm;
+    const float log_min = 1.0f / (float)(fft_bins - 1);
+    if (freq_norm <= log_min) return 0.0f;
+    if (freq_norm >= 1.0f) return 1.0f;
+    const float log_span = -log10f(log_min);
+    return (log10f(freq_norm) - log10f(log_min)) / log_span;
+}
+
+static float fft_axis_to_freq_norm(float axis, bool log_scale, int fft_bins) {
+    if (!log_scale || fft_bins < 3) return axis;
+    const float log_min = 1.0f / (float)(fft_bins - 1);
+    if (axis <= 0.0f) return log_min;
+    if (axis >= 1.0f) return 1.0f;
+    const float log_span = -log10f(log_min);
+    return powf(10.0f, log10f(log_min) + axis * log_span);
+}
+
+// Log-mode gridlines: 1-2-5 per decade inside [start, end] Hz, placed in
+// ascending order into out[]. Fewer than 3 candidates means the visible
+// span is under about one decade - the caller falls back to the linear
+// 1-2-5 grid, which is near-evenly placed on a sub-decade log axis.
+static int fft_log_grid_lines(float start_hz, float end_hz,
+                               float *out, int max_out) {
+    if (start_hz <= 0.0f || end_hz <= start_hz || !out || max_out <= 0) return 0;
+    int count = 0;
+    int decade = (int)floorf(log10f(start_hz));
+    for (; decade <= (int)floorf(log10f(end_hz)) && count < max_out; decade++) {
+        static const float mantissa[3] = {1.0f, 2.0f, 5.0f};
+        for (int m = 0; m < 3 && count < max_out; m++) {
+            float freq = mantissa[m] * powf(10.0f, (float)decade);
+            if (freq >= start_hz && freq <= end_hz) out[count++] = freq;
+        }
+    }
+    return count;
+}
+
 // Format frequency value with appropriate unit (Hz, kHz, MHz)
 static void format_freq_label(char *buf, size_t buf_size, double hz) {
     if (hz >= 1000000.0) {
@@ -685,6 +794,20 @@ static void fft_draw_peak_label(Font *fonts, const char *db_text, const char *fr
     }
 }
 
+// Chrome-hidden flag for the gui_fft_render call in progress. gui_fft_render's
+// signature is public API (gui_fft.h) and fft_state_t cannot carry the flag,
+// so the FFT panel render (fft_panel_state_t wrapper below) publishes its
+// double-click chrome-hide state here immediately before its single call.
+// gui_fft_render has no other callers and always runs on the render thread,
+// so the flag never races or leaks between panels.
+static bool s_fft_chrome_hidden = false;
+
+// Log-frequency-axis toggle + the Scale-button rect, published per render
+// by the panel wrapper (the same single-render-call pattern as the chrome
+// flag above; the click handler reads them from the per-panel wrapper).
+static bool s_fft_log_scale = false;
+static Rectangle s_fft_scale_btn_rect = {0};
+
 void gui_fft_render(fft_state_t *state, float x, float y,
                     float width, float height, Color color, Font *fonts) {
 #if LIBFFTW_ENABLED
@@ -718,16 +841,17 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         int fft_bins = state->fft_bins;
         float zoom = state->zoom_level;
         float pan = state->pan_offset;
-
-        // Calculate visible bin range based on zoom/pan
-        // pan_offset is normalized frequency (0-1), zoom_level scales the view
-        // visible range: [pan, pan + 1/zoom] in normalized frequency
-        float visible_start = pan;
-        float visible_end = pan + 1.0f / zoom;
+        // The axis window [pan, pan + 1/zoom] converts back through the
+        // inverse transform to a bin range; DC (bin 0) has no place on a
+        // log axis and is excluded.
+        bool log_scale = s_fft_log_scale;
+        float start_norm = fft_axis_to_freq_norm(pan, log_scale, fft_bins);
+        float end_norm = fft_axis_to_freq_norm(pan + 1.0f / zoom, log_scale, fft_bins);
 
         // Convert to bin indices
-        int start_bin = (int)(visible_start * (fft_bins - 1));
-        int end_bin = (int)ceilf(visible_end * (fft_bins - 1));
+        int start_bin = (int)(start_norm * (fft_bins - 1));
+        int end_bin = (int)ceilf(end_norm * (fft_bins - 1));
+        if (log_scale && start_bin < 1) start_bin = 1;   // skip DC on the log axis
         if (start_bin < 0) start_bin = 0;
         if (end_bin >= fft_bins) end_bin = fft_bins - 1;
 
@@ -735,14 +859,13 @@ void gui_fft_render(fft_state_t *state, float x, float y,
             float intensity1 = state->magnitude[bin];
             float intensity2 = state->magnitude[bin + 1];
 
-            // Convert bin to normalized frequency (0-1)
+            // Convert bin to normalized frequency (0-1), then through the
+            // active axis transform: screen_x = (axis - pan) * zoom * width
             float freq_norm1 = (float)bin / (float)(fft_bins - 1);
             float freq_norm2 = (float)(bin + 1) / (float)(fft_bins - 1);
-
-            // Map to screen X using zoom/pan
-            // screen_x = (freq_norm - pan) * zoom * width
-            float x1 = (freq_norm1 - pan) * zoom * rt_width;
-            float x2 = (freq_norm2 - pan) * zoom * rt_width;
+            float x1 = (fft_freq_norm_to_axis(freq_norm1, log_scale, fft_bins) - pan) * zoom * rt_width;
+            float x2 = (fft_freq_norm_to_axis(freq_norm2, log_scale, fft_bins) - pan) * zoom * rt_width;
+            if (x2 < -2.0f || x1 > rt_width + 2.0f) continue;  // off-screen cull
 
             // Y positions based on intensity (0 = bottom, 1 = top)
             float y1 = rt_height - (intensity1 * rt_height);
@@ -784,72 +907,117 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         DrawLineV((Vector2){x, line_y}, (Vector2){x + width, line_y},
                 is_zero ? COLOR_GRID_MAJOR : COLOR_GRID);
 
-        char label[16];
-        snprintf(label, sizeof(label), "%+.0fdB", db);
-        fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+        // dB labels are axis STATISTICS: they stay visible even while the
+        // panel's chrome is hidden (the toggle hides only the UI controls -
+        // the Scale button and the FFT title - not the axis/grid readouts).
+        {
+            char label[16];
+            snprintf(label, sizeof(label), "%+.0fdB", db);
+            fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+        }
 
         div_count++;
     }
 
-    // Draw vertical frequency grid lines with 1-2-5 snapping (with zoom/pan support)
+    // Draw vertical frequency grid lines (1-2-5 snapping on the linear axis;
+    // on the log axis 1-2-5 per decade, falling back to the linear walk when
+    // a zoomed view spans under about a decade - over a sub-decade span the
+    // log axis is near-linear and equal-frequency lines are evenly placed).
     if (sample_rate > 0) {
         float nyquist = (float)sample_rate / 2.0f;
         float zoom = state->zoom_level;
         float pan = state->pan_offset;
+        bool log_scale = s_fft_log_scale && state->fft_bins > 1;
 
-        // Visible frequency range based on zoom/pan
-        float visible_freq_start = pan * nyquist;
-        float visible_freq_end = (pan + 1.0f / zoom) * nyquist;
-        float visible_freq_range = visible_freq_end - visible_freq_start;
+        float grid_freqs[FFT_GRID_MAX_DIVISIONS];
+        int grid_count = 0;
+        bool decade_grid = false;
+        float freq_division = 0.0f;
+        if (log_scale) {
+            float axis_start = pan < 0.0f ? 0.0f : pan;
+            float axis_end = pan + 1.0f / zoom;
+            if (axis_end > 1.0f) axis_end = 1.0f;
+            float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
+            float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
+            grid_count = fft_log_grid_lines(vis_start, vis_end, grid_freqs, FFT_GRID_MAX_DIVISIONS);
+            decade_grid = grid_count >= 3;
+        }
+        if (!decade_grid) {
+            // Visible frequency range based on zoom/pan
+            float visible_freq_start = pan * nyquist;
+            float visible_freq_end = (pan + 1.0f / zoom) * nyquist;
+            float freq_per_pixel = (visible_freq_end - visible_freq_start) / width;
 
-        // Calculate frequency per pixel for visible range
-        float freq_per_pixel = visible_freq_range / width;
+            // Snap the division to the 1-2-5 sequence
+            float rough_division = freq_per_pixel * (float)FFT_GRID_MIN_SPACING_PX;
+            freq_division = (float)fft_snap_to_125((double)rough_division);
 
-        // Calculate rough frequency division to get reasonable spacing
-        float rough_division = freq_per_pixel * (float)FFT_GRID_MIN_SPACING_PX;
+            float first_grid_freq = ceilf(visible_freq_start / freq_division) * freq_division;
+            for (float freq = first_grid_freq;
+                 freq < visible_freq_end && grid_count < FFT_GRID_MAX_DIVISIONS;
+                 freq += freq_division) {
+                grid_freqs[grid_count++] = freq;
+            }
+        }
 
-        // Snap to 1-2-5 sequence
-        float freq_division = (float)fft_snap_to_125((double)rough_division);
-
-        // Find first grid line in visible range
-        float first_grid_freq = ceilf(visible_freq_start / freq_division) * freq_division;
-
-        // Draw vertical grid lines at frequency intervals
+        // Draw the collected gridlines through the active axis transform
         char freq_buf[32];
-        div_count = 0;
-        for (float freq = first_grid_freq; freq < visible_freq_end && div_count < FFT_GRID_MAX_DIVISIONS; freq += freq_division) {
-            // Convert frequency to screen position using zoom/pan
+        for (int i = 0; i < grid_count; i++) {
+            float freq = grid_freqs[i];
             float freq_norm = freq / nyquist;  // Normalized frequency (0-1)
-            float screen_norm = (freq_norm - pan) * zoom;  // Normalized screen position (0-1)
+            float axis = fft_freq_norm_to_axis(freq_norm, log_scale, state->fft_bins);
+            float screen_norm = (axis - pan) * zoom;  // Normalized screen position (0-1)
             float line_x = x + (screen_norm * width);
 
             // Only draw if within visible bounds
             if (line_x >= x && line_x <= x + width) {
                 DrawLineV((Vector2){line_x, y}, (Vector2){line_x, y + height}, COLOR_GRID);
 
-                // Draw frequency label (skip if too close to edges)
+                // Draw frequency label (skip if too close to edges). Axis
+                // labels are STATISTICS: visible even while the chrome is
+                // hidden (only the UI controls hide).
                 if (line_x > x + 30 && line_x < x + width - 30) {
                     format_freq_label(freq_buf, sizeof(freq_buf), freq);
                     float label_w = fft_measure_text_mono(fonts, freq_buf, FONT_SIZE_OSC_SCALE).x;
                     fft_draw_text_mono(fonts, freq_buf, line_x - label_w / 2, y + height - 14, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
                 }
             }
-            div_count++;
         }
 
-        // Show frequency per division in top-right corner (below FFT label)
-        format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
-        char div_label[48];
-        snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
-        float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
-        fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+        // /div + zoom/span readouts are STATISTICS: always visible (the
+        // chrome toggle hides only the UI controls, not these readouts).
+        {
+            if (decade_grid) {
+                // A log axis has no fixed per-division step: show the
+                // visible frequency span instead of N/div.
+                float axis_start = pan < 0.0f ? 0.0f : pan;
+                float axis_end = pan + 1.0f / zoom;
+                if (axis_end > 1.0f) axis_end = 1.0f;
+                float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
+                float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
+                char start_buf[32], end_buf[32];
+                format_freq_label(start_buf, sizeof(start_buf), vis_start);
+                format_freq_label(end_buf, sizeof(end_buf), vis_end);
+                char span_label[72];
+                snprintf(span_label, sizeof(span_label), "%s-%s", start_buf, end_buf);
+                float span_label_w = fft_measure_text_mono(fonts, span_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, span_label, x + width - span_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            } else {
+                // Show frequency per division in top-right corner (below FFT label)
+                format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
+                char div_label[48];
+                snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
+                float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            }
 
-        // Show zoom level if zoomed in
-        if (zoom > 1.01f) {
-            char zoom_label[32];
-            snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
-            float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
-            fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
+            // Show zoom level if zoomed in
+            if (zoom > 1.01f) {
+                char zoom_label[32];
+                snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
+                float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
+            }
         }
     }
 
@@ -874,7 +1042,9 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         }
     }
 
-    // Peak detection on mouse hover - show closest peak to mouse (with zoom/pan support)
+    // Peak detection on mouse hover - show closest peak to mouse (with
+    // zoom/pan support). The peak marker + readout are STATISTICS: always
+    // visible (the chrome toggle hides only the UI controls).
     if (state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
         Vector2 mouse = gui_ui_get_mouse_position();
         Rectangle fft_rect = {x, y, width, height};
@@ -884,12 +1054,14 @@ void gui_fft_render(fft_state_t *state, float x, float y,
             int fft_bins = state->fft_bins;
             float zoom = state->zoom_level;
             float pan = state->pan_offset;
+            bool log_scale = s_fft_log_scale && fft_bins > 1;
 
             // Convert mouse X to normalized frequency using zoom/pan
             // screen_norm = (freq_norm - pan) * zoom
-            // => freq_norm = screen_norm / zoom + pan
+            // => freq_norm = screen_norm / zoom + pan  (axis space; converted
+            // through the inverse transform on the log axis)
             float screen_norm = (mouse.x - x) / width;  // 0.0 to 1.0
-            float freq_norm = screen_norm / zoom + pan;
+            float freq_norm = fft_axis_to_freq_norm(screen_norm / zoom + pan, log_scale, fft_bins);
 
             // Convert to bin index
             int mouse_bin = (int)(freq_norm * (fft_bins - 1) + 0.5f);
@@ -935,7 +1107,7 @@ void gui_fft_render(fft_state_t *state, float x, float y,
                     int bin = peaks[i].bin;
                     float peak_mag = state->peak_hold[bin];
                     float bin_freq_norm = (float)bin / (float)(fft_bins - 1);
-                    float px = x + (bin_freq_norm - pan) * zoom * width;
+                    float px = x + (fft_freq_norm_to_axis(bin_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
                     float py = y + height - (peak_mag * height);
 
                     // Calculate circular (Euclidean) distance from mouse
@@ -967,7 +1139,7 @@ void gui_fft_render(fft_state_t *state, float x, float y,
 
                 // Calculate screen position for closest peak using zoom/pan
                 float peak_freq_norm = (float)peak_bin / (float)(fft_bins - 1);
-                float peak_x = x + (peak_freq_norm - pan) * zoom * width;
+                float peak_x = x + (fft_freq_norm_to_axis(peak_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
                 float peak_y = y + height - (peak_mag * height);
 
                 // Calculate frequency and dB
@@ -1021,10 +1193,30 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         }
     }
 
-    // Draw "FFT" label in top-right corner (matching oscilloscope channel label style)
-    const char *fft_label = "FFT";
-    int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
-    fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    // Draw "FFT" label in top-right corner (matching oscilloscope channel
+    // label style). Overlay chrome: hidden with the panel's chrome toggle.
+    if (!s_fft_chrome_hidden) {
+        const char *fft_label = "FFT";
+        int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
+        fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    }
+
+    // Scale toggle button (Linear/Log) in the top-left corner, next to the
+    // annotation chrome. The rect is published per render by the panel
+    // wrapper; the click handler reads it from the per-panel state. Like
+    // every other control it is overlay chrome (UI): hidden with the toggle
+    // - the axis/stat readouts above stay visible.
+    if (!s_fft_chrome_hidden && s_fft_scale_btn_rect.width > 0.0f) {
+        const char *scale_label = s_fft_log_scale ? "Scale: Log" : "Scale: Linear";
+        Rectangle btn = s_fft_scale_btn_rect;
+        Vector2 mouse = gui_ui_get_mouse_position();
+        Color btn_bg = CheckCollisionPointRec(mouse, btn) ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+        DrawRectangleRounded(btn, 0.15f, 4, btn_bg);
+        float scale_text_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(scale_label, btn.x + (btn.width - scale_text_w) * 0.5f,
+                      btn.y + (btn.height - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
 
 #else
     (void)state;
@@ -1041,6 +1233,21 @@ void gui_fft_render(fft_state_t *state, float x, float y,
 // Zoom and Pan Interaction
 //=============================================================================
 
+// FFT panel state: the base fft engine plus the per-instance double-click
+// chrome-hide tracker. Declared here (before the zoom/pan handlers and the
+// vtable below) because those functions carry the panel state. Processing
+// still happens in the display thread via the embedded fft_state_t.
+typedef struct {
+    fft_state_t fft;
+    gui_chrome_hide_t chrome_hide;   // double-click toggles the UI chrome (the
+                                     // Scale button + the FFT title); the axis
+                                     // dB/frequency labels and the /div, span
+                                     // and peak readouts stay visible
+    bool log_scale;                  // Linear/Log frequency-axis toggle (false
+                                     // = Linear, the stock original default)
+    Rectangle scale_btn_rect;         // cached Scale-button rect for the click handler
+} fft_panel_state_t;
+
 // Zoom limits
 #define FFT_ZOOM_MIN 1.0f      // No zoom (full spectrum)
 #define FFT_ZOOM_MAX 64.0f     // Maximum zoom (64x)
@@ -1051,7 +1258,8 @@ static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
 #if LIBFFTW_ENABLED
     if (!state_ptr || delta == 0.0f) return false;
 
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
     if (!state->initialized) return false;
 
     Vector2 mouse = gui_ui_get_mouse_position();
@@ -1094,7 +1302,7 @@ static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
 #endif
 }
 
-// Handle mouse click for drag-to-pan
+// Handle mouse click for drag-to-pan and the double-click chrome toggle
 static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
                               Vector2 click, Rectangle bounds) {
 #if LIBFFTW_ENABLED
@@ -1103,17 +1311,41 @@ static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
 
     if (!state_ptr) return false;
 
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
     if (!state->initialized) return false;
 
-    // Only allow panning when zoomed in
-    if (state->zoom_level <= 1.0f) return false;
-
-    // Check if click is inside bounds
+    // Click outside the panel resets double-click tracking (and cancels any
+    // pan drag).
     if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&panel->chrome_hide);
         state->dragging = false;
         return false;
     }
+
+    // Scale toggle button (Linear/Log): a control click, so it also resets
+    // the double-click tracker (mirrors the other panels' controls). The
+    // button is not drawn while the chrome is hidden, so its (stale) rect
+    // must not trigger; the click then falls through to the chrome feed
+    // below.
+    if (!gui_chrome_hide_hidden(&panel->chrome_hide) &&
+        panel->scale_btn_rect.width > 0.0f &&
+        CheckCollisionPointRec(click, panel->scale_btn_rect)) {
+        gui_chrome_hide_reset(&panel->chrome_hide);
+        panel->log_scale = !panel->log_scale;
+        return true;
+    }
+
+    // Every other in-bounds click feeds the double-click chrome toggle. A
+    // double-click toggles the annotation labels and consumes the click; a
+    // single click still falls through to the pan drag below (data
+    // interaction, unchanged).
+    if (gui_chrome_hide_feed_click(&panel->chrome_hide, click)) {
+        return true;
+    }
+
+    // Only allow panning when zoomed in
+    if (state->zoom_level <= 1.0f) return false;
 
     // Start dragging
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -1169,8 +1401,9 @@ static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
 // Panel Interface (vtable) Implementation
 //=============================================================================
 
-// FFT panel state is just the base fft_state_t
-// Processing happens in display thread, rendering in render thread
+// FFT panel state is the fft_panel_state_t wrapper (see the Zoom and Pan
+// Interaction section above). Processing happens in display thread via the
+// embedded fft_state_t, rendering in render thread.
 
 //-----------------------------------------------------------------------------
 // Lifecycle Functions
@@ -1178,15 +1411,15 @@ static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
 
 static void *fft_vtable_create(void) {
 #if LIBFFTW_ENABLED
-    fft_state_t *state = calloc(1, sizeof(fft_state_t));
-    if (!state) return NULL;
+    fft_panel_state_t *panel = calloc(1, sizeof(fft_panel_state_t));
+    if (!panel) return NULL;
 
-    if (!gui_fft_init(state)) {
-        free(state);
+    if (!gui_fft_init(&panel->fft)) {
+        free(panel);
         return NULL;
     }
 
-    return state;
+    return panel;
 #else
     return NULL;
 #endif
@@ -1194,15 +1427,15 @@ static void *fft_vtable_create(void) {
 
 static void fft_vtable_destroy(void *state_ptr) {
     if (!state_ptr) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
-    gui_fft_cleanup(state);
-    free(state);
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_cleanup(&panel->fft);
+    free(panel);
 }
 
 static void fft_vtable_clear(void *state_ptr) {
     if (!state_ptr) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
-    gui_fft_clear(state);
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_clear(&panel->fft);
 }
 
 //-----------------------------------------------------------------------------
@@ -1211,10 +1444,10 @@ static void fft_vtable_clear(void *state_ptr) {
 
 static void fft_vtable_process(void *state_ptr, const int16_t *samples, size_t count, uint32_t sample_rate) {
     if (!state_ptr || !samples || count == 0) return;
-    fft_state_t *state = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
 
     // Process raw ADC samples and compute FFT
-    gui_fft_process_raw(state, samples, count, sample_rate);
+    gui_fft_process_raw(&panel->fft, samples, count, sample_rate);
 }
 
 //-----------------------------------------------------------------------------
@@ -1227,7 +1460,8 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     if (!state_ptr || !app) return;
 
-    fft_state_t *fft = (fft_state_t *)state_ptr;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *fft = &panel->fft;
 
     if (!fft->initialized) {
         const char *text = gui_fft_available() ? "FFT Initializing..." : "FFT Not Available";
@@ -1243,6 +1477,21 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     // Swap buffers to get latest FFT data from display thread
     gui_fft_swap_buffers(fft);
+
+    // Publish the panel's double-click chrome state and the Linear/Log
+    // scale mode for the draws inside gui_fft_render (see the statics
+    // above), and cache the Scale-button rect for the click handler.
+    // gui_text_measure falls back to the default font, so this also works
+    // headless.
+    s_fft_chrome_hidden = gui_chrome_hide_hidden(&panel->chrome_hide);
+    s_fft_log_scale = panel->log_scale;
+    {
+        const char *scale_label = panel->log_scale ? "Scale: Log" : "Scale: Linear";
+        float btn_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+        if (btn_w < 96.0f) btn_w = 96.0f;
+        panel->scale_btn_rect = (Rectangle){bounds.x + 8.0f, bounds.y + 4.0f, btn_w, 18.0f};
+    }
+    s_fft_scale_btn_rect = panel->scale_btn_rect;
 
     // Render FFT (sample_rate is read atomically inside gui_fft_render)
     gui_fft_render(fft, bounds.x, bounds.y, bounds.width, bounds.height,

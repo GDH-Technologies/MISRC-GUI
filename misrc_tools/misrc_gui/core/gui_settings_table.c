@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>   // MultiByteToWideChar: the legacy ANSI-codepage migration
+#endif
 
 // Defined in the CLI lib (misrc_capture.c via numcores.h), which the GUI
 // links on every host but Android; declared here, not included, to avoid a
@@ -48,9 +51,13 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->capture_a = true;
     settings->capture_b = true;
 
-    // Set default save path to Desktop
-    strncpy(settings->output_path, gui_settings_get_desktop_path(), MAX_FILENAME_LEN - 1);
-    settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
+    // Set default save path to Desktop. A desktop path that does not fit
+    // leaves it empty rather than naming a different directory.
+    {
+        const char *desktop = gui_settings_get_desktop_path();
+        size_t len = desktop ? strlen(desktop) : 0;
+        if (len < sizeof(settings->output_path)) memcpy(settings->output_path, desktop, len + 1);
+    }
 
     // Auto naming defaults
     settings->auto_names_enabled = true;
@@ -149,6 +156,20 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->flac_affinity_enabled = false;
     settings->flac_affinity_cpu_list[0] = '\0';
 
+    // Shared preview budget default, scaled to the machine so the RF preview
+    // can admit parallel video/HiFi consumers while retaining an aggregate
+    // CPU allowance. Actual cost depends on the profile and hardware. 12+ cores
+    // -> 300%, 6-11 -> 200%, else 100%. The Budget button overrides per session.
+    // (upstream v1.2.6; client-local here, so a net client keeps its own.)
+    settings->rf_preview_budget_percent = 100;
+#if !defined(__ANDROID__)
+    {
+        uint32_t cores = get_num_cores();
+        if (cores >= 12) settings->rf_preview_budget_percent = 300;
+        else if (cores >= 6) settings->rf_preview_budget_percent = 200;
+    }
+#endif
+
     // Audio output defaults
     settings->enable_audio_4ch = false;
     settings->video_record_enabled = false;
@@ -237,6 +258,10 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->demod_volume = 1.0f;              // 1.0 = unity gain
     settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
 
+    // Video panel default system: PAL unless the user's persisted pick
+    // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
+    settings->video_system = 0;
+
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
     settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
@@ -288,21 +313,34 @@ static void sanitize_tag(char *dst, size_t dst_len, const char *src) {
     dst[0] = '\0';
     if (!src || !src[0]) return;
 
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
-        char c = src[i];
+    size_t i = 0, j = 0;
+    for (; src[i] && j + 1 < dst_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        // Preserve non-ASCII filename bytes; map spaces to '-'.
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
-            dst[j++] = c;
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c >= 0x80) {
+            dst[j++] = (char)c;
         } else if (c == ' ' || c == '\t') {
             dst[j++] = '-';
         }
     }
-    dst[j] = '\0';
-
-    while (j > 0 && dst[j - 1] == '-') {
-        dst[--j] = '\0';
+    // Do not split a UTF-8 sequence when shortening the capture-log base.
+    if (src[i] && ((unsigned char)src[i] & 0xc0) == 0x80) {
+        while (j > 0 && ((unsigned char)dst[j - 1] & 0xc0) == 0x80) j--;
+        if (j > 0 && (unsigned char)dst[j - 1] >= 0xc0) j--;
     }
+    while (j > 0 && dst[j - 1] == '-') j--;
+    dst[j] = '\0';
+}
+
+// A derived name that does not fit is cleared, never cut to a different name
+// (upstream v1.2.6's gui_settings_format); record start then refuses it.
+static void name_format(char *dst, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(dst, MAX_FILENAME_LEN, fmt, args);
+    va_end(args);
+    if (len < 0 || len >= MAX_FILENAME_LEN) dst[0] = '\0';
 }
 
 // Keep derived filenames in sync with current auto-naming settings.
@@ -326,22 +364,22 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
+            name_format(settings->output_filename_a, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
         } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
+            name_format(settings->output_filename_a, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
         } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
+            name_format(settings->output_filename_a, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
         } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
+            name_format(settings->output_filename_a, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
+            name_format(settings->output_filename_b, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
         } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
+            name_format(settings->output_filename_b, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
         } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
+            name_format(settings->output_filename_b, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
         } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
+            name_format(settings->output_filename_b, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
         }
     } else {
         // RAW: 8/16 only. Extension is per-channel (.u8 / .u16) so the
@@ -360,22 +398,22 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
+            name_format(settings->output_filename_a, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
         } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
+            name_format(settings->output_filename_a, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
         } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
+            name_format(settings->output_filename_a, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
         } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
+            name_format(settings->output_filename_a, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
+            name_format(settings->output_filename_b, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
         } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
+            name_format(settings->output_filename_b, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
         } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
+            name_format(settings->output_filename_b, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
         } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
+            name_format(settings->output_filename_b, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
         }
     }
 
@@ -387,9 +425,9 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     sanitize_tag(audio_tag_34, sizeof(audio_tag_34), settings->audio_output_tags[2]);
 
     if (audio_tag_4ch[0]) {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
+        name_format(settings->audio_4ch_filename, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
     } else {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
+        name_format(settings->audio_4ch_filename, "%s_quad_4ch.wav", base);
     }
 
     /* Reference video. Deliberately no codec in the name: it is discoverable
@@ -399,9 +437,9 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     char video_tag[40] = {0};
     sanitize_tag(video_tag, sizeof(video_tag), settings->video_output_tag);
     if (video_tag[0]) {
-        snprintf(settings->video_filename, MAX_FILENAME_LEN, "%s_%s_video.mkv", base, video_tag);
+        name_format(settings->video_filename, "%s_%s_video.mkv", base, video_tag);
     } else {
-        snprintf(settings->video_filename, MAX_FILENAME_LEN, "%s_video.mkv", base);
+        name_format(settings->video_filename, "%s_video.mkv", base);
     }
     /* Closed captions. Must stay in lockstep with the same block in
      * gui_record_apply_auto_names(); the only intended difference there is
@@ -410,29 +448,29 @@ void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     char cc_tag[40] = {0};
     sanitize_tag(cc_tag, sizeof(cc_tag), settings->usbref_cc_tag);
     if (cc_tag[0]) {
-        snprintf(settings->usbref_cc_filename, MAX_FILENAME_LEN, "%s_%s_captions.scc", base, cc_tag);
+        name_format(settings->usbref_cc_filename, "%s_%s_captions.scc", base, cc_tag);
     } else {
-        snprintf(settings->usbref_cc_filename, MAX_FILENAME_LEN, "%s_captions.scc", base);
+        name_format(settings->usbref_cc_filename, "%s_captions.scc", base);
     }
 
     if (audio_tag_12[0]) {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
+        name_format(settings->audio_2ch_12_filename, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_stereo_ch1_ch2.wav", base);
+        name_format(settings->audio_2ch_12_filename, "%s_stereo_ch1_ch2.wav", base);
     }
     if (audio_tag_34[0]) {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
+        name_format(settings->audio_2ch_34_filename, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
     } else {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_stereo_ch3_ch4.wav", base);
+        name_format(settings->audio_2ch_34_filename, "%s_stereo_ch3_ch4.wav", base);
     }
 
     for (int i = 0; i < 4; i++) {
         char tag[40];
         sanitize_tag(tag, sizeof(tag), settings->audio_1ch_labels[i]);
         if (tag[0]) {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_%s_audio_ch%d.wav", base, tag, i + 1);
+            name_format(settings->audio_1ch_filenames[i], "%s_%s_audio_ch%d.wav", base, tag, i + 1);
         } else {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_audio_ch%d.wav", base, i + 1);
+            name_format(settings->audio_1ch_filenames[i], "%s_audio_ch%d.wav", base, i + 1);
         }
     }
 }
@@ -521,9 +559,11 @@ static bool parse_float_text(const char *value, bool strict, float *out, char *e
     return true;
 }
 
-/* The file loader truncates silently; the network path refuses anything the
- * raw file dialect could not hold (a quote or a line break ends the value
- * early on the next load) and anything that would be cut. */
+/* The file loader stores a value that does not fit as empty -- never a prefix,
+ * which would name a different file (upstream v1.2.6). The network path
+ * refuses it, and refuses what an older build's raw file dialect could not
+ * hold (a quote or a line break ends the value early when a rollback build
+ * loads a format-2 file). */
 static bool store_string(char *dst, size_t cap, const char *value, bool strict, char *err, size_t errcap) {
     size_t len = strlen(value);
     if (strict) {
@@ -533,7 +573,7 @@ static bool store_string(char *dst, size_t cap, const char *value, bool strict, 
             return false;
         }
     }
-    if (len >= cap) len = cap - 1;
+    if (len >= cap) len = 0;
     memcpy(dst, value, len);
     dst[len] = '\0';
     return true;
@@ -624,6 +664,10 @@ static void strip_timestamp_prefix_inplace(char *s) {
 
 static bool hook_base_name(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
                            bool strict, char *err, size_t errcap) {
+    /* An oversized base name in the file also clears the output folder (its
+     * row comes first), so the next record start refuses instead of writing
+     * "capture" files where the operator did not ask (upstream v1.2.6). */
+    if (!strict && strlen(value) >= sizeof(s->output_base_name)) s->output_path[0] = '\0';
     if (!store_string(s->output_base_name, sizeof(s->output_base_name), value, strict, err, errcap)) return false;
     strip_timestamp_prefix_inplace(s->output_base_name);
     (void)d;
@@ -857,6 +901,39 @@ static bool hook_waveform_scale_mv_alias(const gui_setting_desc_t *d, gui_settin
     return true;
 }
 
+/* The RF preview's Budget button steps (upstream v1.2.6). A file value off
+ * the ladder keeps the machine-scaled default; the network path refuses it. */
+static bool hook_rf_preview_budget(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                                   bool strict, char *err, size_t errcap) {
+    long long v;
+    if (!parse_int_text(value, strict, &v, err, errcap)) return false;
+    switch (v) {
+        case 50: case 75: case 100: case 150: case 200: case 300:
+            s->rf_preview_budget_percent = (int)v;
+            break;
+        default:
+            if (strict) { set_err(err, errcap, "expected 50, 75, 100, 150, 200 or 300"); return false; }
+            break;
+    }
+    (void)d;
+    return true;
+}
+
+/* CVBS System selector: 0=PAL, 1=NTSC, 2=SECAM (gui_cvbs_set_format's space). */
+static bool hook_video_system(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                              bool strict, char *err, size_t errcap) {
+    long long v;
+    if (!parse_int_text(value, strict, &v, err, errcap)) return false;
+    if (v >= 0 && v <= 2) {
+        s->video_system = (int)v;
+    } else if (strict) {
+        set_err(err, errcap, "expected 0 (PAL), 1 (NTSC) or 2 (SECAM)");
+        return false;
+    }
+    (void)d;
+    return true;
+}
+
 /* ============================================================================
  * The table. Order = the order the file has always been written.
  * ============================================================================ */
@@ -1052,6 +1129,12 @@ static const gui_setting_desc_t s_table[] = {
      * effective scale, for builds that read it as the whole scale. Client-local
      * like the rest of the display scale: it describes this machine's screen. */
     GS_IH ("ui_zoom_percent",                 ui_zoom_percent,            GS_LOCAL, hook_ui_zoom),
+    /* upstream v1.2.6: the RF preview's CPU budget, the CVBS System pick and
+     * the drag-and-dropped playback monitor file. All three describe this
+     * machine (its cores, its panels, its files), so a net client keeps its own. */
+    GS_IH ("rf_preview_budget_percent",       rf_preview_budget_percent,  GS_LOCAL, hook_rf_preview_budget),
+    GS_IH ("video_system",                    video_system,               GS_LOCAL, hook_video_system),
+    GS_S  ("playback_audio_file",             playback_audio_file,        GS_LOCAL),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))
@@ -1128,24 +1211,27 @@ bool gui_settings_format_value(const gui_settings_t *s, const gui_setting_desc_t
     return k.len < cap;
 }
 
+static void sink_put_json_string(sink_t *k, const char *text);
+
+/* Format 2 (upstream v1.2.6): the version key first, then every row, strings
+ * JSON-escaped so a quote, a backslash or a control character round-trips. */
 size_t gui_settings_format_file(const gui_settings_t *s, char *buf, size_t cap) {
     sink_t k = { buf, cap, 0 };
     if (buf && cap) buf[0] = '\0';
     if (!s) return 0;
 
-    sink_puts(&k, "{\n");
-    bool first = true;
+    sink_printf(&k, "{\n  \"%s\": %d", GUI_SETTINGS_FORMAT_VERSION_KEY, GUI_SETTINGS_FORMAT_VERSION);
     for (size_t i = 0; i < GS_TABLE_COUNT; i++) {
         const gui_setting_desc_t *d = &s_table[i];
         if (d->flags & GS_LOAD_ONLY) continue;
-        if (!first) sink_puts(&k, ",\n");
-        first = false;
-        sink_puts(&k, "  \"");
+        sink_puts(&k, ",\n  \"");
         sink_puts(&k, d->key);
         sink_puts(&k, "\": ");
-        if (d->type == GS_STR) sink_puts(&k, "\"");
-        format_bare(&k, s, d);
-        if (d->type == GS_STR) sink_puts(&k, "\"");
+        if (d->type == GS_STR) {
+            sink_put_json_string(&k, (const char *)field_cptr(s, d));
+        } else {
+            format_bare(&k, s, d);
+        }
     }
     sink_puts(&k, "\n}\n");
     return k.len;
@@ -1234,6 +1320,16 @@ static int hex_nibble(char c) {
     return -1;
 }
 
+static int hex4(const char *p) {
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = p[i] ? hex_nibble(p[i]) : -1;
+        if (h < 0) return -1;
+        v = (v << 4) | h;
+    }
+    return v;
+}
+
 bool gui_settings_find_value(const char *content, const char *key,
                              char *out, size_t cap, bool json) {
     if (!content || !key || !out || cap == 0) return false;
@@ -1270,17 +1366,34 @@ bool gui_settings_find_value(const char *content, const char *key,
                     case 'b': c = '\b'; break;
                     case 'f': c = '\f'; break;
                     case 'u': {
-                        int h[4];
-                        bool ok = true;
-                        for (int i = 0; i < 4; i++) {
-                            h[i] = pos[i] ? hex_nibble(pos[i]) : -1;
-                            if (h[i] < 0) ok = false;
-                        }
-                        if (!ok) return false;
-                        unsigned cp = (unsigned)((h[0] << 12) | (h[1] << 8) | (h[2] << 4) | h[3]);
+                        /* UTF-8 out, surrogate pairs joined, as upstream's
+                         * v1.2.6 reader does. A lone surrogate or a NUL is
+                         * refused: a native path cannot hold either. */
+                        int hi = hex4(pos);
+                        if (hi < 0) return false;
                         pos += 4;
-                        c = (cp < 0x80) ? (char)cp : '?';
-                        break;
+                        unsigned cp = (unsigned)hi;
+                        if (cp >= 0xd800 && cp <= 0xdbff) {
+                            if (pos[0] != '\\' || pos[1] != 'u') return false;
+                            int lo = hex4(pos + 2);
+                            if (lo < 0xdc00 || lo > 0xdfff) return false;
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + (unsigned)(lo - 0xdc00);
+                            pos += 6;
+                        } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                            return false;
+                        }
+                        if (cp == 0) return false;
+                        char enc[4];
+                        size_t m;
+                        if (cp < 0x80) { enc[0] = (char)cp; m = 1; }
+                        else if (cp < 0x800) { enc[0] = (char)(0xc0 | (cp >> 6)); m = 2; }
+                        else if (cp < 0x10000) { enc[0] = (char)(0xe0 | (cp >> 12)); m = 3; }
+                        else { enc[0] = (char)(0xf0 | (cp >> 18)); m = 4; }
+                        for (size_t k = 1; k < m; k++)
+                            enc[k] = (char)(0x80 | ((cp >> (6 * (m - 1 - k))) & 0x3f));
+                        /* Never a partial sequence at the cap. */
+                        if (j + m < cap) { memcpy(out + j, enc, m); j += m; }
+                        continue;
                     }
                     default: c = e; break;   /* \" \\ \/ and anything else */
                 }
@@ -1364,14 +1477,46 @@ void gui_settings_post_load(gui_settings_t *settings) {
     gui_settings_refresh_auto_names(settings);
 }
 
+#if defined(_WIN32) || defined(_WIN64)
+/* Older native folder pickers saved ANSI-codepage bytes. Keep existing UTF-8
+ * intact and migrate only legacy strings that do not decode as UTF-8 (upstream
+ * v1.2.6 does the same for a version-1 file). */
+static void migrate_legacy_acp(char *value, size_t cap) {
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0)) return;
+    wchar_t wide[FILE_PATH_MAX];
+    if (!MultiByteToWideChar(CP_ACP, 0, value, -1, wide, FILE_PATH_MAX)) { value[0] = '\0'; return; }
+    int need = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, NULL, 0, NULL, NULL);
+    if (need <= 0 || (size_t)need > cap ||
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, value, (int)cap, NULL, NULL) != need) {
+        value[0] = '\0';
+    }
+}
+#endif
+
 void gui_settings_parse_text(gui_settings_t *s, const char *content) {
     if (!s || !content) return;
-    char value[512];
-    for (size_t i = 0; i < GS_TABLE_COUNT; i++) {
-        const gui_setting_desc_t *d = &s_table[i];
-        if (d->flags & GS_WRITE_ONLY) continue;
-        if (!gui_settings_find_value(content, d->key, value, sizeof(value), false)) continue;
-        (void)gui_settings_apply_key(s, d->key, value, false, NULL, 0);
+    /* Format 2 (upstream v1.2.6) escapes its strings. Version 1 wrote Windows
+     * backslashes literally, so decode escapes only after an explicit marker;
+     * otherwise C:\tapes\new would change meaning. */
+    char version[16];
+    bool escaped = gui_settings_find_value(content, GUI_SETTINGS_FORMAT_VERSION_KEY,
+                                           version, sizeof(version), false) &&
+                   strtol(version, NULL, 10) >= 2;
+    /* One byte past the widest field (FILE_PATH_MAX): a value cut at the
+     * buffer is still longer than any field, so store_string drops it. */
+    const size_t value_cap = FILE_PATH_MAX + 1;
+    char *value = malloc(value_cap);
+    if (value) {
+        for (size_t i = 0; i < GS_TABLE_COUNT; i++) {
+            const gui_setting_desc_t *d = &s_table[i];
+            if (d->flags & GS_WRITE_ONLY) continue;
+            if (!gui_settings_find_value(content, d->key, value, value_cap, escaped)) continue;
+#if defined(_WIN32) || defined(_WIN64)
+            if (!escaped && d->type == GS_STR) migrate_legacy_acp(value, value_cap);
+#endif
+            (void)gui_settings_apply_key(s, d->key, value, false, NULL, 0);
+        }
+        free(value);
     }
     gui_settings_post_load(s);
 }

@@ -52,7 +52,20 @@ require_tools() {
   [[ "$missing" -eq 0 ]] || fail "Install missing tools and retry."
 }
 
-require_tools meson ninja pkg-config cc nasm
+require_tools meson ninja pkg-config cc nasm python3
+
+# CI parity gate: run the same static guard tests CI's preflight runs BEFORE
+# any deps/meson work, so a guard break (optional-dep guard consistency,
+# workflow contracts, ...) fails the local build first instead of only the
+# manually dispatched CI run. Regression e34dce9: libFLAC-guarded struct
+# members were referenced outside the guard in gui_playback.c; local builds
+# passed and the dispatched CI run failed a day later.
+GUARD_SCRIPT="$REPO_ROOT/misrc_tools/test/ci_guard_tests.py"
+if [[ ! -f "$GUARD_SCRIPT" ]]; then
+  fail "CI guard test script not found: $GUARD_SCRIPT"
+fi
+log "CI guard tests (static) before build"
+python3 "$GUARD_SCRIPT" --static-only || fail "CI guard tests failed (see output above). Fix the reported errors and rerun."
 
 # Force the system pkg-config for native builds. A leaked PKG_CONFIG pointing
 # at a cross wrapper (e.g. android/android-pkg-config) only searches a cross

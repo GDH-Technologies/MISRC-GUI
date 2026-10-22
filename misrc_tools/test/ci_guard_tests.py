@@ -495,10 +495,12 @@ def check_meson_vendored_hsdaoh_policy(meson_path: Path) -> int:
     meson_text = read_text(meson_path)
     required_snippets = [
         # The vendored-pc probe was generalized (lib/lib64, hsdaoh/libhsdaoh)
-        # in the Fedora-build merge; these match the probing implementation.
+        # in the Fedora-build merge, over upstream's per-platform prefix
+        # (install-win on Windows, v1.2.6); these match the probing
+        # implementation.
         "vendored_pc_dir",
-        "fs.exists(hsdaoh_deps_root / _libdir / 'pkgconfig' / (_pc + '.pc'))",
-        "Using vendored hsdaoh from .deps/install (mirrors CI",
+        "fs.exists(hsdaoh_vendored_prefix / _libdir / 'pkgconfig' / (_pc + '.pc'))",
+        "Using vendored hsdaoh from ' + hsdaoh_vendored_prefix",
         "declare_dependency",
         "deps = [ hsdaoh_dep ]",
     ]
@@ -873,6 +875,12 @@ def check_no_tracked_generated_dirty_sources(repo_root: Path) -> int:
 # soxr_in_buf/soxr_out_buf inside #if LIBSOXR_ENABLED but referenced them
 # unguarded; Windows arm64 (no mingw-w64-clang-aarch64-libsoxr =>
 # LIBSOXR_ENABLED=0) failed to compile with "no member named 'soxr_in_buf'".
+# Regression e34dce9: gui_playback.c's channel-preparation helpers sat
+# outside #if LIBFLAC_ENABLED while touching guarded members (decoder_a/b,
+# io_a/b) and calling functions defined inside the guard. Member
+# declarations are resolved across the source AND the repo headers, so
+# members declared unguarded in headers (playback_file_info_t.duration_seconds
+# in gui_playback.h) are not false-flagged.
 _OPTIONAL_DEP_MACROS = (
     "LIBSOXR_ENABLED",
     "LIBFLAC_ENABLED",
@@ -946,21 +954,18 @@ def _make_c_stripper():
     return strip
 
 
-def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[int, str]]:
-    """Return [(lineno, member_name), ...] for struct member references
-    (->name / .name) that occur in plain code NOT enclosed by any conditional
-    chain that mentions <macro>, while the member is declared only inside an
-    enabled #if <macro> branch (not outside it, not in a #else branch). Those
-    compile-fail when <macro> is undefined.
-
-    Limitation: to avoid false positives on the legitimate #if/#elif !MACRO/
-    #else idiom (where the final #else is only reached when MACRO is defined),
-    a reference is NOT flagged if any enclosing #if/#elif/#else chain mentions
-    <macro> at all. This means references inside a negated guard (#if !MACRO)
-    are not caught — that rarer pattern would need a real preprocessor to
-    evaluate precisely. The guard still catches the common regression where a
-    guarded-only member is referenced in plain code with no macro conditional
-    around it (regression 64b2171 in gui_demod.c)."""
+def _scan_struct_member_source(
+    source: str,
+    macro: str,
+    members: Optional[Dict[str, Dict[str, bool]]],
+    refs: Optional[List[Tuple[int, str, str, bool]]],
+) -> None:
+    """One comment/string-stripped pass over a C source. When `members` is
+    given, record per-region struct member DECLARATIONS (a name declared
+    inside an enabled #if <macro> branch / inside a #else branch of that
+    chain / outside it). When `refs` is given, record member-style references
+    (->name / .name) with their region/enclosure state. Both may be given
+    (declarations + references from the same source in one pass)."""
     strip = _make_c_stripper()
     lines = [strip(l) for l in source.splitlines()]
 
@@ -972,11 +977,6 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
     member_re = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;")
     ref_re = re.compile(r"(?:->|\.)\s*([A-Za-z_]\w*)")
     macro_token_re = re.compile(rf"\b{re.escape(macro)}\b")
-
-    # member name -> per-region declared flags
-    members: Dict[str, Dict[str, bool]] = {}
-    # (lineno, name, region, enclosed_by_macro_chain)
-    refs: List[Tuple[int, str, str, bool]] = []
 
     for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -1025,12 +1025,13 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
             if struct_depth <= 0:
                 in_struct = False
                 continue
-            for m in member_re.finditer(line):
-                name = m.group(1)
-                if name in _C_TYPE_KEYWORDS:
-                    continue
-                rec = members.setdefault(name, {"enabled": False, "disabled": False, "outside": False})
-                rec[region] = True
+            if members is not None:
+                for m in member_re.finditer(line):
+                    name = m.group(1)
+                    if name in _C_TYPE_KEYWORDS:
+                        continue
+                    rec = members.setdefault(name, {"enabled": False, "disabled": False, "outside": False})
+                    rec[region] = True
             continue
 
         if struct_open_re.search(line):
@@ -1046,8 +1047,60 @@ def _find_unguarded_struct_member_refs(source: str, macro: str) -> List[Tuple[in
             continue
 
         # Outside any struct body: collect member-style references.
-        for m in ref_re.finditer(line):
-            refs.append((idx, m.group(1), region, enclosed))
+        if refs is not None:
+            for m in ref_re.finditer(line):
+                refs.append((idx, m.group(1), region, enclosed))
+
+
+def _struct_member_decl_baseline(header_texts: List[str], macro: str) -> Dict[str, Dict[str, bool]]:
+    """Member-name declaration records collected from the repo's headers.
+
+    Struct types legitimately live in headers regardless of whether the
+    header text mentions <macro>, so the baseline scans EVERY header: a
+    member name declared by any header struct outside an enabled
+    #if <macro> branch is NOT guard-only. False-positive class this fixes
+    (2026-10-19): gui_playback.c declares duration_seconds inside
+    #if LIBFLAC_ENABLED (playback_vorbis_rf_tags_t) while
+    playback_file_info_t in gui_playback.h also declares it unguarded, so
+    file-local-only analysis false-flagged a plain info->duration_seconds
+    reference outside the guard."""
+    members: Dict[str, Dict[str, bool]] = {}
+    for text in header_texts:
+        _scan_struct_member_source(text, macro, members, None)
+    return members
+
+
+def _find_unguarded_struct_member_refs(
+    source: str,
+    macro: str,
+    preseed_members: Optional[Dict[str, Dict[str, bool]]] = None,
+) -> List[Tuple[int, str]]:
+    """Return [(lineno, member_name), ...] for struct member references
+    (->name / .name) that occur in plain code NOT enclosed by any conditional
+    chain that mentions <macro>, while the member is declared only inside an
+    enabled #if <macro> branch (not outside it, not in a #else branch) across
+    the source file AND the repo headers (preseed_members: struct types
+    legitimately live in headers, so a member declared unguarded in any
+    header is not guard-only). Those compile-fail when <macro> is undefined.
+
+    Limitation: to avoid false positives on the legitimate #if/#elif !MACRO/
+    #else idiom (where the final #else is only reached when MACRO is defined),
+    a reference is NOT flagged if any enclosing #if/#elif/#else chain mentions
+    <macro> at all. This means references inside a negated guard (#if !MACRO)
+    are not caught — that rarer pattern would need a real preprocessor to
+    evaluate precisely. The guard still catches the common regression where a
+    guarded-only member is referenced in plain code with no macro conditional
+    around it (regression 64b2171 in gui_demod.c; regression e34dce9 in
+    gui_playback.c: decoder_a/b + io_a/b referenced by unguarded
+    channel-preparation helpers)."""
+    # member name -> per-region declared flags, pre-seeded from the headers
+    members: Dict[str, Dict[str, bool]] = {}
+    if preseed_members:
+        for name, rec in preseed_members.items():
+            members[name] = dict(rec)
+    # (lineno, name, region, enclosed_by_macro_chain)
+    refs: List[Tuple[int, str, str, bool]] = []
+    _scan_struct_member_source(source, macro, members, refs)
 
     guarded_only = {
         name for name, rec in members.items()
@@ -1086,16 +1139,30 @@ def check_optional_dep_guard_consistency(repo_root: Path) -> int:
     referenced (->name / .name) outside the branch. Those fail to compile
     when the dependency is absent. Regression 64b2171: gui_demod.c soxr
     scratch buffers were #if LIBSOXR_ENABLED-guarded but referenced unguarded,
-    breaking the Windows arm64 build (no libsoxr => LIBSOXR_ENABLED=0)."""
+    breaking the Windows arm64 build (no libsoxr => LIBSOXR_ENABLED=0).
+    Regression e34dce9: gui_playback.c channel-preparation helpers sat
+    outside #if LIBFLAC_ENABLED while touching guarded members (decoder_a/b,
+    io_a/b) and calling FLAC/reader functions defined inside the guard.
+    Member declarations are resolved across the source file AND the repo
+    headers, so members declared unguarded in headers
+    (playback_file_info_t.duration_seconds in gui_playback.h) are not
+    false-flagged."""
     tools_dir = repo_root / "misrc_tools"
-    sources = sorted(tools_dir.rglob("*.c"))
+    sources = [(p, read_text(p)) for p in sorted(tools_dir.rglob("*.c"))]
+    header_texts = [read_text(p) for p in sorted(tools_dir.rglob("*.h"))]
     any_problem = False
-    for src_path in sources:
-        text = read_text(src_path)
-        for macro in _OPTIONAL_DEP_MACROS:
+    for macro in _OPTIONAL_DEP_MACROS:
+        # Per-macro header declaration baseline (lazy: only built when some
+        # source mentions the macro).
+        header_baseline: Optional[Dict[str, Dict[str, bool]]] = None
+        for src_path, text in sources:
             if macro not in text:
                 continue
-            for lineno, name in _find_unguarded_struct_member_refs(text, macro):
+            if header_baseline is None:
+                header_baseline = _struct_member_decl_baseline(header_texts, macro)
+            for lineno, name in _find_unguarded_struct_member_refs(
+                text, macro, preseed_members=header_baseline
+            ):
                 any_problem = True
                 rel = src_path.relative_to(repo_root)
                 print(
@@ -1127,25 +1194,38 @@ def check_settings_persistence_contract(gui_settings_c_path: Path) -> int:
     source = read_text(gui_settings_c_path)
     required_snippets = [
         "gui_settings_ensure_parent_dirs(path)",
-        "getenv(\"APPDATA\")",
-        "getenv(\"LOCALAPPDATA\")",
-        "getenv(\"XDG_CONFIG_HOME\")",
-        "_mkdir(path)",
-        "mkdir(path, 0700)",
+        "file_getenv_utf8(\"APPDATA\")",
+        "file_getenv_utf8(\"LOCALAPPDATA\")",
+        "file_getenv_utf8(\"XDG_CONFIG_HOME\")",
+        "file_mkdir_utf8(path, 0700)",
     ]
     for snippet in required_snippets:
         if snippet not in source:
             return fail(f"Missing settings persistence contract snippet in gui_settings.c: {snippet}")
 
+    # Directory creation and file I/O now live in the shared UTF-8 helpers.
+    # Retain the platform checks here as well as the settings call-site checks.
+    file_utils = read_text(gui_settings_c_path.parents[2] / "common/file_utils.c")
+    for snippet in (
+        "GetEnvironmentVariableW(wide_name,",
+        "getenv(name)",
+        "_wmkdir(wide)",
+        "mkdir(path, (mode_t)mode)",
+        "_wfopen(wide, wide_mode)",
+        "fopen(filename, mode)",
+    ):
+        if snippet not in file_utils:
+            return fail(f"Missing settings filesystem contract snippet in file_utils.c: {snippet}")
+
     save_pos = source.find("void gui_settings_save(")
     if save_pos < 0:
         return fail("Could not locate gui_settings_save() in gui_settings.c")
     ensure_pos = source.find("gui_settings_ensure_parent_dirs(path)", save_pos)
-    fopen_pos = source.find("FILE *f = fopen(path, \"w\");", save_pos)
+    fopen_pos = source.find("FILE *f = file_open_utf8(path, \"w\");", save_pos)
     if ensure_pos < 0 or fopen_pos < 0:
-        return fail("Missing parent-dir ensure or fopen call in gui_settings_save()")
+        return fail("Missing parent-dir ensure or file_open_utf8 call in gui_settings_save()")
     if ensure_pos > fopen_pos:
-        return fail("gui_settings_save() must ensure parent directories before fopen")
+        return fail("gui_settings_save() must ensure parent directories before file_open_utf8")
     return 0
 
 def check_flac_large_file_offsets_contract(flac_writer_c_path: Path) -> int:
@@ -1889,20 +1969,32 @@ def check_cc_sidecar_in_overwrite_set(repo_root: Path) -> int:
     if start < 0:
         return fail("gui_record_start not found")
     body = code[start:start + 12000]
-    if "settings.usbref_cc_filename" not in body:
-        return fail("gui_record_start never builds the caption path for the overwrite check")
-    if "file_cc_exists" not in body:
-        return fail("gui_record_start never stat()s the caption sidecar")
-    if "path_cc, s_finalizing->path_cc" not in body.replace("\n", " ").replace("  ", " "):
-        if "s_finalizing->path_cc" not in body:
-            return fail(
-                "a finalizing session's caption path is not checked, so a new recording "
-                "could reuse a file the previous one is still writing"
-            )
-    if "CAPTIONS:" not in body:
-        return fail("the overwrite prompt does not name the caption sidecar it would replace")
-    if "VIDEO:" not in body:
-        return fail("the overwrite prompt does not name the reference video it would replace")
+    # Since upstream v1.2.6 the overwrite set is gui_record_check_output_paths:
+    # parallel names/enabled/labels arrays, one entry per output, each stat()ed
+    # and named in the prompt's details. The fork's two outputs ride in it.
+    if "gui_record_check_output_paths(app, &existing_count, details" not in body:
+        return fail("gui_record_start no longer runs gui_record_check_output_paths for the overwrite prompt")
+    if "details" not in body[body.find("existing_count && !app->settings.overwrite_files"):][:600]:
+        return fail("the overwrite prompt no longer prints the per-file details it would replace")
+    at = code.find("static bool gui_record_check_output_paths(")
+    end = code.find("\n}", at)
+    if at < 0 or end < 0:
+        return fail("gui_record_check_output_paths not found in gui_record.c")
+    check = code[at:end]
+    flat = " ".join(check.split())
+    for name, enable, label, what in (
+        ("app->settings.usbref_cc_filename", "app->settings.usbref_cc_enabled", '"Captions"', "caption sidecar"),
+        ("app->settings.video_filename", "app->settings.video_record_enabled", '"Video"', "reference video"),
+    ):
+        if name not in flat or enable not in flat:
+            return fail(f"gui_record_check_output_paths does not stat() the {what} (its name or enable is missing)")
+        if label not in flat:
+            return fail(f"the overwrite prompt does not name the {what} it would replace")
+    if "s_finalizing->path_cc" not in body:
+        return fail(
+            "a finalizing session's caption path is not checked, so a new recording "
+            "could reuse a file the previous one is still writing"
+        )
     return 0
 
 
@@ -2353,6 +2445,9 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     "net_mode", "net_server_port", "net_server_port_str", "net_client_host", "net_client_port",
     "net_client_port_str", "playback_file_a", "playback_file_b",
     "waveform_scale_mode", "net_client_record_local", "ui_zoom_percent",
+    # upstream v1.2.6: this machine's preview CPU budget, CVBS System pick and
+    # drag-and-dropped playback monitor file.
+    "rf_preview_budget_percent", "video_system", "playback_audio_file",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to
@@ -3476,7 +3571,10 @@ def check_record_parity(repo_root: Path) -> int:
     if "gui_app_effective_recording(&app)" not in main_c[key_r:key_r + 500] or \
        "gui_app_control_capturing(&app)" not in main_c[key_r - 20:key_r + 500]:
         return fail("misrc_gui.c: the R hotkey does not use the effective recording and capture state")
-    if "gui_app_control_capturing(&app)" not in main_c[key_space:key_space + 300]:
+    # 2000, not 300: upstream v1.2.6 put its playback start-cancel and
+    # play/pause branches ahead of the disconnect branch in the same handler
+    # (the call sits ~1190 characters in).
+    if "gui_app_control_capturing(&app)" not in main_c[key_space:key_space + 2000]:
         return fail("misrc_gui.c: the Space hotkey does not use the effective capture state")
 
     capture_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/input/gui_capture.c"))
@@ -4141,7 +4239,10 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         "create_release:",
         "release_tag:",
         "push:",
-        "- 'v*'",
+        # CI must also run on direct pushes to main (regression e34dce9: a
+        # guard break was pushed straight to main and ran no CI for a day;
+        # the tags-only push trigger never fired).
+        "push:\n    branches:\n      - main\n    tags:\n      - 'v*'",
         "preflight-guard-tests:",
         "linux-appimage:",
         "windows-exe:",
@@ -4229,7 +4330,7 @@ def check_local_build_bootstrap_contract(repo_root: Path,
 def check_local_deps_cache_contract(repo_root: Path,
                                      workflow_path: Path,
                                      dev_notes_path: Path,
-                                     tools_readme_path: Path) -> int:
+                                     installation_md_path: Path) -> int:
     """Assert the local==CI deps caching path is present and wired.
 
     Prevents silent removal of the deps scripts, stamp gate, build-local
@@ -4288,7 +4389,10 @@ def check_local_deps_cache_contract(repo_root: Path,
         if snippet not in dev_notes_text:
             return fail(f"Dev notes are missing deps-cache contract snippet: {snippet}")
 
-    installation_text = read_text(tools_readme_path)
+    # The Vendored deps caching model section lives in the repo-root
+    # INSTALLATION.md (misrc_tools/README.md only points here); the
+    # parameter is named for the file it actually receives.
+    installation_text = read_text(installation_md_path)
     required_installation_snippets = [
         "Vendored deps caching model",
         "build-deps-windows.sh",
@@ -4298,6 +4402,334 @@ def check_local_deps_cache_contract(repo_root: Path,
     for snippet in required_installation_snippets:
         if snippet not in installation_text:
             return fail(f"INSTALLATION.md is missing deps-cache contract snippet: {snippet}")
+    return 0
+
+
+def check_local_guard_gate_contract(repo_root: Path) -> int:
+    """The local build scripts must run the static CI guard tests before any
+    build work, and direct pushes to main must run CI. Regression e34dce9:
+    guarded libFLAC struct members (decoder_a/b, io_a/b) were referenced
+    outside the guard in gui_playback.c; local builds passed because the
+    guard tests were never run locally, and the direct push to main ran no
+    CI (the push trigger was tags-only), so the break surfaced only when a
+    manually dispatched workflow run failed a day later."""
+    ps1_path = repo_root / "scripts/build-local.ps1"
+    sh_path = repo_root / "scripts/build-local.sh"
+    workflow_path = repo_root / ".github/workflows/build.yml"
+    for path in (ps1_path, sh_path, workflow_path):
+        if not path.exists():
+            return fail(f"Missing local guard-gate contract file: {path}")
+    for label, script_path in [("build-local.ps1", ps1_path), ("build-local.sh", sh_path)]:
+        text = read_text(script_path)
+        if "misrc_tools/test/ci_guard_tests.py" not in text:
+            return fail(f"{label} must run the static CI guard tests before building")
+        if "--static-only" not in text:
+            return fail(f"{label} must run the guard in --static-only mode (the documented local mode)")
+        if "CI guard tests failed" not in text:
+            return fail(f"{label} must FAIL the build when the CI guard tests fail ('CI guard tests failed')")
+    workflow_text = read_text(workflow_path)
+    push_main = "push:\n    branches:\n      - main\n    tags:\n      - 'v*'"
+    if push_main not in workflow_text:
+        return fail(
+            "build.yml must run CI on direct pushes to main (push: branches: [main] "
+            "alongside the v* tags trigger); a tags-only push trigger let a guard "
+            "break reach main with no CI (regression e34dce9)"
+        )
+    return 0
+
+
+def check_playback_drag_drop_contract(repo_root: Path) -> int:
+    """The playback drag-and-drop wiring (2026-10-20, the full-capture-set
+    loading feature: RF per channel zone + clockgen audio in one drop).
+
+    - The main loop polls the raylib drop event exactly once and routes it
+      through the logical pointer wrapper (never a second raw
+      GetMousePosition call - the UI scale integration contract allows
+      exactly one call site, in gui_ui.c).
+    - gui_playback owns the drop handler + the position-synced audio feed
+      (the monitor queue push + the seek/loop flush + the prepare-time open
+      + the release).
+    - gui_audio implements the playback push/flush queue API.
+    - The audio file setting persists (save + load) and the settings panel
+      shows + clears it.
+    """
+    gui_c_path = repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"
+    gui_c = read_text(gui_c_path)
+    for snippet, label in [
+        ("IsFileDropped()", "the per-frame drop poll"),
+        ("LoadDroppedFiles()", "the dropped-files load"),
+        ("UnloadDroppedFiles(", "the dropped-files unload"),
+        ("gui_playback_handle_dropped_files(", "the drop handler call"),
+        ("gui_ui_get_mouse_position()", "the logical drop point (wrapper)"),
+    ]:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c drag-and-drop wiring is missing {label}: {snippet}")
+    if "GetMousePosition()" in gui_c:
+        return fail(
+            "misrc_gui.c must not call GetMousePosition() directly (the UI scale "
+            "integration contract allows exactly one call site, in gui_ui.c)"
+        )
+    pb_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.h")
+    if "gui_playback_handle_dropped_files" not in pb_h:
+        return fail("gui_playback.h must declare gui_playback_handle_dropped_files")
+    pb_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.c")
+    for snippet, label in [
+        ("gui_playback_audio_feed(", "the position-synced audio feed"),
+        ("gui_audio_push_playback(", "the monitor queue push"),
+        ("gui_audio_reset_playback_queue()", "the seek/loop queue flush"),
+        ("gui_playback_audio_open(", "the prepare-time audio source open"),
+        ("gui_playback_audio_destroy(", "the audio source release"),
+        ("PLAYBACK_AUDIO_FEED_LOOKAHEAD_MS", "the feed lookahead contract"),
+        ("gui_playback_drop_zone(", "the panel-zone mapping"),
+        ("gui_playback_classify_drop(", "the content classifier"),
+    ]:
+        if snippet not in pb_c:
+            return fail(f"gui_playback.c drag-and-drop is missing {label}: {snippet}")
+    audio_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.c")
+    audio_h = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.h")
+    if "gui_audio_push_playback" not in audio_h:
+        return fail("gui_audio.h must declare gui_audio_push_playback")
+    if "gui_audio_reset_playback_queue" not in audio_h:
+        return fail("gui_audio.h must declare gui_audio_reset_playback_queue")
+    if "void gui_audio_push_playback(" not in audio_c:
+        return fail("gui_audio.c must implement gui_audio_push_playback")
+    if "void gui_audio_reset_playback_queue(void)" not in audio_c:
+        return fail("gui_audio.c must implement gui_audio_reset_playback_queue")
+    app_h = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_app.h")
+    # GDH fork: gui_settings_t lives in gui_settings.h (included by gui_app.h)
+    # and persists through one descriptor-table row, which is both the save
+    # and the load path. Upstream's layout keeps its own two-reference rule.
+    table_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"
+    settings_h_path = repo_root / "misrc_tools/misrc_gui/core/gui_settings.h"
+    if table_path.exists() and '#include "gui_settings.h"' in app_h:
+        if "playback_audio_file[" not in read_text(settings_h_path):
+            return fail("gui_settings.h settings must carry playback_audio_file")
+        rows = re.findall(r'GS_\w+\s*\(\s*"playback_audio_file"', read_text(table_path))
+        if len(rows) != 1:
+            return fail(
+                "gui_settings_table.c must persist playback_audio_file in exactly one "
+                f"row (the save and the load path; found {len(rows)})"
+            )
+    else:
+        if "playback_audio_file[" not in app_h:
+            return fail("gui_app.h settings must carry playback_audio_file")
+        settings_c = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings.c")
+        if settings_c.count('"playback_audio_file"') != 2:
+            return fail(
+                "gui_settings.c must persist playback_audio_file in BOTH the save "
+                "and the load paths (found "
+                + str(settings_c.count('"playback_audio_file"'))
+                + " of 2 key references)"
+            )
+    ui_c = read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c")
+    if "PlaybackFileClearAudio" not in ui_c:
+        return fail("gui_ui.c must show + clear the playback audio file row")
+    return 0
+
+
+def check_drop_obeys_recording_locks(repo_root: Path) -> int:
+    """A playback drag-and-drop stops whatever is running and starts
+    playback, so it obeys the Disconnect locks (v1.2.6 sync, 2026-10-21):
+    refused while this machine records or finalizes and on a net client
+    (whose stop goes to the server), and the handler stops the capture with
+    the CURRENT device still selected. gui_app_stop_capture picks its backend
+    from app->selected_device, so selecting Playback first ended the
+    recording and left a live CXADC/MISRC capture running that neither
+    Disconnect nor exit could stop."""
+    gui_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"))
+    at = gui_c.find("IsFileDropped()")
+    call = gui_c.find("gui_playback_handle_dropped_files(", at)
+    if at < 0 or call < 0:
+        return fail("misrc_gui.c: the drop poll or the drop handler call was not found")
+    site = gui_c[at:call]
+    if "app.is_recording" not in site or "gui_record_is_finalizing()" not in site:
+        return fail("misrc_gui.c: a file drop is not refused while recording or finalizing")
+    if "gui_net_is_client(&app)" not in site:
+        return fail("misrc_gui.c: a file drop is not refused on a net client")
+    pb_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.c"))
+    start = pb_c.find("bool gui_playback_handle_dropped_files(")
+    end = pb_c.find("\n}", start)
+    if start < 0 or end < 0:
+        return fail("gui_playback.c: gui_playback_handle_dropped_files not found")
+    body = pb_c[start:end]
+    stop = body.find("gui_app_stop_capture(app)")
+    select = body.find("app->selected_device = pb")
+    if stop < 0 or select < 0:
+        return fail("gui_playback.c: the drop handler no longer stops the capture or selects Playback")
+    if select < stop:
+        return fail(
+            "gui_playback.c: the drop handler selects Playback before stopping the capture, so "
+            "gui_app_stop_capture dispatches to the Playback backend and the live capture keeps running"
+        )
+    return 0
+
+
+def check_windows_modal_resize_contract(repo_root: Path) -> int:
+    """The Windows modal move/size render driver (2026-10-20, backlog item
+    2: the window froze during move/resize because DefWindowProc's modal
+    loop blocked raylib's event poll for the whole drag).
+
+    - The Windows-only module subclasses the GLFW window proc, drives a
+      WM_TIMER render frame between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE,
+      and passes everything to the original proc (CallWindowProcW). The
+      module itself never polls events.
+    - misrc_gui.c registers the render-only modal frame + installs the
+      driver before the main loop and shuts it down before cleanup; the
+      modal frame body is the frame tail core WITHOUT event polling or the
+      normal frame tail (a nested PeekMessage inside DefWindowProc's modal
+      loop is reentrancy).
+    - meson compiles the module only on windows/cygwin; the header provides
+      no-op stubs for the other platforms (no modal loop there).
+    """
+    modal_c_path = repo_root / "misrc_tools/misrc_gui/core/gui_win32_modal.c"
+    modal_h_path = repo_root / "misrc_tools/misrc_gui/core/gui_win32_modal.h"
+    for path in (modal_c_path, modal_h_path):
+        if not path.exists():
+            return fail(f"Missing the Windows modal render driver file: {path}")
+    modal_c = read_text(modal_c_path)
+    for snippet, label in [
+        ("WM_ENTERSIZEMOVE", "the modal-loop entry"),
+        ("WM_EXITSIZEMOVE", "the modal-loop exit"),
+        ("WM_TIMER", "the timer-driven frame"),
+        ("SetTimer(", "the timer start"),
+        ("KillTimer(", "the timer stop"),
+        ("CallWindowProcW(", "the original-proc passthrough"),
+        ("SetWindowLongPtrW(", "the window-proc subclass"),
+        ("GetWindowHandle()", "the raylib window handle"),
+    ]:
+        if snippet not in modal_c:
+            return fail(f"gui_win32_modal.c is missing {label}: {snippet}")
+    if "PollInputEvents" in modal_c or "glfwPollEvents" in modal_c:
+        return fail(
+            "gui_win32_modal.c must never poll events itself (the modal frame "
+            "callback renders only - a nested PeekMessage inside DefWindowProc's "
+            "modal loop is reentrancy)"
+        )
+    gui_c = read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c")
+    for snippet, label in [
+        ("gui_win32_modal_set_frame(app_modal_frame", "the modal frame registration"),
+        ("gui_win32_modal_install()", "the driver install"),
+        ("gui_win32_modal_shutdown()", "the driver shutdown"),
+        ("app_build_render_commands(", "the shared Clay layout build"),
+    ]:
+        if snippet not in gui_c:
+            return fail(f"misrc_gui.c modal-loop wiring is missing {label}: {snippet}")
+    frame_body = func_body_from(gui_c, "static void app_modal_frame(void *ctx)")
+    for snippet in [
+        "rlDrawRenderBatchActive()",
+        "SwapScreenBuffer()",
+        "Clay_SetLayoutDimensions",
+        "gui_audio_update_playback",
+        "app_build_render_commands",
+    ]:
+        if snippet not in frame_body:
+            return fail(
+                f"the modal frame body is missing {snippet} "
+                "(render core without polling)"
+            )
+    for forbidden in ["EndDrawing()", "PollInputEvents"]:
+        if forbidden in frame_body:
+            return fail(
+                f"the modal frame must NOT contain {forbidden} "
+                "(no event polling / FPS wait inside the modal loop)"
+            )
+    modal_h = read_text(modal_h_path)
+    if "static inline bool gui_win32_modal_install" not in modal_h:
+        return fail(
+            "gui_win32_modal.h must provide no-op stubs for non-Windows platforms"
+        )
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+    if "misrc_gui/core/gui_win32_modal.c" not in meson:
+        return fail(
+            "meson.build must compile gui_win32_modal.c on the windows/cygwin "
+            "source list"
+        )
+    return 0
+
+
+def check_secam_mode_contract(repo_root: Path) -> int:
+    """The SECAM FM-chroma mode (2026-10-20, backlog item 4): the tbc-tools
+    secamdecoder pipeline (libchromadec v0.1.0 parameters) ported to the
+    streaming real-time per-line decode.
+
+    - Parameters VERBATIM from the reference (pinned below): the nominal
+      carriers (272/282 fH), deviations, scales, bell centre, LF break,
+      combined band, calibration gates, the exact 10*fH pair split, the
+      deviation rails, the killer ratio, the colour-diff LPF.
+    - The pipeline stages + the field-commit + the ident ladder + the
+      concealment are wired in gui_cvbs.c; the mode is user-selectable
+      through the CVBS System dropdown's SECAM entry (2026-10-20, the
+      same 0/1/2 value space as gui_cvbs_set_format) and the dormant
+      tape-format selection, gated on colour AUTO + PLL lock.
+    - The harness carries the numeric port contract (the time-domain
+      filters vs the reference closed forms) + synthetic SECAM decode
+      contracts (studio block, converter offset, LF pre-correction).
+    """
+    cvbs_c = read_text(repo_root / "misrc_tools/misrc_gui/signal/gui_cvbs.c")
+    verbatim = [
+        ("4250000.0", "the D'b rest carrier (272 fH)"),
+        ("4406250.0", "the D'r rest carrier (282 fH)"),
+        ("230000.0", "the D'B deviation"),
+        ("280000.0", "the D'R deviation"),
+        ("1.505", "the D'B scale"),
+        ("-1.902", "the D'R scale"),
+        ("4286000.0", "the bell centre"),
+        ("85000.0", "the LF pre-correction break"),
+        ("450000.0", "the combined band flat"),
+        ("580000.0", "the combined band stop"),
+        ("78125.0", "the exact 10*fH pair split"),
+        ("90000.0", "the calibration min separation"),
+        ("230000.0", "the calibration max separation"),
+        ("350000.0", "the calibration max carrier offset"),
+        ("10000.0", "the recentre threshold"),
+        ("0.25", "the colour killer ratio"),
+        ("1600000.0", "the colour-diff LPF pass"),
+        ("1950000.0", "the colour-diff LPF stop"),
+        ("4.0/5.0", "the discriminator tap 4/5"),
+        ("-1.0/280.0", "the discriminator tap -1/280"),
+        ("2.032062", "the D'B->U matrix constant"),
+        ("1.139883", "the D'R->V matrix constant"),
+    ]
+    for value, label in verbatim:
+        if value not in cvbs_c:
+            return fail(f"gui_cvbs.c SECAM parameters: missing {label} ({value})")
+    wiring = [
+        ("cvbs_secam_decode_line(", "the per-line FM decode"),
+        ("cvbs_secam_field_commit(decoder)", "the field-boundary commit"),
+        ("cvbs_secam_bell_apply", "the cloche application"),
+        ("cvbs_secam_build_filters", "the filter builder"),
+        ("g_secam_diff_taps", "the discriminator taps"),
+        ("CVBS_FORMAT_SECAM", "the SECAM format gate"),
+        ("dr_on_even", "the identification state"),
+        ("bottle", "the bottles ident cross-check"),
+        ("noise_mad", "the concealment noise term"),
+        ("one-line hold", "the causal hold"),
+        ("\"PAL\", \"NTSC\", \"SECAM\"", "the System selector options"),
+        ("gui_cvbs_set_format(decoder, sys_values[i])", "the System dropdown click wiring"),
+        ("gui_cvbs_get_secam_diag(decoder", "the OSD Stats SECAM diag readout"),
+    ]
+    for snippet, label in wiring:
+        if snippet.lower() not in cvbs_c.lower():
+            return fail(f"gui_cvbs.c SECAM wiring: missing {label} ({snippet})")
+    cvbs_h = read_text(repo_root / "misrc_tools/misrc_gui/signal/gui_cvbs.h")
+    if "cvbs_secam_state_t" not in cvbs_h:
+        return fail("gui_cvbs.h must declare the SECAM state struct")
+    if "gui_cvbs_get_secam_diag" not in cvbs_h:
+        return fail("gui_cvbs.h must declare gui_cvbs_get_secam_diag")
+    if "system_options_rect[3]" not in cvbs_h:
+        return fail("gui_cvbs.h must size the System selector dropdown for the three PAL/NTSC/SECAM options")
+    test_c = read_text(repo_root / "misrc_tools/test/gui_cvbs_test.c")
+    for snippet, label in [
+        ("ref_bell_mag", "the reference bell closed form"),
+        ("ref_inverse_lf_mag", "the reference de-emphasis closed form"),
+        ("run_secam_numeric_match", "the numeric port contract"),
+        ("run_secam_bars", "the synthetic decode contracts"),
+        ("gen_secam(", "the synthetic SECAM generator"),
+        ("105000.0", "the converter-offset variant"),
+        ("pre_correct", "the LF pre-correction variant"),
+    ]:
+        if snippet not in test_c:
+            return fail(f"gui_cvbs_test.c SECAM harness: missing {label} ({snippet})")
     return 0
 
 
@@ -5828,7 +6260,6 @@ def main() -> int:
     gui_ui_c_path = repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"
     flac_writer_c_path = repo_root / "misrc_tools/common/flac_writer.c"
     meson_path = repo_root / "misrc_tools/meson.build"
-    tools_readme_path = repo_root / "misrc_tools/README.md"
     installation_md_path = repo_root / "INSTALLATION.md"
     dev_notes_path = repo_root / "misrc_tools/misrc_gui/dev/dev_notes_README.md"
     icon_path = repo_root / "assets/Icons/MISRC_Icon.png"
@@ -5899,6 +6330,10 @@ def main() -> int:
         ("no capture-stability Actions clutter", lambda: check_no_capture_stability_clutter(workflow_path)),
         ("local build bootstrap contract", lambda: check_local_build_bootstrap_contract(repo_root, dev_notes_path, installation_md_path)),
         ("local deps cache contract", lambda: check_local_deps_cache_contract(repo_root, workflow_path, dev_notes_path, installation_md_path)),
+        ("local CI guard gate contract", lambda: check_local_guard_gate_contract(repo_root)),
+        ("playback drag-and-drop contract", lambda: check_playback_drag_drop_contract(repo_root)),
+        ("Windows modal move/size render contract", lambda: check_windows_modal_resize_contract(repo_root)),
+        ("SECAM FM-chroma mode contract", lambda: check_secam_mode_contract(repo_root)),
         ("raw direct passthrough contract", lambda: check_raw_direct_passthrough_contract(repo_root)),
         ("GUI auto-test flags contract", lambda: check_gui_auto_test_flags(repo_root)),
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),
@@ -5914,6 +6349,7 @@ def main() -> int:
         ("UI zoom is relative to the desktop", lambda: check_ui_zoom_is_desktop_relative(repo_root)),
         ("session launch file contract", lambda: check_session_launch_file_contract(repo_root)),
         ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
+        ("file drop obeys the recording locks", lambda: check_drop_obeys_recording_locks(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

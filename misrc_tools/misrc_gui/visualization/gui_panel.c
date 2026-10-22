@@ -246,6 +246,10 @@ void panel_config_init_default(channel_panel_config_t *config) {
     config->split = false;
     config->left_view = PANEL_VIEW_WAVEFORM;
     config->right_view = PANEL_VIEW_FFT;
+    config->left_cached_view = PANEL_VIEW_COUNT;
+    config->left_cached_state = NULL;
+    config->right_cached_view = PANEL_VIEW_COUNT;
+    config->right_cached_state = NULL;
     // Create initial state for the default left view
     config->left_state = panel_create_view_state(config->left_view);
     // Right state only created when split mode is enabled
@@ -257,40 +261,71 @@ void panel_config_cleanup(channel_panel_config_t *config) {
         panel_destroy_view_state(config->left_view, config->left_state);
         config->left_state = NULL;
     }
+    if (config->left_cached_state) {
+        panel_destroy_view_state(config->left_cached_view,
+                                 config->left_cached_state);
+        config->left_cached_state = NULL;
+    }
     if (config->right_state) {
         panel_destroy_view_state(config->right_view, config->right_state);
         config->right_state = NULL;
     }
+    if (config->right_cached_state) {
+        panel_destroy_view_state(config->right_cached_view,
+                                 config->right_cached_state);
+        config->right_cached_state = NULL;
+    }
+}
+
+// Switch a panel slot to a new view through the ONE-SLOT state cache: the
+// current live state is PARKED (not destroyed) so switching back to its
+// view restores it instantly - the video panel keeps its decoder sync
+// lock and system selection, the waveform keeps its zoom (user report
+// 2026-10-20: switching panel modes lost sync and reset the system to
+// PAL). A switch to any different view evicts the parked state. A parked
+// panel is neither rendered nor processed; its decoder resumes on restore
+// (one stream-jump relock, far cheaper than a full re-acquisition - the
+// levels, rate calibration and SECAM calibration all persist).
+static void panel_slot_switch_view(panel_view_type_t *view, void **state,
+                                   panel_view_type_t *cached_view,
+                                   void **cached_state,
+                                   panel_view_type_t new_view,
+                                   bool create_state) {
+    if (*view == new_view) return;
+    if (*cached_state && *cached_view == new_view) {
+        // Switching back: restore the parked state, park the current one.
+        void *restored = *cached_state;
+        *cached_state = *state;
+        *cached_view = *view;
+        *state = restored;
+        *view = new_view;
+        return;
+    }
+    // A different view: evict whatever is parked, park the current state,
+    // create the new view's state (or leave NULL for the un-split right
+    // slot, which only materialises on set_split).
+    if (*cached_state) {
+        panel_destroy_view_state(*cached_view, *cached_state);
+        *cached_state = NULL;
+    }
+    *cached_view = *view;
+    *cached_state = *state;
+    *view = new_view;
+    *state = create_state ? panel_create_view_state(new_view) : NULL;
 }
 
 void panel_config_set_left_view(channel_panel_config_t *config, panel_view_type_t type) {
-    if (config->left_view == type) return;
-
-    // Destroy old state
-    if (config->left_state) {
-        panel_destroy_view_state(config->left_view, config->left_state);
-        config->left_state = NULL;
-    }
-
-    // Set new view and create state
-    config->left_view = type;
-    config->left_state = panel_create_view_state(type);
+    panel_slot_switch_view(&config->left_view, &config->left_state,
+                           &config->left_cached_view,
+                           &config->left_cached_state,
+                           type, true);
 }
 
 void panel_config_set_right_view(channel_panel_config_t *config, panel_view_type_t type) {
-    if (config->right_view == type) return;
-
-    // Destroy old state
-    if (config->right_state) {
-        panel_destroy_view_state(config->right_view, config->right_state);
-        config->right_state = NULL;
-    }
-
-    // Set new view and create state
-    config->right_view = type;
-    if (config->split) {
-        config->right_state = panel_create_view_state(type);
-    }
+    panel_slot_switch_view(&config->right_view, &config->right_state,
+                           &config->right_cached_view,
+                           &config->right_cached_state,
+                           type, config->split);
 }
 
 void panel_config_set_split(channel_panel_config_t *config, bool split) {
@@ -299,14 +334,27 @@ void panel_config_set_split(channel_panel_config_t *config, bool split) {
     config->split = split;
 
     if (split) {
-        // Entering split mode - create right panel state
-        config->right_state = panel_create_view_state(config->right_view);
-    } else {
-        // Leaving split mode - destroy right panel state
-        if (config->right_state) {
-            panel_destroy_view_state(config->right_view, config->right_state);
-            config->right_state = NULL;
+        // Entering split mode: restore the parked right state when it is
+        // the right view's own (else create fresh).
+        if (config->right_cached_state
+            && config->right_cached_view == config->right_view) {
+            config->right_state = config->right_cached_state;
+            config->right_cached_state = NULL;
+        } else {
+            config->right_state = panel_create_view_state(config->right_view);
         }
+    } else {
+        // Leaving split mode: PARK the right state instead of destroying
+        // it, so re-splitting restores the live decoders.
+        if (config->right_state) {
+            if (config->right_cached_state) {
+                panel_destroy_view_state(config->right_cached_view,
+                                         config->right_cached_state);
+            }
+            config->right_cached_view = config->right_view;
+            config->right_cached_state = config->right_state;
+        }
+        config->right_state = NULL;
     }
 }
 
