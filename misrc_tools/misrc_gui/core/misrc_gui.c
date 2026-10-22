@@ -125,6 +125,7 @@ static void print_usage(const char *program_name) {
             "  --session-selftest                         (--session overlay is never saved)\n"
             "  --capture-meta-selftest [keep_dir] [secs]  (sidecar, log block, FLAC tags)\n"
             "  --record-gate-selftest                     (no record start while finalizing)\n"
+            "  --record-order-selftest [keep_dir]         (every sample once, in order, through an overflow)\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
@@ -203,6 +204,8 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
             return "Capture stopped: low disk space (dynamic guard)";
         case GUI_DROPOUT_LOW_SIGNAL:
             return "Recording stopped: sustained low/no signal (tape end)";
+        case GUI_DROPOUT_RECORD_OUTPUT:
+            return "Capture stopped: a recording output failed (FLAC encoder error; see the capture log)";
         case GUI_DROPOUT_NONE:
         default:
             return "Capture stopped: dropout detected";
@@ -625,6 +628,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--record-gate-selftest") == 0) {
             return gui_record_finalize_gate_selftest_main();
+        }
+        if (strcmp(a, "--record-order-selftest") == 0) {
+            const char *keep = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
+            return gui_record_order_selftest_main(keep);
         }
         /* Headless preview diagnostics. These run without a window so the
          * reader can be exercised -- and its unplug, teardown and scheduling

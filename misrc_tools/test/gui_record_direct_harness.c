@@ -2,10 +2,10 @@
  * Unit harness for the direct native RAW record path (gui_record_direct.c).
  *
  * Drives the REAL producer push (gui_record_direct_push) and writer thread
- * (gui_record_direct_writer_thread) through a REAL buffer manager +
- * ringbuffer, with an in-memory spill stub and counting log / write-error
- * callbacks, and asserts:
- *   - the tap handshake: pushes while the tap is disabled are ignored
+ * (gui_record_direct_writer_thread) through the REAL record FIFO (record
+ * ring + a spill file in a private temp dir) on a real buffer manager, with
+ * counting log / write-error callbacks, and asserts:
+ *   - the gate handshake: pushes while the gate is closed are ignored
  *   - the spill fallback is used once the ring is full (deterministic: the
  *     producer pushes more than the ring holds before the writer starts)
  *   - the output file is byte-identical to the pushed pattern, which proves
@@ -38,47 +38,15 @@ static void expect_true(bool condition, const char *message) {
     }
 }
 
-/* ---- in-memory spill stub (byte FIFO per channel) ---- */
+/* ---- the real record FIFO, with its spill in a private temp dir ---- */
 
-static uint8_t *g_spill_data[2];
-static size_t g_spill_len[2];
-static size_t g_spill_read_off[2];
-static size_t g_spill_enqueue_count[2];
+static char g_spill_dir[512];
 
-static bool stub_spill_enqueue(void *user, int channel, const void *bytes, size_t len,
-                               uint32_t frame_index) {
-    (void)user;
-    (void)frame_index;
-    if (channel < 0 || channel > 1 || !bytes || len == 0) return false;
-    if (g_spill_read_off[channel] > 0) {
-        memmove(g_spill_data[channel],
-                g_spill_data[channel] + g_spill_read_off[channel],
-                g_spill_len[channel] - g_spill_read_off[channel]);
-        g_spill_len[channel] -= g_spill_read_off[channel];
-        g_spill_read_off[channel] = 0;
-    }
-    uint8_t *grown = (uint8_t *)realloc(g_spill_data[channel], g_spill_len[channel] + len);
-    if (!grown) return false;
-    g_spill_data[channel] = grown;
-    memcpy(g_spill_data[channel] + g_spill_len[channel], bytes, len);
-    g_spill_len[channel] += len;
-    g_spill_enqueue_count[channel]++;
-    return true;
-}
-
-static bool stub_spill_read(void *user, int channel, void *dst, size_t len) {
-    (void)user;
-    if (channel < 0 || channel > 1 || !dst) return false;
-    if (g_spill_len[channel] - g_spill_read_off[channel] < len) return false;
-    memcpy(dst, g_spill_data[channel] + g_spill_read_off[channel], len);
-    g_spill_read_off[channel] += len;
-    return true;
-}
-
-static uint64_t stub_spill_backlog(void *user, int channel) {
-    (void)user;
-    if (channel < 0 || channel > 1) return 0;
-    return (uint64_t)(g_spill_len[channel] - g_spill_read_off[channel]);
+static bool make_spill_dir(void) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0]) tmp = "/tmp";
+    snprintf(g_spill_dir, sizeof(g_spill_dir), "%s/misrc_direct_harness_XXXXXX", tmp);
+    return mkdtemp(g_spill_dir) != NULL;
 }
 
 /* ---- counting log / write-error stubs ---- */
@@ -106,11 +74,6 @@ static void stub_set_write_error(void *user, int channel, bool active) {
 
 static void reset_stubs(void) {
     for (int i = 0; i < 2; i++) {
-        free(g_spill_data[i]);
-        g_spill_data[i] = NULL;
-        g_spill_len[i] = 0;
-        g_spill_read_off[i] = 0;
-        g_spill_enqueue_count[i] = 0;
         g_log_count[i] = 0;
         g_write_error_state[i] = false;
         g_write_error_transitions[i] = 0;
@@ -182,6 +145,50 @@ static bool init_mgr(size_t record_size) {
 
 static uint8_t g_push_buf[1024 * 1024];
 
+static gui_record_fifo_t g_fifo;
+static gui_record_gate_t g_gate;
+
+/* A direct channel's context on the real FIFO (u8 samples, 64 KiB pushes). */
+static void setup_ctx(gui_record_direct_ctx_t *ctx, FILE *out,
+                      atomic_uint_fast64_t *total_read, atomic_uint_fast64_t *total_written,
+                      atomic_uint_fast64_t *ch_written) {
+    gui_record_fifo_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.bufmgr = &g_mgr;
+    cfg.buf_id = BUF_RECORD_A;
+    cfg.channel = 0;
+    cfg.sample_bytes = 1;
+    cfg.max_push_bytes = 1024 * 1024;
+    cfg.max_read_bytes = GUI_RECORD_DIRECT_MAX_BLOCK_BYTES;
+    cfg.spill_dir = g_spill_dir;
+    cfg.log = stub_log;
+    char err[256] = {0};
+    expect_true(gui_record_fifo_init(&g_fifo, &cfg, err, sizeof(err)) == 0 &&
+                gui_record_fifo_spill_available(&g_fifo), "record FIFO with a spill file");
+    atomic_init(&g_gate.enabled, false);
+    atomic_init(&g_gate.inflight, 0);
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->channel = 0;
+    ctx->file = out;
+    ctx->fifo = &g_fifo;
+    ctx->gate = &g_gate;
+    ctx->exit_flag = NULL;
+    ctx->bytes_read_total = total_read;
+    ctx->bytes_written_total = total_written;
+    ctx->bytes_written_channel = ch_written;
+    ctx->cb.user = NULL;
+    ctx->cb.set_write_error = stub_set_write_error;
+    ctx->cb.log = stub_log;
+}
+
+/* The record layer's stop: no producer runs, then the FIFO ends. */
+static void stop_recording(void) {
+    gui_record_gate_disable(&g_gate);
+    gui_record_gate_wait_idle(&g_gate);
+    gui_record_fifo_close(&g_fifo);
+}
+
 /* Test 1: handshake, spill fallback under ring-full, ordered byte-exact
  * drain including the odd tail (3 x 2 MiB + 12345 bytes, odd chunk sizes). */
 static void run_passthrough_test(void) {
@@ -190,7 +197,6 @@ static void run_passthrough_test(void) {
     FILE *out = tmpfile();
     expect_true(out != NULL, "tmpfile for passthrough output");
 
-    volatile bool rec_active = true;
     atomic_uint_fast64_t total_read;
     atomic_uint_fast64_t total_written;
     atomic_uint_fast64_t ch_written;
@@ -199,32 +205,16 @@ static void run_passthrough_test(void) {
     atomic_init(&ch_written, 0);
 
     gui_record_direct_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.bufmgr = &g_mgr;
-    ctx.buf_id = BUF_RECORD_A;
-    ctx.channel = 0;
-    ctx.file = out;
-    ctx.recording_active = &rec_active;
-    ctx.exit_flag = NULL;
-    ctx.bytes_read_total = &total_read;
-    ctx.bytes_written_total = &total_written;
-    ctx.bytes_written_channel = &ch_written;
-    ctx.cb.user = NULL;
-    ctx.cb.spill_enqueue = stub_spill_enqueue;
-    ctx.cb.spill_read = stub_spill_read;
-    ctx.cb.spill_backlog = stub_spill_backlog;
-    ctx.cb.set_write_error = stub_set_write_error;
-    ctx.cb.log = stub_log;
+    setup_ctx(&ctx, out, &total_read, &total_written, &ch_written);
 
-    // Handshake: pushes while the tap is disabled are ignored entirely.
-    gui_record_direct_tap_disable(&ctx);
+    // Handshake: pushes while the gate is closed are ignored entirely.
     fill_pattern(g_push_buf, 0, 8);
     gui_record_direct_push_result_t r =
         gui_record_direct_push(&ctx, g_push_buf, 8, 0);
-    expect_true(r == GUI_RECORD_DIRECT_PUSH_IDLE, "tap disabled -> push is IDLE");
-    expect_true(atomic_load(&total_read) == 0, "tap disabled -> no bytes counted");
+    expect_true(r == GUI_RECORD_DIRECT_PUSH_IDLE, "gate closed -> push is IDLE");
+    expect_true(atomic_load(&total_read) == 0, "gate closed -> no bytes counted");
 
-    gui_record_direct_tap_enable(&ctx);
+    gui_record_gate_enable(&g_gate);
 
     // Push more than the ring holds with no consumer yet: the ring fills,
     // then every further push must go to the spill (producer ordering rule).
@@ -245,15 +235,16 @@ static void run_passthrough_test(void) {
                     "push accepted (ring or spill)");
         pushed += n;
     }
-    expect_true(g_spill_enqueue_count[0] > 0,
-                "spill fallback used when the ring is full");
+    gui_record_fifo_stats_t st;
+    gui_record_fifo_get_stats(&g_fifo, &st);
+    expect_true(st.spill_bytes > 0, "spill fallback used when the ring is full");
 
     // Now start the writer: it must drain ring + spill in order, including
     // the odd tail, then exit once recording stops.
     thrd_t writer;
     expect_true(thrd_create(&writer, gui_record_direct_writer_thread, &ctx) == thrd_success,
                 "writer thread started");
-    rec_active = false;
+    stop_recording();
     thrd_join(writer, NULL);
 
     expect_true(atomic_load(&total_read) == total, "tap counted every pushed byte");
@@ -264,6 +255,7 @@ static void run_passthrough_test(void) {
     expect_true(!g_write_error_state[0], "no write errors in the happy path");
 
     fclose(out);
+    gui_record_fifo_destroy(&g_fifo);
     bufmgr_cleanup(&g_mgr);
     memset(&g_mgr, 0, sizeof(g_mgr));
 }
@@ -286,7 +278,6 @@ static void run_write_error_recovery_test(void) {
     FILE *out = tmpfile();
     expect_true(out != NULL, "tmpfile for recovery output");
 
-    volatile bool rec_active = true;
     atomic_uint_fast64_t total_read;
     atomic_uint_fast64_t total_written;
     atomic_uint_fast64_t ch_written;
@@ -295,24 +286,9 @@ static void run_write_error_recovery_test(void) {
     atomic_init(&ch_written, 0);
 
     gui_record_direct_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.bufmgr = &g_mgr;
-    ctx.buf_id = BUF_RECORD_A;
-    ctx.channel = 0;
-    ctx.file = full;
-    ctx.recording_active = &rec_active;
-    ctx.exit_flag = NULL;
-    ctx.bytes_read_total = &total_read;
-    ctx.bytes_written_total = &total_written;
-    ctx.bytes_written_channel = &ch_written;
-    ctx.cb.user = NULL;
-    ctx.cb.spill_enqueue = stub_spill_enqueue;
-    ctx.cb.spill_read = stub_spill_read;
-    ctx.cb.spill_backlog = stub_spill_backlog;
-    ctx.cb.set_write_error = stub_set_write_error;
-    ctx.cb.log = stub_log;
+    setup_ctx(&ctx, full, &total_read, &total_written, &ch_written);
 
-    gui_record_direct_tap_enable(&ctx);
+    gui_record_gate_enable(&g_gate);
     thrd_t writer;
     expect_true(thrd_create(&writer, gui_record_direct_writer_thread, &ctx) == thrd_success,
                 "writer thread started (write-error test)");
@@ -347,7 +323,7 @@ static void run_write_error_recovery_test(void) {
     }
     expect_true(!g_write_error_state[0], "write error cleared after the output file became writable");
 
-    rec_active = false;
+    stop_recording();
     thrd_join(writer, NULL);
     expect_true(atomic_load(&total_written) == total, "recovered writer accounted all bytes");
     expect_true(file_matches_pattern(out, total),
@@ -355,16 +331,22 @@ static void run_write_error_recovery_test(void) {
 
     fclose(out);
     fclose(full);
+    gui_record_fifo_destroy(&g_fifo);
     bufmgr_cleanup(&g_mgr);
     memset(&g_mgr, 0, sizeof(g_mgr));
 }
 
 int main(void) {
+    if (!make_spill_dir()) {
+        fprintf(stderr, "cannot create a spill dir\n");
+        return 2;
+    }
     reset_stubs();
     run_passthrough_test();
     reset_stubs();
     run_write_error_recovery_test();
     reset_stubs();
+    remove(g_spill_dir);  /* the spill files were unlinked at creation */
 
     printf("PASS: direct RAW record harness (%d checks, %d failures)\n",
            g_checks, g_failures);

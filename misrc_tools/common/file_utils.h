@@ -26,6 +26,13 @@ bool file_disk_free_space_utf8(const char *path, uint64_t *available);
 /* Returns an allocated value (including an empty value), or NULL if absent. */
 char *file_getenv_utf8(const char *name);
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <wchar.h>
+/* A UTF-8 path as a malloc'd wide string for the W Win32 APIs, or NULL
+ * (errno set). The caller frees it. */
+wchar_t *file_utf8_to_wide(const char *path);
+#endif
+
 /*-----------------------------------------------------------------------------
  * File Opening
  *-----------------------------------------------------------------------------*/

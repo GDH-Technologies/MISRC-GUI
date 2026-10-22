@@ -382,8 +382,32 @@ void *bufmgr_write_begin(buffer_manager_t *mgr, buffer_id_t id,
     return ptr;
 }
 
+void *bufmgr_try_write_begin(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
+    if (!mgr || id >= BUF_COUNT) return NULL;
+    if (!mgr->initialized[id]) {
+        if (bufmgr_ensure_init(mgr, id) < 0) return NULL;
+    }
+    return rb_write_ptr(&mgr->buffers[id], bytes);
+}
+
+size_t bufmgr_free_space(buffer_manager_t *mgr, buffer_id_t id) {
+    if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return 0;
+    /* Direct loads, not an rb_* call: the write-tap harness stubs the
+     * ringbuffer functions and links this file. tail is the caller's own
+     * counter, so reading head second can only under-report free space. */
+    ringbuffer_t *rb = &mgr->buffers[id];
+    size_t tail = atomic_load(&rb->tail);
+    size_t head = atomic_load(&rb->head);
+    size_t fill = tail - head;
+    return fill >= rb->buffer_size ? 0 : rb->buffer_size - fill;
+}
+
 void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
-    if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return;
+    (void)bufmgr_write_commit(mgr, id, bytes);
+}
+
+bool bufmgr_write_commit(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
+    if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return false;
 
     ringbuffer_t *rb = &mgr->buffers[id];
     /* The region being committed. rb_write_ptr() has no side effects, so
@@ -393,7 +417,9 @@ void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
     if (id == BUF_CAPTURE_RF && mgr->rf_write_observer)
         mgr->rf_write_observer(mgr->rf_write_observer_context,
                                 atomic_load(&mgr->stats[id].bytes_written), bytes);
-    rb_write_finished(rb, bytes);
+    if (rb_write_finished(rb, bytes) != 0) {
+        return false;
+    }
     atomic_fetch_add(&mgr->stats[id].bytes_written, bytes);
 
     /* Signal that data is available */
@@ -407,6 +433,7 @@ void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
     if (tap && region) {
         tap(atomic_load(&mgr->write_tap_ctx[id]), id, region, bytes);
     }
+    return true;
 }
 
 void bufmgr_set_write_tap(buffer_manager_t *mgr, buffer_id_t id,

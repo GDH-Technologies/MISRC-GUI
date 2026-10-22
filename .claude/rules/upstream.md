@@ -20,6 +20,7 @@ Say which in the PR body. A change that mixes both is split before it is opened.
 `misrc_tools/misrc_gui/ui/gui_usbref_settings.{c,h}` ·
 `misrc_tools/misrc_gui/core/gui_capture_meta.{c,h}` · `misrc_tools/misrc_gui/output/gui_capture_sidecar.{c,h}` ·
 `misrc_tools/misrc_gui/ui/gui_capture_meta_panel.{c,h}` · `misrc_tools/test/gui_capture_meta_harness.c` ·
+`misrc_tools/misrc_gui/output/gui_record_{fifo,sink,order_check}.{c,h}` · `misrc_tools/test/gui_record_fifo_harness.c` ·
 the fork's guards in
 `misrc_tools/test/ci_guard_tests.py` and `misrc_tools/test/*_harness.c` that name them.
 

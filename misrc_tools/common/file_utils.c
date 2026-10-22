@@ -49,6 +49,10 @@ static wchar_t *file_wide_path(const char *filename) {
     }
     return wide;
 }
+
+wchar_t *file_utf8_to_wide(const char *path) {
+    return file_wide_path(path);
+}
 #endif
 
 FILE *file_open_utf8(const char *filename, const char *mode)

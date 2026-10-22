@@ -47,13 +47,15 @@ void panel_process_all(gui_app_t *app,const int16_t *a,const int16_t *b,size_t c
 bool gui_record_check_disk_space_guard(gui_app_t *app,uint32_t frame,char *msg,size_t capacity) {
     (void)app; (void)frame; (void)msg; (void)capacity; return false;
 }
-bool gui_record_spill_enqueue(gui_app_t *app,int channel,const void *samples,size_t bytes,
-    uint32_t frame,char *msg,size_t capacity) {
-    (void)app; (void)channel; (void)samples; (void)bytes; (void)frame; (void)msg; (void)capacity;
-    assert(false); return false; /* Recording is disabled in this harness. */
+bool gui_record_producer_enter(void) { return false; }
+void gui_record_producer_leave(void) {}
+gui_record_push_result_t gui_record_push(int channel,const void *bytes,size_t len,uint32_t frame) {
+    (void)channel; (void)bytes; (void)len; (void)frame;
+    assert(false); return GUI_RECORD_PUSH_IDLE; /* Recording is disabled in this harness. */
 }
-bool gui_record_spill_is_forced(int channel) { (void)channel; return false; }
-void gui_record_spill_clear_forced(int channel) { (void)channel; }
+void gui_record_note_capture_drops(gui_app_t *app,uint64_t drops,uint32_t frame) {
+    (void)app; (void)drops; (void)frame; assert(false);
+}
 void gui_record_log_capture_event(gui_app_t *app,const char *level,const char *message,
     gui_error_class_t error_class,uint32_t count) {
     (void)app; (void)level; (void)message; (void)error_class; (void)count; assert(false);

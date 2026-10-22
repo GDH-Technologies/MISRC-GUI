@@ -185,6 +185,14 @@ const char *flac_writer_get_error_string(flac_writer_t *writer);
 // Get total samples written so far
 uint64_t flac_writer_get_samples_written(flac_writer_t *writer);
 
+// Samples in frames that actually reached the output file. Equals
+// samples_written once finish() has flushed; after an output failure it is
+// what the file really holds (the encoder had accepted more).
+uint64_t flac_writer_get_samples_committed(flac_writer_t *writer);
+
+// errno of the last failed output write (0 = none).
+int flac_writer_get_last_write_errno(flac_writer_t *writer);
+
 // Get total compressed bytes written so far (stream mode only)
 uint64_t flac_writer_get_bytes_written(flac_writer_t *writer);
 

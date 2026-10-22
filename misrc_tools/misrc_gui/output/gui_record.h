@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gui_record_fifo.h"
+
 // Forward declarations
 typedef struct gui_app gui_app_t;
 
@@ -73,27 +75,30 @@ bool gui_record_has_write_error(void);
 void gui_record_log_capture_event(gui_app_t *app, const char *level, const char *message,
                                   gui_error_class_t error_class, uint32_t error_count);
 
-// Spillover support for record-path backpressure.
-// Channel: 0 = A, 1 = B.
-bool gui_record_spill_is_forced(int channel);
-// Clear the sticky spill-forced flag for a channel. Call this when the
-// in-memory record ringbuffer write succeeds again, so the capture path
-// returns to direct ringbuffer -> FLAC encoding and the spill temp file
-// can be recycled via the existing drain path. Prevents a single
-// backpressure blip from permanently routing recording through disk.
-void gui_record_spill_clear_forced(int channel);
-// Spillover support for record-path backpressure. Byte-generic: `data` may
-// be the extraction thread's int16 sample blocks or the direct RAW path's
-// native device bytes.
-bool gui_record_spill_enqueue(gui_app_t *app, int channel, const void *data, size_t bytes,
-                              uint32_t frame_index, char *error_msg, size_t error_msg_size);
+// Record producers (the extraction thread). Each recorded block goes into
+// the channel's ordered record FIFO (gui_record_fifo.h: the record ring
+// first, a local spill file for overflow; every accepted byte reaches the
+// writer once, in order). Bracket the pushes of one extraction iteration
+// with enter/leave -- always leave, on every path -- so gui_record_stop can
+// wait until no push is running before it closes the FIFOs:
+//
+//   bool on = gui_record_producer_enter();
+//   if (on) { gui_record_push(0, a, len, frame); gui_record_push(1, b, len, frame); }
+//   gui_record_producer_leave();
+//
+// push() never waits and never touches the output filesystem. It returns
+// IDLE when the channel has no FIFO (not recording, or a direct channel fed
+// by the CXADC tap), DROPPED when the block was lost (already logged with
+// its RF sample position and counted; the caller decides stop_on_dropout).
+bool gui_record_producer_enter(void);
+void gui_record_producer_leave(void);
+gui_record_push_result_t gui_record_push(int channel, const void *bytes, size_t len,
+                                         uint32_t frame_index);
 
-// Read `bytes` from a channel's spill backlog into dst (byte-generic).
-// Returns false when less than `bytes` remains (or no spill file is open).
-bool gui_record_spill_read_block(int channel, void *dst, size_t bytes);
-
-// Current spill backlog in bytes for a channel (0 when none).
-uint64_t gui_record_spill_backlog_bytes(int channel);
+// Capture-buffer (BUF_CAPTURE_RF) blocks lost while recording: the
+// extraction thread reports new drops with the RF position it had reached,
+// so the gap is logged and counted against the recording.
+void gui_record_note_capture_drops(gui_app_t *app, uint64_t new_drops, uint32_t frame_index);
 
 // Direct native RAW passthrough (CXADC, FLAC off, per-channel resampling
 // off): push the exact bytes just read from CXADC card `card` (0 = channel
@@ -147,6 +152,21 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
  * marked in flight gui_record_start must refuse ("Finalizing previous
  * recording..."); with none it must get past that gate. Exit code 0 = pass. */
 int gui_record_finalize_gate_selftest_main(void);
+
+/* --record-order-selftest [keep_dir]: headless. The Simulated device emits
+ * the record-order counter stream (gui_record_order_check.h), the RF writers
+ * are stalled for 3 s so the record rings (1 GB budget) overflow, and a FLAC
+ * and a converted RAW A+B recording are read back: every sample must be
+ * present once, in capture order, and the capture log must show the
+ * overflow. Outputs go to TMPDIR/TEMP and are removed unless keep_dir is
+ * given. Exit code 0 = pass, 1 = fail, 2 = could not run. */
+int gui_record_order_selftest_main(const char *keep_dir);
+
+/* Debug: stall the RF writer threads from start_ms after the record start
+ * for duration_ms (repeating every period_ms when > 0); start_ms < 0 turns it
+ * off. MISRC_GUI_DEBUG_RECORD_WRITER_STALL="start:duration[:period]" sets it
+ * at the next record start. */
+void gui_record_debug_set_writer_stall(int start_ms, int duration_ms, int period_ms);
 
 // Live on-disk size of each channel's output file via stat(). For the UI
 // readout so it shows the exact file size (1:1 with `ls`/file-manager), not

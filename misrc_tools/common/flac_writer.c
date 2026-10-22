@@ -250,7 +250,9 @@ struct flac_writer {
 
     // Statistics
     uint64_t samples_written;
+    uint64_t samples_committed;      // samples in frames that reached the file
     uint64_t bytes_written;
+    int last_write_errno;            // errno of the last failed output write
     size_t initial_tags_dropped;     // config.initial_tags libFLAC refused
 
     // Error state
@@ -298,15 +300,19 @@ static FLAC__StreamEncoderWriteStatus stream_write_callback(
     uint32_t current_frame,
     void *client_data)
 {
-    (void)encoder; (void)samples; (void)current_frame;
+    (void)encoder; (void)current_frame;
     flac_writer_t *writer = (flac_writer_t *)client_data;
 
+    errno = 0;
     size_t written = fwrite(buffer, 1, bytes, writer->output_file);
     if (written != bytes) {
+        /* Fatal for libFLAC: the encoder never leaves CLIENT_ERROR. */
+        writer->last_write_errno = errno ? errno : EIO;
         return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
     }
 
     writer->bytes_written += bytes;
+    writer->samples_committed += samples;  /* 0 for metadata writes */
 
     // Call user callback if provided
     if (writer->config.bytes_cb) {
@@ -904,6 +910,14 @@ uint64_t flac_writer_get_samples_written(flac_writer_t *writer) {
     return writer ? writer->samples_written : 0;
 }
 
+uint64_t flac_writer_get_samples_committed(flac_writer_t *writer) {
+    return writer ? writer->samples_committed : 0;
+}
+
+int flac_writer_get_last_write_errno(flac_writer_t *writer) {
+    return writer ? writer->last_write_errno : 0;
+}
+
 uint64_t flac_writer_get_bytes_written(flac_writer_t *writer) {
     return writer ? writer->bytes_written : 0;
 }
@@ -984,6 +998,8 @@ const char *flac_writer_get_error_string(flac_writer_t *w) {
 }
 
 uint64_t flac_writer_get_samples_written(flac_writer_t *w) { (void)w; return 0; }
+uint64_t flac_writer_get_samples_committed(flac_writer_t *w) { (void)w; return 0; }
+int flac_writer_get_last_write_errno(flac_writer_t *w) { (void)w; return 0; }
 uint64_t flac_writer_get_bytes_written(flac_writer_t *w) { (void)w; return 0; }
 size_t flac_writer_initial_tags_dropped(const flac_writer_t *w) { (void)w; return 0; }
 bool flac_writer_available(void) { return false; }
