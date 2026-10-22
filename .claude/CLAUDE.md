@@ -107,8 +107,8 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 106
-  checks in a Linux `--post-build` run (81 `--static-only`; v1.2.6 sync, 2026-10-21), several of
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 107
+  checks in a Linux `--post-build` run (82 `--static-only`; v1.2.6 sync, 2026-10-21), several of
   which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 40 `test()`
   targets (`meson test -C build-local`; `gui_rf_preview` alone takes ~70 s on wm); upstream's
   `gui_stats_layout` stubs the panel-name table and must keep the fork's `"Preview"` entry.

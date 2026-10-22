@@ -118,7 +118,7 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 
 ```bash
 scripts/build-local.sh --clean                                   # build + --smoke-test
-python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 106 PASS at v1.2.6 (81 static)
+python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 107 PASS at v1.2.6 (82 static)
 meson test -C build-local                                         # 40 targets at v1.2.6 (gui_rf_preview ~70 s)
 bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # 33 PASS incl. the cancel check (below) at v1.2.6, from the worktree root
 build-local/misrc_gui --video-name-test                           # both auto-namers agree, FLAC and RAW
