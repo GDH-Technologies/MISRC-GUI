@@ -1105,6 +1105,22 @@ gui_record_direct_test = executable('gui_record_direct_test',
 )
 test('gui_record_direct', gui_record_direct_test)
 
+# Ordered record FIFO (ring first, local spill for overflow, segment log),
+# the RAW hold-and-retry sink and the ringbuffer counters, against the real
+# buffer manager/ringbuffer and a real spill file.
+gui_record_fifo_test = executable('gui_record_fifo_test',
+  ['test/gui_record_fifo_harness.c',
+   'misrc_gui/output/gui_record_fifo.c',
+   'misrc_gui/output/gui_record_sink.c',
+   'common/buffer_manager.c',
+   'common/ringbuffer.c',
+   'common/rb_event.c',
+   'common/file_utils.c'],
+  dependencies: record_direct_test_deps,
+  c_args: cflags,
+)
+test('gui_record_fifo', gui_record_fifo_test, timeout: 120)
+
 # CXADC measured feed-rate tier snapping (dependency-free header).
 cxadc_rate_tiers_test = executable('cxadc_rate_tiers_test',
   'test/cxadc_rate_tiers_test.c',
