@@ -30,6 +30,7 @@
 #include "../processing/gui_display_thread.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
+#include "../output/gui_record_order_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +119,9 @@
 
 static uint64_t s_sim_sample_count = 0;
 static double s_vhs_fm_phase = 0.0;  // FM phase must be accumulated (frequency varies with signal)
+
+static atomic_int s_sim_pattern = GUI_SIM_PATTERN_VIDEO;
+static atomic_uint_fast64_t s_sim_rf_drops = 0;
 
 // Color carrier lookup table (hacktv approach)
 // The table length equals sample_rate / carrier_freq in lowest terms
@@ -637,9 +641,18 @@ static int simulated_capture_thread(void *ctx) {
     atomic_store(&app->sample_rate, SIM_SAMPLE_RATE);
 
     uint64_t batch_count = 0;
+    bool counter = atomic_load(&s_sim_pattern) == GUI_SIM_PATTERN_COUNTER;
+    if (counter) {
+        fprintf(stderr, "[SIM] Pattern: record-order counter on both channels\n");
+    }
 
     while (atomic_load(&app->sim_running)) {
-        for (int i = 0; i < SIM_BUFFER_SIZE; i++) {
+        for (int i = 0; counter && i < SIM_BUFFER_SIZE; i++) {
+            buf_a[i] = gui_record_order_counter_sample(s_sim_sample_count, GUI_RECORD_ORDER_KEY_A);
+            buf_b[i] = gui_record_order_counter_sample(s_sim_sample_count, GUI_RECORD_ORDER_KEY_B);
+            s_sim_sample_count++;
+        }
+        for (int i = 0; !counter && i < SIM_BUFFER_SIZE; i++) {
             int line_in_frame = 0;
             int field = 0;
             double chroma_u = 0.0;
@@ -697,6 +710,7 @@ static int simulated_capture_thread(void *ctx) {
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, raw_bytes);
         } else {
             // Buffer full - this shouldn't happen often with proper sizing
+            atomic_fetch_add(&s_sim_rf_drops, 1);
             fprintf(stderr, "[SIM] Warning: BUF_CAPTURE_RF full, frame dropped\n");
         }
 
@@ -754,6 +768,13 @@ int gui_simulated_start(gui_app_t *app) {
 
     // Reset signal generation state
     s_sim_sample_count = 0;
+    atomic_store(&s_sim_rf_drops, 0);
+    {
+        const char *pat = getenv("MISRC_GUI_SIM_PATTERN");
+        if (pat && strcmp(pat, "counter") == 0) {
+            atomic_store(&s_sim_pattern, GUI_SIM_PATTERN_COUNTER);
+        }
+    }
     s_vhs_fm_phase = 0.0;
     s_current_line = -1;
     s_line_lookup_offset = 0;
@@ -834,4 +855,12 @@ void gui_simulated_stop(gui_app_t *app) {
 
 bool gui_simulated_is_running(gui_app_t *app) {
     return atomic_load(&app->sim_running);
+}
+
+void gui_simulated_set_pattern(gui_sim_pattern_t pattern) {
+    atomic_store(&s_sim_pattern, (int)pattern);
+}
+
+uint64_t gui_simulated_rf_drops(void) {
+    return atomic_load(&s_sim_rf_drops);
 }

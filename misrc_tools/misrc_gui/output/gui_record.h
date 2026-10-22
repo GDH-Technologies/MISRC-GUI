@@ -148,6 +148,21 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
  * recording..."); with none it must get past that gate. Exit code 0 = pass. */
 int gui_record_finalize_gate_selftest_main(void);
 
+/* --record-order-selftest [keep_dir]: headless. The Simulated device emits
+ * the record-order counter stream (gui_record_order_check.h), the RF writers
+ * are stalled for 3 s so the record rings (1 GB budget) overflow, and a FLAC
+ * and a converted RAW A+B recording are read back: every sample must be
+ * present once, in capture order, and the capture log must show the
+ * overflow. Outputs go to TMPDIR/TEMP and are removed unless keep_dir is
+ * given. Exit code 0 = pass, 1 = fail, 2 = could not run. */
+int gui_record_order_selftest_main(const char *keep_dir);
+
+/* Debug: stall the RF writer threads from start_ms after the record start
+ * for duration_ms (repeating every period_ms when > 0); start_ms < 0 turns it
+ * off. MISRC_GUI_DEBUG_RECORD_WRITER_STALL="start:duration[:period]" sets it
+ * at the next record start. */
+void gui_record_debug_set_writer_stall(int start_ms, int duration_ms, int period_ms);
+
 // Live on-disk size of each channel's output file via stat(). For the UI
 // readout so it shows the exact file size (1:1 with `ls`/file-manager), not
 // the writer-thread atomic which can lead the flushed file by the FILE*

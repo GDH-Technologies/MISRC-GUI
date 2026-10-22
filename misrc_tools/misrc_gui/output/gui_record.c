@@ -20,6 +20,8 @@
 #include "../input/gui_capture.h"
 #include "../input/gui_cxadc.h"
 #include "gui_record_direct.h"
+#include "gui_record_order_check.h"
+#include "../input/gui_simulated.h"
 
 #include "../../common/ringbuffer.h"
 #include "../../common/rb_event.h"
@@ -1199,6 +1201,51 @@ static soxr_t ensure_soxr(writer_ctx_t *wctx, float out_rate_khz) {
 }
 #endif
 
+/* Debug: stall the RF writer threads for a window measured from the record
+ * start, so a backpressure episode can be reproduced on demand
+ * (--record-order-selftest, or MISRC_GUI_DEBUG_RECORD_WRITER_STALL=
+ * "start_ms:duration_ms[:period_ms]" on any recording). Off by default. The
+ * stall ends at stop, so the drain is never held up. */
+static atomic_int s_writer_stall_start_ms = -1;
+static atomic_int s_writer_stall_dur_ms = 0;
+static atomic_int s_writer_stall_period_ms = 0;
+
+static double gui_record_mono_seconds(void);
+
+void gui_record_debug_set_writer_stall(int start_ms, int duration_ms, int period_ms)
+{
+    atomic_store(&s_writer_stall_start_ms, start_ms);
+    atomic_store(&s_writer_stall_dur_ms, duration_ms);
+    atomic_store(&s_writer_stall_period_ms, period_ms);
+}
+
+static void gui_record_debug_writer_stall_load_env(void)
+{
+    const char *v = getenv("MISRC_GUI_DEBUG_RECORD_WRITER_STALL");
+    if (!v || !v[0]) return;
+    int start = -1, dur = 0, period = 0;
+    if (sscanf(v, "%d:%d:%d", &start, &dur, &period) >= 2 && start >= 0 && dur > 0) {
+        gui_record_debug_set_writer_stall(start, dur, period);
+        fprintf(stderr, "[REC] Debug writer stall: start=%d ms duration=%d ms period=%d ms\n",
+                start, dur, period);
+    }
+}
+
+static void gui_record_debug_writer_stall(gui_record_session_t *ses)
+{
+    int start = atomic_load(&s_writer_stall_start_ms);
+    int dur = atomic_load(&s_writer_stall_dur_ms);
+    int period = atomic_load(&s_writer_stall_period_ms);
+    if (start < 0 || dur <= 0 || !ses) return;
+    while (atomic_load(&ses->recording) && !atomic_load(&do_exit)) {
+        double el_ms = (gui_record_mono_seconds() - ses->start_mono_s) * 1000.0 - (double)start;
+        if (el_ms < 0.0) return;
+        if (period > 0) el_ms = fmod(el_ms, (double)period);
+        if (el_ms >= (double)dur) return;
+        thrd_sleep_ms(5);
+    }
+}
+
 #if LIBFLAC_ENABLED == 1
 // Error callback for GUI FLAC writer
 static void gui_flac_error_callback(void *user_data, flac_writer_error_t error, const char *message) {
@@ -1369,6 +1416,7 @@ static int flac_writer_thread(void *ctx) {
         const int16_t *in = NULL;
         bool from_ringbuffer = false;
         bool encode_failed = false;
+        gui_record_debug_writer_stall(wctx->ses);
         int timeout_ms = (atomic_load(&do_exit) || !atomic_load(&wctx->ses->recording)) ? 0 : 10;
 
         if (!gui_record_get_next_block(wctx, len, timeout_ms, spill_i16, &in, &from_ringbuffer)) {
@@ -1572,6 +1620,7 @@ static int raw_writer_thread(void *ctx) {
     while (1) {
         const int16_t *in = NULL;
         bool from_ringbuffer = false;
+        gui_record_debug_writer_stall(wctx->ses);
         int timeout_ms = (atomic_load(&do_exit) || !atomic_load(&wctx->ses->recording)) ? 0 : 10;
 
         // When in write-error state (output file locked by another app),
@@ -3219,6 +3268,8 @@ typedef struct {
     bool use_flac;
     bool with_cc;
     const char *base_name;     /* NULL = "auto" */
+    uint32_t memory_budget_gb; /* 0 = the default budget */
+    int finalize_wait_s;       /* 0 = 30 s */
 } gui_record_headless_opts_t;
 
 static int gui_record_headless_run(const gui_record_headless_opts_t *o,
@@ -3242,6 +3293,7 @@ static int gui_record_headless_run(const gui_record_headless_opts_t *o,
     app.settings.enable_audio_4ch = false;
     app.settings.enable_audio_2ch_12 = false;
     app.settings.enable_audio_2ch_34 = false;
+    if (o->memory_budget_gb) app.settings.memory_budget_gb = o->memory_budget_gb;
     gui_settings_refresh_auto_names(&app.settings);
 
     gui_app_init(&app);
@@ -3285,7 +3337,8 @@ static int gui_record_headless_run(const gui_record_headless_opts_t *o,
     /* Finalize runs on its own thread; wait it out rather than racing it, and
      * reap it (the thread stays "running" until joined, so polling
      * gui_record_is_finalizing() alone always waited the full 30 s). */
-    for (int i = 0; i < 300 && gui_record_is_finalizing(); i++) {
+    int finalize_polls = (o->finalize_wait_s > 0 ? o->finalize_wait_s : 30) * 10;
+    for (int i = 0; i < finalize_polls && gui_record_is_finalizing(); i++) {
         if (gui_record_collect_finalize_if_done()) break;
         struct timespec ts = { 0, 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
@@ -3314,7 +3367,7 @@ static int gui_record_headless_run(const gui_record_headless_opts_t *o,
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
                                 bool use_flac, bool with_cc)
 {
-    gui_record_headless_opts_t o = { out_dir, seconds, with_video, use_flac, with_cc, NULL };
+    gui_record_headless_opts_t o = { out_dir, seconds, with_video, use_flac, with_cc, NULL, 0, 0 };
     char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
     int rc = gui_record_headless_run(&o, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     if (rc != 0) return rc;
@@ -3562,7 +3615,7 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_FALSE);
 
     char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
-    gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked" };
+    gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked", 0, 0 };
     int rc = gui_record_headless_run(&lo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     CM_CHECK(rc == 0, "linked run failed (%d)", rc);
     char sidecar[1024];
@@ -3625,7 +3678,7 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     /* 2. Unlinked, RAW: what nobody typed is "" / null, operator the OS login. */
     int before = s_cm_failures;
     gui_capture_meta_init();
-    gui_record_headless_opts_t uo = { dir_unlinked, 1, false, false, false, "Selftest_Unlinked" };
+    gui_record_headless_opts_t uo = { dir_unlinked, 1, false, false, false, "Selftest_Unlinked", 0, 0 };
     rc = gui_record_headless_run(&uo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     CM_CHECK(rc == 0, "unlinked run failed (%d)", rc);
     side = rc == 0 ? cm_check_run("unlinked", dir_unlinked, rf_a, rf_b, &log_text, sidecar, sizeof(sidecar)) : NULL;
@@ -3663,6 +3716,154 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
         return 1;
     }
     printf("capture-meta selftest passed\n");
+    return 0;
+}
+
+/* ---- --record-order-selftest --------------------------------------------- */
+
+/* The record path must write every sample it accepts, once, in capture
+ * order -- including through a backpressure episode. The Simulated device
+ * emits the record-order counter stream (gui_record_order_check.h) on both
+ * channels, the writers are stalled for 3 s so the 128 MiB record rings
+ * (memory budget 1 GB) overflow, and the FLAC and converted RAW recordings
+ * are then read back and checked group by group. Returns 0 pass, 1 fail,
+ * 2 when the run itself could not be set up. */
+static int ro_check_run(const char *dir, bool use_flac, const char *rf_a, const char *rf_b)
+{
+    int failures = 0;
+    const char *names[2] = { rf_a, rf_b };
+    gui_record_order_report_t rep[2];
+    memset(rep, 0, sizeof(rep));
+    for (int ch = 0; ch < 2; ch++) {
+        char path[1100], err[256] = {0};
+        snprintf(path, sizeof(path), "%s/%s", dir, names[ch]);
+        /* Either key: the Simulated device runs in MISRC mode, which may swap
+         * A and B; the two files must just carry different keys. */
+        bool read_ok = use_flac
+            ? gui_record_order_check_flac(path, GUI_RECORD_ORDER_KEY_ANY, &rep[ch], err, sizeof(err))
+            : gui_record_order_check_s16(path, GUI_RECORD_ORDER_KEY_ANY, &rep[ch], err, sizeof(err));
+        const gui_record_order_report_t *r = &rep[ch];
+        printf("  %s %c: key=0x%03X samples=%llu groups=%llu g=%llu..%llu gaps=%llu (missing %llu) "
+               "reorders=%llu corrupt=%llu tail=%llu",
+               use_flac ? "FLAC" : "RAW", ch == 0 ? 'A' : 'B', (unsigned)r->key,
+               (unsigned long long)r->samples, (unsigned long long)r->groups,
+               (unsigned long long)r->first_group, (unsigned long long)r->last_group,
+               (unsigned long long)r->gaps, (unsigned long long)r->missing_groups,
+               (unsigned long long)r->reorders, (unsigned long long)r->corrupt,
+               (unsigned long long)r->tail_samples);
+        if (r->first_bad_sample != UINT64_MAX) {
+            printf(" first_bad_sample=%llu", (unsigned long long)r->first_bad_sample);
+        }
+        printf("\n");
+        if (!read_ok) {
+            printf("  FAIL: %s %c could not be read: %s\n", use_flac ? "FLAC" : "RAW",
+                   ch == 0 ? 'A' : 'B', err);
+            failures++;
+        } else if (!gui_record_order_report_ok(r)) {
+            printf("  FAIL: %s %c is not the capture stream in order\n",
+                   use_flac ? "FLAC" : "RAW", ch == 0 ? 'A' : 'B');
+            failures++;
+        }
+    }
+    if (rep[0].key == rep[1].key) {
+        printf("  FAIL: both files carry key 0x%03X; one channel was recorded twice\n",
+               (unsigned)rep[0].key);
+        failures++;
+    }
+    if (rep[0].first_group != rep[1].first_group || rep[0].samples != rep[1].samples) {
+        printf("  FAIL: channels A and B differ (first group %llu vs %llu, samples %llu vs %llu)\n",
+               (unsigned long long)rep[0].first_group, (unsigned long long)rep[1].first_group,
+               (unsigned long long)rep[0].samples, (unsigned long long)rep[1].samples);
+        failures++;
+    }
+
+    /* The run proves nothing unless the record path actually overflowed. */
+    char log_path[1100];
+    char *log_text = NULL;
+    if (cm_find(dir, "_misrc_capture.log", log_path, sizeof(log_path))) {
+        log_text = cm_read(log_path);
+    }
+    bool overflowed = log_text &&
+        (strstr(log_text, "Record overflow") || strstr(log_text, "Record buffer backpressure"));
+    if (!overflowed) {
+        printf("  FAIL: the capture log shows no record overflow; the stall did not exercise the spill\n");
+        failures++;
+    }
+    free(log_text);
+    return failures;
+}
+
+int gui_record_order_selftest_main(const char *keep_dir)
+{
+    char root[700], dir_flac[760], dir_raw[760], cfg[760];
+    if (keep_dir && keep_dir[0]) {
+        snprintf(root, sizeof(root), "%s", keep_dir);
+    } else {
+#if defined(_WIN32) || defined(_WIN64)
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !tmp[0]) tmp = ".";
+#else
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0]) tmp = "/tmp";
+#endif
+        snprintf(root, sizeof(root), "%s/misrc_record_order_selftest_%d", tmp, (int)cm_getpid());
+    }
+    snprintf(dir_flac, sizeof(dir_flac), "%s/flac", root);
+    snprintf(dir_raw, sizeof(dir_raw), "%s/raw", root);
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", root);
+    cm_mkdir(root);
+    cm_mkdir(dir_flac);
+    cm_mkdir(dir_raw);
+    /* Never the live settings file (see the capture-meta selftest). */
+    gui_settings_set_override_path(cfg);
+    printf("record-order selftest: %s%s\n", root, keep_dir ? " (kept)" : " (scratch)");
+
+    gui_simulated_set_pattern(GUI_SIM_PATTERN_COUNTER);
+    gui_record_debug_set_writer_stall(1000, 3000, 0);
+
+    int failures = 0;
+    struct { const char *dir; bool flac; const char *name; } runs[] = {
+        { dir_flac, true, "Order_FLAC" },
+        { dir_raw, false, "Order_RAW" },
+    };
+    for (size_t i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
+        gui_record_headless_opts_t o = { runs[i].dir, 7, false, runs[i].flac, false, runs[i].name, 1, 180 };
+        char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
+        int rc = gui_record_headless_run(&o, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
+        if (rc != 0) {
+            printf("record-order selftest: %s run could not start (rc=%d)\n",
+                   runs[i].flac ? "FLAC" : "RAW", rc);
+            gui_settings_set_override_path(NULL);
+            gui_record_debug_set_writer_stall(-1, 0, 0);
+            gui_simulated_set_pattern(GUI_SIM_PATTERN_VIDEO);
+            return 2;
+        }
+        uint64_t src_drops = gui_simulated_rf_drops();
+        printf("%s run: source drops=%llu\n", runs[i].flac ? "FLAC" : "RAW",
+               (unsigned long long)src_drops);
+        int f = ro_check_run(runs[i].dir, runs[i].flac, rf_a, rf_b);
+        if (src_drops) {
+            printf("  FAIL: the simulated source lost %llu batch(es) to a full capture ring\n",
+                   (unsigned long long)src_drops);
+            f++;
+        }
+        failures += f;
+    }
+
+    gui_record_debug_set_writer_stall(-1, 0, 0);
+    gui_simulated_set_pattern(GUI_SIM_PATTERN_VIDEO);
+    gui_settings_set_override_path(NULL);
+    remove(cfg);
+    if (!keep_dir) {
+        cm_rmdir(dir_flac);
+        cm_rmdir(dir_raw);
+        cm_rmdir(root);
+    }
+    if (failures) {
+        printf("RECORD-ORDER SELFTEST FAILED (%d check(s))\n", failures);
+        return 1;
+    }
+    printf("record-order selftest passed\n");
     return 0;
 }
 
@@ -4111,6 +4312,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
              GUI_CAPTURE_SIDECAR_SUFFIX);
     gui_record_build_utc_iso8601(ses->started_at, sizeof(ses->started_at));
     ses->start_mono_s = gui_record_mono_seconds();
+    gui_record_debug_writer_stall_load_env();
     snprintf(ses->output_path, sizeof(ses->output_path), "%s", app->settings.output_path);
     snprintf(ses->base_name, sizeof(ses->base_name), "%s",
              app->settings.output_base_name[0] ? app->settings.output_base_name : "capture");

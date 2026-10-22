@@ -43,4 +43,18 @@ void gui_simulated_stop(gui_app_t *app);
 // Check if simulated capture is running
 bool gui_simulated_is_running(gui_app_t *app);
 
+// Test pattern. VIDEO is the CVBS/VHS signal above; COUNTER is the
+// record-order counter stream (gui_record_order_check.h), used to prove the
+// record path keeps every sample in order. Takes effect at the next start;
+// MISRC_GUI_SIM_PATTERN=counter selects COUNTER too.
+typedef enum {
+    GUI_SIM_PATTERN_VIDEO = 0,
+    GUI_SIM_PATTERN_COUNTER = 1,
+} gui_sim_pattern_t;
+void gui_simulated_set_pattern(gui_sim_pattern_t pattern);
+
+// Batches the simulated capture thread lost to a full BUF_CAPTURE_RF since
+// the last start (a source-side gap, not a record-path one).
+uint64_t gui_simulated_rf_drops(void);
+
 #endif // GUI_SIMULATED_H
