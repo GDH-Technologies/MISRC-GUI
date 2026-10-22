@@ -4506,10 +4506,17 @@ bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
         gui_app_set_status(app, "No playback device available");
         return false;
     }
-    app->selected_device = pb;
+    // Stop with the CURRENT device still selected: gui_app_stop_capture
+    // picks its backend from the selected device, so selecting Playback
+    // first left a live capture running with nothing able to stop it.
     if (app->is_capturing || gui_playback_is_running(app)) {
         gui_app_stop_capture(app);
     }
+    if (app->is_capturing) {
+        gui_app_set_status(app, "Could not stop the running capture - stop it before dropping files");
+        return false;
+    }
+    app->selected_device = pb;
     if (app->settings.playback_file_a[0] || app->settings.playback_file_b[0]) {
         // start_async sets "Loading playback..."; the commit sets "Playback started".
         return gui_app_start_capture(app) == 0;

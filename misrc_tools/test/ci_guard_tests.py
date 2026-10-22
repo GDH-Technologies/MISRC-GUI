@@ -4527,6 +4527,43 @@ def check_playback_drag_drop_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_drop_obeys_recording_locks(repo_root: Path) -> int:
+    """A playback drag-and-drop stops whatever is running and starts
+    playback, so it obeys the Disconnect locks (v1.2.6 sync, 2026-10-21):
+    refused while this machine records or finalizes and on a net client
+    (whose stop goes to the server), and the handler stops the capture with
+    the CURRENT device still selected. gui_app_stop_capture picks its backend
+    from app->selected_device, so selecting Playback first ended the
+    recording and left a live CXADC/MISRC capture running that neither
+    Disconnect nor exit could stop."""
+    gui_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/misrc_gui.c"))
+    at = gui_c.find("IsFileDropped()")
+    call = gui_c.find("gui_playback_handle_dropped_files(", at)
+    if at < 0 or call < 0:
+        return fail("misrc_gui.c: the drop poll or the drop handler call was not found")
+    site = gui_c[at:call]
+    if "app.is_recording" not in site or "gui_record_is_finalizing()" not in site:
+        return fail("misrc_gui.c: a file drop is not refused while recording or finalizing")
+    if "gui_net_is_client(&app)" not in site:
+        return fail("misrc_gui.c: a file drop is not refused on a net client")
+    pb_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/input/gui_playback.c"))
+    start = pb_c.find("bool gui_playback_handle_dropped_files(")
+    end = pb_c.find("\n}", start)
+    if start < 0 or end < 0:
+        return fail("gui_playback.c: gui_playback_handle_dropped_files not found")
+    body = pb_c[start:end]
+    stop = body.find("gui_app_stop_capture(app)")
+    select = body.find("app->selected_device = pb")
+    if stop < 0 or select < 0:
+        return fail("gui_playback.c: the drop handler no longer stops the capture or selects Playback")
+    if select < stop:
+        return fail(
+            "gui_playback.c: the drop handler selects Playback before stopping the capture, so "
+            "gui_app_stop_capture dispatches to the Playback backend and the live capture keeps running"
+        )
+    return 0
+
+
 def check_windows_modal_resize_contract(repo_root: Path) -> int:
     """The Windows modal move/size render driver (2026-10-20, backlog item
     2: the window froze during move/resize because DefWindowProc's modal
@@ -6312,6 +6349,7 @@ def main() -> int:
         ("UI zoom is relative to the desktop", lambda: check_ui_zoom_is_desktop_relative(repo_root)),
         ("session launch file contract", lambda: check_session_launch_file_contract(repo_root)),
         ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
+        ("file drop obeys the recording locks", lambda: check_drop_obeys_recording_locks(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

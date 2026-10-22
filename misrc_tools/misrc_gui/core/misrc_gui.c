@@ -1393,7 +1393,17 @@ int main(int argc, char **argv) {
         // GetMousePosition call - UI scale integration contract).
         if (IsFileDropped()) {
             FilePathList dropped_files = LoadDroppedFiles();
-            if (dropped_files.count > 0 && dropped_files.paths) {
+            // A drop stops whatever is running and starts playback, so it
+            // obeys the same locks as Disconnect: refused while this machine
+            // records or finalizes (tearing the capture down races the record
+            // finalize), and on a net client, where the stop would be
+            // forwarded to the server's capture.
+            if (dropped_files.count > 0 && dropped_files.paths &&
+                (app.is_recording || gui_record_is_finalizing())) {
+                gui_app_set_status(&app, "Stop recording before dropping playback files");
+            } else if (dropped_files.count > 0 && dropped_files.paths && gui_net_is_client(&app)) {
+                gui_app_set_status(&app, "Playback drag-and-drop works in Local or Server mode only");
+            } else if (dropped_files.count > 0 && dropped_files.paths) {
                 Vector2 drop_point = gui_ui_get_mouse_position();
                 gui_playback_handle_dropped_files(&app,
                     (const char *const *)dropped_files.paths,
