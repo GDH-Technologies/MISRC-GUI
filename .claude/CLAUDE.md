@@ -24,6 +24,9 @@ gui_preview_v4l2.c`, `misrc_tools/misrc_gui/input/gui_preview_sdtv.{c,h}`,
 `misrc_tools/misrc_gui/ui/gui_usbref_settings.{c,h}`,
 `misrc_tools/misrc_gui/core/gui_capture_meta.{c,h}`, `misrc_tools/misrc_gui/output/gui_capture_sidecar.{c,h}`,
 `misrc_tools/misrc_gui/ui/gui_capture_meta_panel.{c,h}`,
+`misrc_tools/misrc_gui/output/gui_record_{fifo,sink,order_check}.{c,h}` and their harness
+`misrc_tools/test/gui_record_fifo_harness.c` (the ordered record path, kept fork-only by Reece's
+call on 2026-10-21),
 `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
 `scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `.claude/`, `.clangd`.
 
@@ -107,9 +110,9 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 107
-  checks in a Linux `--post-build` run (82 `--static-only`; v1.2.6 sync, 2026-10-21), several of
-  which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 40 `test()`
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 110
+  checks in a Linux `--post-build` run (83 `--static-only`; record FIFO, 2026-10-22), several of
+  which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 41 `test()`
   targets (`meson test -C build-local`; `gui_rf_preview` alone takes ~70 s on wm); upstream's
   `gui_stats_layout` stubs the panel-name table and must keep the fork's `"Preview"` entry.
 - Two upstream meson tests carry fork adaptations, keep them on every sync:
@@ -128,7 +131,9 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 - Headless modes for automation (`misrc_gui --help`):
   `--headless-record <dir> [secs] [video] [raw] [cc]` (the fork's Simulated-device recorder;
   `--auto-record` until the v1.2.4 sync, renamed so upstream's flag of that name works),
-  `--session-selftest`, `--capture-meta-selftest [keep_dir] [secs]` (both on scratch settings
+  `--session-selftest`, `--record-order-selftest [keep_dir]` (a counter stream through a forced
+  3 s writer stall; FLAC and RAW must hold every sample in order; pass an NFS dir to prove the
+  capture side stays off the network), `--capture-meta-selftest [keep_dir] [secs]` (both on scratch settings
   files), `--config <path>`
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
@@ -218,9 +223,19 @@ Fork-side:
   and v1.2.3-gdh.1 a 12-bit-scale `.u16`. The toolkit reads only `.u8`/`.u16` today. Both
   auto-namers (`gui_record_apply_auto_names`, `gui_settings_refresh_auto_names` in the table)
   must agree; `--video-name-test` checks it for FLAC and converted RAW.
-- Record path: `BUF_RECORD_A/B` wait up to 1 s, then spill to a disk temp file (sticky per
-  channel, ordered). Only a failed spill is a real drop, and it stops the capture only when
-  `stop_on_dropout` is on (default off). Tape-end is `level_autostop_enabled`, a separate
+- Record path (fork-only, 2026-10-22): each channel is one ordered FIFO
+  (`output/gui_record_fifo.c`): the `BUF_RECORD_A/B` ring while it has room, a spill file on a
+  LOCAL disk for what does not fit (`record_spill_dir`; automatic = the output folder if local,
+  else `~/.cache/misrc_gui/spill`; NFS/SMB/tmpfs are refused), a segment log keeping capture
+  order. Every accepted byte reaches the file once, in order, partial tail included; the
+  upstream per-block spill reordered RF (1998 Christmas Gift) and, with the spill on NFS, backed
+  up the capture ring (Martin Luther 1953 lost 2,909 blocks). Producers never wait and never
+  touch the output filesystem: free space and the capture log go through the per-session record
+  monitor thread. A drop (ring full and the spill failed) is logged with its `rf_sample` and
+  stops the capture only when `stop_on_dropout` is on (default off); capture-buffer drops are
+  logged the same way. A dead FLAC encoder always stops the capture (`GUI_DROPOUT_RECORD_OUTPUT`).
+  `--record-order-selftest` proves it end to end; `docs/gdh-record-path.md` is the design.
+  Tape-end is `level_autostop_enabled`, a separate
   switch. Since v1.2.0 it ends the recording, not the capture, and its trigger is a
   normalized 0.1-0.8 string; a legacy percent ("33") is migrated on load, so a rollback to
   v1.1.9-gdh.4 or older reads a saved "0.2" as 0.2 %.

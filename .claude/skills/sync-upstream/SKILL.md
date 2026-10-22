@@ -90,9 +90,23 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
   `raw_ext_for_bits` is the load-time preview); `--video-name-test` catches drift.
 - **Direct RAW on the session.** Upstream's direct tap callbacks are global; the fork's
   record state is per session. Keep the callbacks' `user` = the `gui_record_session_t`
-  (the direct writer drains after `s_active` is cleared), the `_ses` spill forms, the
-  finalize copy of the direct byte totals into `ses->acc_raw`, and the tap handshake ahead
-  of `gui_record_stop`'s no-session branch.
+  (the direct writer drains after `s_active` is cleared), the finalize copy of the direct
+  byte totals into `ses->acc_raw`, and the producer-gate handshake ahead of
+  `gui_record_stop`'s no-session branch.
+- **Ordered record FIFO (fork-only, 2026-10-22).** Upstream's record path spills one block
+  at a time and retries the ring on the next, which reorders RF under backpressure (1998
+  Christmas Gift, Martin Luther 1953). The fork replaces it end to end:
+  `output/gui_record_fifo.{c,h}` (record ring first, a spill file on a LOCAL disk for
+  overflow, a segment log for order), `gui_record_sink.{c,h}` (RAW hold-and-retry),
+  extraction and the direct tap push through one producer gate, and every writer reads only
+  its FIFO. Resolve `gui_record.c`'s writers, start/stop/finalize, the spill code,
+  `gui_extract.c`'s record block and `gui_record_direct.{c,h}` toward the fork; port any
+  upstream change in those areas by hand. `common/ringbuffer.c` keeps the fork's grow-only
+  counters (upstream's rebase can drop a commit at a wrap) and `common/flac_writer.c` its
+  `samples_committed`/`last_write_errno`. The capture side never touches the output
+  filesystem: free space and the capture log go through the per-session record monitor
+  thread. Guards: `record FIFO contract`, `record FIFO runtime`,
+  `record order selftest (post-build)`.
 - **CXADC RF B.** The fork's RF B on/off handshake (`b_enabled`/`b_active`, card 1 closed
   while off) stays; upstream's RF-thread changes key card B on `read_b`, and probes/sync run
   over `open_count`, not `card_count`.
@@ -118,8 +132,9 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 
 ```bash
 scripts/build-local.sh --clean                                   # build + --smoke-test
-python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 107 PASS at v1.2.6 (82 static)
-meson test -C build-local                                         # 40 targets at v1.2.6 (gui_rf_preview ~70 s)
+python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 110 PASS since the record FIFO (83 static)
+meson test -C build-local                                         # 41 targets since the record FIFO (gui_rf_preview ~70 s)
+build-local/misrc_gui --record-order-selftest                     # every sample once, in order, through a forced overflow
 bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # 33 PASS incl. the cancel check (below) at v1.2.6, from the worktree root
 build-local/misrc_gui --video-name-test                           # both auto-namers agree, FLAC and RAW
 ```
