@@ -224,6 +224,28 @@ void *bufmgr_write_begin(buffer_manager_t *mgr, buffer_id_t id,
 void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes);
 
 /*
+ * bufmgr_write_end that reports the commit result: false when the ring could
+ * not take the bytes (never after a successful write_begin of the same size
+ * by the buffer's single producer). Same signalling and tap as write_end.
+ */
+bool bufmgr_write_commit(buffer_manager_t *mgr, buffer_id_t id, size_t bytes);
+
+/*
+ * Non-blocking write_begin for a caller with its own overflow policy: the
+ * contiguous write pointer, or NULL when the ring lacks `bytes` of free space
+ * right now. Never waits and touches no statistics. Initializes a lazy
+ * buffer on first use.
+ */
+void *bufmgr_try_write_begin(buffer_manager_t *mgr, buffer_id_t id, size_t bytes);
+
+/*
+ * Free space in bytes as the producer sees it (0 for an uninitialized
+ * buffer). The consumer only ever frees space, so the answer is a lower
+ * bound by the time the caller uses it.
+ */
+size_t bufmgr_free_space(buffer_manager_t *mgr, buffer_id_t id);
+
+/*
  * Convenience: write data with default policy
  *
  * @param mgr       Buffer manager instance

@@ -124,82 +124,76 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 	return 0;
 }
 
+/*
+ * head and tail are byte counters that only ever grow; a position in the
+ * buffer is the counter modulo buffer_size, and the mirrored second mapping
+ * makes any run of up to buffer_size bytes from such a position contiguous.
+ *
+ * The reader used to rebase both counters when head passed buffer_size
+ * (head -= size; tail -= size): two separate atomic updates, one of them to
+ * the counter the writer owns. A writer that loaded head before the rebase
+ * and tail after it saw tail < head and failed its commit -- bufmgr_write_end
+ * ignores that result, so the block was silently dropped -- and one that
+ * loaded them the other way round saw a full ring as empty. With counters
+ * that only grow, each side writes only its own counter and every
+ * combination of loads is consistent: the writer can only see too little
+ * free space, the reader too little data.
+ *
+ * 64-bit size_t never wraps in practice (2^64 bytes); a 32-bit build would
+ * wrap after 4 GiB and break the modulo, so it is refused at compile time.
+ */
+_Static_assert(sizeof(size_t) >= 8, "ringbuffer counters need a 64-bit size_t");
+
+static inline size_t rb_index(const ringbuffer_t *rb, size_t counter) {
+	return counter % rb->buffer_size;
+}
+
 int rb_put(ringbuffer_t *rb, void *data, size_t size) {
 	size_t head = atomic_load(&rb->head);
 	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
+	if(size > rb->buffer_size || rb->buffer_size - (tail - head) < size) {
 		return 1;
 	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	memcpy(&rb->buffer[tail], data, size);
-	rb->tail += size;
+	memcpy(&rb->buffer[rb_index(rb, tail)], data, size);
+	atomic_fetch_add(&rb->tail, size);
 	return 0;
 }
 
 void* rb_write_ptr(ringbuffer_t *rb, size_t size) {
 	size_t head = atomic_load(&rb->head);
 	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
+	if(size > rb->buffer_size || rb->buffer_size - (tail - head) < size) {
 		return NULL;
 	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return NULL;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return NULL;
-	}
-	return &rb->buffer[tail];
+	return &rb->buffer[rb_index(rb, tail)];
 }
 
 int rb_write_finished(ringbuffer_t *rb, size_t size) {
 	size_t head = atomic_load(&rb->head);
 	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
+	if(size > rb->buffer_size || rb->buffer_size - (tail - head) < size) {
 		return 1;
 	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	rb->tail += size;
+	atomic_fetch_add(&rb->tail, size);
 	return 0;
 }
 
 void* rb_read_ptr(ringbuffer_t *rb, size_t size) {
 	size_t head = atomic_load(&rb->head);
 	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head){
+	if(size > rb->buffer_size || tail - head < size){
 		return NULL;
 	}
-	if(tail - head < size){
-		return NULL;
-	}
-	if(head >= map_size || size > (map_size - head)) {
-		return NULL;
-	}
-	return &rb->buffer[head];
+	return &rb->buffer[rb_index(rb, head)];
 }
 
 int rb_read_finished(ringbuffer_t *rb, size_t size) {
-	if(rb->tail - rb->head < size){
+	size_t head = atomic_load(&rb->head);
+	size_t tail = atomic_load(&rb->tail);
+	if(tail - head < size){
 		return 1;
 	}
-	rb->head += size;
-	if(rb->head >= rb->buffer_size) {
-		rb->head -= rb->buffer_size;
-		rb->tail -= rb->buffer_size;
-	}
+	atomic_fetch_add(&rb->head, size);
 	return 0;
 }
 

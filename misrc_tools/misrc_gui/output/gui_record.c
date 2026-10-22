@@ -3798,22 +3798,38 @@ int gui_record_order_selftest_main(const char *keep_dir)
     char root[700], dir_flac[760], dir_raw[760], cfg[760];
     if (keep_dir && keep_dir[0]) {
         snprintf(root, sizeof(root), "%s", keep_dir);
+        (void)cm_mkdir(root);
     } else {
 #if defined(_WIN32) || defined(_WIN64)
+        /* %TEMP% is per-user on Windows. */
         const char *tmp = getenv("TEMP");
         if (!tmp || !tmp[0]) tmp = ".";
+        snprintf(root, sizeof(root), "%s/misrc_record_order_selftest_%d", tmp, (int)cm_getpid());
+        if (cm_mkdir(root) != 0) {
+            printf("record-order selftest: cannot create %s\n", root);
+            return 2;
+        }
 #else
+        /* A fresh, private directory: never a predictable name in a shared
+         * /tmp that another user could have pre-created or linked. */
         const char *tmp = getenv("TMPDIR");
         if (!tmp || !tmp[0]) tmp = "/tmp";
+        snprintf(root, sizeof(root), "%s/misrc_record_order_selftest_XXXXXX", tmp);
+        if (!mkdtemp(root)) {
+            printf("record-order selftest: cannot create a scratch dir under %s: %s\n",
+                   tmp, strerror(errno));
+            return 2;
+        }
 #endif
-        snprintf(root, sizeof(root), "%s/misrc_record_order_selftest_%d", tmp, (int)cm_getpid());
     }
     snprintf(dir_flac, sizeof(dir_flac), "%s/flac", root);
     snprintf(dir_raw, sizeof(dir_raw), "%s/raw", root);
     snprintf(cfg, sizeof(cfg), "%s/settings.json", root);
-    cm_mkdir(root);
-    cm_mkdir(dir_flac);
-    cm_mkdir(dir_raw);
+    if ((cm_mkdir(dir_flac) != 0 && errno != EEXIST) ||
+        (cm_mkdir(dir_raw) != 0 && errno != EEXIST)) {
+        printf("record-order selftest: cannot create run dirs under %s\n", root);
+        return 2;
+    }
     /* Never the live settings file (see the capture-meta selftest). */
     gui_settings_set_override_path(cfg);
     printf("record-order selftest: %s%s\n", root, keep_dir ? " (kept)" : " (scratch)");
