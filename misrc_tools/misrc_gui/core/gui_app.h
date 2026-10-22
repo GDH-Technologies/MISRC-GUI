@@ -205,6 +205,7 @@ typedef enum {
     GUI_DROPOUT_BACKPRESSURE = 6,
     GUI_DROPOUT_DISK_SPACE = 7,
     GUI_DROPOUT_LOW_SIGNAL = 8,   // Level autostop: sustained low/no signal (tape end)
+    GUI_DROPOUT_RECORD_OUTPUT = 9, // A record output cannot continue (FLAC encoder dead); always stops
 } gui_dropout_reason_t;
 
 // Main application state

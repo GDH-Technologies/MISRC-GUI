@@ -231,6 +231,13 @@ typedef struct {
     // after fixed RF/Audio/Display allocations; record buffers stay lazy.
     uint32_t memory_budget_gb;
 
+    // Where the record path spills what does not fit in the RAM record
+    // buffers. Must be a LOCAL disk: the capture side writes it in real time.
+    // Empty = automatic: the output folder when that is local, otherwise this
+    // machine's cache folder (~/.cache/misrc_gui/spill and equivalents). A
+    // network or RAM filesystem here is refused at record start.
+    char record_spill_dir[FILE_PATH_MAX];
+
     // Update check metadata (GitHub releases). last_check_unix_s is persisted
     // so the automatic checker runs at most once every 7 days.
     uint64_t update_last_check_unix_s;

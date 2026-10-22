@@ -10052,6 +10052,14 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_ui_set_click_consumed();
                     return;
                 }
+                /* A finalizing recording's writers are still draining the
+                 * record buffers (minutes over NFS): re-initializing the
+                 * buffer manager would unmap them under the writers. */
+                if (gui_record_is_finalizing()) {
+                    gui_app_set_status(app, "Wait for the recording to finish finalizing to change memory budget");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
                 static const uint32_t cycle[] = { 1, 2, 4, 8, 16 };
                 uint32_t cur = app->settings.memory_budget_gb;
                 if (cur < 1) cur = 1;

@@ -2448,6 +2448,9 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     # upstream v1.2.6: this machine's preview CPU budget, CVBS System pick and
     # drag-and-dropped playback monitor file.
     "rf_preview_budget_percent", "video_system", "playback_audio_file",
+    # GDH fork: the record path's overflow spill folder, a path on this
+    # machine's own local disk.
+    "record_spill_dir",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to
@@ -4751,10 +4754,12 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
     FLAC off, no resampling): tap placement before the A/B pairing
     truncation, shared eligibility predicate, naming by content
     (.u8/.u16 direct, .s8/.s16 converted), single producer per record
-    ring, and the start/stop tap handshakes."""
+    FIFO, and the start/stop gate handshakes. Ordering itself is the record
+    FIFO's contract (check_record_fifo_contract)."""
     record_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c")
     record_h = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.h")
     direct_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c")
+    fifo_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record_fifo.c")
     cxadc_c = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.c")
     cxadc_h = read_text(repo_root / "misrc_tools/misrc_gui/input/gui_cxadc.h")
     extract_c = read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.c")
@@ -4764,9 +4769,11 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
     harness_c = read_text(repo_root / "misrc_tools/test/gui_record_direct_harness.c")
 
     required_snippets = [
-        (direct_c, "atomic_fetch_add(&ctx->tap_inflight, 1);", "producer marks in-flight"),
-        (direct_c, "atomic_load(&ctx->tap_enabled)", "producer checks the enabled flag"),
-        (direct_c, "bufmgr_fill_level(ctx->bufmgr, (buffer_id_t)ctx->buf_id)", "writer reads variable lengths"),
+        (fifo_c, "atomic_fetch_add(&g->inflight, 1);", "gate marks in-flight"),
+        (fifo_c, "atomic_load(&g->enabled)", "gate checks the enabled flag"),
+        (direct_c, "gui_record_gate_enter(ctx->gate)", "producer enters the recording's gate"),
+        (direct_c, "gui_record_fifo_push(ctx->fifo", "producer pushes through the record FIFO"),
+        (direct_c, "gui_record_fifo_next(ctx->fifo", "writer reads the record FIFO (variable lengths)"),
         (direct_c, "GUI_RECORD_DIRECT_MAX_BLOCK_BYTES", "writer read granularity cap"),
         (cxadc_c, "gui_record_direct_tap_push_latched(0, true, card_buf_a", "card A latched native tap"),
         (cxadc_c, "gui_record_direct_tap_push_latched(1, true, card_buf_b", "card B latched native tap"),
@@ -4779,8 +4786,8 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         (direct_c, "gui_record_direct_push_latched(", "latched push in the record-direct module"),
         (cxadc_h, "gui_cxadc_direct_record_available", "CXADC direct availability query"),
         (record_h, "gui_record_direct_tap_push", "tap entry point declaration"),
-        (record_h, "gui_record_spill_read_block", "public spill read"),
-        (record_h, "gui_record_spill_backlog_bytes", "public spill backlog query"),
+        (record_h, "gui_record_producer_enter", "extraction producer gate"),
+        (record_h, "gui_record_push(", "extraction producer push"),
         (record_c, '"Recording (RAW direct)..."', "direct status text"),
         (record_c, "RAW direct native passthrough", "capture_format log line"),
         (record_c, "gui_record_direct_channel_eligible", "shared eligibility predicate"),
@@ -4816,20 +4823,22 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
     if not (gate_leave_a < display_write):
         return fail("Direct RAW tap gate must complete before the display-ring write")
 
-    # Producer handshake: mark in-flight, THEN read enabled.
-    push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push")
-    if push_body.find("atomic_fetch_add(&ctx->tap_inflight, 1);") > push_body.find("atomic_load(&ctx->tap_enabled)"):
-        return fail("Direct RAW push must mark in-flight before reading tap_enabled")
+    # Gate handshake: mark in-flight, THEN read enabled (the stopper clears
+    # enabled, then waits for in-flight 0, so no push can slip past a stop).
+    enter_body = func_body_from(fifo_c, "bool gui_record_gate_enter(gui_record_gate_t *g)")
+    if not (0 <= enter_body.find("atomic_fetch_add(&g->inflight, 1);") < enter_body.find("atomic_load(&g->enabled)")):
+        return fail("gui_record_gate_enter must mark in-flight before reading enabled")
 
-    # Producer ordering rule: while the spill backlog is non-zero, pushes go
-    # to the spill (never into the ring ahead of older spill data).
-    if "backlog > 0" not in push_body:
-        return fail("Direct RAW push must key its spill-vs-ring decision on the spill backlog")
-
-    # Writer drain order: ringbuffer before spill (oldest data first).
+    # The direct push goes through the gate and the FIFO, and the writer
+    # reads only the FIFO (no private ring/spill reads that could reorder).
+    push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push(gui_record_direct_ctx_t *ctx,")
+    if push_body.find("gui_record_gate_enter(ctx->gate)") < 0 or push_body.find("gui_record_gate_leave(ctx->gate)") < 0:
+        return fail("Direct RAW push must enter and leave the recording's gate")
     writer_body = func_body_from(direct_c, "int gui_record_direct_writer_thread(void *ctx_ptr)")
-    if writer_body.find("bufmgr_read_begin") > writer_body.find("ctx->cb.spill_read"):
-        return fail("Direct RAW writer must drain the ringbuffer before the spill backlog")
+    if "gui_record_fifo_next(" not in writer_body or "gui_record_fifo_consume(" not in writer_body:
+        return fail("Direct RAW writer must read the record FIFO")
+    if "bufmgr_read_begin" in writer_body:
+        return fail("Direct RAW writer must not read the record ring around the FIFO")
 
     # Naming by content: direct -> .u8/.u16, converted -> .s8/.s16.
     ext_body = func_body_from(record_c, "static const char *raw_ext_for_bits")
@@ -4862,24 +4871,27 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         if snippet not in set_rec_body:
             return fail(f"gui_extract_set_recording must carry the direct mask: {snippet}")
 
-    # Stop handshake: taps disabled and idle BEFORE is_recording clears.
+    # Stop handshake: every producer off and idle, then the FIFOs closed,
+    # BEFORE is_recording clears (the writers then drain to the end).
     stop_body = func_body_from(record_c, "void gui_record_stop(gui_app_t *app)")
-    tap_disable_pos = stop_body.find("gui_record_direct_tap_disable")
-    tap_idle_pos = stop_body.find("gui_record_direct_tap_wait_idle")
-    is_recording_pos = stop_body.find("app->is_recording = false;")
-    if min(tap_disable_pos, tap_idle_pos, is_recording_pos) < 0:
-        return fail("Direct RAW stop handshake anchors not found in gui_record_stop")
-    if not (tap_disable_pos < tap_idle_pos < is_recording_pos):
-        return fail("gui_record_stop must disable+idle the taps before clearing is_recording")
+    gate_disable_pos = stop_body.find("gui_record_gate_disable(&s_gate)")
+    gate_idle_pos = stop_body.find("gui_record_gate_wait_idle(&s_gate)")
+    close_pos = stop_body.find("gui_record_fifo_close(")
+    is_recording_pos = stop_body.find("app->is_recording = false;", max(close_pos, 0))
+    if min(gate_disable_pos, gate_idle_pos, close_pos, is_recording_pos) < 0:
+        return fail("Record stop handshake anchors not found in gui_record_stop")
+    if not (gate_disable_pos < gate_idle_pos < close_pos < is_recording_pos):
+        return fail("gui_record_stop must disable+idle the producer gate, then close the FIFOs, before clearing is_recording")
 
-    # Start order: writers, then taps, then extraction recording (skip mask).
+    # Start order (RAW branch): writers, then extraction recording (skip
+    # mask), then the producer gate last.
     start_writer = record_c.find("gui_record_direct_writer_thread")
-    start_tap = record_c.find("gui_record_direct_tap_enable(&s_direct_ctx_a)")
     start_extract = record_c.find("gui_extract_set_recording(true, false, bits_a, bits_b, direct_a, direct_b)")
-    if min(start_writer, start_tap, start_extract) < 0:
-        return fail("Direct RAW start-order anchors not found in gui_record.c")
-    if not (start_writer < start_tap < start_extract):
-        return fail("Record start must start writers, then enable taps, then extraction recording")
+    start_gate = record_c.find("gui_record_gate_enable(&s_gate)", max(start_extract, 0))
+    if min(start_writer, start_extract, start_gate) < 0:
+        return fail("Record start-order anchors not found in gui_record.c")
+    if not (start_writer < start_extract < start_gate):
+        return fail("Record start must start writers, then extraction recording, then open the producer gate")
     return 0
 
 
@@ -4993,9 +5005,12 @@ def check_raw_direct_writer_runtime(repo_root: Path) -> int:
     sources = [
         repo_root / "misrc_tools/test/gui_record_direct_harness.c",
         repo_root / "misrc_tools/misrc_gui/output/gui_record_direct.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_fifo.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_sink.c",
         repo_root / "misrc_tools/common/buffer_manager.c",
         repo_root / "misrc_tools/common/ringbuffer.c",
         repo_root / "misrc_tools/common/rb_event.c",
+        repo_root / "misrc_tools/common/file_utils.c",
     ]
     for path in sources:
         if not path.exists():
@@ -5034,6 +5049,85 @@ def check_raw_direct_writer_runtime(repo_root: Path) -> int:
                 f"stdout:\n{exc.stdout}\n"
                 f"stderr:\n{exc.stderr}"
             )
+    return 0
+
+
+def check_record_fifo_runtime(repo_root: Path) -> int:
+    """GDH fork: the ordered record FIFO (record ring first, local spill for
+    overflow, segment log) delivers every accepted byte once, in order --
+    under random pressure, across 200 random-moment stops, with failing spill
+    writes and a 4-slot segment log -- and its harness proves it can see the
+    old per-block spill's reordering. Built a second time with
+    -fsanitize=thread where the compiler supports it, since x86's strong
+    ordering cannot expose a missing acquire/release."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("SKIP: record FIFO runtime guard (Linux/macOS only)")
+        return 0
+    cc = shutil.which("cc")
+    if cc is None:
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            return fail("C compiler 'cc' is required for the record FIFO runtime guard")
+        print("SKIP: record FIFO runtime guard (cc not available)")
+        return 0
+
+    sources = [
+        repo_root / "misrc_tools/test/gui_record_fifo_harness.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_fifo.c",
+        repo_root / "misrc_tools/misrc_gui/output/gui_record_sink.c",
+        repo_root / "misrc_tools/common/buffer_manager.c",
+        repo_root / "misrc_tools/common/ringbuffer.c",
+        repo_root / "misrc_tools/common/rb_event.c",
+        repo_root / "misrc_tools/common/file_utils.c",
+    ]
+    for path in sources:
+        if not path.exists():
+            return fail(f"Record FIFO runtime source is missing: {path}")
+
+    def build(compiler: str, extra: list, exe: Path) -> subprocess.CompletedProcess:
+        cmd = [compiler, "-std=c11", "-Wall", "-Wextra", "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE"]
+        if sys.platform == "darwin":
+            cmd.append("-D_DARWIN_C_SOURCE")
+        cmd += extra + [str(p) for p in sources]
+        if sys.platform.startswith("linux"):
+            cmd += ["-lpthread"]
+        cmd += ["-o", str(exe)]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory(prefix="misrc_record_fifo_guard_") as temp_root:
+        exe = Path(temp_root) / "gui_record_fifo_guard"
+        res = build(cc, ["-O2"], exe)
+        if res.returncode != 0:
+            return fail("Failed to compile the record FIFO harness\n"
+                        f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        try:
+            run_checked([str(exe)])
+        except subprocess.CalledProcessError as exc:
+            return fail("Record FIFO harness failed\n"
+                        f"stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}")
+
+        # ThreadSanitizer pass: skipped (not failed) when the toolchain has no
+        # TSan runtime -- gcc without libtsan is common; clang usually has it.
+        tsan_exe = Path(temp_root) / "gui_record_fifo_guard_tsan"
+        for compiler in [c for c in (shutil.which("clang"), cc) if c]:
+            res = build(compiler, ["-O1", "-g", "-fsanitize=thread"], tsan_exe)
+            if res.returncode == 0:
+                break
+        else:
+            print("SKIP: record FIFO ThreadSanitizer pass (no TSan runtime)")
+            return 0
+        env = dict(os.environ)
+        env["TSAN_OPTIONS"] = "halt_on_error=1 exitcode=66"
+        res = subprocess.run([str(tsan_exe)], capture_output=True, text=True, env=env)
+        if res.returncode == 66 or "WARNING: ThreadSanitizer" in res.stderr:
+            return fail("Record FIFO harness: ThreadSanitizer reported a data race\n"
+                        f"stderr:\n{res.stderr[-4000:]}")
+        if res.returncode != 0:
+            if "ThreadSanitizer" in res.stderr and ("unexpected memory mapping" in res.stderr
+                                                    or "FATAL" in res.stderr):
+                print("SKIP: record FIFO ThreadSanitizer pass (TSan cannot run on this kernel)")
+                return 0
+            return fail("Record FIFO harness failed under ThreadSanitizer\n"
+                        f"stdout:\n{res.stdout}\nstderr:\n{res.stderr[-4000:]}")
     return 0
 
 
@@ -6059,6 +6153,117 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
     return None
 
 
+def check_record_fifo_contract(repo_root: Path) -> int:
+    """GDH fork: the record path's ordering and capture-side contracts.
+
+    Every byte the record path accepts reaches the output once, in capture
+    order: one ordered FIFO per channel (record ring first, local spill for
+    overflow, segment log), no per-block spill fallback, no writer re-spill,
+    and the reader's load order closed -> pub_seq -> seg_tail. And the
+    capture side (extraction, the FIFO push) never waits on the destination
+    filesystem: no free-space query, file open or log write there -- the
+    destination may be an NFS share (the Martin Luther 1953 capture lost
+    2,909 capture blocks to a spill file on NFS)."""
+    record_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record.c"))
+    extract_c = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/processing/gui_extract.c"))
+    fifo_c_raw = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_record_fifo.c")
+    fifo_c = strip_c_comments(fifo_c_raw)
+    ring_c = strip_c_comments(read_text(repo_root / "misrc_tools/common/ringbuffer.c"))
+    meson = read_text(repo_root / "misrc_tools/meson.build")
+
+    for name, text in (("gui_record.c", record_c), ("gui_extract.c", extract_c)):
+        for retired in ("gui_record_spill_", "forced_mode", "s_record_write_policy", "gui_record_get_next_block"):
+            if retired in text:
+                return fail(f"{name} still uses the retired per-block spill path: {retired}")
+
+    # Writers: a dead FLAC encoder is a stop, never a silent "recovery" or a
+    # re-spill (a second producer that reorders).
+    flac_body = func_body_from(record_c, "static int flac_writer_thread(void *ctx)")
+    if "write recovered" in flac_body or "gui_record_push(" in flac_body:
+        return fail("flac_writer_thread must not claim recovery or push back into the record path")
+    failed_body = func_body_from(record_c, "static void gui_record_writer_output_failed(writer_ctx_t *wctx, const char *what)")
+    for snippet in ("GUI_DROPOUT_RECORD_OUTPUT", "dropout_stop_requested"):
+        if snippet not in failed_body:
+            return fail(f"A failed record output must stop the capture: missing {snippet}")
+    for name in ("static int flac_writer_thread(void *ctx)", "static int raw_writer_thread(void *ctx)"):
+        body = func_body_from(record_c, name)
+        if "gui_record_fifo_next(" not in body or "bufmgr_read_begin" in body:
+            return fail(f"{name.split('(')[0].split()[-1]} must read only its record FIFO")
+
+    # Extraction: enter < push < leave, and leave before any exit path.
+    ext_body = func_body_from(extract_c, "static int extraction_thread(void *ctx)")
+    enter = ext_body.find("gui_record_producer_enter()")
+    push = ext_body.find("gui_record_push(", max(enter, 0))
+    leave = ext_body.find("gui_record_producer_leave()", max(push, 0))
+    if min(enter, push, leave) < 0 or not (enter < push < leave):
+        return fail("extraction_thread must push between gui_record_producer_enter() and _leave()")
+    if "goto exit_thread" in ext_body[enter:leave]:
+        return fail("extraction_thread must leave the producer gate before any goto exit_thread "
+                    "(gui_record_stop waits for the gate to go idle)")
+
+    # Capture side never touches the destination filesystem.
+    push_body = func_body_from(fifo_c, "gui_record_push_result_t gui_record_fifo_push(")
+    for name, body in (("extraction_thread", ext_body), ("gui_record_fifo_push", push_body)):
+        for banned in ("statvfs", "file_disk_free_space", "fopen", "file_open_utf8", "fflush(",
+                       "gui_record_log_write_line", "file_path_info_utf8"):
+            if banned in body:
+                return fail(f"{name} must not wait on the output filesystem: uses {banned}")
+    guard_body = func_body_from(record_c, "bool gui_record_check_disk_space_guard(")
+    if "output_path, &" in guard_body:
+        return fail("The disk guard (extraction thread) must read the monitor's destination sample, "
+                    "not query the output path itself")
+    line_body = func_body_from(record_c, "static void gui_record_log_write_line_ses(")
+    if not (0 <= line_body.find("logq_on") < line_body.find("fprintf")):
+        return fail("Session log lines must go through the monitor's queue while it runs")
+
+    # Reader load order: closed, then pub_seq, then seg_tail.
+    next_body = func_body_from(fifo_c, "int gui_record_fifo_next(")
+    c = next_body.find("&f->closed")
+    p = next_body.find("&f->pub_seq")
+    t = next_body.find("&f->seg_tail")
+    if min(c, p, t) < 0 or not (c < p < t):
+        return fail("gui_record_fifo_next must load closed, then pub_seq, then seg_tail")
+
+    # The FIFO stays raylib-free and lock-free on the capture side.
+    for banned in ("gui_app.h", "raylib.h", "atomic_flag"):
+        if banned in fifo_c_raw:
+            return fail(f"gui_record_fifo.c must stay GUI-free and lock-free: found {banned}")
+
+    # Ringbuffer counters only grow (a rebase let a wrap drop a commit).
+    rf_body = func_body_from(ring_c, "int rb_read_finished(ringbuffer_t *rb, size_t size)")
+    if not rf_body or "-=" in rf_body or "buffer_size" in rf_body:
+        return fail("rb_read_finished must only advance head, never rebase the ring counters")
+
+    for snippet in ("test('gui_record_fifo'", "'misrc_gui/output/gui_record_fifo.c'",
+                    "'misrc_gui/output/gui_record_sink.c'"):
+        if snippet not in meson:
+            return fail(f"meson.build is missing {snippet}")
+    return 0
+
+
+def check_record_order_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --record-order-selftest: the Simulated device
+    emits a self-checking counter stream, the writers stall 3 s so the
+    record rings overflow, and the FLAC and RAW recordings must hold every
+    sample once, in order, on both channels. The scratch output (about
+    1 GB) goes beside the build, not into a RAM-backed /tmp."""
+    with tempfile.TemporaryDirectory(prefix="misrc_record_order_guard_", dir=str(gui_path.parent)) as temp_root:
+        out = Path(temp_root) / "out"
+        try:
+            ran = subprocess.run([str(gui_path), "--record-order-selftest", str(out)],
+                                 capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            return fail("misrc_gui --record-order-selftest timed out")
+        if ran.returncode == 2:
+            print("SKIP: record order selftest (post-build): the Simulated device did not run "
+                  f"headless here: {ran.stdout.strip().splitlines()[-1:]}")
+            return 0
+        if ran.returncode != 0:
+            return fail(f"misrc_gui --record-order-selftest failed (rc={ran.returncode}):\n"
+                        f"{ran.stdout.strip()[-3000:]}")
+    return 0
+
+
 def check_capture_metadata_post_build(gui_path: Path) -> int:
     """Run the built GUI's --capture-meta-selftest (a linked FLAC A+B and an
     unlinked RAW recording from the Simulated device; it asserts the sidecar,
@@ -6350,6 +6555,7 @@ def main() -> int:
         ("session launch file contract", lambda: check_session_launch_file_contract(repo_root)),
         ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
         ("file drop obeys the recording locks", lambda: check_drop_obeys_recording_locks(repo_root)),
+        ("record FIFO contract", lambda: check_record_fifo_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
@@ -6370,7 +6576,8 @@ def main() -> int:
         checks.insert(16, ("FLAC worker priority runtime", lambda: check_flac_worker_priority_runtime(repo_root)))
         checks.insert(17, ("SDTV preview geometry runtime", lambda: check_preview_sdtv_geometry_runtime(repo_root)))
         checks.insert(10, ("direct RAW writer runtime", lambda: check_raw_direct_writer_runtime(repo_root)))
-        checks.insert(11, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
+        checks.insert(11, ("record FIFO runtime", lambda: check_record_fifo_runtime(repo_root)))
+        checks.insert(12, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
     # --post-build: always run the binary-introspection guards against the real
     # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
     # that catches vendored-dep shadowing and silent FX3-disable on every build.
@@ -6388,6 +6595,7 @@ def main() -> int:
         checks.append(("per-pane source routing harness (post-build)", lambda: check_panel_source_harness_post_build(args.gui_path)))
         checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
         checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
+        checks.append(("record order selftest (post-build)", lambda: check_record_order_post_build(args.gui_path)))
         checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
 
     for name, check in checks:

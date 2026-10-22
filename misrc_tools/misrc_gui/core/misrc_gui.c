@@ -204,6 +204,8 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
             return "Capture stopped: low disk space (dynamic guard)";
         case GUI_DROPOUT_LOW_SIGNAL:
             return "Recording stopped: sustained low/no signal (tape end)";
+        case GUI_DROPOUT_RECORD_OUTPUT:
+            return "Capture stopped: a recording output failed (FLAC encoder error; see the capture log)";
         case GUI_DROPOUT_NONE:
         default:
             return "Capture stopped: dropout detected";

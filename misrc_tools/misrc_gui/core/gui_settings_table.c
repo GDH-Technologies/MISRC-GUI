@@ -239,6 +239,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
     // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
     settings->memory_budget_gb = 4;
+    settings->record_spill_dir[0] = '\0';   // automatic (see gui_settings.h)
     settings->update_last_check_unix_s = 0;
     settings->update_last_release_tag[0] = '\0';
     settings->update_available_cached = false;
@@ -1135,6 +1136,9 @@ static const gui_setting_desc_t s_table[] = {
     GS_IH ("rf_preview_budget_percent",       rf_preview_budget_percent,  GS_LOCAL, hook_rf_preview_budget),
     GS_IH ("video_system",                    video_system,               GS_LOCAL, hook_video_system),
     GS_S  ("playback_audio_file",             playback_audio_file,        GS_LOCAL),
+    /* GDH fork: where the record path spills on overflow. A path on this
+     * machine's own disk, so a net client keeps its own. */
+    GS_S  ("record_spill_dir",                record_spill_dir,           GS_LOCAL),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

@@ -2944,6 +2944,14 @@ int gui_net_serve_main(int seconds) {
             gui_net_poll_mirror(app);
             gui_capture_service_channel_b(app);
             gui_record_check_popup(app);   /* a client's /record?confirm= answer lands here */
+            /* Stop requests (stop_on_dropout, the disk guard, a dead record
+             * output) are posted from capture and writer threads and acted on
+             * by the main loop; with no window this loop is the main loop. */
+            if (app->is_capturing && atomic_exchange(&app->dropout_stop_requested, false)) {
+                int reason = (int)atomic_exchange(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
+                fprintf(stderr, "[NET] Stop requested (dropout reason %d): stopping capture\n", reason);
+                gui_app_stop_capture(app);
+            }
             thrd_sleep_ms(20);
         }
         if (app->is_recording) gui_app_stop_recording(app);
