@@ -6,12 +6,14 @@
  */
 
 #include "gui_settings.h"
+#include "../../common/file_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -24,6 +26,7 @@
 #define CloseWindow Win32_CloseWindow
 #define ShowCursor Win32_ShowCursor
 #include <shlobj.h>
+#include <knownfolders.h>
 #include <shobjidl.h>
 #undef ShowCursor
 #undef CloseWindow
@@ -45,53 +48,72 @@
 extern uint32_t get_num_cores(void);
 #endif
 
-bool gui_settings_path_is_dir(const char *path) {
-    struct stat st;
-    if (!path || !path[0]) return false;
-    if (stat(path, &st) != 0) return false;
+// Reject oversized paths instead of silently opening a different filename.
+static bool gui_settings_copy(char *dst, size_t cap, const char *src) {
+    size_t len = strlen(src);
+    if (len >= cap) return false;
+    memcpy(dst, src, len + 1);
+    return true;
+}
+
+static bool gui_settings_format(char *dst, size_t cap, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(dst, cap, fmt, args);
+    va_end(args);
+    if (len < 0 || (size_t)len >= cap) {
+        dst[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static bool gui_settings_separator(char c) {
 #if defined(_WIN32) || defined(_WIN64)
-    return (st.st_mode & _S_IFDIR) != 0;
+    return c == '/' || c == '\\';
 #else
-    return S_ISDIR(st.st_mode);
+    return c == '/';
 #endif
+}
+
+bool gui_settings_path_is_dir(const char *path) {
+    bool is_dir = false;
+    return path && path[0] && file_path_info_utf8(path, NULL, &is_dir) && is_dir;
 }
 
 static bool gui_settings_make_dir_if_needed(const char *path) {
     if (!path || !path[0]) return false;
     if (gui_settings_path_is_dir(path)) return true;
-#if defined(_WIN32) || defined(_WIN64)
-    if (_mkdir(path) == 0) return true;
-#else
-    if (mkdir(path, 0700) == 0) return true;
-#endif
-    if (errno == EEXIST) return gui_settings_path_is_dir(path);
-    return false;
+    if (file_mkdir_utf8(path, 0700) == 0) return true;
+    return errno == EEXIST && gui_settings_path_is_dir(path);
 }
 
-// Best-effort recursive mkdir for a file path's parent directories.
 static bool gui_settings_ensure_parent_dirs(const char *file_path) {
-    if (!file_path || !file_path[0]) return false;
-
-    char path_copy[512];
-    strncpy(path_copy, file_path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
-
-    size_t len = strlen(path_copy);
-    if (len == 0) return false;
-
-    for (size_t i = 0; i < len; i++) {
-        char c = path_copy[i];
-        if (c != '/' && c != '\\') continue;
-        if (i == 0) continue;
+    char path_copy[FILE_PATH_MAX];
+    if (!file_path || !file_path[0] ||
+        !gui_settings_copy(path_copy, sizeof(path_copy), file_path)) return false;
+    size_t start = 1;
 #if defined(_WIN32) || defined(_WIN64)
-        // Skip "C:\" root separator.
+    // A UNC server/share root already exists; do not try mkdir on its server.
+    if (gui_settings_separator(path_copy[0]) && gui_settings_separator(path_copy[1])) {
+        start = 2;
+        while (path_copy[start] && !gui_settings_separator(path_copy[start])) start++;
+        if (path_copy[start]) start++;
+        while (path_copy[start] && !gui_settings_separator(path_copy[start])) start++;
+        if (path_copy[start]) start++;
+    }
+#endif
+    for (size_t i = start; path_copy[i]; i++) {
+        char c = path_copy[i];
+        if (!gui_settings_separator(c)) continue;
+#if defined(_WIN32) || defined(_WIN64)
         if (i == 2 && path_copy[1] == ':') continue;
 #endif
         path_copy[i] = '\0';
-        if (!gui_settings_make_dir_if_needed(path_copy)) return false;
+        bool ok = gui_settings_make_dir_if_needed(path_copy);
         path_copy[i] = c;
+        if (!ok) return false;
     }
-
     return true;
 }
 
@@ -118,120 +140,125 @@ void gui_settings_set_persist_filter(gui_settings_persist_filter_fn fn) {
 
 // Settings file location
 static const char* get_settings_file_path(void) {
-    static char settings_path[512];
+    static char settings_path[FILE_PATH_MAX];
     static bool initialized = false;
-
-    if (s_override_settings_path && s_override_settings_path[0]) {
-        // --config <path> override: use it directly (no platform logic).
-        snprintf(settings_path, sizeof(settings_path), "%s", s_override_settings_path);
-        return settings_path;
-    }
-    if (!initialized) {
+    if (s_override_settings_path) return s_override_settings_path;
+    if (initialized) return settings_path;
+    char *base = NULL;
 #if defined(__ANDROID__)
-        // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
-        // MainActivity.onCreate calls nativeSetStoragePath(getExternalFilesDir)
-        // before main() runs, so android_get_storage_path() returns the real,
-        // scoped-storage-exempt, writable app-external files dir. Fall back to
-        // the static path only if the JNI handoff hasn't happened yet.
-        extern const char *android_get_storage_path(void);
-        const char *ext = android_get_storage_path();
-        if (ext && ext[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/misrc_gui_settings.json", ext);
-        } else {
-            strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
-        }
-#elif defined(__APPLE__)
-        // Use ~/Library/Preferences on macOS
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/Library/Preferences/com.misrc.gui.json", home);
-        } else {
-            strcpy(settings_path, "./misrc_gui_settings.json");
-        }
+    extern const char *android_get_storage_path(void);
+    const char *ext = android_get_storage_path();
+    gui_settings_format(settings_path, sizeof(settings_path), "%s/misrc_gui_settings.json",
+                        ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
 #elif defined(_WIN32) || defined(_WIN64)
-        // Use %APPDATA% on Windows, then LOCALAPPDATA/USERPROFILE fallbacks.
-        const char* appdata = getenv("APPDATA");
-        if (!appdata || !appdata[0]) {
-            appdata = getenv("LOCALAPPDATA");
-        }
-        if (appdata && appdata[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s\\MISRC\\misrc_gui_settings.json", appdata);
-        } else {
-            const char* userprofile = getenv("USERPROFILE");
-            if (userprofile && userprofile[0]) {
-                snprintf(settings_path, sizeof(settings_path),
-                        "%s\\AppData\\Roaming\\MISRC\\misrc_gui_settings.json", userprofile);
-            } else {
-                strcpy(settings_path, "./misrc_gui_settings.json");
-            }
-        }
-#else
-        // Use XDG config directory on Linux/BSD.
-        const char* xdg_config_home = getenv("XDG_CONFIG_HOME");
-        if (xdg_config_home && xdg_config_home[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/misrc_gui_settings.json", xdg_config_home);
-        } else {
-            const char* home = getenv("HOME");
-            if (home && home[0]) {
-                snprintf(settings_path, sizeof(settings_path),
-                        "%s/.config/misrc_gui_settings.json", home);
-            } else {
-                strcpy(settings_path, "./misrc_gui_settings.json");
-            }
-        }
-#endif
-        initialized = true;
+    base = file_getenv_utf8("APPDATA");
+    if (!base || !base[0]) { free(base); base = file_getenv_utf8("LOCALAPPDATA"); }
+    if (base && base[0]) {
+        gui_settings_format(settings_path, sizeof(settings_path), "%s/MISRC/misrc_gui_settings.json", base);
+    } else {
+        free(base);
+        base = file_getenv_utf8("USERPROFILE");
+        if (base && base[0])
+            gui_settings_format(settings_path, sizeof(settings_path), "%s/AppData/Roaming/MISRC/misrc_gui_settings.json", base);
+        else
+            strcpy(settings_path, "./misrc_gui_settings.json");
     }
-
+#else
+    const char *suffix = "/.config/misrc_gui_settings.json";
+#ifdef __APPLE__
+    suffix = "/Library/Preferences/com.misrc.gui.json";
+#else
+    base = file_getenv_utf8("XDG_CONFIG_HOME");
+    if (base && base[0]) suffix = "/misrc_gui_settings.json";
+#endif
+    if (!base || !base[0]) { free(base); base = file_getenv_utf8("HOME"); }
+    if (base && base[0])
+        gui_settings_format(settings_path, sizeof(settings_path), "%s%s", base, suffix);
+    else
+        strcpy(settings_path, "./misrc_gui_settings.json");
+#endif
+    free(base);
+    initialized = true;
     return settings_path;
 }
 
-const char* gui_settings_get_desktop_path(void) {
-    static char desktop_path[512];
-    static bool initialized = false;
-
-    if (!initialized) {
-#if defined(__ANDROID__)
-        // Android 11+: use the scoped-storage-exempt external files dir handed
-        // in from Java (getExternalFilesDir), so native fopen() can write
-        // capture logs/FLAC here and the user can adb pull them. Fall back to
-        // the static path only if the JNI handoff hasn't happened yet.
-        extern const char *android_get_storage_path(void);
-        const char *ext = android_get_storage_path();
-        if (ext && ext[0]) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s", ext);
-        } else {
-            strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+#if defined(_WIN32) || defined(_WIN64)
+static bool gui_settings_from_wide(char *dst, size_t cap, const wchar_t *src) {
+    int need = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, -1, NULL, 0, NULL, NULL);
+    return need > 0 && (size_t)need <= cap &&
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, -1, dst, (int)cap, NULL, NULL) == need;
+}
+#elif !defined(__ANDROID__) && !defined(__APPLE__)
+// user-dirs.dirs contains shell-style quoted paths, but no shell is executed.
+static void gui_settings_xdg_desktop(char *dst, size_t cap, const char *home) {
+    char config[FILE_PATH_MAX];
+    char *xdg = file_getenv_utf8("XDG_CONFIG_HOME");
+    bool ok = xdg && xdg[0]
+        ? gui_settings_format(config, sizeof(config), "%s/user-dirs.dirs", xdg)
+        : gui_settings_format(config, sizeof(config), "%s/.config/user-dirs.dirs", home);
+    free(xdg);
+    FILE *f = ok ? file_open_read_utf8(config) : NULL;
+    if (!f) return;
+    char line[FILE_PATH_MAX * 2];
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        const char key[] = "XDG_DESKTOP_DIR=\"";
+        if (strncmp(p, key, sizeof(key) - 1)) continue;
+        p += sizeof(key) - 1;
+        char path[FILE_PATH_MAX];
+        size_t len = 0;
+        if (!strncmp(p, "$HOME", 5) && (p[5] == '/' || p[5] == '"')) {
+            len = strlen(home);
+            if (len >= sizeof(path)) break;
+            memcpy(path, home, len);
+            p += 5;
         }
-#elif defined(__APPLE__)
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
-        } else {
-            strcpy(desktop_path, ".");
+        while (*p && *p != '"' && len + 1 < sizeof(path)) {
+            if (*p == '\\' && (p[1] == '\\' || p[1] == '"' || p[1] == '$' || p[1] == '`')) p++;
+            path[len++] = *p++;
         }
-#elif defined(_WIN32) || defined(_WIN64)
-        const char* userprofile = getenv("USERPROFILE");
-        if (userprofile) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s\\Desktop", userprofile);
-        } else {
-            strcpy(desktop_path, ".");
-        }
-#else
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
-        } else {
-            strcpy(desktop_path, ".");
-        }
-#endif
-        initialized = true;
+        path[len] = '\0';
+        if (*p == '"' && gui_settings_path_is_dir(path)) gui_settings_copy(dst, cap, path);
+        break;
     }
+    fclose(f);
+}
+#endif
 
+const char* gui_settings_get_desktop_path(void) {
+    static char desktop_path[FILE_PATH_MAX];
+    static bool initialized = false;
+    if (initialized) return desktop_path;
+#if defined(__ANDROID__)
+    extern const char *android_get_storage_path(void);
+    const char *ext = android_get_storage_path();
+    gui_settings_format(desktop_path, sizeof(desktop_path), "%s",
+                        ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
+#elif defined(_WIN32) || defined(_WIN64)
+    PWSTR path = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &path))) {
+        gui_settings_from_wide(desktop_path, sizeof(desktop_path), path);
+        CoTaskMemFree(path);
+    }
+    if (!gui_settings_path_is_dir(desktop_path)) {
+        char *home = file_getenv_utf8("USERPROFILE");
+        gui_settings_copy(desktop_path, sizeof(desktop_path), home ? home : ".");
+        free(home);
+    }
+#else
+    char *home = file_getenv_utf8("HOME");
+    if (home && home[0]) {
+        gui_settings_format(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
+        if (!gui_settings_path_is_dir(desktop_path)) gui_settings_copy(desktop_path, sizeof(desktop_path), home);
+#ifndef __APPLE__
+        gui_settings_xdg_desktop(desktop_path, sizeof(desktop_path), home);
+#endif
+    }
+    free(home);
+#endif
+    if (!desktop_path[0]) strcpy(desktop_path, ".");
+    initialized = true;
     return desktop_path;
 }
 
@@ -274,7 +301,7 @@ void gui_settings_save(const gui_settings_t *settings) {
         free(text);
         return;
     }
-    FILE *f = fopen(path, "w");
+    FILE *f = file_open_utf8(path, "w");
     if (!f) {
         free(text);
         return;
@@ -285,119 +312,56 @@ void gui_settings_save(const gui_settings_t *settings) {
     gui_settings_bump_generation();
 }
 
-// Helpers
-static void trim_newlines(char *s) {
-    if (!s) return;
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
-        s[--len] = '\0';
+#if !defined(_WIN32) && !defined(_WIN64) && !defined(__ANDROID__)
+// Pickers append one newline. Read their complete output so embedded/trailing
+// newlines in a POSIX filename survive; reject overlong output, never a prefix.
+static bool gui_settings_read_picker(FILE *fp, char *dst, size_t cap) {
+    size_t len = 0;
+    bool overflow = false;
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (!c) overflow = true;
+        if (len < cap) dst[len++] = (char)c;
+        else overflow = true;
     }
-}
-
-// Output-folder picker. Returns true if output_path changed.
-// NOTE: On Android this is no longer called — the settings click handler in
-// gui_ui.c launches the async SAF picker (android_pick_output_folder_async)
-// and applies the result via the per-frame poll, so the render thread never
-// blocks across the picker Activity transition. This sync path remains for
-// desktop platforms.
-bool gui_settings_choose_output_folder(gui_settings_t *settings) {
-    if (!settings) return false;
-    char picked[512] = {0};
-#if defined(__ANDROID__)
-    /* Not reached on Android (async path in gui_ui.c handles it). */
-    (void)picked;
-    return false;
-#elif defined(__APPLE__)
-    // Use AppleScript choose folder dialog and return POSIX path.
-    const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-#elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker.
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    BROWSEINFOA bi = {0};
-    bi.lpszTitle = "Select output folder for MISRC captures";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS;
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (pidl) {
-        SHGetPathFromIDListA(pidl, picked);
-        CoTaskMemFree(pidl);
-    }
-    if (hr == S_OK) CoUninitialize();
-#else
-    // Linux/BSD: try zenity first, then kdialog.
-    const char *cmd =
-        "sh -c '"
-        "if command -v zenity >/dev/null 2>&1; then "
-        "zenity --file-selection --directory --title=\"Select output folder for MISRC captures\"; "
-        "elif command -v kdialog >/dev/null 2>&1; then "
-        "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; "
-        "fi'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-#endif
-    trim_newlines(picked);
-    if (picked[0] == '\0') return false;
-
-    size_t len = strlen(picked);
-    while (len > 1 && (picked[len - 1] == '/' || picked[len - 1] == '\\')) {
-        picked[--len] = '\0';
-    }
-
-    if (strncmp(settings->output_path, picked, MAX_FILENAME_LEN) == 0) {
-        return false;
-    }
-    strncpy(settings->output_path, picked, MAX_FILENAME_LEN - 1);
-    settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
+    if (ferror(fp) || overflow) return false;
+    if (len && dst[len - 1] == '\n') len--;
+    if (!len || len >= cap) return false;
+    dst[len] = '\0';
     return true;
 }
+#endif
 
-// Cross-platform (best-effort) playback file picker.
-bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
-    if (!settings) return false;
-    if (channel != 0 && channel != 1) return false;
-
-    char picked[512] = {0};
+// Output-folder and playback-file picker. On Android this is no longer
+// called -- the settings click handler in gui_ui.c launches the async SAF
+// picker (android_pick_output_folder_async) and applies the result via the
+// per-frame poll, so the render thread never blocks across the picker
+// Activity transition. This sync path remains for desktop platforms.
+static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #if defined(__ANDROID__)
-    /* Not reached on Android (async path in gui_ui.c handles it). */
-    (void)picked;
-    return false;
-#elif defined(__APPLE__)
-    // choose file, return POSIX path
-    const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-    trim_newlines(picked);
+    (void)picked; (void)cap; (void)folder;
+    return false; // Android uses the async SAF picker.
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 file picker using IFileOpenDialog
-    HRESULT hr2 = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     IFileOpenDialog *pfd = NULL;
+    bool ok = false;
     if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
-                                    &IID_IFileOpenDialog, (void **)&pfd))) {
-        COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
-        IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
-        IFileOpenDialog_SetTitle(pfd, L"Select FLAC playback file");
+                                   &IID_IFileOpenDialog, (void **)&pfd))) {
+        if (folder) {
+            DWORD options = 0;
+            IFileOpenDialog_GetOptions(pfd, &options);
+            IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        } else {
+            COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
+            IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
+        }
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
                 PWSTR wpath = NULL;
                 if (SUCCEEDED(IShellItem_GetDisplayName(psi, SIGDN_FILESYSPATH, &wpath))) {
-                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, picked, sizeof(picked), NULL, NULL);
+                    ok = gui_settings_from_wide(picked, cap, wpath);
                     CoTaskMemFree(wpath);
                 }
                 IShellItem_Release(psi);
@@ -405,35 +369,49 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
         }
         IFileOpenDialog_Release(pfd);
     }
-    if (hr2 == S_OK) CoUninitialize();
-    trim_newlines(picked);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return ok;
 #else
-    // Linux/BSD: try zenity first, then kdialog.
-    const char *cmd =
-        "sh -c '"
-        "if command -v zenity >/dev/null 2>&1; then "
-        "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
-        "elif command -v kdialog >/dev/null 2>&1; then "
-        "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; "
-        "fi'";
+#ifdef __APPLE__
+    const char *cmd = folder
+        ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
+#else
+    const char *cmd = folder
+        ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
+          "zenity --file-selection --directory --title=\"Select output folder for MISRC captures\"; "
+          "elif command -v kdialog >/dev/null 2>&1; then "
+          "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
+        : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
+          "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
+          "elif command -v kdialog >/dev/null 2>&1; then "
+          "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; fi'";
+#endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-    trim_newlines(picked);
+    bool ok = gui_settings_read_picker(fp, picked, cap);
+    return pclose(fp) == 0 && ok;
 #endif
+}
 
-    if (picked[0] == '\0') return false;
-    char *dst = (channel == 0) ? settings->playback_file_a : settings->playback_file_b;
-    if (strncmp(dst, picked, MAX_FILENAME_LEN) == 0) {
-        return false;
-    }
-    strncpy(dst, picked, MAX_FILENAME_LEN - 1);
-    dst[MAX_FILENAME_LEN - 1] = '\0';
-    return true;
+// Returns true if output_path changed.
+bool gui_settings_choose_output_folder(gui_settings_t *settings) {
+    if (!settings) return false;
+    char picked[FILE_PATH_MAX];
+    if (!gui_settings_pick_path(picked, sizeof(picked), true)) return false;
+    // Keep native root and literal POSIX backslash characters unchanged.
+    if (!strcmp(settings->output_path, picked)) return false;
+    return gui_settings_copy(settings->output_path, sizeof(settings->output_path), picked);
+}
+
+// Cross-platform (best-effort) playback file picker.
+bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
+    if (!settings || (channel != 0 && channel != 1)) return false;
+    char picked[FILE_PATH_MAX];
+    if (!gui_settings_pick_path(picked, sizeof(picked), false)) return false;
+    char *dst = channel == 0 ? settings->playback_file_a : settings->playback_file_b;
+    if (!strcmp(dst, picked)) return false;
+    return gui_settings_copy(dst, sizeof(settings->playback_file_a), picked);
 }
 
 void gui_settings_load(gui_settings_t *settings) {
@@ -443,7 +421,7 @@ void gui_settings_load(gui_settings_t *settings) {
     gui_settings_init_defaults(settings);
 
     const char* path = get_settings_file_path();
-    FILE* f = fopen(path, "r");
+    FILE* f = file_open_utf8(path, "rb");
     if (!f) return; // No settings file, use defaults
 
     // Read entire file
@@ -465,6 +443,12 @@ void gui_settings_load(gui_settings_t *settings) {
     size_t read_size = fread(content, 1, size, f);
     content[read_size] = '\0';
     fclose(f);
+
+    // Editors may prefix either legacy or current settings with a UTF-8 BOM.
+    if (read_size >= 3 && !memcmp(content, "\xef\xbb\xbf", 3)) {
+        read_size -= 3;
+        memmove(content, content + 3, read_size + 1);
+    }
 
     // Parse values (every key the table knows), then the post-load migrations.
     gui_settings_parse_text(settings, content);

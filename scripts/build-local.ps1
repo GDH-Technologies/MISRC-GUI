@@ -249,6 +249,22 @@ if ($BootstrapOnly) {
     exit 0
 }
 
+# CI parity gate: run the same static guard tests CI's preflight runs BEFORE
+# any deps/meson work, so a guard break (optional-dep guard consistency,
+# workflow contracts, ...) fails the local build first instead of only the
+# manually dispatched CI run. Regression e34dce9: libFLAC-guarded struct
+# members were referenced outside the guard in gui_playback.c; local builds
+# passed and the dispatched CI run failed a day later.
+$guardScript = Join-Path $repoRoot "misrc_tools/test/ci_guard_tests.py"
+if (-not (Test-Path $guardScript)) {
+    Fail "CI guard test script not found: $guardScript"
+}
+Write-Log "CI guard tests (static) before build"
+& $pythonExe $guardScript --static-only
+if ($LASTEXITCODE -ne 0) {
+    Fail "CI guard tests failed (see output above). Fix the reported errors and rerun."
+}
+
 Require-Command -Name "pkg-config" -Hint "Install pkg-config (or provide it in your build shell)."
 Require-Command -Name "nasm" -Hint "Install nasm (required by this project build)."
 

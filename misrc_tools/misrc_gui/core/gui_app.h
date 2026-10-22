@@ -9,6 +9,7 @@
 #include <time.h>
 #include "raylib.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 #ifdef ENABLE_DDD
 #include "../../common/ddd_protocol.h"
 #endif
@@ -54,6 +55,18 @@ typedef struct channel_panel_config {
     int right_source;              // Data feeding the right panel
     Rectangle left_bounds;         // Cached bounds from last render (for click handling)
     Rectangle right_bounds;        // Cached bounds for right panel
+    // One-slot view-state cache per side: switching views PARKS the live
+    // state here instead of destroying it, so switching back restores the
+    // live state - the video panel keeps its decoder sync lock and system
+    // selection, the waveform keeps its zoom - instead of re-creating and
+    // re-acquiring from scratch (user report 2026-10-20: switching panel
+    // modes lost sync and reset the system to PAL). A switch to a different
+    // view evicts the parked state. Managed by gui_panel.c; cached_state
+    // NULL means the slot is empty.
+    panel_view_type_t left_cached_view;
+    void *left_cached_state;
+    panel_view_type_t right_cached_view;
+    void *right_cached_state;
 } channel_panel_config_t;
 
 // Display buffer size (samples per channel for oscilloscope)
@@ -272,6 +285,11 @@ typedef struct gui_app {
     atomic_uint_fast32_t clip_count_b_neg;
     atomic_bool stream_synced;
     atomic_uint_fast32_t sample_rate;
+    // Zero per-channel rate falls back to the live shared rate; explicit rates
+    // describe independent hardware/file clocks even when preview is gated.
+    atomic_uint_fast32_t rf_source_rate_hz[2];
+    atomic_bool rf_preview_input_supported;
+    atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
 
     // Audio monitoring peaks (24-bit audio magnitude, per channel 1..4)
@@ -435,9 +453,11 @@ void gui_app_cleanup(gui_app_t *app);
 // Device management
 void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
+/* Commit a prepared FLAC playback start on the UI thread. Call every frame. */
+void gui_app_poll_capture_start(gui_app_t *app);
 /* Android-only: run gui_app_start_capture() on a worker thread so the render
  * loop stays responsive during hsdaoh_open + stream start. On non-Android
- * builds this is not declared/defined. */
+ * builds this is not declared/defined. FLAC uses its own preparation worker. */
 #if defined(__ANDROID__)
 void gui_app_start_capture_async(gui_app_t *app);
 void gui_app_stop_capture_async(gui_app_t *app);

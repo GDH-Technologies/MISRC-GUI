@@ -102,6 +102,10 @@ typedef struct buffer_manager {
     /* Statistics */
     buffer_stats_t stats[BUF_COUNT];
 
+    /* Optional RF sideband publisher, installed only while producers are stopped.
+     * Runs before RF bytes become visible; it must never wait for queue space. */
+    void (*rf_write_observer)(void *context, uint64_t byte_position, size_t bytes);
+    void *rf_write_observer_context;
     /* Optional write taps (bufmgr_set_write_tap); cleared by init */
     _Atomic(bufmgr_write_tap_fn) write_tap[BUF_COUNT];
     _Atomic(void *) write_tap_ctx[BUF_COUNT];

@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "../../common/file_utils.h"   // FILE_PATH_MAX
 
 #ifndef MAX_FILENAME_LEN
 #define MAX_FILENAME_LEN 256
@@ -21,7 +22,7 @@ typedef struct {
     int device_index;
     char output_filename_a[MAX_FILENAME_LEN];
     char output_filename_b[MAX_FILENAME_LEN];
-    char output_path[MAX_FILENAME_LEN];        // Default save path (Desktop)
+    char output_path[FILE_PATH_MAX];           // Default save path (Desktop)
     bool capture_a;
     bool capture_b;
 
@@ -42,6 +43,7 @@ typedef struct {
 
     // RF bit depth selection (per-channel)
     // FLAC supports 8/12/16; RAW supports 8/16 (12 is disabled in RAW UI).
+    int rf_preview_budget_percent;            // Shared preview budget: 50..300% of one logical core (machine-scaled default).
     uint8_t rf_bits_a;
     uint8_t rf_bits_b;
     // CXADC capture mode per card: false=8-bit @ base 40 MSPS,
@@ -250,9 +252,21 @@ typedef struct {
     float   demod_volume;                 // 0.0-2.0 output volume (1.0 = unity)
     int     demod_output_pair;            // 0 = CH1/2, 1 = CH3/4 (audio monitor output pair)
 
+    // Video panel: the CVBS System selector's persisted pick
+    // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).
+    // Applied to every CVBS panel decoder at create; the System dropdown
+    // writes the user's selection back here (saved with the normal
+    // exit-time settings save).
+    int     video_system;
+
     // Playback settings
-    char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
-    char playback_file_b[MAX_FILENAME_LEN];   // FLAC file for channel B playback
+    char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
+    char playback_file_b[FILE_PATH_MAX];   // FLAC file for channel B playback
+    char playback_audio_file[FILE_PATH_MAX]; // Audio-rate file for the playback
+                                             // monitor (drag-and-drop; the
+                                             // position-synced feed in
+                                             // gui_playback.c plays it via
+                                             // Audio Mon)
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),
@@ -317,8 +331,15 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel);
 
 /* A settings file larger than this is ignored on load (defaults are used),
  * and the writer never produces one: the whole table formats into a buffer
- * of this size. */
-#define GUI_SETTINGS_MAX_FILE_BYTES 32768
+ * of this size. 256 KiB, upstream's own load limit since v1.2.6: three
+ * FILE_PATH_MAX paths, JSON-escaped, no longer fit the old 32 KiB. */
+#define GUI_SETTINGS_MAX_FILE_BYTES 262144
+
+/* The file's first key (upstream v1.2.6, format 2): strings in the file are
+ * JSON-escaped. A file without it is format 1, whose strings are raw (Windows
+ * backslashes literal), and is read that way. Not a table row. */
+#define GUI_SETTINGS_FORMAT_VERSION_KEY "settings_format_version"
+#define GUI_SETTINGS_FORMAT_VERSION 2
 
 typedef enum {
     GS_BOOL = 0,

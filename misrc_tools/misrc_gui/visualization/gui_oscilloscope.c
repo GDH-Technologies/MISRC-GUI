@@ -16,7 +16,9 @@
 #include "gui_panel.h"
 #include "gui_panel.h"
 #include "../ui/gui_dropdown.h"
+#include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
+#include "../input/gui_playback.h" // DAW-style pause: re-process on config change
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,10 +107,23 @@ typedef struct {
     Rectangle scale_opts_rect[5];
     bool scale_dropdown_open;
 
+    // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
+    // ALL overlay chrome (Scale/Mode/Trig dropdowns + labels); the grid,
+    // channel label, time/div and waveform keep rendering.
+    gui_chrome_hide_t chrome_hide;
+
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
 
     // Drag state for trigger level
     bool dragging;
+
+    // Config-changed flag (guarded by data_lock): set when zoom / trigger
+    // settings change (scroll, dropdowns, level drag). Cleared when the
+    // config is applied to a frame in waveform_vtable_process. While
+    // playback is PAUSED no new display frames arrive, so waveform_render
+    // re-processes the last frame on this flag (DAW-style: zoom/trigger
+    // adjustments keep rendering while paused).
+    bool config_dirty;
 
     // CVBS detected levels (updated when CVBS trigger mode active)
     int16_t cvbs_sync_level;    // Sync tip level (lowest peak)
@@ -1092,6 +1107,9 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
         state->display_samples_available = new_available;
         state->trigger_display_pos = new_trigger_display_pos;
     }
+    // The current config has been applied to this frame: a pending
+    // zoom/trigger change no longer needs a paused re-process.
+    state->config_dirty = false;
     waveform_state_unlock(state);
 }
 
@@ -1212,6 +1230,12 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
 
     if (!state->initialized) return;
+
+    // Double-click on the panel (waveform_panel_handle_click) toggles ALL
+    // the overlay chrome — Scale/Mode/Trig dropdowns + their labels — for a
+    // clean waveform view; the grid, channel label and waveform (drawn by
+    // the data render path) keep rendering.
+    if (gui_chrome_hide_hidden(&state->chrome_hide)) return;
 
     float btn_h = 18;
     float render_btn_y = bounds.y + 8;
@@ -1530,12 +1554,12 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 // Waveform Panel Click Handler (with dropdown support)
 //-----------------------------------------------------------------------------
 
-static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, int channel,
-                                         Vector2 click, Rectangle bounds) {
-
-    if (!state_ptr || !app) return false;
-    waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
-    waveform_apply_channel_trigger_source_default(state, channel);
+// Overlay control clicks (Scale / Mode / Trig dropdowns). Returns true when a
+// control consumed the click (button hit or an open dropdown's option/close
+// path); false when no control was hit, so the caller can offer the click to
+// the double-click chrome-hide tracker.
+static bool waveform_handle_control_click(waveform_panel_state_t *state, struct gui_app *app,
+                                           int channel, Vector2 click) {
 
     // A popup can overlap either button after wrapping or shifting upward.
     // Its visible rows (including the Channel header) take click priority.
@@ -1616,6 +1640,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         if (CheckCollisionPointRec(click, off_rect)) {
             waveform_state_lock(state);
             state->trigger_enabled = false;
+            state->config_dirty = true;
             waveform_state_unlock(state);
             state->trigger_dropdown_open = false;
             return true;
@@ -1632,6 +1657,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
                     state->trigger_source = waveform_default_trigger_source_for_channel(channel);
                 }
                 state->trigger_mode = (trigger_mode_t)i;
+                state->config_dirty = true;
                 waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
@@ -1644,6 +1670,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
             if (CheckCollisionPointRec(click, src_rect)) {
                 waveform_state_lock(state);
                 state->trigger_source = (trigger_source_t)i;
+                state->config_dirty = true;
                 waveform_state_unlock(state);
                 state->trigger_dropdown_open = false;
                 return true;
@@ -1655,12 +1682,45 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return true;
     }
 
+    // No overlay control was hit by this click.
+    return false;
+}
+
+static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, int channel,
+                                         Vector2 click, Rectangle bounds) {
+
+    if (!state_ptr || !app) return false;
+    waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    waveform_apply_channel_trigger_source_default(state, channel);
+
+    // Click outside the panel resets double-click tracking.
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return false;
+    }
+
+    // Control clicks first (only while the overlay is shown — its rectangles
+    // are stale while hidden) so a double-click ON a control never toggles
+    // the chrome; a consumed control click also resets the tracker.
+    if (!gui_chrome_hide_hidden(&state->chrome_hide) &&
+        waveform_handle_control_click(state, app, channel, click)) {
+        gui_chrome_hide_reset(&state->chrome_hide);
+        return true;
+    }
+
+    // Double-click anywhere else on the panel toggles ALL overlay
+    // chrome (Scale/Mode/Trig dropdowns + labels) for a clean
+    // waveform view.
+    if (gui_chrome_hide_feed_click(&state->chrome_hide, click)) {
+        state->render_mode_dropdown_open = false;
+        state->trigger_dropdown_open = false;
+        state->scale_dropdown_open = false;
+        return true;
+    }
+
     //-------------------------------------------------------------------------
     // Trigger Level Drag
     //-------------------------------------------------------------------------
-    if (!CheckCollisionPointRec(click, bounds)) {
-        return false;
-    }
 
     // Trigger level drag adjusts an already-enabled trigger only.
     if (!state->trigger_enabled) {
@@ -1691,6 +1751,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 
         waveform_state_lock(state);
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        state->config_dirty = true;
         waveform_state_unlock(state);
 
         return true;
@@ -1723,6 +1784,7 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
         waveform_state_lock(state);
 
         state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        state->config_dirty = true;
         waveform_state_unlock(state);
     } else {
         // Mouse released - stop dragging
@@ -1754,6 +1816,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
         if (state->zoom_scale < ZOOM_SCALE_MIN) {
             state->zoom_scale = ZOOM_SCALE_MIN;
         }
+        state->config_dirty = true;
         waveform_state_unlock(state);
     } else {
         // Scroll down = zoom out (more samples per pixel)
@@ -1762,6 +1825,7 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
         if (state->zoom_scale > ZOOM_SCALE_MAX) {
             state->zoom_scale = ZOOM_SCALE_MAX;
         }
+        state->config_dirty = true;
         waveform_state_unlock(state);
     }
 
@@ -1783,7 +1847,30 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
 
+    // DAW-style pause hold (playback only): while PAUSED no new display
+    // frames arrive, so zoom / trigger-level changes would not render until
+    // resume (config is applied per frame in waveform_vtable_process).
+    // Re-process the LAST display frame — the trigger source buffers still
+    // reference it — whenever the config changed while holding, so zoom,
+    // trigger level and trigger mode keep rendering live while paused.
+    if (app->selected_device >= 0 &&
+        app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK &&
+        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED) {
+        bool dirty = false;
+        waveform_state_lock(state);
+        dirty = state->config_dirty;
+        waveform_state_unlock(state);
+        if (dirty) {
+            const int16_t *src = (channel == 1) ? s_trigger_src_ch2 : s_trigger_src_ch1;
+            if (src && s_trigger_src_count > 0) {
+                waveform_vtable_process(state, src, s_trigger_src_count,
+                                        atomic_load(&app->sample_rate));
+            }
+        }
+    }
 
+    // Dispatch based on render mode
     // Dispatch based on render mode
     if (state->render_mode == WAVEFORM_MODE_PHOSPHOR) {
         render_waveform_phosphor_internal(state, app, channel, bounds, channel_color);

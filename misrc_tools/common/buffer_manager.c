@@ -74,8 +74,8 @@ static const backpressure_policy_t s_default_policies[BUF_COUNT] = {
         .log_drops = true,
     },
     [BUF_DISPLAY] = {
-        .max_wait_attempts = 3,    /* Don't really care if this drops */
-        .wait_timeout_ms = 1,
+        .max_wait_attempts = 0,    /* Preview must never hold up RF extraction. */
+        .wait_timeout_ms = 0,
         .log_first_wait = true,
         .log_drops = true,
     },
@@ -390,6 +390,9 @@ void bufmgr_write_end(buffer_manager_t *mgr, buffer_id_t id, size_t bytes) {
      * asking again before rb_write_finished() yields the same pointer
      * bufmgr_write_begin() handed out (the mapping is contiguous). */
     const void *region = rb_write_ptr(rb, bytes);
+    if (id == BUF_CAPTURE_RF && mgr->rf_write_observer)
+        mgr->rf_write_observer(mgr->rf_write_observer_context,
+                                atomic_load(&mgr->stats[id].bytes_written), bytes);
     rb_write_finished(rb, bytes);
     atomic_fetch_add(&mgr->stats[id].bytes_written, bytes);
 

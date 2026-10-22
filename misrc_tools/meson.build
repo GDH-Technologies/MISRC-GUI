@@ -49,6 +49,8 @@ ldflags_capture = [
 
 sources_extract = [
   'misrc_capture/misrc_extract.c',
+  'common/file_utils.c',
+  'common/utf8_argv.c',
   'common/extract.c',
   version_target
 ]
@@ -63,6 +65,7 @@ sources_capture = [
   'common/frame_parser.c',
   'common/device_enum.c',
   'common/file_utils.c',
+  'common/utf8_argv.c',
   'common/ringbuffer_writer.c',
   version_target
 ]
@@ -82,6 +85,9 @@ host_cpu_family = host_machine.cpu_family()
 
 host_system = host_machine.system()
 windows_static_deps = host_system == 'windows' or host_system == 'cygwin'
+if host_system == 'windows'
+  ldflags += ['-lshell32']
+endif
 
 if host_system == 'darwin'
   cflags += ['-D_DARWIN_C_SOURCE']
@@ -143,7 +149,12 @@ endif
 # from an old `make install`). Fall back to pkg-config only if the vendored
 # install is absent, and warn loudly there so the gap is visible.
 fs = import('fs')
-hsdaoh_deps_root = meson.current_source_dir() / '..' / '.deps' / 'install'
+hsdaoh_vendored_prefix = meson.current_source_dir() / '..' / '.deps' / 'install'
+# A local checkout may also contain a Linux .deps/install. Keep Windows
+# archives in the existing install-win prefix separate from ELF libraries.
+if host_system == 'windows' and fs.exists(meson.current_source_dir() / '..' / '.deps' / 'install-win' / 'lib' / 'pkgconfig' / 'hsdaoh.pc')
+  hsdaoh_vendored_prefix = meson.current_source_dir() / '..' / '.deps' / 'install-win'
+endif
 
 # The vendored install lands in 'lib' on Debian/CI but 'lib64' on Fedora and
 # other GNUInstallDirs-multilib distros, and CMake names the file libhsdaoh.pc
@@ -153,8 +164,8 @@ vendored_pc_dir = ''
 hsdaoh_pc_name = ''
 foreach _libdir : ['lib', 'lib64']
   foreach _pc : ['hsdaoh', 'libhsdaoh']
-    if vendored_pc_dir == '' and fs.exists(hsdaoh_deps_root / _libdir / 'pkgconfig' / (_pc + '.pc'))
-      vendored_pc_dir = hsdaoh_deps_root / _libdir / 'pkgconfig'
+    if vendored_pc_dir == '' and fs.exists(hsdaoh_vendored_prefix / _libdir / 'pkgconfig' / (_pc + '.pc'))
+      vendored_pc_dir = hsdaoh_vendored_prefix / _libdir / 'pkgconfig'
       hsdaoh_pc_name = _pc
     endif
   endforeach
@@ -178,7 +189,7 @@ if vendored_pc_dir != ''
     compile_args: hs_cflags,
     link_args: hs_libs + ['-Wl,-rpath,' + hsdaoh_libdir],
   )
-  message('Using vendored hsdaoh from .deps/install (mirrors CI; libdir=' + hsdaoh_libdir + ')')
+  message('Using vendored hsdaoh from ' + hsdaoh_vendored_prefix + ' (mirrors CI; libdir=' + hsdaoh_libdir + ')')
 else
   hsdaoh_dep = dependency('hsdaoh', static: windows_static_deps)
   warning('Vendored hsdaoh not found in .deps/install; falling back to system hsdaoh. ' +
@@ -400,12 +411,22 @@ endif
 # APK has no terminal to run them, and they would only add cross-link risk.
 # The Android build target is the libmisrc_gui.so NativeActivity library below.
 if host_system != 'android'
-  executable('misrc_extract',
+  extract_exe = executable('misrc_extract',
                 sources_extract,
                 dependencies: [],
                 link_args: ldflags,
                 c_args: cflags,
                 install: true)
+
+  path_io_test = executable('path_io_test',
+    ['test/path_io_test.c', 'common/file_utils.c', 'common/utf8_argv.c'],
+    c_args: cflags, link_args: ldflags)
+  path_test_python = find_program('python3', 'python', required: false)
+  if path_test_python.found()
+    test('path_io', path_test_python,
+      args: [files('test/path_io_test.py'), path_io_test.full_path(), extract_exe.full_path()],
+      depends: [path_io_test, extract_exe])
+  endif
 
   executable('misrc_capture',
                 sources_capture,
@@ -445,6 +466,7 @@ if raylib_dep.found()
     'misrc_gui/streaming/gui_alsa_device.c',
     'misrc_gui/streaming/gui_rtsp_stream.c',
     'misrc_gui/streaming/gui_stream_soak.c',
+    'misrc_gui/input/gui_playback_length_cache.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
@@ -453,6 +475,12 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vhs_fm.c',
+    'misrc_gui/signal/gui_rf_preview.c',
+    'misrc_gui/signal/gui_rf_resampler.c',
+    'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
+    'misrc_gui/processing/gui_rf_preview_policy.c',
+    'misrc_gui/processing/gui_rf_preview_pressure.c',
+    'misrc_gui/processing/gui_rf_stream_marks.c',
     'misrc_gui/signal/gui_histogram.c',
     'misrc_gui/signal/gui_demod.c',
     # Visualization
@@ -467,8 +495,10 @@ if raylib_dep.found()
     'misrc_gui/visualization/panel_registry.c',
     'misrc_gui/visualization/gui_preview_panel.c',
     # UI
+    'misrc_gui/ui/gui_font.c',
     'misrc_gui/ui/gui_ui_scale.c',
     'misrc_gui/ui/gui_ui.c',
+    'misrc_gui/ui/gui_chrome_hide.c',
     'misrc_gui/ui/gui_device_label.c',
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
@@ -493,6 +523,7 @@ if raylib_dep.found()
     'common/frame_parser.c',
     'common/device_enum.c',
     'common/file_utils.c',
+    'common/utf8_argv.c',
     'common/ringbuffer_writer.c',
     version_target
   ]
@@ -541,10 +572,22 @@ if raylib_dep.found()
     # MSYS2 install list does not include, so the flag breaks the link with
     # "cannot find -l:libglfw3.dll.a". OpenGL/GDI/winmm are still required.
     gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
-    # RTL-SDR: link the static archive by filename (MSYS2 names it librtlsdr_static.a;
-    # the .pc -lrtlsdr resolves to the DLL import lib which -static rejects).
+    # RTL-SDR: link the static archive by filename (MSYS2 names it
+    # librtlsdr_static.a; the .pc -lrtlsdr resolves to the DLL import lib
+    # which -static rejects), with the .pc's OWN libdir on the search path:
+    # the .pc may resolve from a different MSYS2 environment's pkgconfig
+    # dir than the compiler's (e.g. rtl-sdr installed only under mingw64
+    # while the GUI builds with the ucrt64 toolchain for CI parity) - ld's
+    # default search path only covers the compiler's own environment, so
+    # the by-filename archive link failed with "cannot find
+    # -l:librtlsdr_static.a". CI is unaffected (it installs no rtlsdr:
+    # RTLSDR stays disabled there).
     if rtlsdr_enabled
       gui_ldflags += ['-l:librtlsdr_static.a']
+      rtlsdr_libdir = rtlsdr_pc.get_variable(pkgconfig : 'libdir', default_value : '')
+      if rtlsdr_libdir != ''
+        gui_ldflags += ['-L' + rtlsdr_libdir]
+      endif
     endif
     # Need mincore for VirtualAlloc2/MapViewOfFile3 used by ringbuffer
     gui_ldflags += ['-lmincore']
@@ -552,6 +595,10 @@ if raylib_dep.found()
     gui_ldflags += ['-lws2_32']
     # simple_capture for device enumeration
     sources_gui += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'
+    # Windows modal move/size loop render driver (subclass + WM_TIMER
+    # frames; backlog item 2 - the window froze during move/resize because
+    # DefWindowProc's modal loop blocked raylib's event poll)
+    sources_gui += 'misrc_gui/core/gui_win32_modal.c'
     gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']
@@ -634,6 +681,11 @@ if raylib_dep.found()
   endif
 
   if host_system != 'android'
+    font_test = executable('gui_font_test',
+      ['test/gui_font_test.c', 'common/file_utils.c'],
+      dependencies: [raylib_dep], c_args: cflags, link_args: gui_ldflags)
+    test('gui_font', font_test)
+
     # Exercise the real overlay layout/click code with drawing stubs, without
     # opening a window or linking capture backends. LTO drops unrelated code
     # from the included waveform implementation, including in debug builds.
@@ -642,8 +694,11 @@ if raylib_dep.found()
       overlay_test_deps += dep.partial_dependency(compile_args: true, includes: true)
     endforeach
     overlay_test_deps += meson.get_compiler('c').find_library('m', required: false)
+    # The harness includes the waveform implementation, which now calls the
+    # shared chrome-hide helper (double-click overlay toggle), so compile it
+    # in too. Same for the other panel harnesses below.
     waveform_overlay_test = executable('gui_waveform_overlay_test',
-      'test/gui_waveform_overlay_harness.c',
+      ['test/gui_waveform_overlay_harness.c', 'misrc_gui/ui/gui_chrome_hide.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -652,7 +707,8 @@ if raylib_dep.found()
     test('gui_waveform_overlay', waveform_overlay_test)
 
     fft_label_test = executable('gui_fft_label_test',
-      'test/gui_fft_label_harness.c',
+      ['test/gui_fft_label_harness.c', 'misrc_gui/ui/gui_chrome_hide.c',
+       'misrc_gui/visualization/gui_text.c'],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -660,10 +716,34 @@ if raylib_dep.found()
     )
     test('gui_fft_label', fft_label_test)
 
+    settings_path_ldflags = ldflags
+    if host_system == 'windows'
+      settings_path_ldflags += ['-lole32']
+    else
+      settings_path_ldflags += ['-lm']
+    endif
+    settings_paths_test = executable('gui_settings_paths_test',
+      ['test/gui_settings_paths_test.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/file_utils.c',
+       'common/ddd_protocol.c'],
+      dependencies: overlay_test_deps, include_directories: gui_includes,
+      c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
+      override_options: ['b_lto=true', 'optimization=2'])
+    test('gui_settings_paths', settings_paths_test)
+    if flac_dep.found()
+      record_paths_test = executable('gui_record_paths_test',
+        # GDH fork: the fork's FLAC finalize lives in common/flac_writer.c.
+        ['test/gui_record_paths_test.c', 'common/file_utils.c', 'common/flac_writer.c', version_target],
+        dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
+        c_args: cflags + ['-fwhole-program'], link_args: ldflags,
+        override_options: ['b_lto=true', 'optimization=2'])
+      test('gui_record_paths', record_paths_test)
+    endif
+
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
     stats_layout_test = executable('gui_stats_layout_test',
-      ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c', version_target],
+      ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c',
+       'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -683,7 +763,7 @@ if raylib_dep.found()
 
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
-      ['test/gui_toolbar_layout_harness.c', version_target],
+      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -692,7 +772,7 @@ if raylib_dep.found()
     test('gui_toolbar_layout', toolbar_layout_test)
 
     viewport_layout_test = executable('gui_viewport_layout_test',
-      ['test/gui_viewport_layout_harness.c', version_target],
+      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -708,12 +788,249 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_record_limit', record_limit_test)
+
+    spectrogram_lifetime_test = executable('gui_spectrogram_playback_lifetime_test',
+      ['test/gui_spectrogram_playback_lifetime_test.c', 'misrc_gui/ui/gui_chrome_hide.c'],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_spectrogram_playback_lifetime', spectrogram_lifetime_test)
+
+    # Playback file-info resolution + decoder IO layer (STREAMINFO patch)
+    # coverage. Synthesizes both FLAC header conventions with libFLAC, so it
+    # needs the FLAC dependency at link time (not just compile args). The
+    # paused-analysis path also FFTs on worker threads (gui_fft.c), so FFTW
+    # is linked as well.
+    if flac_dep.found() and fftw3f_dep.found()
+      playback_resolve_test = executable('gui_playback_resolve_test',
+        ['test/gui_playback_resolve_harness.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
+         'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
+        dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_playback_resolve', playback_resolve_test)
+    endif
+    rf_input_stamps_test = executable('gui_rf_input_stamps_test',
+      'test/gui_rf_input_stamps_test.c',
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_rf_input_stamps', rf_input_stamps_test)
+    rf_routes_test = executable('gui_rf_routes_test',
+      'test/gui_rf_routes_test.c',
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_rf_routes', rf_routes_test)
+
+    # Synthetic baseband composite contracts for the ported CVBS profile +
+    # VBI sync model + burst-locked colour (gui_cvbs.c included directly,
+    # trigger_analyze_cvbs_levels links from gui_trigger.c; LTO drops UI paths).
+    # gui_cvbs.c now carries the fixed-rate input resampler, so the soxr
+    # link dependency is needed wherever it is compiled.
+    cvbs_baseband_deps = overlay_test_deps + [dependency('threads')]
+    if soxr_dep.found()
+      cvbs_baseband_deps += [soxr_dep]
+    endif
+    cvbs_baseband_test = executable('gui_cvbs_test',
+      ['test/gui_cvbs_test.c', 'misrc_gui/signal/gui_trigger.c'],
+      dependencies: cvbs_baseband_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_cvbs_baseband', cvbs_baseband_test)
+
+    audio_hifi_monitor_test = executable('gui_audio_hifi_monitor_test',
+      'test/gui_audio_hifi_monitor_test.c',
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
+    test('gui_audio_hifi_monitor', audio_hifi_monitor_test)
+    if soxr_dep.found()
+      audio_soxr_lifecycle_test = executable('gui_audio_soxr_lifecycle_test',
+        'test/gui_audio_soxr_lifecycle_test.c',
+        dependencies: overlay_test_deps + [dependency('threads')],
+        include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
+      test('gui_audio_soxr_lifecycle', audio_soxr_lifecycle_test)
+    endif
+
+
+    capture_watchdog_test = executable('gui_capture_watchdog_test',
+      ['test/gui_capture_watchdog_test.c', 'common/file_utils.c',
+       'test/gui_playback_audio_stub.c'],
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_capture_watchdog', capture_watchdog_test)
+    if flac_dep.found()
+      rf_seek_test = executable('gui_rf_playback_seek_test',
+        ['test/gui_rf_playback_seek_test.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
+         'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
+        dependencies: overlay_test_deps + [flac_dep, fftw3f_dep],
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        link_args: ldflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_rf_playback_seek', rf_seek_test)
+      rf_start_test = executable('gui_rf_playback_start_test',
+        ['test/gui_rf_playback_start_test.c', 'test/gui_playback_audio_stub.c',
+         'common/file_utils.c',
+         'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/visualization/gui_fft.c',
+         'misrc_gui/ui/gui_chrome_hide.c'],
+        dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        link_args: ldflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_rf_playback_start', rf_start_test)
+
+      # Manual exact-media integration: requires one second of 20 MHz NTSC
+      # s16le RF and an output directory, so it is not a default CI test.
+      rf_reconnect_sources = [
+        'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
+        'common/file_utils.c',
+        'misrc_gui/input/gui_playback_length_cache.c',
+        'misrc_gui/visualization/gui_fft.c',
+        'misrc_gui/ui/gui_chrome_hide.c',
+        'common/extract.c', 'common/ringbuffer.c',
+        'common/rb_event.c', 'common/buffer_manager.c',
+        'misrc_gui/processing/gui_rf_stream_marks.c',
+        'misrc_gui/signal/gui_vhs_fm.c',
+        'misrc_gui/signal/gui_rf_preview.c',
+        'misrc_gui/signal/gui_rf_resampler.c',
+        'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
+        'misrc_gui/processing/gui_rf_preview_policy.c',
+        'misrc_gui/processing/gui_rf_preview_pressure.c',
+      ]
+      if host_cpu_family == 'x86_64'
+        rf_reconnect_sources += nasm_genb
+      endif
+      rf_reconnect_deps = overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')]
+      if soxr_dep.found()
+        rf_reconnect_deps += soxr_dep
+      endif
+      if host_system == 'windows'
+        rf_reconnect_deps += [meson.get_compiler('c').find_library('psapi'),
+                              meson.get_compiler('c').find_library('onecore')]
+      endif
+      executable('gui_rf_playback_reconnect_test', rf_reconnect_sources,
+        dependencies: rf_reconnect_deps,
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        link_args: ldflags,
+        build_by_default: false,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+    endif
+
+    # This helper compiles and runs a native fixture itself; cross builds
+    # must use Meson's executable wrapper for their normal C test targets.
+    timeline_cc = meson.get_compiler('c').cmd_array()
+    if not meson.is_cross_build() and timeline_cc.length() == 1
+      timeline_python = find_program('python3', 'python', required: false)
+      if timeline_python.found()
+        test('gui_rf_playback_timeline', timeline_python,
+          args: [files('test/gui_rf_playback_timeline_test.py'), '--cc', timeline_cc[0],
+                 '--temp-dir', meson.current_build_dir()],
+        )
+      endif
+    endif
   endif
 
   message('raylib found, building GUI application')
 else
   message('raylib not found, skipping GUI application. ' +
           'Reconfigure with -Dmisrc_gui=enabled to make this a hard error instead.')
+endif
+
+# Persistent length caching is independent of FLAC and the GUI.
+playback_length_cache_test = executable('gui_playback_length_cache_test',
+  ['test/gui_playback_length_cache_test.c', 'misrc_gui/input/gui_playback_length_cache.c'],
+  c_args: cflags, link_args: ldflags)
+test('gui_playback_length_cache', playback_length_cache_test)
+
+# RF DSP tests are independent of the native GUI and capture backends.
+rf_test_deps = [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)]
+if soxr_dep.found()
+  rf_test_deps += [soxr_dep]
+endif
+rf_test_cflags = cflags + ['-O3', '-ffast-math', '-funroll-loops', '-ftree-vectorize']
+rf_decoder_test = executable('gui_rf_preview_test',
+  ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_preview', rf_decoder_test, timeout: 120)
+rf_resampler_test = executable('gui_rf_resampler_test',
+  ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_resampler', rf_resampler_test)
+rf_worker_test = executable('gui_rf_preview_worker_test',
+  ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
+   'misrc_gui/processing/gui_rf_preview_policy.c'],
+  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)], c_args: cflags, link_args: ldflags)
+test('gui_rf_preview_worker', rf_worker_test)
+if host_machine.system() == 'windows'
+  rf_handoff_test = executable('gui_rf_preview_handoff_test',
+    ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+  test('gui_rf_preview_handoff', rf_handoff_test)
+  rf_idle_cpu_probe = executable('gui_rf_preview_idle_cpu_probe',
+    ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads')], c_args: rf_test_cflags, link_args: ldflags)
+  test('gui_rf_preview_idle_cpu', rf_idle_cpu_probe)
+endif
+rf_file_harness = executable('gui_rf_preview_file',
+  ['test/gui_rf_preview_file.c', 'misrc_gui/signal/gui_rf_preview.c',
+   'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
+   'misrc_gui/processing/gui_rf_preview_policy.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+rf_marks_test = executable('gui_rf_stream_marks_test',
+  ['test/gui_rf_stream_marks_test.c','misrc_gui/processing/gui_rf_stream_marks.c'],
+  dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+test('gui_rf_stream_marks', rf_marks_test)
+rf_pressure_test = executable('gui_rf_preview_pressure_test',
+  ['test/gui_rf_preview_pressure_test.c', 'misrc_gui/processing/gui_rf_preview_pressure.c'],
+  c_args: cflags)
+test('gui_rf_preview_pressure', rf_pressure_test)
+rf_policy_test = executable('gui_rf_preview_policy_test',
+  ['test/gui_rf_preview_policy_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+  c_args: cflags)
+test('gui_rf_preview_policy', rf_policy_test)
+
+if flac_dep.found()
+  rf_record_deps = rf_test_deps + [flac_dep]
+  if host_machine.system() == 'windows'
+    rf_record_deps += [meson.get_compiler('c').find_library('psapi'),
+                       meson.get_compiler('c').find_library('onecore')]
+  endif
+  rf_record_harness = executable('gui_rf_preview_record_load',
+    ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
+     'common/ringbuffer.c', 'common/rb_event.c', 'common/flac_writer.c',
+     'misrc_gui/signal/gui_rf_preview.c', 'misrc_gui/signal/gui_rf_resampler.c',
+     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
+     'misrc_gui/processing/gui_rf_preview_policy.c',
+     'misrc_gui/processing/gui_rf_preview_pressure.c'],
+    dependencies: rf_record_deps, c_args: rf_test_cflags, link_args: ldflags)
 endif
 
 # Dependency-free DDD protocol/policy tests run even when libusb or raylib is
@@ -771,13 +1088,18 @@ test('gui_ddd_async_policy', ddd_async_policy_test)
 # Byte-exact direct RAW record path: the real tap push + writer thread
 # against the real buffer manager/ringbuffer, with an in-memory spill stub
 # (no raylib/GUI dependency).
+record_direct_test_deps = [meson.get_compiler('c').find_library('pthread', required: false)]
+if host_system == 'windows'
+  # The real ringbuffer uses VirtualAlloc2 and MapViewOfFile3.
+  record_direct_test_deps += [meson.get_compiler('c').find_library('onecore')]
+endif
 gui_record_direct_test = executable('gui_record_direct_test',
   ['test/gui_record_direct_harness.c',
    'misrc_gui/output/gui_record_direct.c',
    'common/buffer_manager.c',
    'common/ringbuffer.c',
    'common/rb_event.c'],
-  dependencies: [ meson.get_compiler('c').find_library('pthread', required: false) ],
+  dependencies: record_direct_test_deps,
   c_args: cflags,
 )
 test('gui_record_direct', gui_record_direct_test)
@@ -800,3 +1122,16 @@ if ddd_enabled
   )
   test('gui_ddd_async_fault', ddd_async_fault_test)
 endif
+
+gui_text_edit_test = executable('gui_text_edit_test', 'test/gui_text_edit_test.c', c_args: cflags)
+test('gui_text_edit', gui_text_edit_test)
+
+# NTSC Beta Hi-Fi streaming contracts; production DSP, no audio device required.
+beta_hifi_test = executable('gui_beta_hifi_test',
+  ['test/gui_beta_hifi_test.c', 'misrc_gui/signal/gui_beta_hifi.c'],
+  c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
+test('gui_beta_hifi', beta_hifi_test, timeout: 120)
+beta_hifi_state_test = executable('gui_beta_hifi_state_test',
+  'test/gui_beta_hifi_state_test.c',
+  c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
+test('gui_beta_hifi_state', beta_hifi_state_test)

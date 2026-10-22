@@ -109,8 +109,10 @@ static size_t split_pairs(const char *text, kv_t *out, size_t cap) {
         const char *ve;
         if (*v == '"') {
             v++;
-            ve = strchr(v, '"');
-            if (!ve) break;
+            /* Format 2 escapes a quote inside a value. */
+            ve = v;
+            while (*ve && *ve != '"') ve += (*ve == '\\' && ve[1]) ? 2 : 1;
+            if (!*ve) break;
             p = ve + 1;
         } else {
             ve = v;
@@ -122,6 +124,8 @@ static size_t split_pairs(const char *text, kv_t *out, size_t cap) {
         if (vl >= sizeof(out[count].value)) vl = sizeof(out[count].value) - 1;
         memcpy(out[count].value, v, vl);
         out[count].value[vl] = '\0';
+        /* The format-version key is not a table row; it is checked on its own. */
+        if (strcmp(out[count].key, GUI_SETTINGS_FORMAT_VERSION_KEY) == 0) continue;
         count++;
     }
     return count;
@@ -181,8 +185,11 @@ int main(int argc, char **argv) {
     size_t n2 = gui_settings_format_file(&b, text2, sizeof(text2));
     check(structs_equal(&a, &b, "reload"), "load -> save -> load yields the same struct");
     check(n1 == n2 && strcmp(text1, text2) == 0, "save -> load -> save yields the same text");
-    check(strncmp(text1, "{\n  \"device_index\": ", 20) == 0 && text1[n1 - 1] == '\n' && text1[n1 - 2] == '}',
-          "file text keeps the historic layout ({, two-space keys, closing })");
+    /* Format 2 (upstream v1.2.6): the version key, then the historic first row. */
+    check(strncmp(text1, "{\n  \"" GUI_SETTINGS_FORMAT_VERSION_KEY "\": 2,\n  \"device_index\": ",
+                  strlen("{\n  \"" GUI_SETTINGS_FORMAT_VERSION_KEY "\": 2,\n  \"device_index\": ")) == 0 &&
+              text1[n1 - 1] == '\n' && text1[n1 - 2] == '}',
+          "file text keeps the historic layout ({, version key, two-space keys, closing })");
 
     /* --- 2. keys, order, duplicates, values --------------------------- */
     static kv_t fx[256], sv[256];
@@ -238,8 +245,16 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < nexp && i < nsv; i++) {
         const gui_setting_desc_t *d = gui_settings_find(expect[i].key);
         if (!d || (d->flags & GS_WRITE_ONLY) || in_list(expect[i].key, s_transformed)) continue;
-        if (strcmp(expect[i].value, sv[i].value) != 0) {
-            fprintf(stderr, "  value of %s changed: fixture '%s', saved '%s'\n", expect[i].key, expect[i].value, sv[i].value);
+        /* The fixture is format 1 (raw strings); the save is format 2, so
+         * compare the saved value decoded: a legacy C:\ path must survive. */
+        char decoded[512];
+        const char *saved = sv[i].value;
+        if (d->type == GS_STR &&
+            gui_settings_find_value(text1, expect[i].key, decoded, sizeof(decoded), true)) {
+            saved = decoded;
+        }
+        if (strcmp(expect[i].value, saved) != 0) {
+            fprintf(stderr, "  value of %s changed: fixture '%s', saved '%s'\n", expect[i].key, expect[i].value, saved);
             values_kept = false;
         }
     }
@@ -384,7 +399,9 @@ int main(int argc, char **argv) {
     memset(longv, 'x', sizeof(longv) - 1);
     longv[sizeof(longv) - 1] = '\0';
     check(gui_settings_apply_key(&c, "rf_tag_a", longv, true, err, sizeof(err)) == -2, "strict: over-cap string refused");
-    check(gui_settings_apply_key(&c, "rf_tag_a", longv, false, err, sizeof(err)) == 0 && strlen(c.rf_channel_tags[0]) == 31, "loose: over-cap string truncated to cap-1");
+    /* Upstream v1.2.6's rule (Reece, 2026-10-21): never a prefix, which for a
+     * path names a different file. */
+    check(gui_settings_apply_key(&c, "rf_tag_a", longv, false, err, sizeof(err)) == 0 && c.rf_channel_tags[0][0] == '\0', "loose: over-cap string loads empty");
     check(gui_settings_apply_key(&c, "output_path", "/mnt/x9 pro/captures", true, err, sizeof(err)) == 0
               && strcmp(c.output_path, "/mnt/x9 pro/captures") == 0, "strict: a path with a space accepted verbatim");
     check(gui_settings_apply_key(&c, "resample_rate_a", "2500.5", true, err, sizeof(err)) == 0 && c.resample_rate_a > 2500.4f && c.resample_rate_a < 2500.6f, "strict: float accepted");

@@ -1,5 +1,117 @@
 # MISRC GUI development notes
 
+## 2026-10-20 SECAM FM-chroma decoder shipped (colour user-verified; one open follow-up)
+
+- The tbc-tools secamdecoder pipeline ported to the streaming per-line decode
+  (backlog item 4): bell-free picture demod (the cloche's phase bias measured
+  at -19.5 kHz/+10 kHz on the belled carriers), porch calibration with the
+  exact 10*fH pair lock + ident ladder, rails/concealment, and a CAUSAL
+  pre-warped de-emphasis IIR carrying state across lines - the reference's
+  COMPLEX inverseLf mask, not a magnitude-only FIR (the first port's zero-phase
+  FIR bled bars into their neighbours by up to 26%; measured).
+- Harness: physically-correct fixtures (pre-corrected + the encoder's deviation
+  limiter - without it the pre-correction spikes sweep +-1.9 MHz out of band
+  and the colour killer gates whole bar-heads to zero). All bars asserts pass;
+  saturated-bar prints are the real limiter clamps.
+- UI: SECAM in the System dropdown (+ persisted `video_system` setting), OSD
+  SECAM diag line, VHS FM overlay as a vertical stack, and a ONE-SLOT panel
+  view-state cache so switching Waveform<->Video no longer destroys the
+  decoders (that was the "switching panel modes resets to PAL / loses sync"
+  report). The frame-view toggle no longer resets either (render-time crop).
+- Verified: 43/43 guards, build + smoke, meson 34/34; user real-GUI: colour
+  decodes on a real SECAM capture. OPEN: vertical rolling on that capture
+  while the H-PLL holds - needs the OSD VBI counters + a 20 s raw excerpt
+  (same ask as backlog item 3). Contracts + rules: `secam_fm_chroma_decoder.md`.
+
+## 2026-10-20 Windows move/resize freeze fixed (user-confirmed)
+
+- Root cause: a title-bar/edge drag enters the MODAL LOOP inside DefWindowProc
+  (WM_ENTERSIZEMOVE); raylib drains OS events at the tail of each frame, the
+  caption mouse-down is dispatched inside that drain, and the render loop blocks
+  for the whole drag (no swaps, frozen panels, monitor stutter). Linux/macOS
+  have no modal loop.
+- Fix: `gui_win32_modal.c/.h` subclass the GLFW window proc + a 15 ms WM_TIMER
+  that calls a render-only frame (`app_modal_frame` in misrc_gui.c: audio pump
+  + Clay dims + the SHARED layout build + flush + swap, never event polling)
+  inside the loop; KillTimer + original-proc restore on exit/shutdown.
+  Windows-only TU (meson), no-op header stubs elsewhere.
+- Verified facts behind it (raylib/GLFW source): modal entry always lands after
+  the frame flush+swap (empty batch); the GL context stays current on the
+  render thread; raylib's WindowSizeCallback already runs SetupViewport inside
+  the loop; timeBeginPeriod(1) makes the 15 ms timer real.
+- Verified: 42/42 static guards (new `Windows modal move/size render
+  contract`), build + smoke OK, meson test 34/34; user real-GUI confirmation.
+  Contracts + limits: `windows_modal_resize_render.md`.
+
+## 2026-10-20 Playback drag-and-drop: per-channel zones + audio (user-confirmed)
+
+- Feature: drop files onto the channel panels to load playback - RF files (mono
+  FLAC / Ogg-FLAC / raw widths / .lds) land on the channel whose PANEL ZONE the
+  drop hit (nearest row vertically outside the canvases); an audio-rate file
+  (WAV 1-8 ch incl. the 46.875 kHz clockgen capture, or audio FLAC) becomes the
+  monitor source. One drop of a full capture set (RF A + RF B + audio) selects
+  the Playback device, stops anything running and starts playback. The audio
+  feed is position-synced to the RF playhead (seek/loop/speed/pause follow; a
+  jump flushes the queue) via the shared play_q; Audio Mon gates audibility
+  (no auto-enable). Speeds fold into pitch (tape semantics); Max is silent.
+  The audio file persists (settings.playback_audio_file + the Settings row).
+- Contracts + known limitations: `playback_drag_drop_audio.md`; guarded by
+  the `playback drag-and-drop contract` in ci_guard_tests.py.
+- Verified: 41/41 static guards, LIBFLAC_ENABLED=0 translation proof EXIT 0,
+  build-local.ps1 + smoke OK, meson test 34/34; user real-GUI confirmation.
+
+## 2026-10-19 CI guard break on main + local build gate (HARD rules)
+
+- Symptom: a manual workflow_dispatch run launched to test failed in ~40 s at the
+  preflight guards (optional-dep guard consistency) and every build job was skipped.
+- Root causes: e34dce9 pushed the playback channel-preparation helpers outside the
+  `#if LIBFLAC_ENABLED` guard straight to a tags-only-CI main; a second plain-identifier
+  break (`PLAYBACK_CONV16_*` inside the guard, unguarded `conv16_state` reset) found only
+  by the `LIBFLAC_ENABLED=0` translation proof; the local link then failed on
+  `-l:librtlsdr_static.a` (rtl-sdr installed only under mingw64 vs the ucrt64 CI-parity
+  toolchain; ucrt64 ld never searches mingw64\lib).
+- Fixes: the three helpers guarded as one block; conv16 constants moved outside the
+  guard; header-aware optional-dep member checker (no more `duration_seconds` false
+  positives); `local CI guard gate contract` + static guards wired into
+  `build-local.ps1`/`build-local.sh` before any build work; CI now runs on direct
+  pushes to main (`push: branches: [main]`, release job still tag/dispatch-gated);
+  rtlsdr static link carries the pc libdir `-L`. Purity note: the clean local fix is
+  installing `mingw-w64-ucrt-x86_64-rtl-sdr`.
+- Verified: 40/40 static guards, `LIBFLAC_ENABLED=0` translation of gui_playback.c
+  EXIT 0, `build-local.ps1` + smoke OK, `meson test` 34/34; the pushed main run must be
+  green before this is closed (it now runs CI automatically).
+- HARD rules + procedure: `ci_guard_local_build_gate.md`.
+
+## 2026-10-19 CVBS decoder: real-time budget, feed drops, baseline wander (HARD rules)
+
+- Symptom: live AND playback CVBS decode "chokes after 8-10 s" (sync instability,
+  horizontally shifted top rows, mid-frame tears; toggling the decoder off/on fixed it
+  for another 8-10 s). After that was fixed, the first picture rows still shifted ~13 px
+  and crept back over ~20 rows.
+- Root causes (all measured, see `cvbs_decoder_realtime_sync_rules.md` and
+  `prompt_logs/2026-10-19_cvbs-sync-shift-root-cause_README.md`):
+  1. The panel decode ran at 1.08x real time (per-pixel divisions/trig/window loops in
+     `decode_line_to_pixels`); the display ring (`BUF_DISPLAY`, no-wait drop policy)
+     overran after ~8-10 s and dropped ~26-line chunks; the PLL integrators ingested
+     those jumps as period error (period walked 3000 ppm).
+  2. The source baseline rises ~+25 IRE after the vertical broad pulses (AC coupling);
+     a fixed sync threshold lost ~24 lines of H sync and sliced the recovering edges
+     late - each line's origin followed that error.
+- Fixes: O(1)-per-pixel prefix-sum chroma/luma decode (56 -> 13 us/line, 1.08x -> 0.43x
+  real time, output numerically identical); vectorisable luma FIR; frequency
+  integrators gated on good syncs; per-line back-porch DC clamp driving the sync
+  threshold and the luma black; field blanking commit from on-baseline lines; RF-style
+  EQ+broad cadence gate for VBI candidates; field-buffer clearing + valid-row weave;
+  `jumps:` and true per-field "ms" in the OSD; live-diag file dumps off in the GUI.
+- Verified: `meson test` 34/34; headless exact-GUI-path decode of the user's 1-minute
+  EBU HackDAC capture: 999/0 fields, bars within 0.3 deg, rows aligned top to bottom;
+  user GUI confirmation ("dead stable", top shift gone).
+- HARD rules + mandatory verification procedure: `cvbs_decoder_realtime_sync_rules.md`.
+- Backlog recorded there: player-mode drag-and-drop (DONE 2026-10-20); Windows
+  move/resize freeze (DONE 2026-10-20); sync robustness on real media
+  (fast-action 4:3 anime, Philips pattern); a separate SECAM CVBS mode from the
+  tbc-tools implementation.
+
 Recent capture regressions showed that small callback-gating changes can silently break GUI feeds. Keep the following constraints in mind when touching capture/parser/audio paths:
 
 - Preserve tolerated-frame behavior in MISRC frame mode: only drop frames when `result.error_count > 0 && result.report_errors`.
@@ -249,3 +361,13 @@ Recent capture regressions showed that small callback-gating changes can silentl
   - `misrc_tools/misrc_gui/output/gui_record.c` (replaced `gui_record_embed_flac_duration_metadata` + `gui_record_update_flac_streaminfo_duration` with `gui_record_finalize_flac_metadata`; updated call site).
 - Validation (local, Linux Mint): `scripts/build-local.sh` build + smoke OK (libFLAC 1.5.0 multithreading; pre-existing warnings only); `misrc_tools/test/ci_guard_tests.py` 34/34 PASS; `meson test -C build-local` 3/3 OK.
 - Not yet validated: real multi-GB FLAC recording + finalize against live hardware - confirm (a) no large `flac.metadata`/temp file appears in the output directory during finalize, (b) finalize completes in seconds not minutes, (c) the written FLAC still reports correct duration in a player/Audacity and the DURATION_SECONDS/LENGTH/etc. Vorbis comment tags are present.
+
+## 2026-09-11 RP2350 dual_external_adc black frames on Windows (HARD note)
+
+- `rp2350_firmware_timing_fix.md`: every Windows software layer was instrumented and
+  proven working (libusb transfers, libuvc frame assembly, hsdaoh HID, UVC
+  negotiation) — the failure is the RP2350 firmware's HDMI timing (45-px hsync vs the
+  FPGA's 4-px), outside the MS2130's TMDS data-recovery lock range. Fix-to-make
+  (MODE_H_SYNC_WIDTH 45→4, MODE_V_SYNC_WIDTH 2→1, MODE_V_FRONT_PORCH 1→0) plus the
+  what-NOT-to-touch-again rules (no Windows driver / MS2130 / libuvc-libusb-hsdaoh
+  changes — all proven working) are recorded there.
