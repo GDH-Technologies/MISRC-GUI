@@ -99,14 +99,28 @@ python3 ~/.claude/skills/sync-fork/preflight.py --base origin/main --target <ref
 - **`--headless-record`.** The fork's Simulated-device recorder; upstream owns
   `--auto-record`.
 - **`ci_guard_tests.py`.** Both sides append guards. Keep both, upstream's first.
+- **Settings format 2 and `gui_settings.c`.** Since v1.2.6 the table writes and reads
+  upstream's format 2 (version key first, escaped strings, oversize loads empty). On
+  `gui_settings.c`, take the fork's table-driven load/save/defaults but upstream's path
+  helpers, settings/desktop path lookup and pickers. Diff upstream's
+  `gui_settings_init_defaults`, `sanitize_tag` and `gui_settings_refresh_auto_names` across
+  the range: each has a copy in the table that a taken fork side silently leaves behind.
+- **Adapted upstream tests.** `gui_settings_paths_test.c` (also includes the table, a
+  `find_value` shim, `output_base_name` for the shadow check) and `gui_record_paths_test.c`
+  (the fork's finalize, true `total_samples`) keep their fork hunks; `gui_record_paths_test`
+  links `common/flac_writer.c`.
+- **Playback thread priority.** The main playback thread stays `THRD_PRIORITY_ABOVE`, both
+  its `thrd_create_with_priority` and its own `thrd_set_priority`; upstream writes CRITICAL.
+- **Retired metadata window.** Upstream code that reads `s_metadata_window_open` uses
+  `gui_capture_meta_panel_is_open()` on the fork (a compile error, not a marker).
 
 ## Verification (quote every number)
 
 ```bash
 scripts/build-local.sh --clean                                   # build + --smoke-test
-python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 102 PASS at v1.2.4
-meson test -C build-local                                         # 15 targets at v1.2.4
-bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # 32 PASS + the cancel check (below) at v1.2.4, from the worktree root
+python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-local/misrc_gui   # 106 PASS at v1.2.6 (81 static)
+meson test -C build-local                                         # 40 targets at v1.2.6 (gui_rf_preview ~70 s)
+bash misrc_tools/test/net_settings_e2e.sh build-local/misrc_gui <free port>  # 33 PASS incl. the cancel check (below) at v1.2.6, from the worktree root
 build-local/misrc_gui --video-name-test                           # both auto-namers agree, FLAC and RAW
 ```
 
@@ -147,6 +161,7 @@ upstream's tree on every machine.
 
 | Sync | Conflicts |
 | --- | --- |
+| 2026-10-21, v1.2.6 (`9c3894c`, 25 commits; merge `2deb08a`) | 14 files: `buffer_manager.c/.h` (observer + tap both); `meson.build` (hsdaoh probe combined, interleaved test blocks rebuilt); `gui_app.h` (fork); `gui_settings.c` (rebuilt: upstream helpers/pickers, fork load/save); `misrc_gui.c` (icons + modal frame, Space play/pause ahead of the net-aware disconnect, view_begin ahead of the shared layout); `gui_playback.c` (ABOVE); `gui_record.c` (session paths widened, `check_output_paths` + video/CC); `gui_extract.c` (unpack switch follows per-block B); `gui_cvbs.c`, `gui_vhs_fm.c`, `clay_renderer_raylib.c` (upstream); `gui_ui.c` (locks merged); `ci_guard_tests.py`. Silent clashes: `s_metadata_window_open`; defaults/sanitize/namer copies in the table; `gui_net.c` `val[600]`; two upstream tests written against upstream's settings/finalize; four stale guards. Reece adopted settings format 2, oversize-loads-empty, and upstream's `gui_font` measure |
 | 2026-10-07, v1.2.4 + `c1b231b` (`74c24dc`) | `build.yml` (upstream's side); `meson.build`, `build-appimage-local.sh` (both; mediamtx kept); `gui_settings.c` (fork's side, `.s8`/`.s16` preview ported to the table); `misrc_gui.c` (usage/args both, fork's `--auto-record` renamed `--headless-record`, window on upstream's `MISRC_WINDOW_CLASS_TITLE`); `gui_cxadc.c` (RF B handshake + tap gate, `open_count`); `gui_record.c` (direct tap ported onto `gui_record_session_t`); `ci_guard_tests.py`. Silent clashes: upstream's direct-RAW callbacks on globals the fork removed; `import textwrap` dropped; a comment naming `InitWindow()` fooled a guard; libc direct-include guard vs two fork harnesses. Reece adopted upstream's RAW model, retiring 27c020f/612c086 |
 | 2026-10-01, v1.2.3 (`f693070`) | `gui_settings.c` (took the fork's side again; upstream's `.u8`/`.u16` change to `refresh_auto_names` vanished with it and was ported into the table, `--video-name-test` gained a RAW pass); `gui_record.h` (both appended); `gui_record.c` `raw_writer_thread` (bytes-written accounting in the fork's `wctx->app` form, `acc_raw[]` too). Silent clash: the new `gui_record_get_live_output_bytes` used `s_recording_app` / `s_record_path_a/b`, gone in the fork, rewritten on `s_active`. Upstream's `.u8`/`.u16` names on signed samples: Reece chose unsigned offset-binary data (27c020f, upstream-bound) |
 | 2026-09-25, v1.2.2 | `gui_settings.c` (upstream's defaults block against the fork's empty side -- took the fork's side); `gui_cxadc.c` (the fork's `open_count` + upstream's `saved_errno`). Silent clashes: upstream's `flac_threads` default (8 -> min(8, cores)) vanished with the fork's side of `gui_settings.c` again and was ported with a `get_num_cores` stub in the round-trip harness; the `PROMPT_*` logs moved into `dev/` |

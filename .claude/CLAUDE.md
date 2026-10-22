@@ -86,7 +86,9 @@ source check; the vendored library is what links.
 - `misrc_tools/misrc_gui/dev/prompt_*.md` are harrypm's agent working logs (at the repo
   root as `PROMPT_*.md` until v1.2.2): read, never edit. Upstream's rule
   (`dev/README.md`) is that every prompt log, bug-tracking note and lock-step note lives
-  in `dev/`, never the repo root; the fork's own notes still go in `docs/gdh-*`.
+  in `dev/`, never the repo root; the fork's own notes still go in `docs/gdh-*`. Since
+  v1.2.6 upstream also writes dated session logs to a repo-root `prompt_logs/` (and one
+  `prompt_readme_*.md` at the root): upstream-owned too, read, never edit.
 
 ## CI and deploy (fork-only)
 
@@ -105,11 +107,22 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 102
-  checks in a Linux `--post-build` run (v1.2.4 sync, 2026-10-07), several of which compile and run C
-  harnesses in `misrc_tools/test/*_harness.c`. Meson has fifteen `test()` targets
-  (`meson test -C build-local`); upstream's `gui_stats_layout` stubs the panel-name table and
-  must keep the fork's `"Preview"` entry.
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 106
+  checks in a Linux `--post-build` run (81 `--static-only`; v1.2.6 sync, 2026-10-21), several of
+  which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 40 `test()`
+  targets (`meson test -C build-local`; `gui_rf_preview` alone takes ~70 s on wm); upstream's
+  `gui_stats_layout` stubs the panel-name table and must keep the fork's `"Preview"` entry.
+- Two upstream meson tests carry fork adaptations, keep them on every sync:
+  `gui_settings_paths_test.c` also includes `gui_settings_table.c`, shims upstream's file-local
+  `find_value` over the table reader and uses `output_base_name` for the key-shadow check
+  (`ingest_notes` is retired); `gui_record_paths_test.c` calls the fork's FLAC finalize and
+  asserts the true STREAMINFO `total_samples` (8000), not upstream's kHz-scaled 8.
+- `scripts/build-local.sh`/`.ps1` run `ci_guard_tests.py --static-only` before any build work
+  and fail on a guard error (upstream v1.2.6, "local CI guard gate contract"). Upstream's HARD
+  rule for an edit inside an optional-dep guard (`#if LIBFLAC_ENABLED` etc.): prove the TU
+  translates with the macro off (`gcc -fsyntax-only -DLIBFLAC_ENABLED=0` with the flags from
+  `build-local/compile_commands.json`); the guard's member checker is not that proof
+  (`dev/ci_guard_local_build_gate.md`).
 - `--smoke-test` after every build. `--rtsp-soak` is the acceptance test for anything that
   touches the capture path; run it and quote the numbers.
 - Headless modes for automation (`misrc_gui --help`):
@@ -241,9 +254,21 @@ Fork-side:
   "every settings field is in the table" guard fails otherwise, and the v1.1.8 key list in the
   suite must never lose a key (rollback loads the new file in the old build). Upstream still
   adds fields to its hand-written struct in `gui_app.h` and its load/save in
-  `gui_settings.c`: on a sync take the fork's side of both and port each field into
-  `gui_settings.h`, a default, and a row APPENDED to the table (row order is the file's write
-  order and the round-trip harness compares positionally).
+  `gui_settings.c`: on a sync take the fork's side of `gui_app.h`'s struct and of
+  `gui_settings.c`'s load/save/defaults, and port each field into `gui_settings.h`, a
+  default, and a row APPENDED to the table (row order is the file's write order and the
+  round-trip harness compares positionally). `gui_settings.c`'s path helpers, settings/desktop
+  path lookup and pickers follow upstream since v1.2.6 (UTF-8 file I/O, XDG user-dirs,
+  `SHGetKnownFolderPath`): resolve those hunks toward upstream.
+- Settings file format 2 (upstream v1.2.6, adopted 2026-10-21): the file's first key is
+  `"settings_format_version": 2` (not a table row) and every string is JSON-escaped; the loader
+  decodes escapes only when that marker is >= 2, so a format-1 file keeps Windows backslashes
+  literal, and on Windows a format-1 string that is not UTF-8 is migrated from the ANSI
+  codepage. A string that does not fit its field loads EMPTY, never a prefix, and an oversized
+  `output_base_name` also clears `output_path` (Reece's call: upstream's rule). Paths
+  (`output_path`, `playback_file_a/b`, `playback_audio_file`) are `FILE_PATH_MAX` (4096) and the
+  file cap is 256 KiB. A rollback build reads a format-2 file raw: escaped backslashes double
+  (win0's paths), everything else is unchanged.
 - UI scale: `ui_zoom_percent` (50-200) is relative to the desktop's scale; effective =
   desktop × zoom (50-400), applied only through `gui_ui_apply_ui_scale`. `ui_scale_percent`
   is a rollback mirror written on the old 75-300 grid and never read back; nothing may set
@@ -285,11 +310,38 @@ Fork-side:
 - `common/flac_writer.c`'s `initial_tags` hunk (tags appended to the VORBIS_COMMENT block at
   encoder init, so a crash keeps the asset link) is fork-only: keep it on every upstream sync,
   together with the finalize rule above. The block order and the 4096 padding must not change.
-- `ui/clay_renderer_raylib.c`'s `Raylib_MeasureText` decodes UTF-8 (upstream's indexed the glyph
-  table with a negative index for every byte >= 0x80, which broke Clay's wrap and sizing for any
-  non-ASCII text). Upstream-bound; keep the fork's side until harrypm takes it.
-- The UI fonts load codepoints 32-287 only: an em dash (U+2014) draws as `?`. The middle dot
-  (U+00B7) and Latin-1 letters are fine.
+- UI text measure and draw go through upstream's `ui/gui_font.c` since v1.2.6
+  (`gui_font_measure_text_n` in `Raylib_MeasureText`, `gui_font_draw_text`): it decodes UTF-8,
+  which retired the fork's own measure fix, and loads glyphs the embedded fonts lack
+  (codepoints 32-287) on demand from system fonts (`fc-match` on Linux). That an em dash
+  (U+2014) now draws on wm is not verified; until it is, keep UI strings to Latin-1 and the
+  middle dot (U+00B7).
+- Upstream v1.2.6 HARD rules (mirrored from `dev/`; read the note before touching the area):
+  - Extraction never waits on the RF preview: `BUF_DISPLAY` is zero-wait and the preview
+    worker's enqueue never blocks (`dev/rf_preview_README.md`). `bufmgr_write_end` runs
+    upstream's `rf_write_observer` before the bytes are visible and the fork's write tap after
+    the signal; neither may ever wait.
+  - Every FLAC/RAW record output file gets the 8 MB stdio buffer right after its open
+    (`gui_record_set_output_buffer`); any change to record-open keeps it
+    (`dev/output_stdio_buffer_and_rf_rate_provisions.md`). The fork applies it to the session's
+    `ses->file_a/b`.
+  - A headless dump verifies the GUI only if it reads the final GUI-consumed buffer; every
+    pixel-format conversion to the texture is code under test and its contract (e.g.
+    `cvbs_blit_rgb24_to_color` + `gui_cvbs_test.c`) changes in the same commit
+    (`dev/gui_output_verification_rules.md`).
+  - `gui_ui.c` is the only `GetMousePosition` call site; drag-and-drop uses
+    `gui_ui_get_mouse_position()` (`dev/playback_drag_drop_audio.md`). `gui_playback.c`
+    harnesses link `test/gui_playback_audio_stub.c`: a new `gui_audio` dependency from
+    `gui_playback.c` extends the stub.
+  - Windows modal move/resize frames (`app_modal_frame`) never poll events, and there is one
+    layout build (`app_build_render_commands`) for both paths
+    (`dev/windows_modal_resize_render.md`). The modal frame runs outside the net-client view
+    swap, so on a Windows client it draws this machine's settings for the drag.
+- v1.2.6 behaviour now on the fork: Space in Playback mode pauses/resumes (live capture keeps
+  start/stop, refused while recording); record start refuses a missing output directory,
+  duplicate or invalid output names, and a name that would not fit (the auto-namers refuse
+  rather than truncate); the overwrite prompt lists every enabled output including audio,
+  reference video and captions (`gui_record_check_output_paths`).
 
 ## Worktrees and git hygiene
 
