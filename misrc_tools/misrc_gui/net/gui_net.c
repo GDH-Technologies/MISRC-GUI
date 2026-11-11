@@ -781,7 +781,7 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     uint64_t comp_b = atomic_load(&app->recording_compressed_b);
     uint32_t rec_drops = (uint32_t)(atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops) +
                                     atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops));
-    bool rec_pending = gui_record_is_pending();
+    bool rec_pending;   /* from the published snapshot, below */
     bool rec_finalizing = gui_record_is_finalizing();
     char status_esc[600];
     char pending_esc[1100];   /* 511 chars, every one possibly escaped */
@@ -790,6 +790,13 @@ static void server_build_stats(net_server_t *srv, gui_app_t *app, char *buf, siz
     net_mutex_lock(&srv->pub_mtx);
     gui_settings_json_escape(srv->published_status, status_esc, sizeof(status_esc));
     gui_settings_json_escape(srv->published_pending, pending_esc, sizeof(pending_esc));
+    /* The prompt flag comes from the same snapshot as its text and the status
+     * line (server_publish writes them together on the main thread). Read
+     * live, it went false up to one main-loop tick before the text cleared
+     * and "Recording cancelled" arrived, so one /stats could say "not
+     * pending" while still carrying the old prompt. The pending message is
+     * never empty while a prompt is up. */
+    rec_pending = srv->published_pending[0] != '\0';
     status_seq = srv->published_status_seq;
     gen = srv->published_generation;
     disk_free = srv->published_disk_free;
