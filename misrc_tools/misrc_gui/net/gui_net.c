@@ -2711,6 +2711,21 @@ void gui_net_poll_commands(gui_app_t *app) {
     /* Server mode: execute queued commands locally on the main thread. */
     if (s_server || gui_monitor_server_active()) {
         if (s_server) server_install_tap(app);
+        /* /device before /start: a client that sends both in one poll
+         * interval (20 ms headless, one frame windowed) means "capture from
+         * this device". Draining /start first started the PREVIOUS device
+         * and then refused the selection because capture was running -- on
+         * wm the net e2e captured a real CX card instead of the Simulated
+         * device that way. */
+        if (atomic_exchange(&app->net_cmd_select_device, false)) {
+            int n = atomic_exchange(&app->net_cmd_device_index, 0);
+            /* Keep the original RF /device rule: idle-only selection. */
+            if (!app->is_capturing && !gui_playback_is_starting(app) &&
+                n >= 0 && n < app->device_count) {
+                fprintf(stderr, "[NET] server: executing /device %d\n", n);
+                app->selected_device = n;
+            }
+        }
         if (atomic_exchange(&app->net_cmd_start, false)) {
             if (!app->is_capturing) {
                 fprintf(stderr, "[NET] server: executing /start\n");
@@ -2823,15 +2838,6 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_settings_save(&app->settings);
                 if (restart) (void)gui_app_start_capture(app);
                 fprintf(stderr, "[M-SERVER] Selected capture device: %d\n", n);
-            }
-        }
-        if (atomic_exchange(&app->net_cmd_select_device, false)) {
-            int n = atomic_exchange(&app->net_cmd_device_index, 0);
-            /* Keep the original RF /device rule: idle-only selection. */
-            if (!app->is_capturing && !gui_playback_is_starting(app) &&
-                n >= 0 && n < app->device_count) {
-                fprintf(stderr, "[NET] server: executing /device %d\n", n);
-                app->selected_device = n;
             }
         }
         /* /set requests: apply here, on the main thread, with the settings
