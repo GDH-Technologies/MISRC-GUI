@@ -110,11 +110,16 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
 
 ## Testing
 
-- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 110
-  checks in a Linux `--post-build` run (83 `--static-only`; record FIFO, 2026-10-22), several of
-  which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 41 `test()`
+- The guard suite is the real test surface: `misrc_tools/test/ci_guard_tests.py`, 115
+  checks in a Linux `--post-build` run (88 `--static-only`; v1.2.7 sync, 2026-11-11), several of
+  which compile and run C harnesses in `misrc_tools/test/*_harness.c`. Meson has 50 `test()`
   targets (`meson test -C build-local`; `gui_rf_preview` alone takes ~70 s on wm); upstream's
   `gui_stats_layout` stubs the panel-name table and must keep the fork's `"Preview"` entry.
+  Three upstream v1.2.7 meson tests fail on wm in upstream's own tree too (`gui_stats_layout`
+  "full RAW size readout does not gain another line", `gui_rf_routes` MESECAM selector,
+  `gui_rf_playback_start` index-EOF timeout): not fork regressions, owed to harrypm.
+  `update_cli` needs a release-shaped version: build with `MISRC_TOOLS_VERSION_OVERRIDE=vX.Y.Z-gdh.0`
+  on an untagged commit, or it fails comparing `dev-…` against its test tag.
 - Two upstream meson tests carry fork adaptations, keep them on every sync:
   `gui_settings_paths_test.c` also includes `gui_settings_table.c`, shims upstream's file-local
   `find_value` over the table reader and uses `output_base_name` for the key-shadow check
@@ -179,11 +184,12 @@ callback-gating edits have silently broken GUI feeds before):
 - Minimal, isolated fixes in `frame_parser`, `gui_capture`, `gui_extract`, `gui_audio`.
 - Windows cxadc is not at parity (`dev/cxadc_win_lockstep_notes.md`, upstream v1.2.1+):
   `gui_cxadc_get_sample_rate_hz` returns false on Windows, so that path always assumes the
-  40/20 clockgen baseline and never detects a stock 28.6 card. The 10-bit
-  EACCES/EPERM fallback to 8-bit plus its help popup is Linux-only
-  (`#if !defined(_WIN32)`); on Windows a failed `Set-CxadcWinConfig` returns -1 and aborts
-  the capture instead. Do not "fix" either by widening the Linux branch — upstream's own
-  plan is to make the Windows baseline explicit and give it its own fallback.
+  40/20 clockgen baseline and never detects a stock 28.6 card. Since v1.2.7 (`4245e58`,
+  direct WMI) Windows has its OWN 10-bit -> 8-bit fallback for a denied config write
+  (PutInstance, non-admin): `cxadc_apply_tenbit_mode_card` takes the EACCES/EPERM branch on
+  both platforms with platform-specific stderr/status text. Keep the two texts separate; the
+  sysfs `chgrp` fix named on Linux does not exist on Windows. A native macOS CXADC backend
+  (`input/gui_cxadc_macos.c`) is stock 8-bit only: the tenbit toggle refuses there.
 - One producer per record ring (v1.2.4, `dev/prompt_cxadc_direct_native_raw_stream_readme.md`):
   a direct-RAW channel's `BUF_RECORD_A/B` is fed only by the CXADC capture-thread tap, and
   extraction skips it (the direct mask in `gui_extract_set_recording`). The tap gate latches
@@ -256,7 +262,28 @@ Fork-side:
   `capture_ab_swap_invert`, not a settings field. The server applies `/set` only on its main
   thread through `gui_ui_apply_remote_setting`; HTTP threads read published copies. The
   `/rf` stream is 4 bytes per sample pair (160 MB/s at 40 MSps, above gigabit), dropped
-  oldest with no framing: a monitoring feed, never a recording source.
+  oldest with no framing: a monitoring feed, never a recording source. The server applies
+  `/device` before `/start` in one poll (5a92062), and `/stats` takes `rec_pending` from the
+  published snapshot like its text and status (44c9f10).
+- Monitor & Remote (upstream v1.2.7): net_mode 4 is the M-Client, a separate MISRC-M/2
+  protocol served on the SAME listener as the legacy server (`/monitor/*` is routed to
+  `gui_monitor_server_handle_request`; mode 3 loads as 1). `gui_net_is_client()` is true for
+  an M-Client too, so: the fork's legacy-client-only paths (settings proxy, `/settings`
+  mirror, peer readouts, local `/rf` recording) test `net_mode == GUI_NET_MODE_CLIENT`
+  (`gui_ui_legacy_client`, `gui_app_client_records_here`), and `gui_app_effective_recording`
+  / `gui_app_control_capturing` read the MISRC-M/2 peer state in mode 4. Mode changes run on
+  the main thread (232e064): `gui_net_request_apply_mode` calls upstream's transition body
+  synchronously; never put it back on a worker (server snapshot publish, client view swap).
+  M-Client Local Save is REFUSED by the server (0fc6c63, guard "M-Client Local Save is
+  refused"): upstream redirects `gui_record.c`'s stdio through `mls_proxy_*`, which the
+  fork's FIFO writers never reach. Porting the proxy into `gui_record_sink.c` is owed. The
+  hsdaoh callback feeds the Opus monitor tap directly (the fork removed `gui_net_tap_audio`);
+  the legacy `/rf` + `/baseband` feed stays on the buffer-manager write tap and the fork's
+  `gui_net_fanout.c`, whose drops feed upstream's `rf/audio_fanout_*` `/stats` telemetry.
+- Self-update (upstream v1.2.7 `gui_updater.c`): GDH builds check and open the releases page
+  but `gui_updater_install_asset` refuses any non-loopback asset (a0d70f0, guard "no
+  self-install over a GDH build"); the loopback exception exists only for upstream's
+  `update_cli` test. CI is the only installer on GDH hosts.
 - AppImage container build: `APPIMAGE_BUILD_IMAGE=misrc-appimage-build:22.04
   scripts/build-appimage-local.sh` — stock `ubuntu:22.04` fails at `meson setup` (apt libFLAC
   1.3.3). The image is in `~/misrc-appimage-build/`, outside the repo. The container runs as
@@ -352,6 +379,35 @@ Fork-side:
     layout build (`app_build_render_commands`) for both paths
     (`dev/windows_modal_resize_render.md`). The modal frame runs outside the net-client view
     swap, so on a Windows client it draws this machine's settings for the drag.
+- Upstream v1.2.7 HARD rules (mirrored from `dev/*_rules.md`; read the note before touching
+  the area). Where a rule names harrypm's sign-off, it binds anything bound for his repo; on
+  the fork the sign-off is Reece's:
+  - Every user-interactable GUI element lands with an automation trigger (a CLI flag and/or a
+    `--config` key) in the same change; flags fail fast on an unknown value (print the accepted
+    values, exit nonzero), log `[AUTO]` lines, change something a test can observe, and apply
+    after the settings load with flag > `--config` > default (`gui_automation_flags_rules.md`).
+  - A mode's default configuration applies only while that mode is active and is cleared on
+    exit; user picks (`signal_user_picked`) are never overwritten. Non-test panels keep the
+    stock trigger (off, rising, level 0) (`gui_signal_default_rules.md`).
+  - A visible container sizes to its content (padding*2 + children + gaps, derived at the use
+    site, never a fixed constant); the tier-fit width uses the same expression as the render;
+    check a border fix at more than one size tier (`gui_uniform_border_rules.md`).
+  - No UX change (what the user sees or clicks) without the owner's sign-off first; never
+    bundle a layout change into a functional change; an agent never "improves" the UI on its
+    own initiative (`gui_ux_change_approval_rules.md`).
+  - Root `README.md` is hands-off without an explicit instruction for that edit; upstream PRs
+    never carry the fork's README hunks (`readme_hands_off_rules.md`).
+  - Every hard build dependency is vendored and pinned under `third_party/` with a
+    `VENDOR.md` (now hsdaoh, opus, openh264); no build-time downloads of new dependency
+    source; a dependency or `scripts/build-*` deps-flow change is its own reviewed commit; an
+    agent never downloads, sudo-installs or substitutes a missing dependency -- report it and
+    stop (`self_contained_deps_rules.md`). `check-build-deps.sh` only checks. libzstd is now a
+    hard system dependency; FFmpeg (`modern_monitor_codecs`, auto) is optional.
+  - A push is not done until the CI run it triggers is green; never report it done from
+    local results, never start new work on a red main (`dev/ci_guard_local_build_gate.md`).
+  - macOS: the app relaunches itself elevated for MS2130, and an elevated window never
+    receives Finder drag-and-drop (an OS limit; no `[PLAYBACK] Drop delivered:` line). Use the
+    positional playback-file arguments there (`dev/playback_drag_drop_audio.md`).
 - v1.2.6 behaviour now on the fork: Space in Playback mode pauses/resumes (live capture keeps
   start/stop, refused while recording); record start refuses a missing output directory,
   duplicate or invalid output names, and a name that would not fit (the auto-namers refuse

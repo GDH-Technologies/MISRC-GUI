@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "releases_page": "https://github.com/harrypm/MISRC-GUI/releases/",
+  "tag_lookup_url": "https://github.com/harrypm/MISRC-GUI/releases/latest",
+  "download_base_url": "https://github.com/harrypm/MISRC-GUI/releases/download",
+  "asset_android": "Android_MISRC_GUI_{tag}_arm64.apk",
+  "asset_macos": "macOS_MISRC_GUI_{tag}_universal.dmg",
+  "asset_windows_x86": "Windows_MISRC_GUI_{tag}_x86.zip",
+  "asset_windows_arm64": "Windows_MISRC_GUI_{tag}_arm64.zip",
+  "asset_linux_x86": "Linux_MISRC_GUI_{tag}_x86.zip",
+  "asset_linux_arm64": "Linux_MISRC_GUI_{tag}_arm64.zip"
+}

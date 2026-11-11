@@ -5,6 +5,7 @@
 #include "../misrc_gui/signal/gui_rf_preview.h"
 #include "../misrc_gui/signal/gui_rf_preview_filters.h"
 #include <assert.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 
 #define TEST_PI 3.14159265358979323846
 #define TEST_RATE 20000000.0
+#define TEST_ED_RATE 20000000.0
 
 typedef struct {
     uint8_t *rgba;
@@ -91,13 +93,21 @@ static double quality_gray(int field,test_quality_pattern_t pattern) {
     return pattern==TEST_Q_FADE ? fmax(0.0,.70-.10*field) : field&1 ? .25 : .65;
 }
 
+/* Explicit membership: later SECAM profile IDs are not Beta video. */
+static bool test_beta_profile(gui_rf_profile_t profile) {
+    return profile==GUI_RF_PROFILE_NTSC_BETAMAX || profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
+        profile==GUI_RF_PROFILE_NTSC_SUPERBETA || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI ||
+        profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+}
+
 static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us, bool with_chroma,
                             double clock_scale, int damaged_field,
                             test_vertical_t vertical_case, test_quality_t *quality,
                             size_t *length) {
     bool pal=profile==GUI_RF_PROFILE_PAL_VHS;
+    const bool ed=profile==GUI_RF_PROFILE_NTSC_ED_BETA;
     bool superbeta=profile==GUI_RF_PROFILE_NTSC_SUPERBETA || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
-    bool beta=profile==GUI_RF_PROFILE_NTSC_BETAMAX || profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || superbeta;
+    bool beta=test_beta_profile(profile);
     bool hifi=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI;
     double line_us=pal ? 64.0 : 63.55555555555556;
     /* Independent physical modulation constants; do not query decoder profiles. */
@@ -110,6 +120,12 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
          * -40 IRE sync and 5.6MHz at 100 IRE white. Hi-Fi does not move them.
          * Do not copy the distinct 4.75/6.15MHz .NET SUPERBETA profile. */
         sync=4400000.0;double white=5600000.0;
+        hz_ire=(white-sync)/140.0;blank=sync+40.0*hz_ire;
+    }
+    if(ed) {
+        /* Independent ED physical endpoints; NTSC-J black is 0 IRE.
+         * This is a flat preview oracle, not Sony nonlinear LCR emulation. */
+        sync=6800000.0;double white=9300000.0;
         hz_ire=(white-sync)/140.0;blank=sync+40.0*hz_ire;
     }
     double burst_start=pal ? 5.6 : 5.3, burst_end=pal ? 7.85 : 7.8;
@@ -133,8 +149,8 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
         }
     }
     if (quality) for (int f=0; f<=field_count; ++f)
-        quality->field_start_sample[f]=(uint64_t)floor(timeline[starts[f]*2]*20.0);
-    *length=(size_t)floor(timeline[half_lines]*20.0);
+        quality->field_start_sample[f]=(uint64_t)floor(timeline[starts[f]*2]*(ed ? TEST_ED_RATE/1e6 : TEST_RATE/1e6));
+    *length=(size_t)floor(timeline[half_lines]*(ed ? TEST_ED_RATE/1e6 : TEST_RATE/1e6));
     float *rf=malloc(*length*sizeof(float)); assert(rf);
     int half=0, field=0;
     double fm_phase=0.0, previous_ideal_us=0.0;
@@ -144,7 +160,7 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
     double b0=(1.0+k*tau_pole)/denom, b1=(1.0-k*tau_pole)/denom;
     double a1=(1.0-k*tau_zero)/denom, previous_base=0.0, previous_pre=0.0;
     double shelf[5]={0},previous2_base=0.0,previous2_pre=0.0;
-    if (beta) {
+    if (beta && !ed) {
         /* Physical record pre-emphasis at the RF sample rate, independent of
          * the decoder's inverse shelf evaluated at its 5MHz working rate. */
         double amplitude=pow(10.0,8.0/40.0),omega=2.0*TEST_PI*100000.0/TEST_RATE;
@@ -157,7 +173,7 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
         shelf[4]=((amplitude+1.0)-(amplitude-1.0)*cs-2.0*root*alpha)/den;
     }
     for (size_t n=0; n<*length; ++n) {
-        double real_us=n/20.0;
+        double real_us=n/(ed ? TEST_ED_RATE/1e6 : TEST_RATE/1e6);
         while (half+1<half_lines && timeline[half+1]<=real_us) half++;
         double fraction=(real_us-timeline[half])/(timeline[half+1]-timeline[half]);
         double ideal_us=(half+fraction)*line_us*.5;
@@ -306,12 +322,13 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
             frequency+=quality->carrier_offset_hz;
         }
         double base=frequency-physical_blank;
-        double pre=beta ? shelf[0]*base+shelf[1]*previous_base+shelf[2]*previous2_base
+        double pre=ed ? base : beta ? shelf[0]*base+shelf[1]*previous_base+shelf[2]*previous2_base
             -shelf[3]*previous_pre-shelf[4]*previous2_pre
             : b0*base+b1*previous_base-a1*previous_pre;
         previous2_base=previous_base;previous2_pre=previous_pre;
         previous_base=base; previous_pre=pre;
-        frequency=clamp_value(physical_blank+pre,2400000.0,6800000.0);
+        frequency=ed ? clamp_value(physical_blank+pre,6000000.0,11000000.0)
+            : clamp_value(physical_blank+pre,2400000.0,6800000.0);
         fm_phase+=2.0*TEST_PI*frequency*(ideal_us-previous_ideal_us)*1e-6;
         previous_ideal_us=ideal_us;
         if (fm_phase>2.0*TEST_PI) fm_phase=fmod(fm_phase,2.0*TEST_PI);
@@ -974,7 +991,7 @@ static double row_region_extreme(const test_frames_t *f,int row,bool maximum) {
  * per-parity gray levels as a physical field marker. */
 static void run_full_frame_format(gui_rf_profile_t profile) {
     const bool pal=profile==GUI_RF_PROFILE_PAL_VHS;
-    const bool beta=profile>=GUI_RF_PROFILE_NTSC_BETAMAX;
+    const bool beta=test_beta_profile(profile);
     gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profile);assert(decoder);
     gui_rf_decoder_set_frame_mode(decoder,true);
     test_frames_t frames={.beta_display=beta};
@@ -1082,7 +1099,9 @@ static void run_full_frame_format(gui_rf_profile_t profile) {
 }
 
 static void run_full_frame_contracts(void) {
-    for (int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile)
+    /* This QAM fixture models PAL/NTSC VHS and Beta only. Native SECAM's
+     * independent FM oracle covers its Active/Full geometry separately. */
+    for (int profile=GUI_RF_PROFILE_PAL_VHS;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile)
         run_full_frame_format((gui_rf_profile_t)profile);
 }
 
@@ -1439,7 +1458,7 @@ static void run_beta_acquire_contracts(void) {
 /* Check three distinct nonzero Y/C steps. A small profile-local calibration
  * must hold across the tape clock, line jitter and both original fields,
  * rather than aligning only one favorable synthetic red/blue transition. */
-static void check_superbeta_edges(const test_frames_t *f,double clock,double jitter) {
+static void check_beta_edges(const test_frames_t *f,const char *name,double clock,double jitter) {
     int largest_separation=0;double largest_centroid=0;
     for(int edge=4;edge<=6;++edge) for(int parity=0;parity<2;++parity) {
         int center=f->width*edge/8,radius=f->width/32;
@@ -1469,8 +1488,8 @@ static void check_superbeta_edges(const test_frames_t *f,double clock,double jit
         double centroid=fabs(c_moment/c_sum-y_moment/y_sum);
         if(centroid>largest_centroid) largest_centroid=centroid;
     }
-    printf("SuperBeta midtone registration clock %.3f jitter %.2fus: max edge %dpx, centroid %.3fpx\n",
-        clock,jitter,largest_separation,largest_centroid);
+    printf("%s midtone registration clock %.3f jitter %.2fus: max edge %dpx, centroid %.3fpx\n",
+        name,clock,jitter,largest_separation,largest_centroid);
 }
 
 /* These ordinary-SuperBeta fixtures exercise the independent 4.4/5.6MHz
@@ -1484,7 +1503,7 @@ static void run_superbeta_contracts(void) {
     assert(!gui_rf_profile_has_hifi((gui_rf_profile_t)1000));
     for(int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile) {
         bool expected=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
-                      profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+                      profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
         assert(gui_rf_profile_has_hifi((gui_rf_profile_t)profile)==expected);
     }
     assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_SUPERBETA)==GUI_RF_NTSC);
@@ -1557,9 +1576,249 @@ static void run_superbeta_contracts(void) {
         gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_SUPERBETA);frames.frames=0;frames.end_sample=0;
         process_fixture(decoder,rf,length,0,&frames);
         assert(frames.frames>=2 && frames.status.h_locked && frames.status.v_locked && frames.status.color_locked);
-        check_superbeta_edges(&frames,clocks[clock],jitter*.12);free(rf);
+        check_beta_edges(&frames,"SuperBeta",clocks[clock],jitter*.12);free(rf);
     }
     free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* ED input positions are 20 MSPS; publication stays on the common 20 MSPS
+ * clock. Compare every woven RGBA frame across input partitions. */
+typedef struct {
+    test_frames_t frame;
+    uint64_t ends[16], hashes[16];
+} test_ed_sequence_t;
+static void receive_ed_frame(void *context,const uint8_t *rgba,int width,int height,
+                             uint64_t end_sample,const gui_rf_decode_status_t *status) {
+    test_ed_sequence_t *sequence=context;
+    assert(sequence->frame.frames<16);
+    size_t slot=(size_t)sequence->frame.frames;
+    uint64_t hash=UINT64_C(14695981039346656037);
+    for(size_t n=0;n<(size_t)width*height*4u;n++) { hash^=rgba[n];hash*=UINT64_C(1099511628211); }
+    sequence->ends[slot]=end_sample;sequence->hashes[slot]=hash;
+    receive_frame(&sequence->frame,rgba,width,height,end_sample,status);
+}
+static void process_ed_chunks(gui_rf_decoder_t *decoder,const float *rf,size_t length,
+                              uint64_t origin,bool varied,test_ed_sequence_t *sequence) {
+    static const size_t chunks[]={1u,4093u,32771u,257u};
+    size_t position=0,block=0;
+    while(position<length) {
+        size_t count=varied ? chunks[block++%4u] : 8192u;
+        if(count>length-position) count=length-position;
+        gui_rf_decoder_process(decoder,rf+position,count,origin+position,receive_ed_frame,sequence);
+        position+=count;
+    }
+}
+
+/* External libm calls prevent constant-folded NaN/signed-zero expectations
+ * under the same -ffast-math flags used by production RF DSP. */
+static double (*volatile test_phase_reference)(double,double)=atan2;
+static float (*volatile test_phase_reference_float)(float,float)=atan2f;
+static uint64_t test_phase_bits(double value) {
+    uint64_t bits;memcpy(&bits,&value,sizeof(bits));return bits;
+}
+static double test_phase_from_bits(uint64_t bits) {
+    double value;memcpy(&value,&bits,sizeof(value));return value;
+}
+static bool test_phase_nan(double value) {
+    uint64_t bits=test_phase_bits(value);
+    return (bits&UINT64_C(0x7ff0000000000000))==UINT64_C(0x7ff0000000000000)
+        && (bits&UINT64_C(0x000fffffffffffff))!=0;
+}
+static void check_ed_phase_finite(double x,double z,bool legacy,
+                                  double *maximum,double *maximum_legacy) {
+    double actual=gui_rf_preview_phase(x,z),expected=test_phase_reference(x,z);
+    assert(gui_rf_deemph_finite(actual) && gui_rf_deemph_finite(expected));
+    double error=fabs(actual-expected);
+    *maximum=fmax(*maximum,error);
+    assert(error<=2e-8 && actual>=-TEST_PI && actual<=TEST_PI);
+    /* Some fast-math platform libm atan2 implementations discard -0 on
+     * this finite axis. Its mathematical result keeps the input x sign. */
+    if((test_phase_bits(x)<<1)==0 && z>0) {
+        if(test_phase_bits(actual)!=test_phase_bits(x))
+            fprintf(stderr,"phase zero mismatch:x=%.17g z=%.17g actual=%.17g expected=%.17g "
+                "bits x=%016llx z=%016llx actual=%016llx expected=%016llx\n",x,z,actual,expected,
+                (unsigned long long)test_phase_bits(x),(unsigned long long)test_phase_bits(z),
+                (unsigned long long)test_phase_bits(actual),(unsigned long long)test_phase_bits(expected));
+        assert(test_phase_bits(actual)==test_phase_bits(x));
+    }
+    if(legacy) {
+        double reference=test_phase_reference_float((float)x,(float)z);
+        double difference=fabs(actual-reference);
+        *maximum_legacy=fmax(*maximum_legacy,difference);
+        assert(difference<=5e-7);
+    }
+}
+static void run_ed_phase_contract(void) {
+    double maximum=0,maximum_legacy=0;
+    const double scales[]={1e-150,1e-20,1.0,1e20,1e150};
+    for(size_t scale=0;scale<sizeof(scales)/sizeof(scales[0]);scale++)
+        for(int point=0;point<=50000;point++) {
+            double angle=-TEST_PI+2.0*TEST_PI*point/50000.0;
+            check_ed_phase_finite(scales[scale]*sin(angle),scales[scale]*cos(angle),
+                                    scale>=1 && scale<=3,&maximum,&maximum_legacy);
+        }
+    const double transition=.4142135623730950488;
+    const double ratios[]={0,nextafter(transition,0),transition,nextafter(transition,1),
+                            nextafter(1.0,0),1.0,nextafter(1.0,2)};
+    for(size_t n=0;n<sizeof(ratios)/sizeof(ratios[0]);n++)
+        for(int sx=-1;sx<=1;sx+=2) for(int sz=-1;sz<=1;sz+=2) {
+            check_ed_phase_finite(sx*ratios[n],sz,true,&maximum,&maximum_legacy);
+            check_ed_phase_finite(sx,sz*ratios[n],true,&maximum,&maximum_legacy);
+        }
+    /* These finite doubles overflow/underflow a float cast. Compare with
+     * atan2(double),not the less accurate legacy conversion to atan2f. */
+    const double extremes[][2]={{DBL_MAX,DBL_MAX*.5},{DBL_MAX*.5,DBL_MAX},
+        {DBL_MIN,DBL_MIN*2},{DBL_MIN*2,DBL_MIN},{DBL_MAX,DBL_MIN},{DBL_MIN,DBL_MAX}};
+    for(size_t n=0;n<sizeof(extremes)/sizeof(extremes[0]);n++)
+        for(int sx=-1;sx<=1;sx+=2) for(int sz=-1;sz<=1;sz+=2)
+            check_ed_phase_finite(sx*extremes[n][0],sz*extremes[n][1],false,
+                                    &maximum,&maximum_legacy);
+    /* Volatile bit inputs retain both zero signs and nonfinite values even
+     * with finite-math-only assumptions. Fallback must preserve atan2f's
+     * actual result,including the sign of zero and the +/-pi branch cut. */
+    volatile uint64_t special[]={UINT64_C(0),UINT64_C(0x8000000000000000),
+        UINT64_C(0x3ff0000000000000),UINT64_C(0xbff0000000000000),
+        UINT64_C(0x7ff0000000000000),UINT64_C(0xfff0000000000000),
+        UINT64_C(0x7ff8000000001234)};
+    for(size_t a=0;a<sizeof(special)/sizeof(special[0]);a++)
+        for(size_t b=0;b<sizeof(special)/sizeof(special[0]);b++) {
+            double x=test_phase_from_bits(special[a]),z=test_phase_from_bits(special[b]);
+            bool fallback=!gui_rf_deemph_finite(x) || !gui_rf_deemph_finite(z)
+                            || ((test_phase_bits(x)<<1)==0 && (test_phase_bits(z)<<1)==0);
+            if(fallback) {
+                double actual=gui_rf_preview_phase(x,z);
+                double expected=test_phase_reference_float((float)x,(float)z);
+                if(test_phase_nan(expected)) assert(test_phase_nan(actual));
+                else assert(test_phase_bits(actual)==test_phase_bits(expected));
+            } else check_ed_phase_finite(x,z,true,&maximum,&maximum_legacy);
+        }
+    /* Adjacent octants must meet at pi/4 even after coefficient rounding.
+     * This catches an otherwise tiny but avoidable minimax endpoint jump. */
+    const double adjacent=nextafter(1.0,0.0);
+    assert(fabs(gui_rf_preview_phase(1.0,1.0)-TEST_PI*.25)<=1e-14);
+    for(int sx=-1;sx<=1;sx+=2) for(int sz=-1;sz<=1;sz+=2) {
+        double left=gui_rf_preview_phase(sx*adjacent,sz);
+        double right=gui_rf_preview_phase(sx,sz*adjacent);
+        assert(fabs(left-right)<=1e-14);
+    }
+    double previous=gui_rf_preview_phase(0.0,1.0);
+    for(int point=1;point<=32768;point++) {
+        double phase=gui_rf_preview_phase(point/32768.0,1.0);
+        assert(phase>=previous && phase<=TEST_PI*.25+1e-14);
+        previous=phase;
+    }
+    printf("ED phase: dense full-circle/magnitude/octant/axes/extreme/fallback checks; "
+           "max double %.9g rad,legacy float %.9g rad\n",maximum,maximum_legacy);
+}
+
+static void run_ed_physical_contracts(gui_rf_decoder_t *decoder,size_t capacity) {
+    test_frames_t frames={.beta_display=true};frames.rgba=malloc(capacity);assert(frames.rgba);
+    /* Full-range white exercises ED's9.3MHz endpoint with both physical head
+     * orders and simultaneous strong FM Hi-Fi carriers under tape jitter. */
+    for(int swap=0;swap<2;swap++) {
+        test_quality_t signal={.pattern=TEST_Q_COLOR_BARS,.fields=6,.swap_tracks=swap,
+            .beta_audio_amplitude=.12,.switch_track_line=247};
+        size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_ED_BETA,.14,
+            true,1.001,-1,TEST_V_NORMAL,&signal,&length);
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_ED_BETA);
+        frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        printf("ED Beta head order%d strong Hi-Fi RF%.2f: ",swap,signal.beta_audio_amplitude);
+        check_bars(&frames,.10);
+        assert(frames.width==640 && frames.height==480);
+        free(rf);
+    }
+    /* Reuse the same three nonzero Y/C edges and unchanged5px/gradient
+     * thresholds as SuperBeta,for each original field and tape clock. */
+    const double clocks[]={.999,1.0,1.001};
+    for(int clock=0;clock<3;clock++) for(int jitter=0;jitter<2;jitter++) {
+        test_quality_t signal={.pattern=TEST_Q_MID_BARS,.fields=6,
+            .beta_audio_amplitude=.12,.switch_track_line=247,.swap_tracks=(clock+jitter)&1};
+        size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_ED_BETA,jitter*.12,
+            true,clocks[clock],-1,TEST_V_NORMAL,&signal,&length);
+        gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_ED_BETA);
+        frames.frames=0;frames.end_sample=0;
+        process_fixture(decoder,rf,length,0,&frames);
+        assert(frames.frames>=2 && frames.width==640 && frames.height==480);
+        assert(frames.status.h_locked && frames.status.v_locked && frames.status.color_locked);
+        check_beta_edges(&frames,"ED Beta",clocks[clock],jitter*.12);
+        free(rf);
+    }
+    free(frames.rgba);
+}
+
+static void run_ed_beta_contracts(void) {
+    run_ed_phase_contract();
+    _Static_assert(GUI_RF_PROFILE_PAL_VHS==0 && GUI_RF_PROFILE_NTSC_VHS==1 &&
+        GUI_RF_PROFILE_NTSC_BETAMAX==2 && GUI_RF_PROFILE_NTSC_BETAMAX_HIFI==3 &&
+        GUI_RF_PROFILE_NTSC_SUPERBETA==4 && GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI==5 &&
+        GUI_RF_PROFILE_SECAM_VHS==6 && GUI_RF_PROFILE_MESECAM_VHS==7 &&
+        GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_COUNT==9,
+        "ED appends without changing any existing profile ID");
+    for(int profile=0;profile<GUI_RF_PROFILE_COUNT;profile++)
+        assert(gui_rf_profile_video_rate_hz((gui_rf_profile_t)profile)==
+            20000000u);
+    assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_ED_BETA)==GUI_RF_NTSC);
+    assert(gui_rf_profile_has_hifi(GUI_RF_PROFILE_NTSC_ED_BETA));
+    assert(!strcmp(gui_rf_profile_name(GUI_RF_PROFILE_NTSC_ED_BETA),"NTSC ED Beta"));
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);assert(decoder);
+    const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    test_frames_t gray={.beta_display=true};gray.rgba=malloc(capacity);assert(gray.rgba);
+    test_quality_t levels={.pattern=TEST_Q_LEVEL_BARS,.fields=6};
+    size_t length;float *rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_ED_BETA,0,true,1.0,-1,
+        TEST_V_NORMAL,&levels,&length);
+    assert(length>(size_t)(TEST_ED_RATE*.099) && length<(size_t)(TEST_ED_RATE*.101));
+    process_fixture(decoder,rf,length,0,&gray);
+    assert(gray.frames>=2 && gray.width==640 && gray.height==480);
+    assert(gray.status.h_locked && gray.status.v_locked);
+    const double nominal[]={0.0,.025,.10,.25,.50,.65,.85,1.0};
+    double error=0.0;
+    for(int parity=0;parity<2;parity++) for(int bar=0;bar<8;bar++) for(int channel=0;channel<3;channel++) {
+        quality_rows_t rows=quality_rows(&gray,parity,bar,channel,nominal[bar]);
+        error=fmax(error,rows.maximum_error);
+        assert(fabs(rows.mean-nominal[bar])<.035 && rows.maximum_error<.06 && rows.row_rms<.015);
+    }
+    printf("ED Beta nominal 0-100IRE gray: max error %.5f\n",error);
+    free(rf);free(gray.rgba);
+    test_quality_t color={.pattern=TEST_Q_COLOR_BARS,.fields=6,.swap_tracks=1};
+    rf=make_rf_signal_profile(GUI_RF_PROFILE_NTSC_ED_BETA,0,true,1.0,-1,
+        TEST_V_NORMAL,&color,&length);
+    const uint64_t origin=UINT64_C(10000000003); /* Odd, nonzero 20MSPS input origin. */
+    test_ed_sequence_t reference={.frame={.beta_display=true}},partition={.frame={.beta_display=true}};
+    reference.frame.rgba=malloc(capacity);partition.frame.rgba=malloc(capacity);
+    assert(reference.frame.rgba && partition.frame.rgba);
+    gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_ED_BETA);
+    process_ed_chunks(decoder,rf,length,origin,false,&reference);
+    check_bars(&reference.frame,.10);
+    assert(reference.frame.width==640 && reference.frame.height==480);
+    assert(reference.frame.first_end_sample>=origin && reference.frame.end_sample<=origin+length+4);
+    gui_rf_decoder_reset_profile(decoder,GUI_RF_PROFILE_NTSC_ED_BETA);
+    process_ed_chunks(decoder,rf,length,origin,true,&partition);
+    check_bars(&partition.frame,.10);
+    assert(partition.frame.frames==reference.frame.frames);
+    for(int frame=0;frame<reference.frame.frames;frame++) {
+        assert(partition.ends[frame]==reference.ends[frame]);
+        assert(partition.hashes[frame]==reference.hashes[frame]);
+    }
+    /* A genuine 20MSPS discontinuity discards partial fields and keeps ED.
+     * Recovery timestamps remain on the20MSPS clock, never working-5M. */
+    float silence[257]={0};uint64_t gap=origin+length+UINT64_C(4000001);
+    partition.frame.frames=0;partition.frame.end_sample=0;
+    gui_rf_decoder_process(decoder,silence,257,gap,receive_ed_frame,&partition);
+    gui_rf_decode_status_t state;gui_rf_decoder_get_status(decoder,&state);
+    assert(!state.h_locked && !state.v_locked && !state.color_locked && state.frames_decoded==0);
+    assert(partition.frame.frames==0);
+    uint64_t resume=gap+257;
+    process_ed_chunks(decoder,rf,length,resume,true,&partition);
+    check_bars(&partition.frame,.10);
+    assert(partition.frame.first_end_sample>=resume+color.field_start_sample[2]);
+    assert(partition.frame.end_sample<=resume+length+4);
+    printf("ED Beta 20MSPS partition/gap: %d identical frames, common20M end %llu\n",
+        reference.frame.frames,(unsigned long long)partition.frame.end_sample);
+    free(rf);free(reference.frame.rgba);free(partition.frame.rgba);
+    run_ed_physical_contracts(decoder,capacity);gui_rf_decoder_destroy(decoder);
+    /* Opposite head order, original field parity and complete Full526 rows. */
+    run_full_frame_format(GUI_RF_PROFILE_NTSC_ED_BETA);
 }
 
 static void run_superbeta_acquire_contracts(void) {
@@ -1742,11 +2001,14 @@ int main(int argc, char **argv) {
         run_split_vertical(GUI_RF_PAL,TEST_V_SPLIT_13P5_FIRST,true);
         run_split_vertical(GUI_RF_NTSC,TEST_V_SPLIT_13P5_FIRST,true);return 0;
     }
+    if (argc==2 && strcmp(argv[1],"--ed-beta-only")==0) {
+        run_ed_beta_contracts();puts("ED Beta 20MSPS physical RF contracts passed");return 0;
+    }
     if (argc==2 && strcmp(argv[1],"--full-frame-only")==0) {
         run_full_frame_contracts();puts("Full-frame geometry and level contracts passed");return 0;
     }
     if (argc!=1 && (argc!=3 || strcmp(argv[1],"--real-ntsc-bars")!=0)) {
-        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only]\n",argv[0]);
+        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only] [--ed-beta-only]\n",argv[0]);
         return 2;
     }
     run_deemphasis_contract();
@@ -1755,6 +2017,7 @@ int main(int argc, char **argv) {
     run_superbeta_contracts();
     run_superbeta_acquire_contracts();
     run_superbeta_display_level_contracts();
+    run_ed_beta_contracts();
     run_registration_contract();
     run_quality_contracts();
     run_stop_resume();

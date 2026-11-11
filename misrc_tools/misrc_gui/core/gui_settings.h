@@ -263,8 +263,14 @@ typedef struct {
     // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).
     // Applied to every CVBS panel decoder at create; the System dropdown
     // writes the user's selection back here (saved with the normal
-    // exit-time settings save).
+    // exit-time settings save). The generator Gen box writes 0-3 here
+    // (3 = MESECAM, RF-only; composite maps it to SECAM).
     int     video_system;
+
+    // Test Gen tape format family (0=VHS, 1=S-VHS, 2=Betamax, 3=Video8,
+    // 4=Hi8 - gui_testgen_format_t). Drives the Channel B RF modulation
+    // parameters; persisted so the generator reopens in the last pick.
+    int     gen_tape_format;
 
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
@@ -277,7 +283,9 @@ typedef struct {
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),
-    // 2=Client (connect to a host server, slave).
+    // 2=Client (connect to a host server, slave),
+    // 3=old M-Server ID (loads as 1, the unified Server) and 4=M-Client
+    // (upstream's Monitor & Remote client).
     int  net_mode;
     uint16_t net_server_port;                 // Port to listen on when Server.
     char net_server_port_str[16];             // Editable string mirror of net_server_port.
@@ -289,6 +297,10 @@ typedef struct {
     // and audio the server streams. /rf drops the oldest data when the link
     // cannot keep up, so a local file can have gaps: monitoring grade.
     bool net_client_record_local;
+    /* M-Client ONLY: local output selection. Does not activate file transfer.
+     * Never include this path in monitor HTTP commands or server settings. */
+    char monitor_local_save_path[FILE_PATH_MAX];
+    bool monitor_local_save_enabled;  /* M-Client only; never synced to M-Server */
 } gui_settings_t;
 
 /* ----------------------------------------------------------------------------
@@ -298,6 +310,8 @@ typedef struct {
 // Settings persistence
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
+/* Restore local recording profile after leaving M-Client; never touches other modes. */
+void gui_settings_restore_monitor_profile(gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
 
 /* Regenerate every auto-derived output filename from the current base name and

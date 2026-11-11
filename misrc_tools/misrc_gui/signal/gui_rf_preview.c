@@ -12,6 +12,7 @@
  */
 #include "gui_rf_preview.h"
 #include "gui_rf_preview_filters.h"
+#include "gui_rf_preview_geometry.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +25,6 @@
 #endif
 
 #define RF_PI 3.14159265358979323846
-#define RF_RAW_RATE 20000000.0
 #define RF_VIDEO_RATE 5000000.0
 #define RF_RING_SIZE (1u << 19)
 #define RF_RING_MASK (RF_RING_SIZE - 1u)
@@ -64,38 +64,60 @@ typedef struct {
 
 /* SP carrier/IRE/burst/geometry parameters from the referenced format snapshot. */
 static const rf_profile_t rf_profiles[] = {
-    {768, 576, 22, 5, 64.0, 4100000.0, 3800000.0, 7000.0, 626953.0,
-     5.6, 7.85, 10.5, 62.5, 100e-9, 400e-9,
+    {768, 576, 22, 5, GUI_RF_PAL_LINE_US, 4100000.0, 3800000.0, 7000.0, 626953.0,
+     5.6, 7.85, GUI_RF_PAL_ACTIVE_START_US, GUI_RF_PAL_ACTIVE_END_US, 100e-9, 400e-9,
      4300000.0,1300000.0,6500000.0,400000.0,1,2,0,0,0,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL},
-    {640, 480, 20, 6, 63.55555555555556, 3685714.2857142854, 3400000.0,
+    {640, 480, 20, 6, GUI_RF_NTSC_LINE_US, 3685714.2857142854, 3400000.0,
      7142.857142857143, 629370.6293706294,
-     5.3, 7.8, 9.45, 62.55555555555556, 120e-9, 320e-9,
+     5.3, 7.8, GUI_RF_NTSC_ACTIVE_START_US, GUI_RF_NTSC_ACTIVE_END_US, 120e-9, 320e-9,
      3900000.0,1300000.0,6500000.0,400000.0,1,2,13.9794,273755.82,.462088186,false,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
     /* .NET format-params.snapshot.json NTSC BETAMAX / BETAMAX_HIFI:
      * IRE0/Hz-per-IRE, 688.374kHz color-under, [2,0] quarter-turn rotation,
      * RF cutoffs and 8dB/100kHz shelf. Preview remains bandwidth-reduced;
      * nonlinear sub-deemphasis, RF equalization and dropout repair are omitted. */
-    {640,480,20,6,63.55555555555556,3942857.1428571427,3600000.0,
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,3942857.1428571427,3600000.0,
      8571.42857142857,688374.125874126,
-     5.3,7.8,9.45,62.55555555555556,120e-9,320e-9,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
      4200000.0,1600000.0,5380000.0,600000.0,1,2,8.0,100000.0,.5,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
-    {640,480,20,6,63.55555555555556,4200000.0,3800000.0,
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,4200000.0,3800000.0,
      10000.0,688374.125874126,
-     5.3,7.8,9.45,62.55555555555556,120e-9,320e-9,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
      4500000.0,2000000.0,5880000.0,350000.0,6,4,8.0,100000.0,.5,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
     /* Ordinary NTSC SuperBeta: 4.4MHz sync tip / 5.6MHz peak white
      * (Sencore TT135 service reference), with -40/100 IRE endpoints.
      * Both audio choices share this video modulation; Hi-Fi is routed by the
      * worker. The lightweight RF/chroma cutoffs are preview engineering
      * choices, retaining 20MSPS input / 5MSPS processing, not tape standards. */
-    {640,480,20,6,63.55555555555556,4742857.142857143,4400000.0,
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,4742857.142857143,4400000.0,
      8571.42857142857,688374.125874126,
-     5.3,7.8,9.45,62.55555555555556,120e-9,320e-9,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
      5000000.0,2000000.0,6880000.0,350000.0,6,4,8.0,100000.0,.5,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
-    {640,480,20,6,63.55555555555556,4742857.142857143,4400000.0,
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,4742857.142857143,4400000.0,
      8571.42857142857,688374.125874126,
-     5.3,7.8,9.45,62.55555555555556,120e-9,320e-9,
-     5000000.0,2000000.0,6880000.0,350000.0,6,4,8.0,100000.0,.5,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
+     5000000.0,2000000.0,6880000.0,350000.0,6,4,8.0,100000.0,.5,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
+    /* Native SECAM VHS divides the FM chroma carrier/deviation by four.
+     * This is not PAL color-under and not heterodyne MESECAM. The luma
+     * modulation and 625/50 geometry are shared with PAL VHS SP. A steeper
+     * RF high-pass rejects its higher 1.06/1.10MHz chroma band. */
+    {768,576,22,5,GUI_RF_PAL_LINE_US,4100000.0,3800000.0,7000.0,1082031.25,
+     5.6,7.85,GUI_RF_PAL_ACTIVE_START_US,GUI_RF_PAL_ACTIVE_END_US,100e-9,400e-9,
+     4300000.0,1600000.0,6500000.0,350000.0,2,4,0,0,0,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL},
+    /* MESECAM preserves studio FM deviation and inverts the chroma band
+     * through the PAL converter LO, 5.060571875MHz. Rest Dr/Db therefore
+     * land at 654321.875/810571.875Hz, without PAL head/line rotation.
+     * The wider sideband filter is a preview choice, not a recording spec. */
+    {768,576,22,5,GUI_RF_PAL_LINE_US,4100000.0,3800000.0,7000.0,732446.875,
+     5.6,7.85,GUI_RF_PAL_ACTIVE_START_US,GUI_RF_PAL_ACTIVE_END_US,100e-9,400e-9,
+     4300000.0,1300000.0,6500000.0,600000.0,2,4,0,0,0,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL},
+    /* Sony EDV-9500: 6.8MHz sync / 9.3MHz 100IRE white, 688kHz C.
+     * Use the reduced 20MSPS preview band; upper FM sidebands are omitted.
+     * Flat preview de-emphasis deliberately omits Sony's nonlinear LCR
+     * expansion. RF/IQ bandwidths are streaming-preview engineering choices. */
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,7514285.714285714,6800000.0,
+     17857.14285714286,688374.125874126,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,0,0,
+     8050000.0,4200000.0,9500000.0,350000.0,2,4,0,1000000.0,.70710678,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
 };
 
 _Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_COUNT,
@@ -105,42 +127,64 @@ static bool rf_profile_valid(gui_rf_profile_t profile) {
     return profile>=GUI_RF_PROFILE_PAL_VHS && profile<GUI_RF_PROFILE_COUNT;
 }
 
-gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile) {
-    return profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC;
+uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile) {
+    return profile==GUI_RF_PROFILE_NTSC_ED_BETA ? GUI_RF_ED_BETA_RATE_HZ : GUI_RF_DECODE_RATE_HZ;
 }
+
+gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile) {
+    return profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_SECAM_VHS
+        || profile==GUI_RF_PROFILE_MESECAM_VHS
+        ? GUI_RF_PAL : GUI_RF_NTSC;
+}
+
+static bool rf_native_secam(const gui_rf_decoder_t *d);
+static bool rf_secam_fm(const gui_rf_decoder_t *d);
 
 const char *gui_rf_profile_name(gui_rf_profile_t profile) {
     static const char *names[]={"PAL VHS SP","NTSC VHS SP","NTSC Betamax","NTSC Beta Hi-Fi",
-        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi"};
+        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP","NTSC ED Beta"};
     return rf_profile_valid(profile) ? names[profile] : "Unknown RF profile";
 }
 
 bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
-           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
 }
 
 struct gui_rf_decoder {
     gui_rf_format_t format;
     gui_rf_profile_t profile;
     rf_profile_t p;
+    double raw_rate;
+    unsigned raw_decimation;
     bool full_frame;   /* Active/Full display mode (see set_frame_mode). */
-    float *storage, *luma, *sync, *ci, *cq, *envelope, *sync_luma;
+    float *storage, *luma, *sync, *ci, *cq, *envelope, *sync_luma, *secam_fm;
     uint8_t *rgba;
     uint64_t next_raw, low_first, low_last;
     bool have_raw, have_low;
-    rf_biquad_t rf_hp[6], rf_lp, yi[2], yq[2], ui[4], uq[4], luma_deemph;
+    float *mesecam_i,*mesecam_q;
+    rf_biquad_t rf_hp[6], rf_lp, yi[4], yq[4], ui[4], uq[4], luma_deemph;
 #if GUI_RF_PACKED_IQ
     rf_biquad4_t beta_iq[4];
 #endif
     double y_cos, y_sin, y_step_cos, y_step_sin;
     double c_cos, c_sin, c_step_cos, c_step_sin, fm_center;
     float prev_i, prev_q, deemph_x, deemph_y, sync_y;
+    float secam_prev_i, secam_prev_q, secam_deemph_x, secam_deemph_y;
+    float secam_b0, secam_b1, secam_a1;
+    rf_biquad_t secam_video_lp[2];
+    double mesecam_reference_ratio;
+    uint8_t secam_pixel_valid[RF_MAX_LINES][GUI_RF_FRAME_MAX_WIDTH];
+    bool secam_have_ident, secam_dr_even;
+    int secam_ident_streak, secam_ident_age, secam_last_parity;
+    double secam_last_field;
     float deemph_b0, deemph_b1, deemph_a1, sync_alpha;
-    double luma_delay, chroma_delay, sync_delay, sync_luma_delay;
+    double luma_delay, chroma_delay, sync_delay, sync_luma_delay, secam_fm_delay;
     double luma_wow;
     bool have_luma_wow, use_ntsc_deemph;
     float field_rows[2][3][GUI_RF_FRAME_MAX_WIDTH];
+    /* One field of native line-sequential C, never the opposite field. */
+    float secam_rows[RF_MAX_LINES][GUI_RF_FRAME_MAX_WIDTH];
     double sync_est, blank_est, period;
     double sync_anchor, blank_anchor;
     uint64_t level_search_after, last_level_field;
@@ -149,7 +193,8 @@ struct gui_rf_decoder {
     bool display_levels_valid;
     bool in_pulse;
     double pulse_start, previous_sync;
-    double last_h, first_eq, last_pulse, last_pulse_end, first_v;
+    double last_h, previous_h, last_h_width, previous_h_width;
+    double first_eq, last_pulse, last_pulse_end, first_v;
     int eq_run, v_run, candidate_v_run, good_h;
     bool have_short_broad, have_split_broad, split_broad_weak;
     double short_broad_start, short_broad_end, split_broad_start;
@@ -166,6 +211,14 @@ struct gui_rf_decoder {
     bool ready_color[2];
     gui_rf_decode_status_t status;
 };
+
+static bool rf_native_secam(const gui_rf_decoder_t *d) {
+    return d->profile==GUI_RF_PROFILE_SECAM_VHS;
+}
+
+static bool rf_secam_fm(const gui_rf_decoder_t *d) {
+    return rf_native_secam(d) || d->profile==GUI_RF_PROFILE_MESECAM_VHS;
+}
 
 static double rf_clamp(double x, double lo, double hi) {
     return x < lo ? lo : x > hi ? hi : x;
@@ -349,7 +402,8 @@ static void rf_reacquire_sync(gui_rf_decoder_t *d) {
     d->sync_est=d->sync_anchor=d->p.sync_hz;
     d->blank_est=d->blank_anchor=d->p.blank_hz;
     d->period=d->p.line_us*5.0;
-    d->good_h=0;d->last_h=0.0;
+    d->good_h=0;d->last_h=d->previous_h=0.0;
+    d->last_h_width=d->previous_h_width=0.0;
     d->h_head=d->h_count=0;
     d->in_pulse=false;d->last_kind=RF_PULSE_NONE;
     d->eq_run=d->v_run=d->candidate_v_run=0;
@@ -358,6 +412,7 @@ static void rf_reacquire_sync(gui_rf_decoder_t *d) {
     d->ready_fields=0;d->have_field=false;
     d->have_luma_wow=false;d->luma_wow=1.0;
     d->display_levels_valid=false;
+    d->secam_have_ident=false;d->secam_ident_streak=d->secam_ident_age=0;
     d->display_level_search_after=0;
     snprintf(d->status.reason,sizeof(d->status.reason),"RF sync lost");
 }
@@ -373,6 +428,519 @@ static void rf_reject_field(gui_rf_decoder_t *d, rf_reject_t cause, const char *
     d->status.v_locked=false;
     d->display_levels_valid=false;
     d->display_level_search_after=0;
+}
+
+/* SECAM VHS: ITU-R BT.470-6 Table 2 and JVC VTG82063 section 3.14.
+ * MESECAM instead mixes below LO=5.060571875MHz, with inverted spectrum
+ * and full studio deviation. Its H references are separately usable.
+ * In the native method:
+ * The tape divider records fOB/4=1.0625MHz and fOR/4=1.1015625MHz, with
+ * deviations 230kHz/4 and 280kHz/4. No PAL burst, phase rotation, or cloche
+ * restoration belongs in this direct FM path. ITU-R BT.470-6 Table 2.18
+ * identifies components from references, never active picture frequency:
+ * saturated legal magenta reverses the two active medians. Native divider
+ * settling makes the H porch unreliable on this tape, so identify the VBI
+ * bottles by their opposite ramps AND known plateau frequencies. A gap
+ * discards the four-field confirmation and bounded identification flywheel. */
+/* Take colour-under from the already buffered MESECAM IQ. The 600kHz
+ * sideband filter alone admits low RF near its negative-frequency edge;
+ * its phase discriminator can then count spurious cycles even with a strong
+ * carrier. Remodulate at 5MSPS and reject that ingress in both directions.
+ * This adds no highpass group delay to the legal full-deviation FM. The
+ * 128-sample padding bounds each IIR transient outside the committed chunk;
+ * both pads must already be present, including after gaps and reacquisition.
+ * The 200kHz preview cutoff is below the legal 304kHz instantaneous rail:
+ * RF sidebands extend beyond those rails and may not be hard-clipped there. */
+/* Additional octant reduction covers legal full-deviation phase without
+ * a libm call. For .25<|x/z|<=.7, rotation by pi/8 leaves |r|<=.2217;
+ * the same r^7 alternating series then errs below.114Hz at5MSPS, less
+ * than the existing .35Hz bound on the unchanged small-ratio branch. */
+static inline double rf_mesecam_phase(double x,double z) {
+    if(z>0 && fabs(x)<=.25*z) {
+        double r=x/z,r2=r*r;
+        return r*(1+r2*(-1.0/3+r2*(1.0/5-r2/7)));
+    }
+    if(z>0 && fabs(x)<=.7*z) {
+        const double tangent=.4142135623730950488;
+        double magnitude=fabs(x),r=(magnitude-tangent*z)/(z+tangent*magnitude),r2=r*r;
+        double residual=r*(1+r2*(-1.0/3+r2*(1.0/5-r2/7)));
+        return copysign(RF_PI/8.0+residual,x);
+    }
+    return atan2f((float)x,(float)z);
+}
+
+static bool rf_level_finite(float value);
+
+/* A finite float's square and their sum fit in double without underflow.
+ * Keep libm's Inf/NaN rules through the exponent-bit finite check, which
+ * also survives finite-math-only. Normal RF needs only hardware sqrt. */
+static inline float rf_mesecam_magnitude(float i,float q) {
+    if(!rf_level_finite(i) || !rf_level_finite(q))return hypotf(i,q);
+    return (float)sqrt((double)i*i+(double)q*q);
+}
+
+static void rf_prepare_mesecam_field(gui_rf_decoder_t *d,double field_start) {
+    /* 2048 samples commit 409.6us at 5MSPS. Each 25.6us pad is over
+     * twelve decay constants of the slowest 200kHz fourth-order pole.
+     * Full mode has at most313 rows; cover an extra measured H so its last
+     * row's demodulator/post-LP lookahead is still inside prepared data. */
+    enum { PAD=128, STEP=2048, N=STEP+2*PAD };
+    const double w=2.0*RF_PI*d->p.carrier_hz/RF_VIDEO_RATE;
+    const double step_c=cos(w),step_s=sin(w);
+    int64_t first=(int64_t)floor(field_start+d->secam_fm_delay-d->sync_delay)-16;
+    int64_t last=(int64_t)ceil(field_start+314*d->period+d->secam_fm_delay-d->sync_delay)+32;
+    if(first<(int64_t)d->low_first+PAD)first=(int64_t)d->low_first+PAD;
+    if(last>(int64_t)d->low_last-PAD)last=(int64_t)d->low_last-PAD;
+#if GUI_RF_PACKED_IQ
+    /* Lanes0/1 and2/3 are separate chunks' I/Q.
+     * Each oscillator seed, pad, filter state, pass order and commit span
+     * remains independent. No adjacent samples share recursive state. */
+    for(int64_t start=first;start<last;start+=2*STEP) {
+        const int blocks=start+STEP<last?2:1;
+        int take[2]={0,0},span[2]={0,0};
+        int64_t chunk_start[2]={start,start+STEP};
+        float re[2][N],im[2][N];
+        for(int block=0;block<blocks;block++) {
+            int64_t at_start=chunk_start[block];
+            take[block]=last-at_start<STEP?(int)(last-at_start):STEP;
+            span[block]=take[block]+2*PAD;
+            double c=cos(w*(at_start-PAD)),s=sin(w*(at_start-PAD));
+            for(int n=0;n<span[block];n++) {
+                unsigned at=(unsigned)((at_start-PAD+n)&RF_RING_MASK);
+                double i=d->mesecam_i[at],q=d->mesecam_q[at];
+                re[block][n]=(float)(i*c-q*s);im[block][n]=(float)(i*s+q*c);
+                double next_c=c*step_c-s*step_s;s=s*step_c+c*step_s;c=next_c;
+            }
+        }
+        const double qs[2]={.5411961,1.3065630};
+        for(int direction=0;direction<2;direction++) {
+            rf_biquad4_t hp[2]={0};
+            for(int j=0;j<2;j++) {
+                rf_biquad_t f=rf_filter(RF_VIDEO_RATE,200000.0,qs[j],true);
+                for(int lane=0;lane<4;lane++) {
+                    hp[j].b0[lane]=f.b0;hp[j].b1[lane]=f.b1;hp[j].b2[lane]=f.b2;
+                    hp[j].a1[lane]=f.a1;hp[j].a2[lane]=f.a2;
+                }
+            }
+            if(blocks==2 && span[0]==span[1]) {
+                /* The common full pair has no per-sample tail branch. */
+                for(int k=0;k<span[0];k++) {
+                    int n=direction?span[0]-1-k:k;
+                    __m128 value=_mm_setr_ps(re[0][n],im[0][n],re[1][n],im[1][n]);
+                    value=rf_filter4_sample(&hp[0],value);
+                    value=rf_filter4_sample(&hp[1],value);
+                    float out[4];_mm_storeu_ps(out,value);
+                    re[0][n]=out[0];im[0][n]=out[1];re[1][n]=out[2];im[1][n]=out[3];
+                }
+            } else {
+                /* Backward sample indices are relative to EACH own span.
+                 * A short second chunk stops writing at its actual end;
+                 * later dummy-lane state is never committed or reused. */
+                for(int k=0;k<span[0];k++) {
+                    int n0=direction?span[0]-1-k:k;
+                    int n1=direction?span[1]-1-k:k;
+                    bool second=k<span[1];
+                    /* Finished dummy lanes must not run their obsolete state
+                     * into subnormals when the host leaves FTZ disabled.
+                     * They have no remaining input/output in either pass. */
+                    if(k==span[1])for(int j=0;j<2;j++)for(int lane=2;lane<4;lane++)
+                        hp[j].z1[lane]=hp[j].z2[lane]=0.0f;
+                    __m128 value=_mm_setr_ps(re[0][n0],im[0][n0],
+                        second?re[1][n1]:0.0f,second?im[1][n1]:0.0f);
+                    value=rf_filter4_sample(&hp[0],value);
+                    value=rf_filter4_sample(&hp[1],value);
+                    float out[4];_mm_storeu_ps(out,value);re[0][n0]=out[0];im[0][n0]=out[1];
+                    if(second){re[1][n1]=out[2];im[1][n1]=out[3];}
+                }
+            }
+        }
+        for(int block=0;block<blocks;block++)for(int n=PAD;n<PAD+take[block];n++) {
+            double cross=(double)re[block][n-1]*im[block][n]-(double)im[block][n-1]*re[block][n];
+            double dot=(double)re[block][n-1]*re[block][n]+(double)im[block][n-1]*im[block][n];
+            double x=cross*step_c-dot*step_s,z=dot*step_c+cross*step_s;
+            double phase;
+            phase=rf_mesecam_phase(x,z);
+            unsigned at=(unsigned)((chunk_start[block]+n-PAD)&RF_RING_MASK);
+            d->secam_fm[at]=(float)(d->p.carrier_hz+phase*(RF_VIDEO_RATE/(2.0*RF_PI)));
+            d->cq[at]=rf_mesecam_magnitude(re[block][n],im[block][n]);
+        }
+    }
+#else
+    for(int64_t start=first;start<last;start+=STEP) {
+        int take=last-start<STEP?(int)(last-start):STEP,span=take+2*PAD;
+        float re[N],im[N];
+        double c=cos(w*(start-PAD)),s=sin(w*(start-PAD));
+        for(int n=0;n<span;n++) {
+            unsigned at=(unsigned)((start-PAD+n)&RF_RING_MASK);
+            double i=d->mesecam_i[at],q=d->mesecam_q[at];
+            re[n]=(float)(i*c-q*s);im[n]=(float)(i*s+q*c);
+            double next_c=c*step_c-s*step_s;s=s*step_c+c*step_s;c=next_c;
+        }
+        const double qs[2]={.5411961,1.3065630};
+        for(int direction=0;direction<2;direction++) {
+            rf_biquad_t hi[2],hq[2];
+            for(int k=0;k<2;k++)hi[k]=hq[k]=rf_filter(RF_VIDEO_RATE,200000.0,qs[k],true);
+            for(int k=0;k<span;k++) {
+                int n=direction?span-1-k:k;
+                for(int j=0;j<2;j++){re[n]=rf_filter_sample(&hi[j],re[n]);im[n]=rf_filter_sample(&hq[j],im[n]);}
+            }
+        }
+        for(int n=PAD;n<PAD+take;n++) {
+            double cross=(double)re[n-1]*im[n]-(double)im[n-1]*re[n];
+            double dot=(double)re[n-1]*re[n]+(double)im[n-1]*im[n];
+            double x=cross*step_c-dot*step_s,z=dot*step_c+cross*step_s;
+            double phase;
+            phase=rf_mesecam_phase(x,z);
+            unsigned at=(unsigned)((start+n-PAD)&RF_RING_MASK);
+            d->secam_fm[at]=(float)(d->p.carrier_hz+phase*(RF_VIDEO_RATE/(2.0*RF_PI)));
+            d->cq[at]=rf_mesecam_magnitude(re[n],im[n]);
+        }
+    }
+#endif
+}
+
+static float rf_level_quantile(float *values,int count,int target);
+
+/* Identification survives short missing references; carrier presence does
+ * not. Measure the current line's amplitude and unclipped FM before the LF
+ * inverse can spread a phase error into the picture. Keep a pixel mask so a
+ * local dropout never turns a healthy remainder into one-component colour. */
+static int rf_build_mesecam_rows(gui_rf_decoder_t *d,const double *lines,
+                                 const double *periods,const double *wow,
+                                 int rows,int line_first,bool *valid) {
+    /* A PAL line is320 working samples. The64-sample (12.8us) tail covers
+     * the250kHz post-LP delay, three-sample display registration and linear
+     * interpolation. Confidence covers THIS line only. A17-sample (3.4us)
+     * envelope window rejects a brief high noise peak; a bounded24us bridge
+     * prevents LF memory from extending a local hole across the picture. */
+    enum { N=384, AM_PAD=8, CLICK_PAD=8, MAX_REPAIR=120 };
+    const double nominal=d->p.line_us*5.0;
+    const double low=304321.875,high=1160571.875;
+    const double video_delay=rf_filter_delay(&d->secam_video_lp[0])
+                            +rf_filter_delay(&d->secam_video_lp[1]);
+    const double win_start=d->full_frame?0.0:d->p.active_start_us;
+    const double win_end=d->full_frame?d->p.line_us:d->p.active_end_us;
+    int valid_rows=0;
+    for(int y=0;y<rows;y++) {
+        const int line=line_first+y;
+        bool dr=(((line&1)==0)==d->secam_dr_even);
+        double rest=dr?654321.875:810571.875;
+        double deviation=dr?-280000.0:-230000.0;
+        double gain=dr?-1.0/(1.902*1.139883):1.0/(1.505*2.032062);
+        double scale=periods[y]/nominal;
+        float f[N],decoded[N],relative[N],levels[N];int level_count=0;
+        uint8_t amplitude[N],click[N],outside[N],good[N],display[N];
+        for(int n=0;n<N;n++) {
+            double p=lines[y]+n*scale+d->secam_fm_delay-d->sync_delay;
+            f[n]=(float)(rf_read(d,d->secam_fm,p)*wow[y]);
+            double env=rf_read(d,d->cq,p);
+            double yenv=rf_read(d,d->envelope,lines[y]+n*scale+d->sync_luma_delay-d->sync_delay);
+            relative[n]=(float)(env/fmax(yenv,1e-12));
+            if(n>=ceil(d->p.active_start_us*5.0) && n<d->p.active_end_us*5.0)levels[level_count++]=relative[n];
+            outside[n]=(uint8_t)(f[n]<low-100000.0 || f[n]>high+100000.0);
+            click[n]=(uint8_t)(env>1e-7 && (f[n]<0 || f[n]>1500000.0));
+        }
+        /* A low amplitude quantile follows a genuine picture-only AM fade
+         * and SECAM's legal Bell envelope. Cap it by the quiet reference so
+         * highly modulated colour cannot raise its own admission threshold.
+         * The reference floor and raw-FM rail density reject band noise;
+         * no active hue, saturation, or single-tone coherence is assumed. */
+        double local=rf_level_quantile(levels,level_count,level_count/10);
+        double floor_ratio=fmax(.012,fmax(.25*d->mesecam_reference_ratio,
+            .75*fmin(d->mesecam_reference_ratio,local)));
+        int amplitude_sum[N+1],click_sum[N+1],outside_sum[N+1];
+        amplitude_sum[0]=click_sum[0]=outside_sum[0]=0;
+        for(int n=0;n<N;n++) {
+            amplitude[n]=(uint8_t)(n<320 && relative[n]>floor_ratio);
+            amplitude_sum[n+1]=amplitude_sum[n]+amplitude[n];
+            click_sum[n+1]=click_sum[n]+click[n];
+            outside_sum[n+1]=outside_sum[n]+outside[n];
+        }
+        for(int n=0;n<N;n++) {
+            int a=n-AM_PAD,b=n+AM_PAD;
+            if(a<0)a=0;
+            if(b>=N)b=N-1;
+            int count=b-a+1,am=amplitude_sum[b+1]-amplitude_sum[a];
+            display[n]=(uint8_t)(am*5>=count*4 && (outside_sum[b+1]-outside_sum[a])*5<count);
+            int ca=n-CLICK_PAD,cb=n+CLICK_PAD;
+            if(ca<0)ca=0;
+            if(cb>=N)cb=N-1;
+            good[n]=(uint8_t)(display[n] && click_sum[cb+1]==click_sum[ca]);
+        }
+        /* Interpolate only bounded, witnessed phase/AM holes before LF
+         * recovery. Missing-carrier pixels stay muted even when frequency
+         * is bridged, and a long unusable run cannot invent colour. */
+        for(int n=0;n<N;) {
+            if(good[n]) {n++;continue;}
+            int first=n;while(n<N && !good[n])n++;
+            int last=n-1,left=first-1,right=n;
+            bool repair=last-first+1<=MAX_REPAIR && left>=0 && right<N;
+            double a=left>=0?f[left]:rest,b=right<N?f[right]:a;
+            for(int k=first;k<=last;k++) {
+                f[k]=(float)(repair?a+(b-a)*(k-left)/(right-left):rest);
+                if(!repair)display[k]=0;
+            }
+        }
+        float dx=0,dy=0;rf_biquad_t lp[2]={d->secam_video_lp[0],d->secam_video_lp[1]};
+        lp[0].z1=lp[0].z2=lp[1].z1=lp[1].z2=0;
+        for(int n=0;n<N;n++) {
+            float x=(float)(rf_clamp(f[n],low,high)-rest);
+            float z=d->secam_b0*x+d->secam_b1*dx-d->secam_a1*dy;dx=x;dy=z;
+            for(int k=0;k<2;k++)z=rf_filter_sample(&lp[k],z);
+            decoded[n]=z;
+        }
+        int visible=0,carrier=0;
+        for(int x=0;x<d->p.width;x++) {
+            double physical=(win_start+(x+.5)*(win_end-win_start)/d->p.width)*5.0;
+            int raw_index=(int)floor(physical+.5);
+            double at=physical+3.0+video_delay;int a=(int)floor(at);double frac=at-a;
+            if(a<0)a=0;
+            if(a>=N-1)a=N-2;
+            bool q=raw_index>=0 && raw_index<N && display[raw_index];
+            d->secam_pixel_valid[y][x]=(uint8_t)q;
+            d->secam_rows[y][x]=q?(float)((decoded[a]+(decoded[a+1]-decoded[a])*frac)/deviation*gain):0.0f;
+            if(physical>=d->p.active_start_us*5.0 && physical<d->p.active_end_us*5.0) {
+                visible++;carrier+=q;
+            }
+        }
+        valid[y]=carrier>visible/2;if(valid[y])valid_rows++;
+    }
+    return valid_rows;
+}
+
+static bool rf_render_secam_field(gui_rf_decoder_t *d, const double *lines,
+                                  const double *periods, const double *luma_wow,
+                                  int rows, int line_first, int parity,
+                                  double field_start) {
+    const double nominal=d->p.line_us*5.0;
+    const bool native=rf_native_secam(d);
+    if(!native)rf_prepare_mesecam_field(d,field_start);
+    bool valid[RF_MAX_LINES];
+    int votes[2]={0,0},components[2]={0,0},observations=0,valid_rows=0;
+    int previous_line=-2,previous_ident=-1,ident_run=0,longest_ident_run=0;
+    double reference_ratios[RF_MAX_LINES],bottle_ratios[RF_MAX_LINES];
+    int reference_count=0,bottle_count=0;
+    /* Bottles occupy early VBI lines. Use measured H anchors rather than
+     * guessing a row phase from a raw block boundary. Require three late
+     * windows at the legal Dr/Db endpoint plus the corresponding ramp;
+     * picture colour and a single chance FM click cannot vote here. */
+    for(int line=7;line<d->p.active_first;++line) {
+        bool measured,next_measured;
+        double start=rf_nearest_h(d,field_start+line*d->period,nominal*.30,&measured);
+        double next=rf_nearest_h(d,start+d->period,nominal*.30,&next_measured);
+        if(!measured || !next_measured) continue;
+        double scale=(next-start)/nominal;
+        if(scale<.98 || scale>1.02) continue;
+        double windows[4]={0},power=0,luma_power=0,plateau_power=0,plateau_luma=0;
+        const double begin_us[4]={12,28,36,44};
+        for(int w=0;w<4;++w) for(int n=0;n<16;++n) {
+            double offset=(begin_us[w]+(n+.5)*.5)*5.0*scale;
+            double at=start+offset+(native?d->chroma_delay:d->secam_fm_delay)-d->sync_delay;
+            windows[w]+=rf_read(d,native?d->ci:d->secam_fm,at)*scale/16.0;
+            power+=rf_read(d,d->cq,at)/64.0;
+            double ypower=rf_read(d,d->envelope,start+offset+d->sync_luma_delay-d->sync_delay);
+            luma_power+=ypower/64.0;
+            if(!native && w) {plateau_power+=rf_read(d,d->cq,at)/48.0;plateau_luma+=ypower/48.0;}
+        }
+        if(power<=1e-7 || power<=luma_power*.012) continue;
+        double plateau=(windows[1]+windows[2]+windows[3])/3.0;
+        bool dr=native ? plateau>1082031.25 : plateau<732446.875;
+        double rest=native ? (dr ? 1189062.5 : 975000.0)
+            : (dr ? 304321.875 : 1160571.875);
+        bool plateau_valid=true;
+        for(int w=1;w<4;++w) if(fabs(windows[w]-rest)>(native?25000.0:45000.0)) plateau_valid=false;
+        double ramp=(plateau-windows[0])*(dr?1.0:-1.0)*(native?1.0:-1.0);
+        if(!plateau_valid || ramp<(native?20000.0:80000.0)) continue;
+        /* A bottles-only recording may have no quiet H carrier. Its known
+         * steady plateaus still measure current chroma strength. Divide by
+         * four, conservatively allowing the legal HF Bell boost (below3.5)
+         * without treating an amplified identification bottle as picture C. */
+        if(!native && bottle_count<RF_MAX_LINES)
+            bottle_ratios[bottle_count++]=plateau_power/fmax(4.0*plateau_luma,1e-12);
+        int ident=dr==((line&1)==0);
+        votes[ident]++;components[dr]++;observations++;
+        ident_run=line==previous_line+1 && ident==previous_ident ? ident_run+1 : 1;
+        if(ident_run>longest_ident_run) longest_ident_run=ident_run;
+        previous_line=line;previous_ident=ident;
+    }
+    bool bottles=observations>=4 && longest_ident_run>=4 && components[0]>=2 && components[1]>=2
+        && (votes[0]>votes[1]?votes[0]:votes[1])>=observations*.85;
+    if(!native) {
+        /* MESECAM's mixer preserves quiet undeviated H references. Read
+         * pre-LF discriminator samples: LF/post-LP memory and picture
+         * content may not teach line identity. Both known rest carriers,
+         * a long alternating sequence and four agreeing fields are needed.
+         * Native VHS keeps its separately validated bottles-only ID. */
+        if(!bottles) {
+            votes[0]=votes[1]=components[0]=components[1]=observations=0;
+            previous_line=-2;previous_ident=-1;ident_run=longest_ident_run=0;
+        }
+        for(int line=7;line<300;++line) {
+            bool measured,next_measured;
+            double start=rf_nearest_h(d,field_start+line*d->period,nominal*.30,&measured);
+            double next=rf_nearest_h(d,start+d->period,nominal*.30,&next_measured);
+            if(!measured || !next_measured) continue;
+            double scale=(next-start)/nominal;
+            if(scale<.98 || scale>1.02) continue;
+            double frequency=0,begin=0,end=0,power=0,luma_power=0;
+            for(int n=0;n<20;++n) {
+                double offset=(7.3+(n+.5)*.1)*5.0*scale;
+                double at=start+offset+d->secam_fm_delay-d->sync_delay;
+                double f=rf_read(d,d->secam_fm,at)*d->luma_wow;
+                frequency+=f/20.0;
+                if(n<10) begin+=f/10.0;else end+=f/10.0;
+                power+=rf_read(d,d->cq,at)/20.0;
+                luma_power+=rf_read(d,d->envelope,start+offset+d->sync_luma_delay-d->sync_delay)/20.0;
+            }
+            bool dr=frequency<732446.875;
+            double rest=dr?654321.875:810571.875;
+            if(power<=1e-7 || power<=luma_power*.012 || fabs(frequency-rest)>45000.0 ||
+                fabs(begin-end)>60000.0) continue;
+            if(reference_count<RF_MAX_LINES)reference_ratios[reference_count++]=(float)(power/fmax(luma_power,1e-12));
+            if(bottles)continue;
+            int ident=dr==((line&1)==0);
+            votes[ident]++;components[dr]++;observations++;
+            ident_run=line==previous_line+1 && ident==previous_ident ? ident_run+1 : 1;
+            if(ident_run>longest_ident_run)longest_ident_run=ident_run;
+            previous_line=line;previous_ident=ident;
+        }
+    }
+    for(int y=0;native && y<rows;++y) {
+        float frequencies[48],powers[48];
+        double scale=periods[y]/nominal,luma_power=0.0;
+        for(int n=0;n<48;++n) {
+            double offset=(12.0+n*(48.0/47.0))*5.0*scale;
+            double at=lines[y]+offset+d->chroma_delay-d->sync_delay;
+            frequencies[n]=(float)(rf_read(d,d->ci,at)*scale);
+            powers[n]=rf_read(d,d->cq,at);
+            luma_power+=rf_read(d,d->envelope,lines[y]+offset+d->sync_luma_delay-d->sync_delay);
+        }
+        double frequency;
+        /* This small fixed-size sort is field work, never per RF sample. */
+        for(int n=1;n<48;++n) {
+            float f=frequencies[n],p=powers[n];int a=n,b=n;
+            while(a>0 && frequencies[a-1]>f) {frequencies[a]=frequencies[a-1];--a;}
+            frequencies[a]=f;
+            while(b>0 && powers[b-1]>p) {powers[b]=powers[b-1];--b;}
+            powers[b]=p;
+        }
+        frequency=.5*(frequencies[23]+frequencies[24]);
+        double power=.5*(powers[23]+powers[24]);
+        valid[y]=power>1e-7 && power>luma_power/48.0*.012
+            && frequency>(native?975000.0:304000.0) && frequency<(native?1190000.0:1161000.0);
+        if(valid[y]) valid_rows++;
+    }
+    bool adjacent=d->secam_have_ident &&
+        fabs(field_start-d->secam_last_field-312.5*nominal*d->luma_wow)<2.0*nominal;
+    if(adjacent) d->secam_dr_even^=(d->secam_last_parity!=0);
+    else {d->secam_have_ident=false;d->secam_ident_streak=0;}
+    int selected=votes[1]>votes[0] ? 1 : 0;
+    bool decisive=observations>=(native||bottles?4:64) && longest_ident_run>=(native||bottles?4:8)
+        && components[0]>=(native||bottles?2:24) && components[1]>=(native||bottles?2:24)
+        && votes[selected]>=observations*.85;
+    if(decisive) {
+        if(!native) {
+            double reference=reference_count>=4?rf_median(reference_ratios,reference_count):0.0;
+            if(bottles && bottle_count>=4)reference=fmax(reference,rf_median(bottle_ratios,bottle_count));
+            if(reference>0.0)d->mesecam_reference_ratio=reference;
+        }
+        if(!d->secam_have_ident || d->secam_dr_even!=(selected!=0))
+            d->secam_ident_streak=1;
+        else if(d->secam_ident_streak<4) d->secam_ident_streak++;
+        d->secam_dr_even=selected!=0;d->secam_have_ident=true;
+        d->secam_ident_age=0;
+    } else if(d->secam_have_ident && ++d->secam_ident_age>=32) {
+        d->secam_have_ident=false;d->secam_ident_streak=0;
+    }
+    d->secam_last_field=field_start;d->secam_last_parity=parity;
+    if(!native)valid_rows=rf_build_mesecam_rows(d,lines,periods,luma_wow,rows,line_first,valid);
+    bool identified=d->secam_have_ident && d->secam_ident_streak>=4;
+    /* Field lock is a coverage statistic. A locally healthy colour region
+     * still uses its pixel confidence when much of the field has dropped. */
+    bool color=identified && valid_rows>rows*3/4;
+    /* Historical line order alone cannot authorize sparse noise after a
+     * carrier failure. Fresh references permit a healthy local remainder;
+     * absent references need broadly usable current carrier for flywheel. */
+    bool usable_ident=identified && (decisive || valid_rows>rows*3/4);
+    if(!native && !usable_ident)memset(d->secam_rows,0,sizeof(d->secam_rows));
+    if(!color) rf_color_loss(d,valid_rows<=rows*3/4
+        ? "weak SECAM FM chroma" : "acquiring SECAM line identification");
+    const double win_start=d->full_frame ? 0.0 : d->p.active_start_us;
+    const double win_end=d->full_frame ? d->p.line_us : d->p.active_end_us;
+    const int active_x0=(int)ceil(d->p.active_start_us*d->p.width/d->p.line_us-.5);
+    const int active_x1=(int)ceil(d->p.active_end_us*d->p.width/d->p.line_us-.5);
+    for(int y=0;native && y<rows;++y) {
+        int line=line_first+y;
+        bool dr=(((line&1)==0)==d->secam_dr_even);
+        double rest=native ? (dr ? 1101562.5 : 1062500.0) : (dr ? 654321.875 : 810571.875);
+        double deviation=native ? (dr ? 70000.0 : 57500.0) : (dr ? -280000.0 : -230000.0);
+        double gain=dr ? -1.0/(1.902*1.139883) : 1.0/(1.505*2.032062);
+        double scale=periods[y]/nominal;
+        double step=(win_end-win_start)*5.0*scale/d->p.width;
+        for(int x=0;x<d->p.width;++x) {
+            double offset=win_start*5.0*scale+(x+.5)*step;
+            /* Pixel geometry follows measured H spacing. Frequency scaling
+             * uses the robust tape clock, so slicer jitter cannot shift the
+             * entire line's colour-difference DC level. */
+            double frequency=rf_read(d,d->ci,lines[y]+offset+d->chroma_delay-d->sync_delay)*luma_wow[y];
+            d->secam_rows[y][x]=color && valid[y] ? (float)((frequency-rest)/deviation*gain) : 0.0f;
+        }
+    }
+    /* Work on like components two measured lines apart in THIS field.
+     * Preserve the original previous rows while filtering in place. The
+     * range weight rejects a colour boundary instead of spreading it into
+     * its neighbour; VBI and picture never contribute to each other. */
+    float previous[2][GUI_RF_FRAME_MAX_WIDTH]={{0}};
+    for(int y=0;y<rows;++y) for(int x=0;x<d->p.width;++x) {
+        float centre=d->secam_rows[y][x];
+        double total=2.0*centre,weight=2.0;
+        for(int direction=-2;direction<=2;direction+=4) {
+            int neighbour=y+direction;
+            if(neighbour<0 || neighbour>=rows ||
+                (native ? (!valid[y] || !valid[neighbour])
+                    : (!usable_ident || !d->secam_pixel_valid[y][x] || !d->secam_pixel_valid[neighbour][x])) ||
+                ((line_first+y>=d->p.active_first)!=(line_first+neighbour>=d->p.active_first))) continue;
+            double value=direction<0 ? previous[y&1][x] : d->secam_rows[neighbour][x];
+            double w=fmax(0.0,1.0-fabs(value-centre)/.12);
+            total+=w*value;weight+=w;
+        }
+        previous[y&1][x]=centre;
+        d->secam_rows[y][x]=(float)(total/weight);
+    }
+    for(int y=0;y<rows;++y) {
+        int line=line_first+y;
+        bool dr=(((line&1)==0)==d->secam_dr_even);
+        double scale=periods[y]/nominal;
+        double step=(win_end-win_start)*5.0*scale/d->p.width;
+        size_t row=(size_t)(y*2+parity)*d->p.width*4u;
+        for(int x=0;x<d->p.width;++x) {
+            double offset=win_start*5.0*scale+(x+.5)*step;
+            double hz=rf_read(d,d->luma,lines[y]+offset+d->luma_delay-d->sync_delay);
+            double ire=(hz*luma_wow[y]-d->display_blank_hz)/d->display_hz_ire;
+            bool leveled=!d->full_frame ||
+                (line>=d->p.active_first && x>=active_x0 && x<active_x1);
+            double luminance=leveled ? rf_display_level(ire/100.0)
+                : rf_clamp((ire-d->p.hybrid_black_ire)/d->p.hybrid_span_ire,0.0,1.0);
+            double other=0.0;int count=0;
+            for(int direction=-1;direction<=1;direction+=2) {
+                int neighbour=y+direction;
+                if(neighbour>=0 && neighbour<rows &&
+                    (native ? (color && valid[y] && valid[neighbour])
+                        : (usable_ident && d->secam_pixel_valid[y][x] && d->secam_pixel_valid[neighbour][x])) &&
+                    ((line>=d->p.active_first)==(line_first+neighbour>=d->p.active_first))) {
+                    other+=d->secam_rows[neighbour][x];count++;
+                }
+            }
+            if(count) other/=count;
+            double own=d->secam_rows[y][x];
+            double u=dr ? other : own,v=dr ? own : other;
+            d->rgba[row+x*4u]=rf_byte(luminance+1.140*v);
+            d->rgba[row+x*4u+1u]=rf_byte(luminance-.395*u-.581*v);
+            d->rgba[row+x*4u+2u]=rf_byte(luminance+2.032*u);
+            d->rgba[row+x*4u+3u]=255;
+        }
+    }
+    return color;
 }
 
 static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
@@ -435,6 +1003,10 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         periods[y]=rf_clamp(lines[y+1]-lines[y], nominal*.8, nominal*1.2);
     rf_prepare_luma_wow(d,periods,anchors,rows,nominal,luma_wow);
     rf_prepare_display_levels(d);
+    bool color;
+    if(rf_secam_fm(d)) {
+        color=rf_render_secam_field(d,lines,periods,luma_wow,rows,line_first,parity,field_start);
+    } else {
     for (int y=0; y<rows; ++y) {
         int line=line_first+y;
         double start=d->p.burst_start_us*5.0*periods[y]/nominal;
@@ -480,7 +1052,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     }
     double common_phase=atan2(common.im,common.re)-RF_PI;
     double coherence=burst_count ? hypot(common.re,common.im)/burst_count : 0.0;
-    bool color = burst_count>rows*3/4 && coherence>(d->format==GUI_RF_PAL ? .40 : .65);
+    color = burst_count>rows*3/4 && coherence>(d->format==GUI_RF_PAL ? .40 : .65);
     if (!color) rf_color_loss(d,burst_count<=rows*3/4
         ? "insufficient valid color bursts" : "incoherent tape track/burst phase");
     /* PAL swings its burst about the -U axis. Use neighboring measured burst
@@ -551,6 +1123,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         if (y&1) rf_render_rows(d,y-1,2,parity,color&&valid[y-1],color&&valid[y]);
         else if (y+1==rows) rf_render_rows(d,y,1,parity,color&&valid[y],false);
     }
+    }
     /* PAL parity-0 (312 lines) can never write row 624 and NTSC parity-1
      * never writes row 525; each field clears its own beyond-last row so no
      * stale content survives from earlier geometry or mode switches. */
@@ -570,7 +1143,8 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         d->status.color_locked=d->ready_color[0] && d->ready_color[1];
         snprintf(d->status.reason,sizeof(d->status.reason),"%s %s",
                  gui_rf_profile_name(d->profile),
-                 d->status.color_locked ? "color locked" : "luma locked; weak burst");
+                 d->status.color_locked ? "color locked" :
+                    rf_secam_fm(d) ? "luma locked; acquiring FM color" : "luma locked; weak burst");
         if (callback) callback(context,d->rgba,d->p.width,frame_height,end_sample,&d->status);
         d->ready_fields=0;
     }
@@ -580,6 +1154,37 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
 static void rf_vertical_start(gui_rf_decoder_t *d, double first_eq,
                               gui_rf_frame_callback_t callback, void *context) {
     double nominal=d->p.line_us*5.0;
+    bool recovered_first_eq=false;
+    if(d->format==GUI_RF_PAL && d->p.eq_count==5 && d->eq_run==d->p.eq_count-1 &&
+        d->last_h_width>=3.5 && d->last_h_width<=3.8 &&
+        d->previous_h>0.0 && d->previous_h_width>=3.8 &&
+        fabs(first_eq-d->last_h-.5*d->period)<.08*d->period &&
+        fabs(d->first_v-d->last_h-.5*d->p.eq_count*d->period)<.10*d->period) {
+        /* A band-limited first equalizer can straddle the 3.5us H/EQ
+         * threshold. Four following measured half-line equalizers and
+         * three measured broad pulses place it in the missing fifth slot.
+         * Reclassify only that borderline pulse, then retain the earlier
+         * clear H for parity: using the equalizer itself would falsely
+         * force integer phase if the half-line field is also broadened.
+         * This is PAL-family luminance timing, independent of the selected
+         * chroma decoder: a wrong colour system must still show stable Y.
+         * No global pulse-width threshold or field cadence is relaxed. */
+        first_eq=d->last_h;recovered_first_eq=true;
+        d->last_h=d->previous_h;d->last_h_width=d->previous_h_width;
+        if(d->h_count) {
+            d->h_head=(d->h_head+RF_PULSE_SIZE-1u)%RF_PULSE_SIZE;
+            d->h_count--;
+            /* Classification events may already have reached the worker.
+             * Keep published counters monotonic across this correction. */
+        }
+    }
+    if(d->profile==GUI_RF_PROFILE_MESECAM_VHS &&
+        d->eq_run!=d->p.eq_count && !recovered_first_eq) {
+        /* A genuinely absent equalizer is not the witnessed borderline
+         * pulse above. Do not invent its phase from the expected cadence. */
+        rf_reject_field(d,RF_REJECT_PARITY,"MESECAM vertical EQ train incomplete");
+        return;
+    }
     if (d->last_h<=0.0 || first_eq-d->last_h>nominal*2.1) {
         rf_reject_field(d,RF_REJECT_PARITY,"vertical EQ lacks recent H reference");
         return;
@@ -597,14 +1202,23 @@ static void rf_vertical_start(gui_rf_decoder_t *d, double first_eq,
                                          : (parity==0 ? 1.0 : .5);
     double start=first_eq-boundary*d->period;
     if (d->have_field) {
-        double field_lines=(start-d->field_start)/nominal;
+        /* Last-line H jitter near a tape head switch must not move a field's
+         * cadence reference. SECAM uses the robust preceding line-grid clock;
+         * allow its initial +/-1% acquisition before that clock is learned. */
+        double cadence_period=nominal;
+        double cadence_tolerance=2.0;
+        if(rf_secam_fm(d)) {
+            cadence_period*=d->luma_wow;
+            if(!d->have_luma_wow) cadence_tolerance=4.0;
+        }
+        double field_lines=(start-d->field_start)/cadence_period;
         double expected=d->format==GUI_RF_PAL ? 312.5 : 262.5;
-        if (fabs(field_lines-expected)<2.0 && parity!=d->field_parity) {
+        if (fabs(field_lines-expected)<cadence_tolerance && parity!=d->field_parity) {
             rf_render_field(d,d->field_start,d->field_parity,
                             (uint64_t)llround(start*4.0),callback,context);
         } else {
             d->ready_fields=0;
-            if (fabs(field_lines-expected)>=2.0)
+            if (fabs(field_lines-expected)>=cadence_tolerance)
                 rf_reject_field(d,RF_REJECT_CADENCE,"vertical field cadence outside profile");
             else rf_reject_field(d,RF_REJECT_PARITY,"vertical fields repeat parity");
         }
@@ -716,8 +1330,15 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
         }
         tip/=n;
         if (fabs(tip-d->sync_anchor)<400000.0) d->sync_est=d->sync_est*.99+tip*.01;
-        d->last_h=start;
-        d->h_positions[d->h_head]=start;
+        d->previous_h=d->last_h;d->previous_h_width=d->last_h_width;
+        d->last_h=start;d->last_h_width=us;
+        /* Native SECAM's higher colour-under band can disturb the falling
+         * sync threshold while the H trailing edge remains clean. Use the
+         * measured end of THIS pulse and the physical 4.7us H duration for
+         * rendering; retain its original start for pulse/cadence tracking.
+         * No neighbouring line position is smoothed into the tape timing. */
+        d->h_positions[d->h_head]=rf_secam_fm(d)
+            ? end-4.7*5.0*d->luma_wow : start;
         d->h_head=(d->h_head+1u)%RF_PULSE_SIZE;
         if (d->h_count<RF_PULSE_SIZE) d->h_count++;
         d->status.hsync_count++;
@@ -849,7 +1470,8 @@ static bool rf_level_measure(const gui_rf_decoder_t *d,uint64_t first,
  * individual porches and ordinary picture changes cannot pump brightness. */
 static void rf_prepare_display_levels(gui_rf_decoder_t *d) {
     if((d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA &&
-        d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI) ||
+        d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI &&
+        d->profile!=GUI_RF_PROFILE_NTSC_ED_BETA && !rf_secam_fm(d)) ||
         d->display_levels_valid || !d->have_low ||
         d->low_last<d->display_level_search_after) return;
     uint64_t window=(uint64_t)(d->p.line_us*5.0*192.0);
@@ -858,7 +1480,8 @@ static void rf_prepare_display_levels(gui_rf_decoder_t *d) {
     double tip,blank;
     if(!rf_level_measure(d,d->low_last-window,d->low_last,
                          (d->sync_est+d->blank_est)*.5,&tip,&blank)) return;
-    double hz_ire=(blank-tip)/40.0;
+    double sync_ire=rf_secam_fm(d) ? (d->p.blank_hz-d->p.sync_hz)/d->p.hz_ire : 40.0;
+    double hz_ire=(blank-tip)/sync_ire;
     /* Acquisition permits a wider slicer range than a trustworthy display
      * gain. Reject improbable scale changes instead of magnifying noise. */
     if(hz_ire<d->p.hz_ire*.5 || hz_ire>d->p.hz_ire*1.75) return;
@@ -869,7 +1492,7 @@ static void rf_prepare_display_levels(gui_rf_decoder_t *d) {
 }
 
 static void rf_acquire_beta_levels(gui_rf_decoder_t *d) {
-    if(!d->p.beta_rotation || !d->have_low || d->low_last<d->level_search_after) return;
+    if((!d->p.beta_rotation && !rf_secam_fm(d)) || !d->have_low || d->low_last<d->level_search_after) return;
     /* Healthy fields take the original path, including its exact level updates.
      * A stale H lock alone is insufficient: H-only input has no field progress. */
     if(d->status.fields_decoded && d->low_last>=d->last_level_field
@@ -902,7 +1525,8 @@ static void rf_acquire_beta_levels(gui_rf_decoder_t *d) {
         d->sync_est=d->sync_anchor=sync_level;
         d->blank_est=d->blank_anchor=blank_level;
         d->previous_sync=d->sync_y;
-        snprintf(d->status.reason,sizeof(d->status.reason),"Beta RF levels acquired; waiting for field sync");
+        snprintf(d->status.reason,sizeof(d->status.reason),"%s RF levels acquired; waiting for field sync",
+                 rf_secam_fm(d) ? "SECAM" : "Beta");
         return;
     }
 }
@@ -927,9 +1551,13 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->ci=storage+2u*RF_RING_SIZE; d->cq=storage+3u*RF_RING_SIZE;
     d->envelope=storage+4u*RF_RING_SIZE;
     d->sync_luma=storage+5u*RF_RING_SIZE;
+    d->secam_fm=storage+6u*RF_RING_SIZE;
+    d->mesecam_i=storage+7u*RF_RING_SIZE;d->mesecam_q=storage+8u*RF_RING_SIZE;
     d->profile=profile;
     d->format=gui_rf_profile_format(profile);
     d->p=rf_profiles[profile];
+    d->raw_rate=gui_rf_profile_video_rate_hz(profile);
+    d->raw_decimation=(unsigned)(d->raw_rate/RF_VIDEO_RATE);
     d->period=d->p.line_us*5.0;
     d->sync_est=d->p.sync_hz; d->blank_est=d->p.blank_hz;
     d->sync_anchor=d->p.sync_hz;d->blank_anchor=d->p.blank_hz;
@@ -937,32 +1565,52 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->luma_wow=1.0;
     d->fm_center=d->p.fm_center;
     d->y_cos=d->c_cos=1.0;
-    d->y_step_cos=cos(2.0*RF_PI*d->fm_center/RF_RAW_RATE);
-    d->y_step_sin=sin(2.0*RF_PI*d->fm_center/RF_RAW_RATE);
-    d->c_step_cos=cos(2.0*RF_PI*d->p.carrier_hz/RF_RAW_RATE);
-    d->c_step_sin=sin(2.0*RF_PI*d->p.carrier_hz/RF_RAW_RATE);
+    d->y_step_cos=cos(2.0*RF_PI*d->fm_center/d->raw_rate);
+    d->y_step_sin=sin(2.0*RF_PI*d->fm_center/d->raw_rate);
+    d->c_step_cos=cos(2.0*RF_PI*d->p.carrier_hz/d->raw_rate);
+    d->c_step_sin=sin(2.0*RF_PI*d->p.carrier_hz/d->raw_rate);
     for (int n=0;n<d->p.rf_highpass_sections;++n) {
         double q=d->p.rf_highpass_sections==1 ? .70710678
             : 1.0/(2.0*cos((2.0*n+1.0)*RF_PI/(4.0*d->p.rf_highpass_sections)));
-        d->rf_hp[n]=rf_filter(RF_RAW_RATE,d->p.rf_low,q,true);
+        d->rf_hp[n]=rf_filter(d->raw_rate,d->p.rf_low,q,true);
     }
-    d->rf_lp=rf_filter(RF_RAW_RATE,d->p.rf_high,.70710678,false);
+    d->rf_lp=rf_filter(d->raw_rate,d->p.rf_high,.70710678,false);
     const double qs[2]={.5411961,1.3065630};
+    /* ED filters before each reduction: Y at 20/20M, C at 20/20/5/5M.
+     * Keep absolute raw-sample phases in process(), and account for each
+     * section's actual rate when registering the common 5M picture. */
+    /* Elliptic order 4: 1.75 MHz edge, 0.2 dB ripple, 40 dB stopband at 20M. */
+    static const float ed_pre[2][5]={
+        {0.019659819678039651, 0.0077996131655782711, 0.019659819678039651, -1.3876127529628812, 0.52659077574587287},
+        {1, -1.0966208836416169, 0.99999999999999978, -1.5179442038870754, 0.83136103141623829}
+    };
     for (int n=0; n<2; ++n) {
-        d->yi[n]=d->yq[n]=rf_filter(RF_RAW_RATE,1750000.0,qs[n],false);
-        d->luma_delay+=rf_filter_delay(&d->yi[n])*.25;
+        double stage_rate=d->raw_rate;
+        if(profile==GUI_RF_PROFILE_NTSC_ED_BETA)
+            d->yi[n]=d->yq[n]=(rf_biquad_t){ed_pre[n][0],ed_pre[n][1],ed_pre[n][2],ed_pre[n][3],ed_pre[n][4],0,0};
+        else d->yi[n]=d->yq[n]=rf_filter(stage_rate,1750000.0,qs[n],false);
+        d->luma_delay+=rf_filter_delay(&d->yi[n])/(stage_rate/RF_VIDEO_RATE);
+    }
+    if(profile==GUI_RF_PROFILE_NTSC_ED_BETA) for(int n=2;n<4;++n) {
+        double rate=RF_VIDEO_RATE;
+        double cutoff=2000000.0;
+        double q=qs[n-2];
+        d->yi[n]=d->yq[n]=rf_filter(rate,cutoff,q,false);
+        d->luma_delay+=rf_filter_delay(&d->yi[n])/(rate/RF_VIDEO_RATE);
     }
     for (int n=0;n<d->p.chroma_sections;++n) {
         double q=d->p.chroma_sections==2 ? qs[n]
             : 1.0/(2.0*cos((2.0*n+1.0)*RF_PI/(4.0*d->p.chroma_sections)));
-        d->ui[n]=d->uq[n]=rf_filter(RF_RAW_RATE,d->p.chroma_lowpass,q,false);
-        d->chroma_delay+=rf_filter_delay(&d->ui[n])*.25;
+        double stage_rate=profile==GUI_RF_PROFILE_NTSC_ED_BETA ?
+            (n>=2 ? RF_VIDEO_RATE : d->raw_rate) : d->raw_rate;
+        d->ui[n]=d->uq[n]=rf_filter(stage_rate,d->p.chroma_lowpass,q,false);
+        d->chroma_delay+=rf_filter_delay(&d->ui[n])/(stage_rate/RF_VIDEO_RATE);
     }
 #if GUI_RF_PACKED_IQ
-    if(d->p.beta_rotation) for(int stage=0;stage<d->p.chroma_sections;++stage) {
+    if(d->p.beta_rotation || rf_secam_fm(d)) for(int stage=0;stage<d->p.chroma_sections;++stage) {
         for(int lane=0;lane<4;++lane) {
             const rf_biquad_t *f=lane>=2 ? (lane==2 ? &d->ui[stage] : &d->uq[stage])
-                : stage<2 ? (lane==0 ? &d->yi[stage] : &d->yq[stage]) : NULL;
+                : stage<(profile==GUI_RF_PROFILE_NTSC_ED_BETA ? 4 : 2) ? (lane==0 ? &d->yi[stage] : &d->yq[stage]) : NULL;
             if(!f) continue; // Extra Hi-Fi chroma stages have no luma stream.
             rf_biquad4_t *packed=&d->beta_iq[stage];
             packed->b0[lane]=f->b0;packed->b1[lane]=f->b1;packed->b2[lane]=f->b2;
@@ -970,6 +1618,7 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
         }
     }
 #endif
+    d->secam_fm_delay=d->chroma_delay+.5;
     double k=2.0*RF_VIDEO_RATE, denominator=1.0+k*d->p.deemph_pole;
     d->deemph_b0=(float)((1.0+k*d->p.deemph_zero)/denominator);
     d->deemph_b1=(float)((1.0-k*d->p.deemph_zero)/denominator);
@@ -1003,6 +1652,29 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
         d->luma_deemph.z2=(float)(d->luma_deemph.b2*x-d->luma_deemph.a2*y);
     }
     d->deemph_x=d->deemph_y=(float)(d->p.blank_hz-d->fm_center);
+    if(rf_secam_fm(d)) {
+        /* Inverse of SECAM's 85/255kHz LF pre-correction, with phase and
+         * continuous state. The divider scales deviation, not video time. */
+        double pole=1.0/(2.0*RF_PI*85000.0),zero=pole/3.0;
+        double lf_denominator=1.0+2.0*RF_VIDEO_RATE*pole;
+        d->secam_b0=(float)((1.0+2.0*RF_VIDEO_RATE*zero)/lf_denominator);
+        d->secam_b1=(float)((1.0-2.0*RF_VIDEO_RATE*zero)/lf_denominator);
+        d->secam_a1=(float)((1.0-2.0*RF_VIDEO_RATE*pole)/lf_denominator);
+        /* The recording's LF pre-correction cancels this inverse network's
+         * delay. Compensating its DC delay again advances C about 18 pixels
+         * relative to Y. Retain the discriminator's half-sample, plus the
+         * three working samples measured on physical midtone RF edges for
+         * these reduced-bandwidth filter pairs (physical native/ME RF tests).
+         * This 600ns registration trim is not a tape-standard parameter. */
+        d->chroma_delay+=3.5;
+        /* LF inverse alone retains one third of discriminator HF noise.
+         * Limit decoded C separately from the pre-FM sideband filter and
+         * register its causal delay against the original luma samples. */
+        for(int n=0;n<2;++n) {
+            d->secam_video_lp[n]=rf_filter(RF_VIDEO_RATE,250000.0,qs[n],false);
+            d->chroma_delay+=rf_filter_delay(&d->secam_video_lp[n]);
+        }
+    }
     d->sync_y=(float)d->p.blank_hz;
     memset(d->rgba,0,(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
     snprintf(d->status.reason,sizeof(d->status.reason),"waiting for %s RF sync",gui_rf_profile_name(profile));
@@ -1016,7 +1688,7 @@ gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
     if (!rf_profile_valid(profile)) return NULL;
     gui_rf_decoder_t *d=calloc(1,sizeof(*d));
     if (!d) return NULL;
-    d->storage=calloc(RF_RING_SIZE*6u,sizeof(float));
+    d->storage=calloc(RF_RING_SIZE*9u,sizeof(float));
     d->rgba=calloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT,4u);
     if (!d->storage || !d->rgba) { gui_rf_decoder_destroy(d); return NULL; }
     gui_rf_decoder_reset_profile(d,profile);
@@ -1045,25 +1717,56 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         snprintf(d->status.reason,sizeof(d->status.reason),"RF gap; reacquiring sync");
     }
     d->have_raw=true; d->next_raw=first_sample+count;
+    const bool ed=d->profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+    /* 20M -> 5M uses an absolute four-phase schedule.
+     * Derive it once per call so arbitrary block splits retain the same
+     * absolute phase without a 64-bit division on every input sample. */
+    unsigned ed_phase=ed ? (unsigned)(first_sample%4u) : 0;
+    uint64_t ed_position=ed ? first_sample/4u+(ed_phase!=0u) : 0;
+#if GUI_RF_PACKED_IQ
+    /* ED's two independent oscillators share SSE2 lanes. Keep their state
+     * local across the block; the field renderer never changes RF state. */
+    __m128d ed_cos=_mm_set_pd(d->c_cos,d->y_cos),ed_sin=_mm_set_pd(d->c_sin,d->y_sin);
+    const __m128d ed_step_cos=_mm_set_pd(d->c_step_cos,d->y_step_cos);
+    const __m128d ed_step_sin=_mm_set_pd(d->c_step_sin,d->y_step_sin);
+#endif
     for (size_t n=0; n<count; ++n) {
         uint64_t raw_pos=first_sample+n;
+        bool picture_tick=ed && ed_phase==0u;
+        if(ed && ++ed_phase==4u) ed_phase=0;
         float raw=isfinite(samples[n]) ? samples[n] : 0.0f;
         float band=raw;
         for (int s=0;s<d->p.rf_highpass_sections;++s) band=rf_filter_sample(&d->rf_hp[s],band);
         band=rf_filter_sample(&d->rf_lp,band);
-        float yi=(float)(band*d->y_cos), yq=(float)(-band*d->y_sin);
-        float ci=(float)(raw*d->c_cos), cq=(float)(-raw*d->c_sin);
+        float yi=0,yq=0,ci=0,cq=0;
 #if GUI_RF_PACKED_IQ
-        if(d->p.beta_rotation) {
-            __m128 iq=_mm_setr_ps(yi,yq,ci,cq);
+        __m128 mixed;
+        if(ed) {
+            __m128d amplitude=_mm_set_pd(raw,band);
+            mixed=_mm_unpacklo_ps(_mm_cvtpd_ps(_mm_mul_pd(amplitude,ed_cos)),
+                _mm_cvtpd_ps(_mm_sub_pd(_mm_setzero_pd(),_mm_mul_pd(amplitude,ed_sin))));
+        } else
+#endif
+        {
+            yi=(float)(band*d->y_cos); yq=(float)(-band*d->y_sin);
+            ci=(float)(raw*d->c_cos); cq=(float)(-raw*d->c_sin);
+        }
+#if GUI_RF_PACKED_IQ
+        if(d->p.beta_rotation || rf_secam_fm(d)) {
+            __m128 iq=ed ? mixed : _mm_setr_ps(yi,yq,ci,cq);
             iq=rf_filter4_sample(&d->beta_iq[0],iq);
             iq=rf_filter4_sample(&d->beta_iq[1],iq);
-            __m128 luma_iq=iq;
-            for(int s=2;s<d->p.chroma_sections;++s) iq=rf_filter4_sample(&d->beta_iq[s],iq);
-            // Preserve the original two-stage luma bits through extra C stages.
-            iq=_mm_movelh_ps(luma_iq,_mm_movehl_ps(iq,iq));
-            float filtered[4];_mm_storeu_ps(filtered,iq);
-            yi=filtered[0];yq=filtered[1];ci=filtered[2];cq=filtered[3];
+            {
+                __m128 luma_iq=iq;
+                for(int s=2;s<d->p.chroma_sections;++s)
+                    if(!ed || picture_tick) iq=rf_filter4_sample(&d->beta_iq[s],iq);
+                // Ordinary Beta preserves Y through its additional C-only stages.
+                if(!ed) iq=_mm_movelh_ps(luma_iq,_mm_movehl_ps(iq,iq));
+            }
+            if(!ed || picture_tick) {
+                float filtered[4];_mm_storeu_ps(filtered,iq);
+                yi=filtered[0];yq=filtered[1];ci=filtered[2];cq=filtered[3];
+            }
         } else
 #endif
         {
@@ -1071,23 +1774,52 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
                 yi=rf_filter_sample(&d->yi[s],yi); yq=rf_filter_sample(&d->yq[s],yq);
             }
             for (int s=0;s<d->p.chroma_sections;++s) {
-                ci=rf_filter_sample(&d->ui[s],ci); cq=rf_filter_sample(&d->uq[s],cq);
+                if(!ed || s<2 || picture_tick) {
+                    ci=rf_filter_sample(&d->ui[s],ci); cq=rf_filter_sample(&d->uq[s],cq);
+                }
+            }
+            if(ed) for(int s=2;s<4;++s) if(picture_tick) {
+                yi=rf_filter_sample(&d->yi[s],yi); yq=rf_filter_sample(&d->yq[s],yq);
             }
         }
-        double yc=d->y_cos*d->y_step_cos-d->y_sin*d->y_step_sin;
-        d->y_sin=d->y_sin*d->y_step_cos+d->y_cos*d->y_step_sin; d->y_cos=yc;
-        double cc=d->c_cos*d->c_step_cos-d->c_sin*d->c_step_sin;
-        d->c_sin=d->c_sin*d->c_step_cos+d->c_cos*d->c_step_sin; d->c_cos=cc;
-        if ((raw_pos&1023u)==0u) {
-            double ym=hypot(d->y_cos,d->y_sin), cm=hypot(d->c_cos,d->c_sin);
-            if (ym>0.0) { d->y_cos/=ym; d->y_sin/=ym; }
-            if (cm>0.0) { d->c_cos/=cm; d->c_sin/=cm; }
+#if GUI_RF_PACKED_IQ
+        if(ed) {
+            __m128d next_cos=_mm_sub_pd(_mm_mul_pd(ed_cos,ed_step_cos),_mm_mul_pd(ed_sin,ed_step_sin));
+            ed_sin=_mm_add_pd(_mm_mul_pd(ed_sin,ed_step_cos),_mm_mul_pd(ed_cos,ed_step_sin));
+            ed_cos=next_cos;
+            if(!(raw_pos&1023u)) {
+                __m128d magnitude=_mm_sqrt_pd(_mm_add_pd(_mm_mul_pd(ed_cos,ed_cos),_mm_mul_pd(ed_sin,ed_sin)));
+                ed_cos=_mm_div_pd(ed_cos,magnitude);ed_sin=_mm_div_pd(ed_sin,magnitude);
+            }
+        } else
+#endif
+        {
+            double yc=d->y_cos*d->y_step_cos-d->y_sin*d->y_step_sin;
+            d->y_sin=d->y_sin*d->y_step_cos+d->y_cos*d->y_step_sin; d->y_cos=yc;
+            double cc=d->c_cos*d->c_step_cos-d->c_sin*d->c_step_sin;
+            d->c_sin=d->c_sin*d->c_step_cos+d->c_cos*d->c_step_sin; d->c_cos=cc;
+            if ((raw_pos&1023u)==0u) {
+                double ym=hypot(d->y_cos,d->y_sin), cm=hypot(d->c_cos,d->c_sin);
+                if (ym>0.0) { d->y_cos/=ym; d->y_sin/=ym; }
+                if (cm>0.0) { d->c_cos/=cm; d->c_sin/=cm; }
+            }
         }
-        if ((raw_pos&3u)!=0u) continue;
-        uint64_t pos=raw_pos/4u;
+        uint64_t pos;
+        if(ed) {
+            if(!picture_tick) continue;
+            pos=ed_position++;
+        } else {
+            if ((raw_pos&(d->raw_decimation-1u))!=0u) continue;
+            pos=raw_pos/d->raw_decimation;
+        }
         double cross=(double)d->prev_i*yq-(double)d->prev_q*yi;
         double dot=(double)d->prev_i*yi+(double)d->prev_q*yq;
-        double frequency=d->fm_center+atan2f((float)cross,(float)dot)*(RF_VIDEO_RATE/(2.0*RF_PI));
+        /* ED uses a full-quadrant bounded approximation; MESECAM keeps
+         * its small-angle path. Other profiles retain atan2f. */
+        double yphase=d->profile==GUI_RF_PROFILE_MESECAM_VHS
+            ? rf_mesecam_phase(cross,dot) : ed ? gui_rf_preview_phase(cross,dot)
+                : atan2f((float)cross,(float)dot);
+        double frequency=d->fm_center+yphase*(RF_VIDEO_RATE/(2.0*RF_PI));
         d->prev_i=yi; d->prev_q=yq;
         if (!isfinite(frequency)) frequency=d->p.blank_hz;
         float x=(float)(frequency-d->fm_center);
@@ -1103,8 +1835,42 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         unsigned at=(unsigned)(pos&RF_RING_MASK);
         d->luma[at]=luma+(float)d->fm_center; d->sync[at]=d->sync_y;
         d->sync_luma[at]=sync_input;
-        d->ci[at]=ci; d->cq[at]=cq;
-        d->envelope[at]=hypotf(yi,yq);
+        if(d->profile==GUI_RF_PROFILE_MESECAM_VHS) {
+            d->mesecam_i[at]=ci;d->mesecam_q[at]=cq;
+            /* Field preparation fills only the buffered, bounded interval.
+             * Any unavailable margin remains explicitly without carrier. */
+            d->secam_fm[at]=(float)d->p.carrier_hz;
+            d->ci[at]=(float)d->p.carrier_hz;d->cq[at]=0.0f;
+        } else if(rf_secam_fm(d)) {
+            double ccross=(double)d->secam_prev_i*cq-(double)d->secam_prev_q*ci;
+            double cdot=(double)d->secam_prev_i*ci+(double)d->secam_prev_q*cq;
+            /* Most deviations are small around the mixed-down centre.
+             * atan(r) through r^7 has error <= 4.3e-7 rad for |r|<=.25
+             * (under .35Hz at 5MSPS). Keep atan2 for fades/clicks/quadrants. */
+            double phase;
+            if(cdot>0.0 && fabs(ccross)<=.25*cdot) {
+                double r=ccross/cdot,r2=r*r;
+                phase=r*(1.0+r2*(-1.0/3.0+r2*(1.0/5.0-r2/7.0)));
+            } else phase=atan2f((float)ccross,(float)cdot);
+            double cf=d->p.carrier_hz+phase*(RF_VIDEO_RATE/(2.0*RF_PI));
+            d->secam_prev_i=ci;d->secam_prev_q=cq;
+            /* Clamp in the recorded carrier domain before LF recovery.
+             * MESECAM inverts the studio rails, native divides by four. */
+            double low=rf_native_secam(d) ? 975000.0 : 304321.875;
+            double high=rf_native_secam(d) ? 1189062.5 : 1160571.875;
+            /* Unclipped frequency makes a quiet reference independent of
+             * the limiter, LF network, post-filter and active content. */
+            if(!rf_native_secam(d)) d->secam_fm[at]=(float)cf;
+            float cx=(float)(rf_clamp(cf,low,high)-d->p.carrier_hz);
+            float cy=d->secam_b0*cx+d->secam_b1*d->secam_deemph_x
+                -d->secam_a1*d->secam_deemph_y;
+            d->secam_deemph_x=cx;d->secam_deemph_y=cy;
+            for(int stage=0;stage<2;++stage) cy=rf_filter_sample(&d->secam_video_lp[stage],cy);
+            d->ci[at]=cy+(float)d->p.carrier_hz;
+            d->cq[at]=hypotf(ci,cq);
+        } else {d->ci[at]=ci;d->cq[at]=cq;}
+        d->envelope[at]=(ed || d->profile==GUI_RF_PROFILE_MESECAM_VHS)
+            ? rf_mesecam_magnitude(yi,yq) : hypotf(yi,yq);
         if (!d->have_low) {
             d->low_first=pos; d->have_low=true;
             d->level_search_after=pos+RF_LEVEL_GRACE;
@@ -1129,5 +1895,11 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
             rf_reacquire_sync(d);
         d->previous_sync=d->sync_y;
     }
+#if GUI_RF_PACKED_IQ
+    if(ed) {
+        double cs[2],sn[2];_mm_storeu_pd(cs,ed_cos);_mm_storeu_pd(sn,ed_sin);
+        d->y_cos=cs[0];d->c_cos=cs[1];d->y_sin=sn[0];d->c_sin=sn[1];
+    }
+#endif
     rf_acquire_beta_levels(d);
 }

@@ -11,6 +11,8 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 - [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
+- CXADC MacOS
+- CXADC Win
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
 - DdD (Domesday Duplicator)
@@ -163,12 +165,21 @@ The record timer has to be armed with a manual button click. Armed before a reco
 
 <img width="473" height="388" alt="image" src="assets/images/MISRC_GUI_Window_Info_Current.png" />
 
+
+The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
 - Core Pinning (Linux Only)
 - Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
+- Mode Selection
 
-The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+### Operation Modes
+
+Local - Entirely local capture standalone.
+Server - Broadcasts current capture and feed to network.
+Client - Takes selected remote feeds from any servers discoverable on the network.
+Remote & Monitor - Low bandwidth remote control mode for start/stop and plugin feed view and audio monitoring.
 
 
 ## Record & Audio Monitoring
@@ -206,7 +217,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Base Name and Output
 - A/B RF Capture On/Off
 - FLAC/RAW PCM Encoding Control
-- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC)
+- Bit-Depth Selection Control
 - FLAC Level & Threads Control
 - Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
@@ -274,7 +285,8 @@ Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
 - FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
-- CVBS (Basic composite video decoder Luma B/W only currently)
+- CVBS (PAL/NTSC/SECAM with hybrid mode) 
+- Tape FM (VHS, Betamax NTSC + HiFi) 
 
 <img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
@@ -588,6 +600,38 @@ These flags open the GUI window (no capture args):
 </details>
 
 <details closed>
+<summary>Headless update mode</summary>
+<br>
+
+The updater pipeline (the same one the Info window uses) runs without the GUI, so it is scriptable and automatically testable:
+
+| Flag | Arg | Description |
+|------|-----|-------------|
+| `--check-update` | — | Fetch the update manifest + latest release tag, print `key: value` lines, exit 0 on success |
+| `--update-dry-run` | — | Also resolve this platform's asset URL, the running executable, the updates dir and the archive path; no download, nothing replaced |
+| `--install-update` | — | Perform the confirmed self-update (download, archive the old binary by rename — never deleted, install in place); requires `--yes` |
+| `--update-manifest` | `<url-or-path>` | Manifest source override (https URL, `http://127.0.0.1` loopback only for automated tests, or a local file) |
+| `--yes` | — | Explicit confirmation for `--install-update` |
+
+Example:
+
+```bash
+$ misrc_gui --check-update
+update_mode: check
+manifest_source: https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json
+manifest: ok
+latest: v1.2.6
+current: v1.2.5
+update_available: true
+```
+
+The full pipeline (check, dry-run, the install refusal without `--yes`, and the confirmed install with the old binary archived) is exercised automatically by the `update_cli` meson test against a local test server.
+
+GDH builds check for updates but never install one: the Info window's Install button and `--install-update --yes` refuse any asset that is not on a loopback host (the test server above), because GDH machines are installed by the fork's own CI.
+
+</details>
+
+<details closed>
 <summary>Headless CLI capture mode (full arg list)</summary>
 <br>
 
@@ -748,3 +792,4 @@ bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-ar
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
 - September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
 - September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
+- October 2026 - CVBS Decoder & FM Tape Decoder plugins overhalled, true cli server mode added. 

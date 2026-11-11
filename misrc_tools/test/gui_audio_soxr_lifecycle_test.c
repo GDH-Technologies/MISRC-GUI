@@ -84,7 +84,24 @@ soxr_error_t soxr_process(soxr_t resampler, soxr_in_t in, size_t ilen,
 
 void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
 void gui_app_set_status(gui_app_t *a,const char *s) { (void)a;(void)s; assert(false); }
-FILE *file_open_utf8(const char *p,const char *m) { (void)p;(void)m; assert(false);return NULL; }
+FILE *file_open_utf8(const char *p, const char *m) { (void)p; (void)m; assert(false); return NULL; }
+/* The stub above compiles to mls_proxy_open: gui_audio.c's stdio redirects
+ * are still in effect here. Undo them, then stub the remaining proxy API the
+ * writer paths reference (never executed - recording outputs stay off). */
+#undef fwrite
+#undef fclose
+#undef fflush
+#undef ferror
+#undef clearerr
+#undef file_open_utf8
+size_t mls_proxy_write(const void *d, size_t s, size_t n, FILE *f) { (void)d; (void)s; (void)n; (void)f; assert(false); return 0; }
+int mls_proxy_close(FILE *f) { (void)f; assert(false); return 0; }
+int mls_proxy_flush(FILE *f) { (void)f; assert(false); return 0; }
+int mls_proxy_error(FILE *f) { (void)f; assert(false); return 0; }
+void mls_proxy_clearerr(FILE *f) { (void)f; assert(false); }
+/* gui_audio.c taps the capture stream for the M-Server monitor display only
+ * while the unified server runs; idle in this harness. */
+bool gui_monitor_server_active(void) { return false; }
 int bufmgr_ensure_init(buffer_manager_t *m,buffer_id_t id)
 { (void)m; assert(id==BUF_CAPTURE_AUDIO); return 0; }
 void *bufmgr_read_begin(buffer_manager_t *m,buffer_id_t id,size_t n,int timeout)
@@ -114,6 +131,8 @@ AudioStream LoadAudioStream(unsigned rate,unsigned bits,unsigned channels)
     return (AudioStream){.buffer=(void*)1,.sampleRate=rate,.sampleSize=bits,.channels=channels};
 }
 bool IsAudioStreamValid(AudioStream stream) { return stream.buffer!=NULL; }
+void SetAudioStreamCallback(AudioStream stream,AudioCallback callback)
+{ assert(main_thread && stream.buffer && callback); }
 void PlayAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=true; }
 void StopAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=false; }
 void UnloadAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); ++stream_unloads; }

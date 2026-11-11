@@ -27,6 +27,9 @@ __pycache__/
 # CI artifact output
 /.ci-artifacts/
 
+# Python bytecode from running the python-driven tests/guards
+__pycache__/
+
 # Scratch
 /.tmp/
 
@@ -89,3 +92,6 @@ Temporary Items
 DerivedData/
 xcuserdata/
 *.xcuserstate
+
+# Local restore-point zips (large; never commit)
+/restore_points/

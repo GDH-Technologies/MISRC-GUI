@@ -125,8 +125,15 @@ else
   curl -s "$(url "/device?$IDX")" >/dev/null
   curl -s "$(url /start)" >/dev/null
   for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .state)" = 1 ] && break; sleep 0.2; done
-  [ "$(curl -s "$(url /stats)" | jq .state)" = 1 ] && pass "capture started on the Simulated device (state 1)" \
-    || fail "capture did not start: $(curl -s "$(url /stats)")"
+  # The device too, not just state 1: on a host with capture cards a lost
+  # /device would otherwise capture real hardware and still pass.
+  ST=$(curl -s "$(url /stats)")
+  if jq -e --argjson idx "$IDX" '.state == 1 and .selected_device == $idx and (.device_name | test("Simulated"))' \
+       <<<"$ST" >/dev/null; then
+    pass "capture started on the Simulated device (state 1)"
+  else
+    fail "capture did not start on the Simulated device: $ST"
+  fi
   curl -s "$(url "/record?on=1")" >/dev/null
   for _ in $(seq 1 50); do [ "$(curl -s "$(url /stats)" | jq .state)" = 2 ] && break; sleep 0.2; done
   ST=$(curl -s "$(url /stats)")

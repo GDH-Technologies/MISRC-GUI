@@ -5,31 +5,35 @@ driver path to parity with the Linux cxadc rate-detection / cycle-mode work
 landed in Sept 2026. It is a living document: update it as modes are tested
 and wired on Windows.
 
-## Current state (as of 2026-09-17)
+## Current state (as of 2026-10-22)
 
 - **Linux**: `gui_cxadc_get_sample_rate_hz()` reads `crystal` + `tenxfsc`
   from sysfs and derives the real hardware rate (stock 28.6, 40 mod, 54 mod,
   10-bit halves). The UI base-rate helper and the rate-box cycle use this.
   10-bit sysfs write permission denial falls back to 8-bit with a help popup.
-- **Windows**: `gui_cxadc_get_sample_rate_hz()` returns `false` (line ~491
-  of `gui_cxadc.c`). The CxadcWin PowerShell module (`Get-CxadcWinConfig` /
-  `Set-CxadcWinConfig`) exposes `EnableTenbit` and `CenterOffset` but does
-  **not** expose `crystal` or `tenxfsc`. So the Windows path always uses
-  the 40/20 MSPS clockgen baseline and never detects a stock 28.6 card.
+- **Windows**: `gui_cxadc_get_sample_rate_hz()` returns `false`. The GUI now
+  talks WMI directly (`ROOT\WMI` classes `CxadcWin_Path` / `CxadcWin_Config`)
+  instead of shelling out to `Import-Module CxadcWin` — the PowerShell detour
+  never worked: it launched Windows PowerShell 5.1 while the module requires
+  pwsh 7.4+ Core, and the module is not importable by name unless installed.
+  The upstream psm1 also has a `PciBusAddress` vs MOF `PciAddress` mismatch
+  in `Get-CxadcWinDevice`. See the "What works on Windows today" section.
 
-## What works on Windows today
+## What works on Windows today (post 2026-10-22 WMI rework)
 
-- `cxadc_win_get_tenbit` / `cxadc_win_set_tenbit` — 10-bit toggle via
-  `Get/Set-CxadcWinConfig -EnableTenbit`.
-- `cxadc_win_get_center_offset` / `cxadc_win_set_center_offset` — DC
-  offset via `Get/Set-CxadcWinConfig -CenterOffset`.
-- `cxadc_open_card` — `CreateFileA("\\.\cxadcN")`.
+- `cxadc_win_get_tenbit` / `cxadc_win_set_tenbit` — 10-bit toggle via direct
+  WMI (`CxadcWin_Path` lookup + `CxadcWin_Config.EnableTenbit` PutInstance,
+  with readback verification). No PowerShell involved.
+- `cxadc_win_get_center_offset` / `cxadc_win_set_center_offset` — DC offset
+  via direct WMI (`CxadcWin_Config.CenterOffset`), readback verified.
+- `gui_cxadc_center_offset_max()` — 63 on Windows (driver
+  `CX_CTRL_CONFIG_CENTER_OFFSET_MAX`), 255 on Linux; the UI DC-offset raw
+  range and the setters clamp to it.
+- `cxadc_open_card` — `CreateFileA("\\\\.\\cxadcN")`.
 - WASAPI clockgen audio capture (same path as Linux ALSA).
-- 10-bit permission fallback: the `EACCES/EPERM` path in
-  `cxadc_apply_tenbit_modes` is Linux-only (`#if !defined(_WIN32)`). On
-  Windows, a `Set-CxadcWinConfig` failure returns -1 and aborts capture.
-  **This needs a Windows equivalent** (PowerShell execution policy or
-  module-not-installed error → fall back to 8-bit + help popup).
+- 10-bit permission fallback: cross-platform. WMI `WBEM_E_ACCESS_DENIED`
+  maps to `EACCES` and takes the same fallback-to-8-bit + help-popup path
+  as the Linux sysfs EACCES case (Windows popup text: re-run as admin).
 
 ## What does NOT work on Windows (lock-step items)
 
@@ -45,15 +49,12 @@ and wired on Windows.
   - **Recommended**: (b) for now (CxadcWin cards are clockgen-driven),
     with a TODO for (a) if crystal-modded Windows cards ever appear.
 
-### 2. 10-bit permission fallback
-- **Blocker**: `cxadc_apply_tenbit_modes` has `#if !defined(_WIN32)` around
-  the `EACCES/EPERM` fallback. On Windows, a `Set-CxadcWinConfig` failure
-  (e.g. module not installed, PowerShell execution policy) returns -1 and
-  aborts capture.
-- **Fix needed**: add a Windows branch that detects the failure reason
-  (PowerShell error, module missing) and falls back to 8-bit + sets
-  `cxadc_perm_help_pending` with Windows-appropriate instructions
-  (install CxadcWin module, set execution policy).
+### 2. 10-bit permission fallback — DONE (2026-10-22)
+- `cxadc_apply_tenbit_modes` now has a Windows branch: WMI
+  `WBEM_E_ACCESS_DENIED` → `EACCES` → fall back to 8-bit, revert the card's
+  tenbit settings/rf_bits, set `cxadc_perm_help_pending` with the Windows
+  popup ("re-run as Administrator"). Non-permission failures still abort
+  capture with a status line + errno in the stderr log.
 
 ### 3. Rate-box cycle presets
 - **Current**: `gui_ui_cxadc_cycle_rate` and `cycle_resample_khz` use

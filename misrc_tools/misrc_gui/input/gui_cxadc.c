@@ -1,9 +1,11 @@
 #include "gui_cxadc.h"
+#include "gui_cxadc_macos.h"
 
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
+#include "../net/gui_monitor_audio.h"
 #include "../output/gui_record.h"
 #include "../signal/gui_headswitch_lock.h"
 #include "../../common/buffer_manager.h"
@@ -22,190 +24,6 @@
 #ifndef LIBASOUND_ENABLED
 #define LIBASOUND_ENABLED 0
 #endif
-#if defined(_WIN32)
-static int cxadc_win_card_path(int card_idx, char *path_out, size_t path_out_len)
-{
-    if (!path_out || path_out_len == 0) return -1;
-    if (card_idx < 0 || card_idx >= 2) return -1;
-    int n = snprintf(path_out, path_out_len, "\\\\.\\cxadc%d", card_idx);
-    if (n <= 0 || (size_t)n >= path_out_len) return -1;
-    return 0;
-}
-
-static void cxadc_win_trim(char *s)
-{
-    if (!s) return;
-    size_t len = strlen(s);
-    while (len > 0 && isspace((unsigned char)s[len - 1])) {
-        s[--len] = '\0';
-    }
-    char *start = s;
-    while (*start && isspace((unsigned char)*start)) {
-        start++;
-    }
-    if (start != s) {
-        memmove(s, start, strlen(start) + 1);
-    }
-}
-
-static int cxadc_win_run_ps_readline(const char *script, char *line_out, size_t line_out_len)
-{
-    if (!script || !line_out || line_out_len == 0) return -1;
-    line_out[0] = '\0';
-
-    char command[2048];
-    int n = snprintf(command,
-                     sizeof(command),
-                     "powershell -NoProfile -ExecutionPolicy Bypass -Command \"%s\"",
-                     script);
-    if (n <= 0 || (size_t)n >= sizeof(command)) return -1;
-
-    FILE *pipe = _popen(command, "r");
-    if (!pipe) return -1;
-
-    bool got_line = false;
-    char buf[256];
-    while (fgets(buf, sizeof(buf), pipe)) {
-        cxadc_win_trim(buf);
-        if (buf[0] == '\0') continue;
-        snprintf(line_out, line_out_len, "%s", buf);
-        got_line = true;
-        break;
-    }
-
-    int rc = _pclose(pipe);
-    if (rc != 0 || !got_line) return -1;
-    return 0;
-}
-static bool cxadc_win_ieq(const char *a, const char *b)
-{
-    if (!a || !b) return false;
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-            return false;
-        }
-        a++;
-        b++;
-    }
-    return (*a == '\0' && *b == '\0');
-}
-
-static int cxadc_win_parse_bool(const char *value, bool *out_bool)
-{
-    if (!value || !out_bool) return -1;
-    if (cxadc_win_ieq(value, "true") || strcmp(value, "1") == 0) {
-        *out_bool = true;
-        return 0;
-    }
-    if (cxadc_win_ieq(value, "false") || strcmp(value, "0") == 0) {
-        *out_bool = false;
-        return 0;
-    }
-    return -1;
-}
-
-static int cxadc_win_get_center_offset(int card_idx, int *value_out)
-{
-    if (!value_out) return -1;
-    char card_path[64];
-    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
-
-    char script[1024];
-    int n = snprintf(script,
-                     sizeof(script),
-                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
-                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
-                     card_path);
-    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
-
-    char line[128];
-    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
-
-    errno = 0;
-    char *endptr = NULL;
-    long parsed = strtol(line, &endptr, 10);
-    if (errno != 0 || endptr == line) return -1;
-    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
-    if (*endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) return -1;
-    *value_out = (int)parsed;
-    return 0;
-}
-
-static int cxadc_win_set_center_offset(int card_idx, int value)
-{
-    char card_path[64];
-    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
-
-    char script[1400];
-    int n = snprintf(script,
-                     sizeof(script),
-                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
-                     "Set-CxadcWinConfig -Path '%s' -CenterOffset %d | Out-Null; "
-                     "(Get-CxadcWinConfig -Path '%s').CenterOffset",
-                     card_path, value, card_path);
-    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
-
-    char line[128];
-    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
-
-    errno = 0;
-    char *endptr = NULL;
-    long parsed = strtol(line, &endptr, 10);
-    if (errno != 0 || endptr == line) return -1;
-    while (*endptr && isspace((unsigned char)*endptr)) endptr++;
-    if (*endptr != '\0') return -1;
-    if ((int)parsed != value) {
-        errno = EIO;
-        return -1;
-    }
-    return 0;
-}
-
-static int cxadc_win_get_tenbit(int card_idx, bool *enabled_out)
-{
-    if (!enabled_out) return -1;
-    char card_path[64];
-    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
-
-    char script[1024];
-    int n = snprintf(script,
-                     sizeof(script),
-                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
-                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
-                     card_path);
-    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
-
-    char line[128];
-    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
-    return cxadc_win_parse_bool(line, enabled_out);
-}
-
-static int cxadc_win_set_tenbit(int card_idx, bool enabled)
-{
-    char card_path[64];
-    if (cxadc_win_card_path(card_idx, card_path, sizeof(card_path)) != 0) return -1;
-    const char *enabled_ps = enabled ? "$true" : "$false";
-
-    char script[1400];
-    int n = snprintf(script,
-                     sizeof(script),
-                     "$ErrorActionPreference='Stop'; Import-Module CxadcWin -ErrorAction Stop; "
-                     "Set-CxadcWinConfig -Path '%s' -EnableTenbit %s | Out-Null; "
-                     "(Get-CxadcWinConfig -Path '%s').EnableTenbit",
-                     card_path, enabled_ps, card_path);
-    if (n <= 0 || (size_t)n >= sizeof(script)) return -1;
-
-    char line[128];
-    if (cxadc_win_run_ps_readline(script, line, sizeof(line)) != 0) return -1;
-    bool readback = false;
-    if (cxadc_win_parse_bool(line, &readback) != 0) return -1;
-    if (readback != enabled) {
-        errno = EIO;
-        return -1;
-    }
-    return 0;
-}
-#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -223,6 +41,7 @@ static int cxadc_win_set_tenbit(int card_idx, bool enabled)
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <propidl.h>
+#include <wbemcli.h>
 #undef Rectangle
 #undef CloseWindow
 #undef ShowCursor
@@ -245,6 +64,503 @@ static const PROPERTYKEY s_PKEY_Device_InstanceId = {
 #if LIBASOUND_ENABLED
 #include <alsa/asoundlib.h>
 #endif
+#endif
+
+#if defined(_WIN32)
+// --- CXADC-Win configuration via WMI (direct ROOT\WMI access) ---
+// The cxadc-win driver exposes its configuration as standard WMI data
+// blocks (cxadc-win/src/driver/cxadc-win.mof):
+//   CxadcWin_Path   : InstanceName <-> Win32 device path (\\.\cxadcN)
+//   CxadcWin_Config : VideoMux / Level / EnableTenbit / EnableSixDB /
+//                     CenterOffset (all [read, write])
+// The upstream CxadcWin PowerShell module is only a thin wrapper over these
+// classes (Get-/Set-CxadcWinConfig use Get-/Set-CimInstance). The GUI talks
+// WMI directly so configuration works regardless of the installed
+// PowerShell edition/version (the module requires pwsh 7.4+ Core, while
+// shelling out launched Windows PowerShell 5.1) and without the module
+// being importable by name. WMI reads need no elevation; writes
+// (PutInstance) can be denied for non-admin users, mapped to EACCES below
+// so callers take the same 8-bit fallback path as the Linux EPERM case.
+// The Windows driver's center-offset range is 0..63
+// (CX_CTRL_CONFIG_CENTER_OFFSET_MAX in cxadc-win/src/shared/cx_ctl_codes.h),
+// unlike the Linux sysfs range of 0..255.
+#define CXADC_WIN_CENTER_OFFSET_MAX 63
+
+static const CLSID s_CLSID_WbemLocator = {
+    0x4590f811, 0x1d3a, 0x11d0, { 0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 }
+};
+static const IID s_IID_IWbemLocator = {
+    // IID_IWbemLocator as defined in MinGW's wbemcli.h (DEFINE_GUID):
+    // {DC12A687-737F-11CF-884D-00AA004B2E24} (same 00aa004b2e24 tail as
+    // CLSID_WbemLocator above).
+    0xdc12a687, 0x737f, 0x11cf, { 0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 }
+};
+
+typedef struct {
+    IWbemServices *svc;
+    bool com_initialized;  // this call owns the CoInitializeEx (-> CoUninitialize)
+} cxadc_win_wmi_t;
+
+static int cxadc_win_wmi_errno_from_hresult(HRESULT hr)
+{
+    // Casts: MinGW's wbemcli.h defines the WBEM_E_* codes as an enum
+    // (tag_WBEMSTATUS) while HRESULT is a signed LONG.
+    if (hr == (HRESULT)WBEM_E_ACCESS_DENIED) return EACCES;
+    if (hr == (HRESULT)WBEM_E_NOT_FOUND ||
+        hr == (HRESULT)WBEM_E_INVALID_CLASS ||
+        hr == (HRESULT)WBEM_E_INVALID_OBJECT ||
+        hr == (HRESULT)WBEM_E_NOT_AVAILABLE) return ENOENT;
+    if (hr == (HRESULT)WBEM_E_INVALID_PARAMETER) return EINVAL;
+    if (hr == E_OUTOFMEMORY) return ENOMEM;
+    return EIO;
+}
+
+static void cxadc_win_wmi_log_failure(const char *what, HRESULT hr)
+{
+    fprintf(stderr, "[CXADC] WMI: %s failed (hr=0x%08lX)\n",
+            what, (unsigned long)hr);
+}
+
+static void cxadc_win_wmi_close(cxadc_win_wmi_t *w)
+{
+    if (!w) return;
+    if (w->svc) {
+        w->svc->lpVtbl->Release(w->svc);
+        w->svc = NULL;
+    }
+    if (w->com_initialized) {
+        CoUninitialize();
+        w->com_initialized = false;
+    }
+}
+
+static int cxadc_win_wmi_open(cxadc_win_wmi_t *w)
+{
+    if (!w) return -1;
+    memset(w, 0, sizeof(*w));
+
+    // Per-thread COM init (same pattern as the WASAPI audio open path).
+    // RPC_E_CHANGED_MODE: the thread already has COM up in another apartment
+    // model (e.g. STA); COM is still usable for WMI, we just don't own the
+    // init and must not CoUninitialize it.
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {
+        w->com_initialized = true;
+    } else if (hr != RPC_E_CHANGED_MODE) {
+        cxadc_win_wmi_log_failure("CoInitializeEx", hr);
+        errno = EIO;
+        return -1;
+    }
+
+    IWbemLocator *loc = NULL;
+    hr = CoCreateInstance(&s_CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                          &s_IID_IWbemLocator, (void **)&loc);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("CoCreateInstance(WbemLocator)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        cxadc_win_wmi_close(w);
+        return -1;
+    }
+
+    hr = loc->lpVtbl->ConnectServer(loc, L"ROOT\\WMI", NULL, NULL, NULL,
+                                    0L, NULL, NULL, &w->svc);
+    loc->lpVtbl->Release(loc);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("ConnectServer(ROOT\\WMI)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        cxadc_win_wmi_close(w);
+        return -1;
+    }
+
+    // Standard WMI client proxy blanket: local provider access needs
+    // impersonation so the driver is touched on behalf of the caller.
+    hr = CoSetProxyBlanket((IUnknown *)w->svc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                           NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                           NULL, EOAC_NONE);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("CoSetProxyBlanket", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        cxadc_win_wmi_close(w);
+        return -1;
+    }
+    return 0;
+}
+
+// Build the Win32 device path (\\.\cxadcN) as a wide string without CRT
+// format ambiguity across MinGW/MSVC runtimes.
+static int cxadc_win_card_path_w(int card_idx, wchar_t *out, size_t cap)
+{
+    if (!out || cap < 12) return -1;
+    if (card_idx < 0 || card_idx >= 2) return -1;
+    static const wchar_t base[] = L"\\\\.\\cxadc";
+    size_t pos = 0;
+    while (base[pos] != L'\0') {
+        out[pos] = base[pos];
+        pos++;
+    }
+    out[pos++] = L'0' + (wchar_t)card_idx;
+    out[pos] = L'\0';
+    return 0;
+}
+
+// Enumerate CxadcWin_Path and find the InstanceName for the given card path.
+// All instances are compared in C (at most two cards) to sidestep WQL string
+// escaping pitfalls with the backslashes in \\.\cxadcN.
+static int cxadc_win_wmi_find_card_instance(cxadc_win_wmi_t *w, int card_idx,
+                                             wchar_t *instance_out,
+                                             size_t instance_cap)
+{
+    wchar_t card_path[16];
+    if (cxadc_win_card_path_w(card_idx, card_path, sizeof(card_path) / sizeof(card_path[0])) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    IEnumWbemClassObject *iter = NULL;
+    HRESULT hr = w->svc->lpVtbl->ExecQuery(
+        w->svc, L"WQL", L"SELECT * FROM CxadcWin_Path",
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &iter);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("ExecQuery(CxadcWin_Path)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+
+    bool found = false;
+    for (;;) {
+        IWbemClassObject *obj = NULL;
+        ULONG returned = 0;
+        hr = iter->lpVtbl->Next(iter, WBEM_INFINITE, 1, &obj, &returned);
+        if (hr != WBEM_S_NO_ERROR || returned == 0) {
+            break;  // end of enumeration (WBEM_S_FALSE) or error
+        }
+        VARIANT vp;
+        VariantInit(&vp);
+        VARIANT vi;
+        VariantInit(&vi);
+        if (SUCCEEDED(obj->lpVtbl->Get(obj, L"Path", 0, &vp, NULL, NULL)) &&
+            vp.vt == VT_BSTR && vp.bstrVal &&
+            wcscmp(vp.bstrVal, card_path) == 0 &&
+            SUCCEEDED(obj->lpVtbl->Get(obj, L"InstanceName", 0, &vi, NULL, NULL)) &&
+            vi.vt == VT_BSTR && vi.bstrVal) {
+            wcsncpy(instance_out, vi.bstrVal, instance_cap - 1);
+            instance_out[instance_cap - 1] = L'\0';
+            found = true;
+        }
+        VariantClear(&vp);
+        VariantClear(&vi);
+        obj->lpVtbl->Release(obj);
+        if (found) break;
+    }
+    iter->lpVtbl->Release(iter);
+
+    if (!found) {
+        fprintf(stderr,
+                "[CXADC] WMI: no CxadcWin_Path instance for card %d "
+                "(driver not loaded or card not present)\n",
+                card_idx);
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+// Build the WMI object path for a CxadcWin_Config instance, escaping the
+// backslashes in the InstanceName (PCI\VEN_14F1&... -> PCI\\VEN_14F1&...).
+static int cxadc_win_wmi_config_object_path(const wchar_t *instance,
+                                             wchar_t *out, size_t out_cap)
+{
+    static const wchar_t prefix[] = L"CxadcWin_Config.InstanceName=\"";
+    size_t pos = 0;
+    for (size_t i = 0; prefix[i] != L'\0'; i++) {
+        if (pos + 1 >= out_cap) return -1;
+        out[pos++] = prefix[i];
+    }
+    for (size_t i = 0; instance[i] != L'\0'; i++) {
+        size_t need = (instance[i] == L'\\') ? 2 : 1;
+        if (pos + need + 1 >= out_cap) return -1;
+        if (instance[i] == L'\\') out[pos++] = L'\\';
+        out[pos++] = instance[i];
+    }
+    if (pos + 2 >= out_cap) return -1;
+    out[pos++] = L'"';
+    out[pos] = L'\0';
+    return 0;
+}
+
+static int cxadc_win_wmi_get_config(cxadc_win_wmi_t *w, const wchar_t *obj_path,
+                                     IWbemClassObject **obj_out)
+{
+    if (!obj_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    *obj_out = NULL;
+    BSTR bpath = SysAllocString(obj_path);
+    if (!bpath) {
+        errno = ENOMEM;
+        return -1;
+    }
+    HRESULT hr = w->svc->lpVtbl->GetObject(w->svc, bpath, 0, NULL, obj_out, NULL);
+    SysFreeString(bpath);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("GetObject(CxadcWin_Config)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_wmi_read_bool(IWbemClassObject *obj, const wchar_t *name,
+                                    bool *out)
+{
+    VARIANT v;
+    VariantInit(&v);
+    HRESULT hr = obj->lpVtbl->Get(obj, name, 0, &v, NULL, NULL);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("Get(property)", hr);
+        VariantClear(&v);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    if (v.vt != VT_BOOL) {
+        // VT_NULL: property absent (driver too old / MOF mismatch)
+        VariantClear(&v);
+        errno = EIO;
+        return -1;
+    }
+    *out = (v.boolVal != VARIANT_FALSE);
+    VariantClear(&v);
+    return 0;
+}
+
+static int cxadc_win_wmi_read_long(IWbemClassObject *obj, const wchar_t *name,
+                                    long *out)
+{
+    VARIANT v;
+    VariantInit(&v);
+    HRESULT hr = obj->lpVtbl->Get(obj, name, 0, &v, NULL, NULL);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("Get(property)", hr);
+        VariantClear(&v);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    if (v.vt != VT_I4) {
+        VariantClear(&v);
+        errno = EIO;
+        return -1;
+    }
+    *out = v.lVal;
+    VariantClear(&v);
+    return 0;
+}
+
+static int cxadc_win_wmi_put_bool(IWbemClassObject *obj, const wchar_t *name,
+                                  bool value)
+{
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BOOL;
+    v.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
+    HRESULT hr = obj->lpVtbl->Put(obj, name, 0, &v, 0);
+    VariantClear(&v);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("Put(property)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_wmi_put_long(IWbemClassObject *obj, const wchar_t *name,
+                                  long value)
+{
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_I4;
+    v.lVal = value;
+    HRESULT hr = obj->lpVtbl->Put(obj, name, 0, &v, 0);
+    VariantClear(&v);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure("Put(property)", hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_wmi_put_instance(cxadc_win_wmi_t *w, IWbemClassObject *obj,
+                                       const char *what)
+{
+    HRESULT hr = w->svc->lpVtbl->PutInstance(w->svc, obj, 0, NULL, NULL);
+    if (FAILED(hr)) {
+        cxadc_win_wmi_log_failure(what, hr);
+        errno = cxadc_win_wmi_errno_from_hresult(hr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cxadc_win_get_tenbit(int card_idx, bool *enabled_out)
+{
+    if (!enabled_out) return -1;
+    cxadc_win_wmi_t w;
+    if (cxadc_win_wmi_open(&w) != 0) return -1;
+
+    int rc = -1;
+    wchar_t instance[256];
+    wchar_t obj_path[512];
+    do {
+        if (cxadc_win_wmi_find_card_instance(&w, card_idx, instance,
+                                             sizeof(instance) / sizeof(instance[0])) != 0) break;
+        if (cxadc_win_wmi_config_object_path(instance, obj_path,
+                                             sizeof(obj_path) / sizeof(obj_path[0])) != 0) {
+            errno = EIO;
+            break;
+        }
+        IWbemClassObject *cfg = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &cfg) != 0) break;
+        rc = cxadc_win_wmi_read_bool(cfg, L"EnableTenbit", enabled_out);
+        cfg->lpVtbl->Release(cfg);
+    } while (0);
+
+    cxadc_win_wmi_close(&w);
+    return rc;
+}
+
+static int cxadc_win_set_tenbit(int card_idx, bool enabled)
+{
+    cxadc_win_wmi_t w;
+    if (cxadc_win_wmi_open(&w) != 0) return -1;
+
+    int rc = -1;
+    wchar_t instance[256];
+    wchar_t obj_path[512];
+    do {
+        if (cxadc_win_wmi_find_card_instance(&w, card_idx, instance,
+                                             sizeof(instance) / sizeof(instance[0])) != 0) break;
+        if (cxadc_win_wmi_config_object_path(instance, obj_path,
+                                             sizeof(obj_path) / sizeof(obj_path[0])) != 0) {
+            errno = EIO;
+            break;
+        }
+        IWbemClassObject *cfg = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &cfg) != 0) break;
+        if (cxadc_win_wmi_put_bool(cfg, L"EnableTenbit", enabled) != 0) {
+            cfg->lpVtbl->Release(cfg);
+            break;
+        }
+        if (cxadc_win_wmi_put_instance(&w, cfg, "PutInstance(EnableTenbit)") != 0) {
+            cfg->lpVtbl->Release(cfg);
+            break;
+        }
+        cfg->lpVtbl->Release(cfg);
+
+        // Readback via a fresh GetObject: confirm the driver really applied
+        // the mode (mirrors the sysfs readback on Linux).
+        IWbemClassObject *chk = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &chk) != 0) break;
+        bool readback = false;
+        rc = cxadc_win_wmi_read_bool(chk, L"EnableTenbit", &readback);
+        chk->lpVtbl->Release(chk);
+        if (rc != 0) break;
+        if (readback != enabled) {
+            fprintf(stderr,
+                    "[CXADC] WMI: EnableTenbit readback mismatch on card %d "
+                    "(expected %d got %d)\n",
+                    card_idx, enabled ? 1 : 0, readback ? 1 : 0);
+            errno = EIO;
+            rc = -1;
+        }
+    } while (0);
+
+    cxadc_win_wmi_close(&w);
+    return rc;
+}
+
+static int cxadc_win_get_center_offset(int card_idx, int *value_out)
+{
+    if (!value_out) return -1;
+    cxadc_win_wmi_t w;
+    if (cxadc_win_wmi_open(&w) != 0) return -1;
+
+    int rc = -1;
+    wchar_t instance[256];
+    wchar_t obj_path[512];
+    do {
+        if (cxadc_win_wmi_find_card_instance(&w, card_idx, instance,
+                                             sizeof(instance) / sizeof(instance[0])) != 0) break;
+        if (cxadc_win_wmi_config_object_path(instance, obj_path,
+                                             sizeof(obj_path) / sizeof(obj_path[0])) != 0) {
+            errno = EIO;
+            break;
+        }
+        IWbemClassObject *cfg = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &cfg) != 0) break;
+        long value = 0;
+        rc = cxadc_win_wmi_read_long(cfg, L"CenterOffset", &value);
+        if (rc == 0) {
+            *value_out = (int)value;
+        }
+        cfg->lpVtbl->Release(cfg);
+    } while (0);
+
+    cxadc_win_wmi_close(&w);
+    return rc;
+}
+
+static int cxadc_win_set_center_offset(int card_idx, int value)
+{
+    if (value < 0) value = 0;
+    if (value > CXADC_WIN_CENTER_OFFSET_MAX) value = CXADC_WIN_CENTER_OFFSET_MAX;
+
+    cxadc_win_wmi_t w;
+    if (cxadc_win_wmi_open(&w) != 0) return -1;
+
+    int rc = -1;
+    wchar_t instance[256];
+    wchar_t obj_path[512];
+    do {
+        if (cxadc_win_wmi_find_card_instance(&w, card_idx, instance,
+                                             sizeof(instance) / sizeof(instance[0])) != 0) break;
+        if (cxadc_win_wmi_config_object_path(instance, obj_path,
+                                             sizeof(obj_path) / sizeof(obj_path[0])) != 0) {
+            errno = EIO;
+            break;
+        }
+        IWbemClassObject *cfg = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &cfg) != 0) break;
+        if (cxadc_win_wmi_put_long(cfg, L"CenterOffset", (long)value) != 0) {
+            cfg->lpVtbl->Release(cfg);
+            break;
+        }
+        if (cxadc_win_wmi_put_instance(&w, cfg, "PutInstance(CenterOffset)") != 0) {
+            cfg->lpVtbl->Release(cfg);
+            break;
+        }
+        cfg->lpVtbl->Release(cfg);
+
+        // Readback via a fresh GetObject to confirm the applied value.
+        IWbemClassObject *chk = NULL;
+        if (cxadc_win_wmi_get_config(&w, obj_path, &chk) != 0) break;
+        long readback = 0;
+        rc = cxadc_win_wmi_read_long(chk, L"CenterOffset", &readback);
+        chk->lpVtbl->Release(chk);
+        if (rc != 0) break;
+        if ((int)readback != value) {
+            fprintf(stderr,
+                    "[CXADC] WMI: CenterOffset readback mismatch on card %d "
+                    "(expected %d got %d)\n",
+                    card_idx, value, (int)readback);
+            errno = EIO;
+            rc = -1;
+        }
+    } while (0);
+
+    cxadc_win_wmi_close(&w);
+    return rc;
+}
 #endif
 
 extern volatile atomic_int do_exit;
@@ -445,16 +761,37 @@ int gui_cxadc_get_center_offset(int card_idx, int *value_out)
 #if defined(_WIN32)
     return cxadc_win_get_center_offset(card_idx, value_out);
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; return gui_cxadc_macos_get("center_offset", value_out);
+#else
     return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
+#endif
+#endif
+}
+
+// Maximum CXADC center offset accepted by the platform driver:
+// 0..255 on Linux/macOS, 0..63 on Windows (cxadc-win
+// CX_CTRL_CONFIG_CENTER_OFFSET_MAX in cxadc-win/src/shared/cx_ctl_codes.h).
+// Values above the driver max are rejected by the hardware path, so the GUI
+// clamps to this range before writing.
+int gui_cxadc_center_offset_max(void)
+{
+#if defined(_WIN32)
+    return CXADC_WIN_CENTER_OFFSET_MAX;
+#else
+    return CXADC_SYSFS_CENTER_OFFSET_MAX;
 #endif
 }
 
 int gui_cxadc_set_center_offset(int card_idx, int value)
 {
-#if defined(_WIN32)
     if (value < 0) value = 0;
-    if (value > 255) value = 255;
+    int offset_max = gui_cxadc_center_offset_max();
+    if (value > offset_max) value = offset_max;
+#if defined(_WIN32)
     return cxadc_win_set_center_offset(card_idx, value);
+#elif defined(__APPLE__)
+    (void)card_idx; return gui_cxadc_macos_set("center_offset", value);
 #else
     if (value < CXADC_SYSFS_CENTER_OFFSET_MIN) value = CXADC_SYSFS_CENTER_OFFSET_MIN;
     if (value > CXADC_SYSFS_CENTER_OFFSET_MAX) value = CXADC_SYSFS_CENTER_OFFSET_MAX;
@@ -470,7 +807,8 @@ int gui_cxadc_adjust_center_offset(int card_idx, int delta, int *new_value_out)
     }
     int next = current + delta;
     if (next < 0) next = 0;
-    if (next > 255) next = 255;
+    int offset_max = gui_cxadc_center_offset_max();
+    if (next > offset_max) next = offset_max;
     if (gui_cxadc_set_center_offset(card_idx, next) != 0) {
         return -1;
     }
@@ -533,6 +871,9 @@ int gui_cxadc_get_tenbit(int card_idx, int *value_out)
     *value_out = enabled ? 1 : 0;
     return 0;
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; *value_out=0; return 0;
+    #endif
     int raw = 0;
     if (cxadc_sysfs_read_int_param(card_idx, "tenbit", &raw) != 0) {
         return -1;
@@ -547,6 +888,9 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 #if defined(_WIN32)
     return cxadc_win_set_tenbit(card_idx, enabled);
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; return enabled ? -1 : 0;
+    #endif
     return cxadc_sysfs_write_int_param(card_idx, "tenbit", enabled ? 1 : 0);
 #endif
 }
@@ -575,6 +919,10 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
 {
     if (!rate_hz_out) return false;
     *rate_hz_out = 0;
+#if defined(__APPLE__)
+    if (card_idx>=0 && card_idx<CXADC_MAX_CARDS && !tenbit) {*rate_hz_out=28636363;return true;}
+    return false;
+#endif
     if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS) return false;
 #if defined(_WIN32)
     // CxadcWin PowerShell config doesn't expose tenxfsc/crystal; callers use
@@ -640,7 +988,6 @@ static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool e
 // Main thread only: it may rewrite and save settings on the 8-bit fallback.
 static int cxadc_apply_tenbit_mode_card(gui_app_t *app, int i, bool mode)
 {
-    (void)app;  // only the non-Windows 8-bit fallback uses it
     // Read the card's current tenbit setting first. The cxadc driver
     // defaults to 8-bit (tenbit=0), so when the user wants 8-bit (the
     // common case) and the card is already in 8-bit, skip the sysfs write
@@ -657,42 +1004,47 @@ static int cxadc_apply_tenbit_mode_card(gui_app_t *app, int i, bool mode)
     }
 
     if (gui_cxadc_set_tenbit(i, mode) != 0) {
-#if !defined(_WIN32)
         int saved_errno = errno;
         fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
                 i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
         // If the write was denied for permissions, fall back to 8-bit
         // (the driver default) instead of aborting the whole capture.
-        // 8-bit needs no sysfs write; 10-bit does, but degrading to
-        // 8-bit is better than refusing to start. Revert this card's
-        // tenbit flag so the live sample-rate readout matches reality.
+        // 8-bit needs no elevated write; degrading to 8-bit is better
+        // than refusing to start. Revert this card's tenbit flag so the
+        // live sample-rate readout matches reality. On Windows the
+        // denial comes from the WMI config write (PutInstance denied
+        // for non-admin users) - the popup text in gui_ui.c carries the
+        // Windows fix instructions, the stderr line stays Linux-only
+        // because the sysfs fix it names does not exist on Windows.
         if (saved_errno == EACCES || saved_errno == EPERM) {
+#if defined(_WIN32)
+            fprintf(stderr, "[CXADC] WMI config write denied; falling back to 8-bit (re-run as administrator for 10-bit)\n");
+#else
             fprintf(stderr, "[CXADC] sysfs write denied; falling back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/* for 10-bit)\n");
+#endif
             if (mode) {
                 s_cxadc.tenbit_mode[i] = false;
                 app->settings.cxadc_tenbit_mode_card[i] = false;
                 if (i == 0) app->settings.rf_bits_a = 8;
                 else app->settings.rf_bits_b = 8;
                 gui_settings_save(&app->settings);
+#if defined(_WIN32)
+                gui_app_set_status(app, "CXADC 10-bit write denied - fell back to 8-bit (re-run as administrator)");
+#else
                 gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
+#endif
                 // Ask the UI thread to show a help popup with the full
                 // one-time setup instructions (consumed in gui_handle_interactions).
                 atomic_store(&app->cxadc_perm_help_pending, true);
             }
             return 0;
         }
-#else
-        fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed\n",
-                i, mode ? "10-bit" : "8-bit");
-#endif
         return -1;
     }
     int readback = -1;
     if (gui_cxadc_get_tenbit(i, &readback) != 0) {
-#if !defined(_WIN32)
         fprintf(stderr, "[CXADC] tenbit readback failed on card %d: %s (errno %d)\n",
                 i, strerror(errno), errno);
-#endif
         return -1;
     }
     if (((readback != 0) ? true : false) != mode) {
@@ -715,10 +1067,7 @@ static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_
     uint32_t ch_b = (uint32_t)((2047 - sample_b) & 0xFFF);
     return ch_a | (ch_b << 20);
 }
-static inline int16_t cxadc_decode_sample_8bit(uint8_t sample)
-{
-    return (int16_t)(((int)sample - 128) << 4);
-}
+#include "cxadc_samples.h"
 
 static inline int16_t cxadc_decode_sample_tenbit(uint8_t lo, uint8_t hi)
 {
@@ -807,6 +1156,9 @@ static void cxadc_close_handle(HANDLE *handle)
 #else
 static int cxadc_open_card(int card_idx)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_open(card_idx);
+#endif
     char path[32];
     snprintf(path, sizeof(path), "/dev/cxadc%d", card_idx);
     return open(path, O_RDONLY);
@@ -814,6 +1166,9 @@ static int cxadc_open_card(int card_idx)
 
 static int cxadc_read_card(int fd, uint8_t *buf, size_t len)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_read(fd,buf,len);
+#endif
     if (!buf || len == 0 || fd < 0) {
         return -1;
     }
@@ -832,7 +1187,11 @@ static void cxadc_close_fd(int *fd)
 {
     if (!fd) return;
     if (*fd >= 0) {
+#if defined(__APPLE__)
+        gui_cxadc_macos_close(*fd);
+#else
         close(*fd);
+#endif
         *fd = -1;
     }
 }
@@ -927,6 +1286,11 @@ static size_t s_cxadc_probe_consumed_bytes[CXADC_MAX_CARDS];
 static bool cxadc_measure_card_rate_hz(int card_idx, bool tenbit, size_t probe_bytes,
                                         uint32_t *measured_hz_out)
 {
+#if defined(__APPLE__)
+    (void)card_idx;(void)tenbit;(void)probe_bytes;
+    if(measured_hz_out)*measured_hz_out=0;
+    return false; /* configured nominal rate, never claim a calibrated measurement */
+#endif
     if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS || !measured_hz_out) {
         return false;
     }
@@ -1157,6 +1521,9 @@ int gui_cxadc_probe_card_rates(int card_count, const bool tenbit_modes[CXADC_MAX
 
 int gui_cxadc_detect_cards(void)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_detect();
+#endif
     int count = 0;
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
 #if defined(_WIN32)
@@ -2024,6 +2391,7 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                     gui_headswitch_lock_ingest_s24le_interleaved(out, output_bytes, ctx->audio_sample_rate_hz);
                     bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
                     bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+                    gui_monitor_audio_server_tap(app,out,output_bytes);
                     atomic_store(&app->audio_sample_rate, ctx->audio_sample_rate_hz);
                     atomic_store(&app->last_callback_time_ms, get_time_ms());
                 } else {
@@ -2124,6 +2492,7 @@ cxadc_wasapi_done:
 
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
         bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+        gui_monitor_audio_server_tap(app,out,output_bytes);
         atomic_store(&app->audio_sample_rate, ctx->audio_sample_rate_hz);
         atomic_store(&app->last_callback_time_ms, get_time_ms());
     }
@@ -2153,6 +2522,9 @@ static int cxadc_capture_thread(void *ctx_ptr)
     }
     const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
     uint32_t tap_frame_index = 0;
+#if defined(__APPLE__)
+    uint64_t native_last_data=get_time_ms();
+#endif
 
     atomic_store(&app->stream_synced, true);
     atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
@@ -2164,14 +2536,32 @@ static int cxadc_capture_thread(void *ctx_ptr)
         int read_a = cxadc_read_card(ctx->card_fds[0], card_buf_a, CXADC_READ_CHUNK_BYTES);
 #endif
         if (read_a < 0) {
+#if defined(__APPLE__)
+            gui_app_set_status(app,gui_cxadc_macos_error());
+            gui_cxadc_macos_mark_failed();
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_DEVICE_ERROR);
+            atomic_store(&app->dropout_stop_requested,true);
+#else
             gui_app_set_status(app, "CXADC read error on card 0");
+#endif
             break;
         }
         if (read_a == 0) {
+#if defined(__APPLE__)
+            if(get_time_ms()-native_last_data>2000){
+                gui_app_set_status(app,"macOS CXADC stopped delivering samples (device/driver unavailable)");
+                gui_cxadc_macos_mark_failed();
+                atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_CALLBACK_GAP);
+                atomic_store(&app->dropout_stop_requested,true);break;
+            }
+#endif
             thrd_sleep_ms(1);
             continue;
         }
 
+#if defined(__APPLE__)
+        native_last_data=get_time_ms();
+#endif
         int output_samples = read_a / input_bytes_per_sample_a;
         if (output_samples <= 0) {
             thrd_sleep_ms(1);
@@ -2249,6 +2639,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
         uint32_t *raw_out = (uint32_t *)bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, output_bytes, NULL);
         if (!raw_out) {
             atomic_fetch_add(&app->rb_drop_count, 1);
+#if defined(__APPLE__)
+            gui_cxadc_macos_mark_failed();
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
+            atomic_store(&app->dropout_stop_requested,true);break;
+#endif
             continue;
         }
 
@@ -2650,6 +3045,20 @@ static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
+#if defined(__APPLE__)
+    int native_index=0;
+    if(app->selected_device>=0 && app->selected_device<app->device_count)
+        sscanf(app->devices[app->selected_device].serial,"CXADC_MACOS_%d",&native_index);
+    gui_cxadc_macos_select(native_index);
+    if(card_count!=1 || misrc_clockgen_mode){gui_app_set_status(app,"macOS CXADC supports one stock RAW8 card per capture");return -1;}
+    app->settings.cxadc_tenbit_mode_card[0]=false;
+    app->settings.rf_bits_a=8;app->settings.enable_resample_a=false;
+    app->settings.capture_a=true;app->settings.capture_b=false;
+    app->settings.enable_audio_4ch=false;app->settings.enable_audio_2ch_12=false;app->settings.enable_audio_2ch_34=false;
+    for(int n=0;n<4;n++)app->settings.enable_audio_1ch[n]=false;
+    app->settings.audio_monitor_playback=false;app->settings.use_flac=false;
+    app->settings.stop_on_dropout=true;
+#endif
     if (atomic_load(&s_cxadc.running)) return 0;
 
     // card_count == 0 is valid for the audio-only MISRC Clockgen path (no
@@ -2722,10 +3131,20 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             fprintf(stderr, "[CXADC] RF B off: card 1 not opened\n");
         }
         if (cxadc_apply_tenbit_modes(app, open_count, s_cxadc.tenbit_mode) != 0) {
-#if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s): %s (errno %d)\n",
                     open_count, strerror(saved_errno), saved_errno);
+#if defined(_WIN32)
+            // Permission denials normally never reach here: the WMI
+            // EACCES case inside cxadc_apply_tenbit_modes already fell back
+            // to 8-bit and continued. Kept for safety in case a write is
+            // denied in a way that bypassed the fallback.
+            if (saved_errno == EACCES || saved_errno == EPERM) {
+                gui_app_set_status(app, "CXADC: 10-bit write denied - re-run as administrator");
+            } else {
+                gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
+            }
+#else
             if (saved_errno == EACCES || saved_errno == EPERM) {
                 fprintf(stderr, "[CXADC] sysfs write denied. For 10-bit mode you need one-time setup:\n"
                                 "          sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*\n"
@@ -2735,14 +3154,15 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             } else {
                 gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
             }
-#else
-            fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s)\n", open_count);
-            gui_app_set_status(app, "CXADC: failed to apply tenbit mode");
 #endif
             return -1;
         }
 
         if (cxadc_open_cards(&s_cxadc, open_count) != 0) {
+#if defined(__APPLE__)
+            gui_app_set_status(app,gui_cxadc_macos_error());
+            return -1;
+#endif
 #if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to open /dev/cxadc0..%d: %s (errno %d)\n",
@@ -2835,6 +3255,9 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // stays closed and has no fd to probe or align.
     if (open_count > 0) {
         for (int i = 0; i < open_count && i < CXADC_MAX_CARDS; i++) {
+#if defined(__APPLE__)
+            continue; /* on-demand DMA has no boot backlog; keep configured nominal rate */
+#endif
             // Reset the per-session consumed counter before the capture-start
             // probe so the exact-alignment grid references this fd session only.
             s_cxadc_probe_consumed_bytes[i] = 0;

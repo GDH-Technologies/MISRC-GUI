@@ -21,6 +21,7 @@ static void *start_test_malloc(size_t bytes);
 static void *start_test_calloc(size_t count,size_t bytes);
 static void start_test_free(void *memory);
 static FILE *start_test_open_read_utf8(const char *filepath);
+static FILE *start_test_open_utf8(const char *filepath,const char *mode);
 static int start_test_fclose(FILE *file);
 static size_t start_test_fread(void *memory,size_t size,size_t count,FILE *file);
 static int start_test_ferror(FILE *file);
@@ -41,6 +42,7 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #define calloc start_test_calloc
 #define free start_test_free
 #define file_open_read_utf8 start_test_open_read_utf8
+#define file_open_utf8 start_test_open_utf8
 #define fclose start_test_fclose
 #define fread start_test_fread
 #define ferror start_test_ferror
@@ -59,6 +61,7 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #undef ferror
 #undef fclose
 #undef file_open_read_utf8
+#undef file_open_utf8
 #undef free
 #undef calloc
 #undef malloc
@@ -75,6 +78,7 @@ static atomic_uint start_test_live_allocations,start_test_live_decoders;
 static atomic_uint start_test_live_files;
 static atomic_bool start_test_init_failure_once;
 static atomic_bool start_test_scan_malloc_failure_once;
+static atomic_bool start_test_decode_malloc_failure_once;
 static atomic_uint start_test_scan_read_failure_once;
 static atomic_bool start_test_snapshot_failure_once;
 static atomic_bool start_test_tail_disabled=true; // Legacy Unknown cases exercise bounded-tail miss.
@@ -121,6 +125,8 @@ static void *start_test_register_allocation(void *memory) {
     return memory;
 }
 static void *start_test_malloc(size_t bytes) {
+    if(bytes==(size_t)PLAYBACK_BUFFER_SIZE*8u*sizeof(int16_t) &&
+       atomic_exchange(&start_test_decode_malloc_failure_once,false)) return NULL;
     if(bytes==PLAYBACK_FRAME_SCAN_CHUNK_BYTES+64u &&
        atomic_exchange(&start_test_scan_malloc_failure_once,false)) return NULL;
     return start_test_register_allocation(malloc(bytes));
@@ -139,8 +145,8 @@ static void start_test_free(void *memory) {
     start_test_release();
     free(memory);
 }
-static FILE *start_test_open_read_utf8(const char *filepath) {
-    FILE *file=file_open_read_utf8(filepath);
+/* Track input files and the Ogg remux output with the same close/ownership rules. */
+static FILE *start_test_register_file(FILE *file) {
     if (!file) return NULL;
     start_test_acquire();
     unsigned slot=0;
@@ -150,6 +156,12 @@ static FILE *start_test_open_read_utf8(const char *filepath) {
     atomic_fetch_add(&start_test_live_files,1);
     start_test_release();
     return file;
+}
+static FILE *start_test_open_read_utf8(const char *filepath) {
+    return start_test_register_file(file_open_read_utf8(filepath));
+}
+static FILE *start_test_open_utf8(const char *filepath,const char *mode) {
+    return start_test_register_file(file_open_utf8(filepath,mode));
 }
 static int start_test_fclose(FILE *file) {
     if(atomic_load(&start_test_error_file)==file) atomic_store(&start_test_error_file,NULL);
@@ -377,6 +389,44 @@ static void start_test_stop_clean(void) {
     gui_playback_finish_start(&start_test_app);
     start_test_assert_clean();
 }
+/* Exercise the public startup paths, then assert that the specific error
+ * survives disposal of the private prepared context. No probe substitutes. */
+static void start_test_expect_failure(bool asynchronous,const char *file_a,
+                                      const char *file_b,const char *expected) {
+    snprintf(start_test_app.status_message,sizeof(start_test_app.status_message),"stale status");
+    if(asynchronous) {
+        assert(gui_playback_start_async(&start_test_app,file_a,file_b)==0);
+        assert(start_test_poll_complete()==-1);
+    } else assert(gui_playback_start(&start_test_app,file_a,file_b)==-1);
+    assert(strcmp(start_test_app.status_message,expected)==0);
+    gui_playback_finish_start(&start_test_app);start_test_assert_clean();
+    assert(strcmp(start_test_app.status_message,expected)==0);
+}
+static void start_test_error_details(const char *normal,const char *bad,const char *missing) {
+    char detail[192],expected_a[256],expected_b[256];
+    snprintf(detail,sizeof(detail),"open failed: %s",missing);
+    snprintf(expected_a,sizeof(expected_a),"Playback A failed: %s",detail);
+    snprintf(expected_b,sizeof(expected_b),"Playback B failed: %s",detail);
+    for(int asynchronous=0;asynchronous<2;asynchronous++) {
+        start_test_expect_failure(asynchronous!=0,missing,NULL,expected_a);
+        start_test_expect_failure(asynchronous!=0,NULL,missing,expected_b);
+        start_test_expect_failure(asynchronous!=0,normal,bad,
+            "Playback B failed: not a valid FLAC stream (unreadable metadata)");
+        atomic_store(&start_test_decode_malloc_failure_once,true);
+        start_test_expect_failure(asynchronous!=0,normal,NULL,"Playback failed to start");
+        assert(!atomic_load(&start_test_decode_malloc_failure_once));
+    }
+    /* Cancellation wins even when the completed prepare already has an error. */
+    assert(gui_playback_start_async(&start_test_app,missing,NULL)==0);
+    start_test_wait_flag(&s_playback_start.done);
+    assert(s_playback_start.prepared && s_playback_start.prepared->info_a.error[0]);
+    gui_playback_cancel_start(&start_test_app);
+    assert(start_test_poll_complete()==-1);
+    assert(strcmp(start_test_app.status_message,"Playback load cancelled")==0);
+    gui_playback_finish_start(&start_test_app);start_test_assert_clean();
+    puts("Playback sync/async A/B errors, no-detail fallback, cancellation precedence and cleanup passed");
+}
+
 static void start_test_arm_read(void) {
     atomic_store(&start_test_read_entered,false);
     atomic_store(&start_test_release_read,false);
@@ -441,6 +491,79 @@ static void start_test_make_fixture(const char *normal,const char *unknown,const
     FILE *output=fopen(bad,"wb"); assert(output);
     assert(fwrite("not a FLAC",1,10,output)==10); fclose(output);
 }
+/* A small real Ogg-FLAC fixture with a nil packet on its final EOS page.
+ * The previous page loses EOS and both checksums are recomputed independently. */
+static uint32_t start_test_ogg_crc(const uint8_t *bytes,size_t count) {
+    uint32_t crc=0;
+    for(size_t n=0;n<count;n++) {
+        crc^=(uint32_t)bytes[n]<<24;
+        for(int bit=0;bit<8;bit++) crc=(crc<<1)^((crc&UINT32_C(0x80000000))?UINT32_C(0x04c11db7):0);
+    }
+    return crc;
+}
+static uint32_t start_test_ogg_le32(const uint8_t *p) {
+    return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
+}
+static void start_test_ogg_put_le(uint8_t *p,uint64_t value,unsigned bytes) {
+    for(unsigned n=0;n<bytes;n++) p[n]=(uint8_t)(value>>(n*8));
+}
+static bool start_test_encode_ogg_nil(const char *path) {
+    if(!FLAC_API_SUPPORTS_OGG_FLAC) {
+        puts("Playback Ogg nil async fixture skipped: linked libFLAC has no Ogg encoder");return false;
+    }
+    FLAC__StreamEncoder *encoder=FLAC__stream_encoder_new();assert(encoder);
+    assert(FLAC__stream_encoder_set_channels(encoder,1));
+    assert(FLAC__stream_encoder_set_bits_per_sample(encoder,16));
+    assert(FLAC__stream_encoder_set_sample_rate(encoder,20000));
+    assert(FLAC__stream_encoder_set_compression_level(encoder,0));
+    assert(FLAC__stream_encoder_set_blocksize(encoder,START_TEST_BLOCK));
+    assert(FLAC__stream_encoder_set_total_samples_estimate(encoder,START_TEST_SAMPLES));
+    assert(FLAC__stream_encoder_set_ogg_serial_number(encoder,123456));
+    FLAC__StreamMetadata *vc=FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);assert(vc);
+    FLAC__StreamMetadata_VorbisComment_Entry entry;
+    assert(FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&entry,"RF_SAMPLE_RATE","40000000"));
+    assert(FLAC__metadata_object_vorbiscomment_append_comment(vc,entry,false));
+    assert(FLAC__stream_encoder_set_metadata(encoder,&vc,1));
+    assert(FLAC__stream_encoder_init_ogg_file(encoder,path,NULL,NULL)==FLAC__STREAM_ENCODER_INIT_STATUS_OK);
+    FLAC__int32 block[START_TEST_BLOCK];
+    for(unsigned offset=0;offset<START_TEST_SAMPLES;offset+=START_TEST_BLOCK) {
+        for(unsigned n=0;n<START_TEST_BLOCK;n++) block[n]=(FLAC__int32)((int)((offset+n)%4096u)-2048)*16;
+        assert(FLAC__stream_encoder_process_interleaved(encoder,block,START_TEST_BLOCK));
+    }
+    assert(FLAC__stream_encoder_finish(encoder));FLAC__stream_encoder_delete(encoder);
+    FLAC__metadata_object_delete(vc);
+    FILE *file=fopen(path,"r+b");assert(file);
+    uint8_t header[27],segments[255],*last=NULL;size_t last_bytes=0;long last_offset=0;
+    for(;;) {
+        long offset=ftell(file);assert(offset>=0);
+        size_t got=fread(header,1,sizeof(header),file);
+        if(!got) {assert(feof(file));break;}
+        assert(got==sizeof(header) && !memcmp(header,"OggS",4));
+        unsigned nseg=header[26];assert(fread(segments,1,nseg,file)==nseg);
+        size_t body=0;for(unsigned n=0;n<nseg;n++) body+=segments[n];
+        size_t bytes=sizeof(header)+nseg+body;
+        uint8_t *page=malloc(bytes);assert(page);
+        memcpy(page,header,sizeof(header));memcpy(page+sizeof(header),segments,nseg);
+        assert(fread(page+sizeof(header)+nseg,1,body,file)==body);
+        uint32_t checksum=start_test_ogg_le32(page+22);memset(page+22,0,4);
+        assert(start_test_ogg_crc(page,bytes)==checksum);
+        start_test_ogg_put_le(page+22,checksum,4);
+        free(last);last=page;last_bytes=bytes;last_offset=offset;
+    }
+    assert(last && (last[5]&4u) && last[26]>0 && last[27+last[26]-1]<255);
+    last[5]&=(uint8_t)~4u;memset(last+22,0,4);
+    start_test_ogg_put_le(last+22,start_test_ogg_crc(last,last_bytes),4);
+    assert(fseek(file,last_offset,SEEK_SET)==0 && fwrite(last,1,last_bytes,file)==last_bytes);
+    uint8_t nil[28]={0};memcpy(nil,"OggS",4);nil[5]=4;
+    memcpy(nil+6,last+6,8);memcpy(nil+14,last+14,4);
+    start_test_ogg_put_le(nil+18,(uint64_t)start_test_ogg_le32(last+18)+1,4);
+    nil[26]=1;nil[27]=0; /* One zero-length packet, not a page with zero segments. */
+    start_test_ogg_put_le(nil+22,start_test_ogg_crc(nil,sizeof(nil)),4);
+    assert(fwrite(nil,1,sizeof(nil),file)==sizeof(nil));
+    free(last);assert(fclose(file)==0);
+    return true;
+}
+
 static void start_test_play_count(const char *fixture,bool unknown,unsigned channels,unsigned expected_total) {
     atomic_store(&start_test_sink_writes,0);
     atomic_store(&start_test_channel_mask,channels);
@@ -512,6 +635,7 @@ static void start_test_cancel_retry(const char *fixture) {
     assert(!atomic_load(&start_test_release_read));
     atomic_store(&start_test_release_read,true);
     assert(start_test_poll_complete()==-1);
+    assert(strcmp(start_test_app.status_message,"Playback load cancelled")==0);
     gui_playback_finish_start(&start_test_app);
     start_test_assert_clean();
     printf("Playback pending metadata cancellation: returned before read release (%" PRIu64 "ms), no late commit passed\n",request_ms);
@@ -1627,7 +1751,7 @@ int main(int argc,char **argv) {
     const char *directory=argc>1?argv[1]:".";
     char normal[512],unknown[512],bad[512],missing[512];
     char short_normal[512],short_unknown[512],embedded_headers[512];
-    char other_normal[512],other_unknown[512];
+    char other_normal[512],other_unknown[512],ogg_nil[512];
     snprintf(normal,sizeof(normal),"%s/start-normal.flac",directory);
     snprintf(unknown,sizeof(unknown),"%s/start-total-zero.flac",directory);
     snprintf(bad,sizeof(bad),"%s/start-bad.flac",directory);
@@ -1637,6 +1761,7 @@ int main(int argc,char **argv) {
     snprintf(embedded_headers,sizeof(embedded_headers),"%s/start-embedded-fake-headers.flac",directory);
     snprintf(other_normal,sizeof(other_normal),"%s/start-other-normal.flac",directory);
     snprintf(other_unknown,sizeof(other_unknown),"%s/start-other-total-zero.flac",directory);
+    snprintf(ogg_nil,sizeof(ogg_nil),"%s/start-ogg-nil.ldf",directory);
     remove(missing);
     start_test_make_fixture(normal,unknown,bad);
     start_test_encode_fixture(short_normal,START_TEST_SAMPLES+137u);
@@ -1653,22 +1778,34 @@ int main(int argc,char **argv) {
     start_test_play(normal,false,2u);
     start_test_play(normal,false,3u);
     start_test_play(unknown,true,1u);
+    if(start_test_encode_ogg_nil(ogg_nil)) {
+        atomic_store(&start_test_source_rate,40000000u);
+        start_test_play_count(ogg_nil,false,1u,START_TEST_SAMPLES);
+        atomic_store(&start_test_source_rate,20000000u);
+        assert(remove(ogg_nil)==0);
+        puts("Playback valid-CRC Ogg nil EOS: async remux, real FLAC producer, 40MSPS stamps and raw sink passed");
+    }
+    start_test_error_details(normal,bad,missing);
     assert(gui_playback_start_async(&start_test_app,missing,NULL)==0);
     assert(start_test_poll_complete()==-1);
+    assert(strstr(start_test_app.status_message,"Playback A failed: open failed:")==start_test_app.status_message);
     gui_playback_finish_start(&start_test_app); start_test_assert_clean();
     atomic_store(&start_test_init_failure_once,true);
     assert(gui_playback_start_async(&start_test_app,normal,NULL)==0);
     assert(start_test_poll_complete()==-1);
     assert(!atomic_load(&start_test_init_failure_once));
+    assert(strstr(start_test_app.status_message,"Playback A failed: failed to init decoder:")==start_test_app.status_message);
     gui_playback_finish_start(&start_test_app); start_test_assert_clean();
     start_test_play(normal,false,1u);
     puts("Playback private init_stream simulated OOM: caller-owned file closed once, resources zero, retry passed");
     assert(gui_playback_start_async(&start_test_app,normal,bad)==0);
     assert(start_test_poll_complete()==-1);
+    assert(strcmp(start_test_app.status_message,"Playback B failed: not a valid FLAC stream (unreadable metadata)")==0);
     gui_playback_finish_start(&start_test_app); start_test_assert_clean();
     atomic_store(&start_test_extract_failure,true);
     assert(gui_playback_start_async(&start_test_app,normal,NULL)==0);
     assert(start_test_poll_complete()==-1);
+    assert(strcmp(start_test_app.status_message,"Playback failed to start")==0);
     gui_playback_finish_start(&start_test_app); start_test_assert_clean();
     atomic_store(&start_test_extract_failure,false);
     puts("Playback missing A, damaged B and extraction-start failure cleanup passed");

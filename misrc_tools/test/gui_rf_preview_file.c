@@ -94,15 +94,15 @@ static void receive_audio(void *context,const float *pcm,size_t frames,uint64_t 
 }
 
 int main(int argc, char **argv) {
-    bool realtime = false, full_frame = false, budget_supplied = false;
+    bool realtime = false, full_frame = false, budget_supplied = false, no_audio = false;
     double seconds_cap = 0.0, budget = 0.0;
     const char *audio_path = NULL;
     if (argc < 5 ||
-        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 &&
+        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 && strcmp(argv[3], "secam") != 0 && strcmp(argv[3], "mesecam") != 0 &&
          strcmp(argv[3], "ntsc-beta") != 0 && strcmp(argv[3], "ntsc-beta-hifi") != 0 &&
-         strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0)) {
-        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi output.ppm"
-                        " [--max|--realtime] [--full] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
+         strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0 && strcmp(argv[3], "ntsc-ed-beta") != 0)) {
+        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta output.ppm"
+                        " [--max|--realtime] [--full] [--no-audio] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
         return 1;
     }
     /* Retain the upstream --full / seconds-cap form and the Beta probe's
@@ -111,6 +111,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--max") == 0) realtime = false;
         else if (strcmp(argv[i], "--realtime") == 0) realtime = true;
         else if (strcmp(argv[i], "--full") == 0) full_frame = true;
+        else if (strcmp(argv[i], "--no-audio") == 0) no_audio = true;
         else {
             char *option_end = NULL;
             errno = 0;
@@ -132,6 +133,10 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (no_audio && audio_path) {
+        fprintf(stderr, "--no-audio cannot be combined with WAV output\n");
+        return 1;
+    }
     char *end = NULL;
     errno = 0;
     unsigned long parsed_rate = strtoul(argv[2], &end, 10);
@@ -141,10 +146,13 @@ int main(int argc, char **argv) {
     }
     uint32_t rate = (uint32_t)parsed_rate;
     gui_rf_profile_t profile = strcmp(argv[3],"pal")==0 ? GUI_RF_PROFILE_PAL_VHS :
+        strcmp(argv[3],"secam")==0 ? GUI_RF_PROFILE_SECAM_VHS :
+        strcmp(argv[3],"mesecam")==0 ? GUI_RF_PROFILE_MESECAM_VHS :
         strcmp(argv[3],"ntsc-beta")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX :
         strcmp(argv[3],"ntsc-beta-hifi")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI :
         strcmp(argv[3],"ntsc-superbeta")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA :
-        strcmp(argv[3],"ntsc-superbeta-hifi")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI : GUI_RF_PROFILE_NTSC_VHS;
+        strcmp(argv[3],"ntsc-superbeta-hifi")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI :
+        strcmp(argv[3],"ntsc-ed-beta")==0 ? GUI_RF_PROFILE_NTSC_ED_BETA : GUI_RF_PROFILE_NTSC_VHS;
     uint64_t max_samples = seconds_cap > 0.0 ? (uint64_t)(seconds_cap * rate) : UINT64_MAX;
     if (budget_supplied && !realtime) return 1;
     if (!budget_supplied) budget = realtime ? 1.0 : 0.0;
@@ -163,6 +171,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (full_frame) gui_rf_preview_worker_set_frame_mode(worker, true);
+    if (no_audio) gui_rf_preview_worker_set_audio_enabled(worker, false);
     audio_probe_t audio={0};
     if(audio_path) {
         audio.file=fopen(audio_path,"wb");

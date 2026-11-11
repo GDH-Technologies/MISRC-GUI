@@ -70,6 +70,8 @@ struct gui_rf_preview_worker {
     bool audio_have_cpu_baseline;
     uint64_t video_work_wall_us,video_accounted_cpu_us,audio_work_wall_us,audio_accounted_cpu_us;
     rf_mutex_t frame_mutex;
+    void (*monitor_frame_sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t);
+    void *monitor_frame_sink_context;
     atomic_bool stop;
     atomic_bool flush_requested;
     atomic_bool producer_gap;
@@ -93,16 +95,19 @@ struct gui_rf_preview_worker {
     gui_beta_hifi_decoder_t *hifi;
     gui_rf_preview_audio_callback_t audio_callback;
     void *audio_context;
-    gui_rf_resampler_t *resampler;
-    float *output;
-    size_t output_capacity;
+    gui_rf_resampler_t *resampler, *wide_resampler;
+    float *output, *wide_output;
+    size_t output_capacity, wide_output_capacity;
     gui_rf_profile_t profile;
     atomic_uint_fast64_t applied_control;
     uint64_t source_epoch;
     uint64_t expected_source_sample;
     uint32_t source_rate;
     bool stream_valid;
-    uint64_t output_sample;
+    uint64_t output_sample;      /* Audio and legacy video: public 20 MSPS axis. */
+    uint64_t wide_output_sample; /* EDBeta wide-passband video: independent 20 MSPS cursor. */
+    bool narrow_stream_valid;   /* ED may omit its audio-only converter while muted. */
+    uint64_t narrow_audio_generation;
     uint64_t block_enqueue_us;
     uint64_t block_source_end;
     uint64_t work_since_frame_us;
@@ -276,9 +281,11 @@ static uint64_t rf_now_us(const gui_rf_preview_worker_t *w) {
     return get_time_us();
 }
 
+static uint64_t rf_scale_sample_rate(uint64_t sample, uint32_t rate, uint32_t output_rate) {
+    return (sample / rate) * output_rate + (sample % rate) * output_rate / rate;
+}
 static uint64_t rf_scale_sample(uint64_t sample, uint32_t rate) {
-    return (sample / rate) * GUI_RF_DECODE_RATE_HZ +
-           (sample % rate) * GUI_RF_DECODE_RATE_HZ / rate;
+    return rf_scale_sample_rate(sample, rate, GUI_RF_DECODE_RATE_HZ);
 }
 
 /* frame_mutex held. Sampling a real interval also reports zero after a quiet
@@ -361,6 +368,8 @@ static void rf_reset_decoder_preserve(gui_rf_preview_worker_t *w, const char *re
     rf_audio_invalidate(w);
     memset(&w->last_status, 0, sizeof(w->last_status));
     if (w->resampler) gui_rf_resampler_reset(w->resampler);
+    if (w->wide_resampler) gui_rf_resampler_reset(w->wide_resampler);
+    w->narrow_stream_valid = false;
     w->stream_valid = false;
     rf_clear_frame(w, reason, preserve_frame);
 }
@@ -369,21 +378,44 @@ static void rf_reset_decoder(gui_rf_preview_worker_t *w, const char *reason) {
     rf_reset_decoder_preserve(w, reason, false);
 }
 
+static bool rf_reserve_output(float **buffer, size_t *available, size_t capacity) {
+    if (!capacity || capacity > SIZE_MAX / sizeof(float)) return false;
+    if (capacity <= *available) return true;
+    float *output = realloc(*buffer, capacity * sizeof(*output));
+    if (!output) return false;
+    *buffer = output; *available = capacity;
+    return true;
+}
+static const char *rf_rate_error(const gui_rf_preview_worker_t *w) {
+    return w->profile == GUI_RF_PROFILE_NTSC_ED_BETA && w->source_rate < GUI_RF_ED_BETA_RATE_HZ
+        ? "Unsupported EDBeta RF rate: requires at least 20 MSPS"
+        : "Unsupported RF rate or resampler unavailable";
+}
 static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate) {
     gui_rf_resampler_destroy(w->resampler);
-    w->resampler = NULL;
+    gui_rf_resampler_destroy(w->wide_resampler);
+    w->resampler = w->wide_resampler = NULL;
+    w->narrow_stream_valid = false;
     w->source_rate = rate;
-    if (rate < RF_MIN_RATE || rate > RF_MAX_RATE) return false;
-    size_t capacity = gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES);
-    if (capacity == 0 || capacity > SIZE_MAX / sizeof(float)) return false;
-    if (capacity > w->output_capacity) {
-        float *output = (float *)realloc(w->output, capacity * sizeof(float));
-        if (!output) return false;
-        w->output = output;
-        w->output_capacity = capacity;
-    }
+    bool ed_beta = w->profile == GUI_RF_PROFILE_NTSC_ED_BETA;
+    if (rate < RF_MIN_RATE || rate > RF_MAX_RATE ||
+        (ed_beta && rate < GUI_RF_ED_BETA_RATE_HZ)) return false;
+    if (!rf_reserve_output(&w->output, &w->output_capacity,
+            gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES))) return false;
     w->resampler = gui_rf_resampler_create(rate);
-    return w->resampler != NULL;
+    if (!w->resampler) return false;
+    if (ed_beta) {
+        if (!rf_reserve_output(&w->wide_output, &w->wide_output_capacity,
+                gui_rf_resampler_output_capacity_ed_beta(rate, RF_BLOCK_SAMPLES))) goto fail;
+        w->wide_resampler = gui_rf_resampler_create_ed_beta(rate);
+        if (!w->wide_resampler) goto fail;
+    }
+    return true;
+fail:
+    gui_rf_resampler_destroy(w->resampler);
+    gui_rf_resampler_destroy(w->wide_resampler);
+    w->resampler = w->wide_resampler = NULL;
+    return false;
 }
 
 static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
@@ -402,7 +434,9 @@ static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
     double elapsed_ms = (double)(w->work_since_frame_us + now - w->work_segment_us) / 1000.0;
     uint64_t source_end = rf_scale_sample(w->block_source_end, w->source_rate);
     double sample_age = source_end >= end_sample ? (double)(source_end - end_sample) : 0.0;
-    double delay = gui_rf_resampler_delay_samples(w->resampler);
+    double delay = gui_rf_resampler_delay_samples(w->wide_resampler ? w->wide_resampler : w->resampler);
+    /* Frame callbacks retain the public 20 MSPS axis for every profile. */
+    if (w->wide_resampler) delay *= (double)GUI_RF_DECODE_RATE_HZ / gui_rf_profile_video_rate_hz(w->profile);
     if (delay > 0.0) sample_age += delay;
     double latency_ms = (double)(now - w->block_enqueue_us) / 1000.0 +
                         sample_age * 1000.0 / GUI_RF_DECODE_RATE_HZ;
@@ -417,7 +451,11 @@ static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
     w->stats.generation = ++w->generation;
     w->stats.decode_ms = elapsed_ms;
     w->stats.latency_ms = latency_ms;
+    /* Never hold frame_mutex while copying into a monitor's latest-frame box. */
+    void (*sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t) = w->monitor_frame_sink;
+    void *sink_context = w->monitor_frame_sink_context;
     rf_mutex_unlock(&w->frame_mutex);
+    if(sink) sink(sink_context,rgba,(unsigned)width,(unsigned)height,now);
     w->work_since_frame_us = 0;
     w->work_segment_us = rf_now_us(w);
 }
@@ -645,6 +683,10 @@ static int rf_audio_thread(void *context) {
         uint64_t write=atomic_load_explicit(&w->audio_write,memory_order_acquire);
         if(read==write) {rf_audio_wait(w,10000);continue;}
         rf_audio_slot_t *slot=&w->audio_queue[read%RF_AUDIO_QUEUE_SLOTS];
+        /* A source/control change may enqueue a current slot after the loop
+         * captured its old generation. Refresh before discarding fresh audio. */
+        if(slot->generation!=generation &&
+           slot->generation==atomic_load_explicit(&w->audio_generation,memory_order_acquire)) continue;
         if(slot->generation!=generation || !rf_audio_current(w,generation)) goto audio_release;
         if(rf_now_us(w)-slot->enqueue_us>RF_AUDIO_MAX_US) {
             atomic_fetch_add(&w->audio_dropped,1);rf_audio_invalidate(w);goto audio_release;
@@ -727,10 +769,13 @@ static int rf_worker_thread(void *context) {
         }
         uint64_t control = atomic_load_explicit(&w->control, memory_order_acquire);
         if (control != w->applied_control) {
+            bool was_ed_beta = w->profile == GUI_RF_PROFILE_NTSC_ED_BETA;
             w->profile = (gui_rf_profile_t)atomic_load_explicit(&w->requested_profile, memory_order_relaxed);
             if (gui_rf_profile_has_hifi(w->profile)) (void)rf_audio_start(w);
+            if (w->source_rate && was_ed_beta != (w->profile == GUI_RF_PROFILE_NTSC_ED_BETA))
+                (void)rf_configure_rate(w, w->source_rate);
             /* Publish completion only after reset and audio invalidation. */
-            rf_reset_decoder(w, "RF preview reset; acquiring");
+            rf_reset_decoder(w, w->source_rate && !w->resampler ? rf_rate_error(w) : "RF preview reset; acquiring");
             atomic_store_explicit(&w->applied_control,control,memory_order_release);
         }
         uint64_t pause_control = atomic_load_explicit(&w->pause_control, memory_order_acquire);
@@ -804,9 +849,11 @@ static int rf_worker_thread(void *context) {
             if (boundary) {
                 bool changed_rate = slot->info.sample_rate_hz != w->source_rate;
                 if (changed_rate) (void)rf_configure_rate(w, slot->info.sample_rate_hz);
-                rf_reset_decoder(w, w->resampler ? "RF discontinuity; acquiring" : "Unsupported RF rate or resampler unavailable");
+                rf_reset_decoder(w, w->resampler ? "RF discontinuity; acquiring" : rf_rate_error(w));
                 w->source_epoch = slot->info.epoch;
                 w->output_sample = w->source_rate ? rf_scale_sample(slot->info.start_sample, w->source_rate) : 0;
+                w->wide_output_sample = w->source_rate ? rf_scale_sample_rate(slot->info.start_sample,
+                    w->source_rate, gui_rf_profile_video_rate_hz(w->profile)) : 0;
                 w->stream_valid = true;
             }
             w->expected_source_sample = slot->info.start_sample + slot->count;
@@ -818,15 +865,44 @@ static int rf_worker_thread(void *context) {
                 /* Never assign a fresh audio epoch to an old block that was
                  * already resampling when mute/reset/seek changed controls. */
                 uint64_t audio_generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
-                if (gui_rf_resampler_process(w->resampler, slot->samples, slot->count,
-                                             w->output, w->output_capacity, &output_count)) {
-                    if (output_count) {
-                        if (gui_rf_profile_has_hifi(w->profile))
-                            rf_audio_enqueue(w,w->output,output_count,w->output_sample,audio_generation,slot->audio_source_generation,control,pause_control);
-                        gui_rf_decoder_process(w->decoder, w->output, output_count,
-                                               w->output_sample, rf_frame_callback, w);
-                        w->output_sample += output_count;
+                size_t wide_count = 0;
+                bool narrow_needed = !w->wide_resampler ||
+                    atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
+                bool resampled = true;
+                if (narrow_needed) {
+                    if (w->wide_resampler && (!w->narrow_stream_valid ||
+                        w->narrow_audio_generation != audio_generation)) {
+                        /* This converter supplies only ED audio. Drop any old
+                         * buffered tail after mute/control changes and restart
+                         * its independent clock at the current source block. */
+                        gui_rf_resampler_reset(w->resampler);
+                        w->output_sample = rf_scale_sample(slot->info.start_sample,w->source_rate);
                     }
+                    resampled = gui_rf_resampler_process(w->resampler, slot->samples, slot->count,
+                        w->output, w->output_capacity, &output_count);
+                    w->narrow_stream_valid = resampled;
+                    w->narrow_audio_generation = audio_generation;
+                } else {
+                    /* ED video advances normally; resume audio from fresh RF,
+                     * rather than pretending its skipped history is contiguous. */
+                    w->narrow_stream_valid = false;
+                    w->output_sample = rf_scale_sample(w->expected_source_sample,w->source_rate);
+                }
+                if (resampled && w->wide_resampler)
+                    resampled = gui_rf_resampler_process(w->wide_resampler, slot->samples, slot->count,
+                        w->wide_output, w->wide_output_capacity, &wide_count);
+                if (resampled) {
+                    if (output_count && gui_rf_profile_has_hifi(w->profile))
+                        rf_audio_enqueue(w,w->output,output_count,w->output_sample,audio_generation,slot->audio_source_generation,control,pause_control);
+                    if (w->wide_resampler) {
+                        if (wide_count) gui_rf_decoder_process(w->decoder, w->wide_output, wide_count,
+                            w->wide_output_sample, rf_frame_callback, w);
+                        w->wide_output_sample += wide_count;
+                    } else if (output_count) {
+                        gui_rf_decoder_process(w->decoder, w->output, output_count,
+                            w->output_sample, rf_frame_callback, w);
+                    }
+                    w->output_sample += output_count;
                     w->work_since_frame_us += rf_now_us(w) - w->work_segment_us;
                     gui_rf_decode_status_t status;
                     gui_rf_decoder_get_status(w->decoder, &status);
@@ -937,9 +1013,11 @@ void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *w) {
     if(atomic_load(&w->audio_ready)) thrd_join(w->audio_thread,NULL);
     free(w->audio_queue);
     gui_rf_resampler_destroy(w->resampler);
+    gui_rf_resampler_destroy(w->wide_resampler);
     gui_rf_decoder_destroy(w->decoder);
     gui_beta_hifi_destroy(w->hifi);
     free(w->output);
+    free(w->wide_output);
     free(w->queue);
     free(w->frame);
     rf_mutex_destroy(&w->frame_mutex);
@@ -1081,6 +1159,16 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
 #endif
     atomic_flag_clear_explicit(&w->producer_busy, memory_order_release);
     return true;
+}
+
+void gui_rf_preview_worker_set_monitor_frame_sink(gui_rf_preview_worker_t *w,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context) {
+    if (!w) return;
+    rf_mutex_lock(&w->frame_mutex);
+    w->monitor_frame_sink = callback;
+    w->monitor_frame_sink_context = context;
+    rf_mutex_unlock(&w->frame_mutex);
 }
 
 bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,

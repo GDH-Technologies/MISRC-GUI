@@ -1,10 +1,14 @@
 # DEV NOTE (HARD): CI guard break on main — optional-dep guards, local build gate, CI-on-push
 
 Status: incident-driven (2026-10-19: a manual workflow_dispatch run launched to
-test failed in ~40 s at the preflight guards and every build job was skipped).
+test failed in ~40 s at the preflight guards and every build job was skipped;
+2026-10-22: an updater rework passed every local guard/test on Linux but broke
+BOTH Windows CI jobs — MSVC-only `_stat` API forms — and was pushed without
+watching the triggered Actions run, leaving main red).
 Read this before touching `gui_playback.c`'s optional-dep guard regions,
 `misrc_tools/test/ci_guard_tests.py`, `scripts/build-local.ps1`/`build-local.sh`,
-`.github/workflows/build.yml` triggers, or the `meson.build` static link flags.
+`.github/workflows/build.yml` triggers, the `meson.build` static link flags, or
+any cross-platform `#if` code path.
 
 Companion notes: `cvbs_decoder_realtime_sync_rules.md` (the playback reader this
 note builds on), session log `prompt_logs/2026-10-19_ci-guard-local-build-gate_README.md`.
@@ -50,6 +54,19 @@ note builds on), session log `prompt_logs/2026-10-19_ci-guard-local-build-gate_R
    parameter was misleadingly named `tools_readme_path` while receiving the
    repo-root INSTALLATION.md; renamed to `installation_md_path` and the dead
    `tools_readme_path` variable in `main()` removed — the exact wiring trap.)
+5. GREEN LOCALLY, RED IN CI — AND PUSHED WITHOUT LOOKING (2026-10-22). The
+   updater rework (`gui_updater.c`) passed every local gate on Linux
+   (compile, 38/38 meson tests, 43/43 static guards) but its Windows paths
+   used the MSVC-only API spellings `_stat`/`struct _stat`/`_S_IFDIR`/
+   `_S_IFREG` — which MinGW (both Windows CI toolchains) does not expose —
+   AND `<sys/stat.h>` was only included on the POSIX branch. Runs 39789335139
+   + 39789161172: both Windows jobs failed to compile; Linux/macOS/Android
+   green. The commits were then reported as done without checking the
+   triggered Actions run, so main sat red until the user saw it. Fixed with
+   the portable `stat`/`S_ISDIR`/`S_ISREG` forms + a shared `#include
+   <sys/stat.h>`. Root lesson: a Linux-only dev machine is structurally
+   blind to other platforms' headers and API spellings — the CI matrix is the
+   only compiler of record for Windows/macOS/Android.
 
 ## HARD RULES
 
@@ -79,17 +96,41 @@ note builds on), session log `prompt_logs/2026-10-19_ci-guard-local-build-gate_R
    never rely on the compiler environment's default search path — the .pc can
    resolve from a different MSYS2 environment than the toolchain (rtlsdr:
    mingw64 .pc, ucrt64 gcc).
+6. THE PUSH IS NOT DONE UNTIL THE GH ACTIONS RUN IS VERIFIED GREEN. Every push
+   (main or PR) triggers the workflow; the work is NOT complete until that
+   run's conclusion is checked and green. Procedure:
+   - `gh run list --repo harrypm/MISRC-GUI --limit 3` — find the run for the
+     pushed SHA,
+   - wait for completion (`gh run watch <id> --repo harrypm/MISRC-GUI
+     --exit-status`, or poll `gh run view <id> --json status,conclusion`),
+   - if red: `gh run view <id> --repo harrypm/MISRC-GUI --log-failed` for the
+     exact error, fix, re-verify locally (this procedure), push again, and
+     repeat until the run is green.
+   Never report a push as done from local results alone (incident 5), and
+   never start new work on top of a red main run.
+7. CROSS-PLATFORM `#if` CODE USES THE PORTABLE FORMS — CI IS THE COMPILER OF
+   RECORD FOR THE OTHER PLATFORMS. In `#if defined(_WIN32)/__APPLE__/
+   __ANDROID__` regions use the portable spelling first (`stat`/`S_ISDIR`/
+   S_ISREG` + `<sys/stat.h>`, ISO `rename()`, `popen/_popen` splits kept
+   minimal) and include the shared headers unconditionally where the
+   portable API is shared. Platform-only spellings (`_stat`, `_S_IFDIR`,
+   `_wmkdir`-style CRT variants) are what incident 5 shipped. If a cross
+   toolchain is unavailable locally, say so and let rule 6's run be the proof
+   before the change is called done.
 
 ## Verification procedure (any guard/checker/trigger/local-script change)
 
 1. `python misrc_tools/test/ci_guard_tests.py --static-only` — all PASS
-   (40/40 after 2026-10-19, including `local CI guard gate contract`).
+   (43/43 after 2026-10-22, including `local CI guard gate contract`).
 2. The macro-off translation proof for touched TUs (rule 3) — EXIT 0.
 3. `pwsh -File scripts/build-local.ps1` — guards PASS, deps stamp reuse, meson
    compile + link + `--smoke-test` OK.
-4. `meson test -C build-local` — 34/34.
-5. Push; the CI run the push itself now triggers must be green (guards + all
-   platform builds) before the change is considered closed.
+4. `meson test -C build-local` (or `-C build-ci-check`) — all green
+   (38/38 after 2026-10-22).
+5. Push, then rule 6: `gh run list` -> `gh run watch <id> --exit-status` —
+   the CI run the push itself triggers must be GREEN (guards + every platform
+   build job) before the change is considered closed. Red run = fix + repeat;
+   the change is never "done" while main is red.
 
 ## Backlog
 
