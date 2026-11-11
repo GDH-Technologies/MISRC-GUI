@@ -627,6 +627,8 @@ update_available: true
 
 The full pipeline (check, dry-run, the install refusal without `--yes`, and the confirmed install with the old binary archived) is exercised automatically by the `update_cli` meson test against a local test server.
 
+GDH builds check for updates but never install one: the Info window's Install button and `--install-update --yes` refuse any asset that is not on a loopback host (the test server above), because GDH machines are installed by the fork's own CI.
+
 </details>
 
 <details closed>

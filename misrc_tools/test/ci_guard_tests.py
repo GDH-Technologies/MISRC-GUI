@@ -6399,6 +6399,34 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
     return None
 
 
+def check_no_self_install(repo_root: Path) -> int:
+    """GDH fork: a GDH build never replaces itself with harrypm's release.
+
+    Upstream v1.2.7's updater downloads its platform asset and swaps it in for
+    the running binary after two clicks (or --install-update --yes). On a
+    capture host that would drop the fork's record path, streaming and capture
+    metadata. gui_updater_install_asset() is the one install path (the GUI's
+    Install button and the CLI both call it): it must refuse any asset that is
+    not on a loopback host (the update_cli meson test's local server) before
+    it locates or touches the running executable."""
+    src = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/core/gui_updater.c"))
+    start = src.find("bool gui_updater_install_asset(")
+    if start < 0:
+        return fail("gui_updater.c: gui_updater_install_asset() not found; the self-install guard needs updating")
+    body = src[start:src.find("\n}\n", start)]
+    refuse = body.find("self-update is disabled in GDH builds")
+    if refuse < 0:
+        return fail("gui_updater.c: gui_updater_install_asset() no longer refuses a real release; "
+                    "a GDH build could replace itself with upstream's")
+    gate = body.rfind("gui_updater_url_scheme_ok(asset_url)", 0, refuse)
+    if gate < 0 or "!gui_updater_ci_starts_with(asset_url, \"http://\")" not in body[:refuse]:
+        return fail("gui_updater.c: the self-install refusal is no longer limited to non-loopback assets")
+    exe = body.find("gui_updater_get_executable_path(")
+    if exe >= 0 and exe < refuse:
+        return fail("gui_updater.c: the install pipeline locates the executable before the GDH refusal")
+    return 0
+
+
 def check_monitor_local_save_refused(repo_root: Path) -> int:
     """GDH fork: the unified server refuses an M-Client Local Save record.
 
@@ -6833,6 +6861,7 @@ def main() -> int:
         ("file drop obeys the recording locks", lambda: check_drop_obeys_recording_locks(repo_root)),
         ("record FIFO contract", lambda: check_record_fifo_contract(repo_root)),
         ("M-Client Local Save is refused", lambda: check_monitor_local_save_refused(repo_root)),
+        ("no self-install over a GDH build", lambda: check_no_self_install(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

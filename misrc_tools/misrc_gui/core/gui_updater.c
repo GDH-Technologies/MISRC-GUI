@@ -837,6 +837,22 @@ bool gui_updater_install_asset(const char *asset_url, const char *asset_name,
         return false;
     }
 
+    /* GDH fork: no self-install. A GDH build is installed by the fork's CI
+     * (wm, cs0, air0, win0); replacing it with harrypm's release would drop
+     * the fork's record path, streaming and capture metadata on a capture
+     * host. The check and the releases page still work. Only a loopback
+     * asset is installed: that is the update_cli meson test's local server,
+     * which keeps proving upstream's pipeline; a real release URL never is. */
+    if (!gui_updater_ci_starts_with(asset_url, "http://") ||
+        !gui_updater_url_scheme_ok(asset_url)) {
+        if (status_out) {
+            snprintf(status_out, status_len,
+                     "self-update is disabled in GDH builds (installs come from the fork's CI); "
+                     "see the releases page for what changed");
+        }
+        return false;
+    }
+
     /* 1. Where the current binary/app lives (the replace target). */
     char exe_path[GUI_UPDATER_PATH_MAX];
     if (!gui_updater_get_executable_path(exe_path, sizeof(exe_path))) {
