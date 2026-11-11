@@ -1037,8 +1037,9 @@ static void cli_flac_error_callback(void *user_data, flac_writer_error_t error, 
 
 
 /* RF samples are stored at 40 MSPS, but FLAC STREAMINFO uses 40 kHz.
- * Match the GUI's post-encode duration correction, changing metadata only.
- * This runs after flac_writer_finish() has closed the output file. */
+ * Write the duration tags in place, changing metadata only; total_samples
+ * stays the true count (see below). This runs after flac_writer_finish() has
+ * closed the output file. */
 static bool cli_finalize_rf_flac_metadata(const char *path, uint64_t total_samples,
                                            uint32_t sample_rate_khz)
 {
@@ -1047,11 +1048,14 @@ static bool cli_finalize_rf_flac_metadata(const char *path, uint64_t total_sampl
     const uint64_t sample_rate_hz = (uint64_t)sample_rate_khz * 1000ULL;
     const double seconds = (double)total_samples / (double)sample_rate_hz;
     const uint64_t length_ms = (uint64_t)llround(seconds * 1000.0);
-    uint64_t stored_samples = (total_samples / 1000ULL) +
-                              ((total_samples % 1000ULL) >= 500ULL);
-    if (stored_samples == 0) stored_samples = 1;
+    /* GDH fork: STREAMINFO total_samples is the TRUE sample count (the same
+     * rule as the GUI's record finalize), not upstream's kHz-scaled count:
+     * readers that trust total_samples stop decoding there, so a /1000 count
+     * truncates the file to 0.1% of its length. Past the 36-bit field it is
+     * 0 ("unknown"), never a wrapped or clamped value (~28.6 min at 40 MSps). */
+    uint64_t stored_samples = total_samples;
     if (stored_samples > ((1ULL << 36) - 1ULL))
-        stored_samples = (1ULL << 36) - 1ULL;
+        stored_samples = 0;
 
     char duration[64], length[32], count[32], rate[32], rate_khz[32];
     snprintf(duration, sizeof(duration), "%.6f", seconds);

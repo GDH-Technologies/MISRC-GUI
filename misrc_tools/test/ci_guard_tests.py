@@ -6399,6 +6399,24 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
     return None
 
 
+def check_cli_flac_true_total_samples(repo_root: Path) -> int:
+    """GDH fork: the CLI's RF FLAC finalize keeps STREAMINFO total_samples the
+    true count, like the GUI's (guard "FLAC STREAMINFO total_samples runtime").
+    Upstream v1.2.7's cli_finalize_rf_flac_metadata() writes total/1000, which
+    truncates decodes in readers that trust the field."""
+    src = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_capture/misrc_capture.c"))
+    start = src.find("static bool cli_finalize_rf_flac_metadata(")
+    if start < 0:
+        return 0  # upstream dropped the pass: nothing scales the count any more
+    body = src[start:src.find("\n}\n", start)]
+    if not re.search(r"stored_samples\s*=\s*total_samples\s*;", body):
+        return fail("misrc_capture.c: cli_finalize_rf_flac_metadata() no longer writes the true "
+                    "total_samples into STREAMINFO (upstream scales it by 1/1000)")
+    if re.search(r"total_samples\s*/\s*1000", body):
+        return fail("misrc_capture.c: cli_finalize_rf_flac_metadata() divides total_samples by 1000 again")
+    return 0
+
+
 def check_no_self_install(repo_root: Path) -> int:
     """GDH fork: a GDH build never replaces itself with harrypm's release.
 
@@ -6862,6 +6880,7 @@ def main() -> int:
         ("record FIFO contract", lambda: check_record_fifo_contract(repo_root)),
         ("M-Client Local Save is refused", lambda: check_monitor_local_save_refused(repo_root)),
         ("no self-install over a GDH build", lambda: check_no_self_install(repo_root)),
+        ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
