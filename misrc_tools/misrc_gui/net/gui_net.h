@@ -1,12 +1,16 @@
 /*
  * MISRC GUI - Server/Client networking (cxadc_vhs_server-style peer mode)
  *
- * Any MISRC-GUI instance can run in one of three modes (gui_settings_t.net_mode):
+ * Server handles both legacy RF and low-bandwidth monitor requests on one port.
+ * The monitor client has its own restricted preview protocol.
+ * Any MISRC-GUI instance selects one role (gui_settings_t.net_mode):
  *   0 = Local  (default; no networking, behaves exactly as before)
  *   1 = Server (host/master: owns hardware + capture, serves HTTP control + RF/audio streams)
  *   2 = Client (slave: connects to a Server, mirrors device list/controls/state,
  *               ingests RF+audio streams into the local pipeline, and forwards its
  *               own start/stop/record/device-select actions to the server)
+ *   3 = reserved old M-Server config ID (mapped to Server 1)
+ *   4 = M-Client (low-bandwidth monitor status/control client)
  *
  * Protocol: HTTP/1.0, GET-only (adapted from the reference cxadc-capture-server).
  *   GET /version            -> MISRC version text
@@ -61,6 +65,11 @@
 #define GUI_NET_MODE_LOCAL  0
 #define GUI_NET_MODE_SERVER 1
 #define GUI_NET_MODE_CLIENT 2
+#define GUI_NET_MODE_MONITOR_SERVER 3 /* old config ID; maps to Server */
+#define GUI_NET_MODE_MONITOR_CLIENT 4
+
+/* Monitor client NEVER falls back to legacy /rf. No separate server mode. */
+#define GUI_NET_MODE_LAST GUI_NET_MODE_MONITOR_CLIENT
 
 /* One-time global init/cleanup (WSAStartup/WSACleanup on Windows; SIGPIPE ignore
  * on POSIX). Safe to call multiple times; idempotent. */
@@ -69,8 +78,26 @@ void gui_net_cleanup_globals(void);
 
 /* Apply the configured net mode to the app. Starts/stops the server or client so
  * that app state matches app->settings.net_mode + port/host. Called from the UI
- * on mode change and at startup. Returns 0 on success, negative on error. */
+ * on mode change and at startup. Returns 0 on success, negative on error.
+ * This STOPS/STARTS and JOINS network worker threads (multi-second socket
+ * timeouts against an unreachable peer): UI click handlers must use the
+ * asynchronous gui_net_request_apply_mode() instead. */
 int gui_net_apply_mode(gui_app_t *app);
+
+/* Asynchronous gui_net_apply_mode on a worker so the render thread never
+ * stalls on thread joins. The worker CHASES app->settings.net_mode: a click
+ * while a transition is running returns 0 (queued) - the newest target is
+ * applied next, so rapid cycling converges on the last chosen mode.
+ * prev_mode: the mode before this request (for the deferred local device
+ * re-enumeration when leaving a client mode / returning to Local).
+ * force_reapply: apply once even when the mode is unchanged (same-mode port
+ * or host edits). Returns 0 started/queued, -1 only when the worker could
+ * not be created (caller may then apply synchronously). */
+int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply);
+
+/* True while an async mode transition (gui_net_request_apply_mode) runs. The
+ * main-thread pollers and query helpers early-out while it is set. */
+bool gui_net_transition_busy(void);
 
 /* Tear down any active server/client (for gui_app_cleanup and mode switches). */
 void gui_net_stop(gui_app_t *app);
@@ -112,9 +139,9 @@ void gui_net_set_status(gui_app_t *app, const char *msg);
 /* Read the current network status line into buf (for the info window UI). */
 void gui_net_status_string(const gui_app_t *app, char *buf, size_t len);
 
-/* LAN server discovery (client mode). The client listens for UDP beacons
- * broadcast by servers and exposes the found servers for the UI to render as a
- * selectable list, replacing manual host:port entry. */
+/* LAN server discovery (Client and M-Client modes). Both display the same
+ * UDP server list. M-Client only discovers/selects hosts until the dedicated
+ * monitor backend is integrated; never use legacy RF endpoints in M-Client. */
 int  gui_net_discovered_count(void);
 bool gui_net_get_discovered(int index, char *host, size_t host_cap,
                             uint16_t *port, char *name, size_t name_cap);

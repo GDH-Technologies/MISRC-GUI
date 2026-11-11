@@ -36,7 +36,8 @@ bool gui_cxadc_detect_misrc_clockgen_audio(void);
 int gui_cxadc_get_center_offset(int card_idx, int *value_out);
 
 // Set per-card CXADC center offset (driver DC offset).
-// value is clamped to the driver range [0, 255].
+// value is clamped to the platform driver range (see
+// gui_cxadc_center_offset_max: 0..255 Linux, 0..63 Windows).
 // Returns 0 on success, -1 on error.
 int gui_cxadc_set_center_offset(int card_idx, int value);
 
@@ -64,6 +65,11 @@ int gui_cxadc_set_level(int card_idx, int value);
 // Adjust per-card capture gain by delta and optionally return new value.
 // Returns 0 on success, -1 on error.
 int gui_cxadc_adjust_level(int card_idx, int delta, int *new_value_out);
+
+// Maximum CXADC center offset accepted by the platform driver: 255 on Linux
+// (sysfs range), 63 on Windows (cxadc-win driver CX_CTRL_CONFIG_CENTER_OFFSET_MAX).
+// The UI uses this to clamp its DC-offset raw value range per platform.
+int gui_cxadc_center_offset_max(void);
 // Read per-card CXADC tenbit mode (0=8-bit, 1=16-bit tenbit mode).
 // Returns 0 on success, -1 on error.
 int gui_cxadc_get_tenbit(int card_idx, int *value_out);

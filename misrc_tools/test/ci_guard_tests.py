@@ -134,6 +134,43 @@ def run_checked(command: List[str], *, env: Optional[Dict[str, str]] = None) -> 
     return subprocess.run(command, check=True, capture_output=True, text=True, env=env)
 
 
+def check_shell_script_git_modes(repo_root: Path) -> int:
+    """Protect executable Git index bits, including on Windows checkouts.
+
+    The index is authoritative: os.stat().st_mode is not reliable on Windows,
+    where checkout files may all appear readable/executable irrespective of
+    the Git tree mode. Skip source tarballs with no .git metadata.
+    """
+    if not (repo_root / ".git").exists():
+        return 0
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--stage", "-z"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return fail(f"Cannot validate Git executable bits for shell scripts: {exc}")
+    wrong = []
+    shell_scripts = 0
+    for record in result.stdout.split(b"\x00"):
+        if not record or b"\t" not in record:
+            continue
+        metadata, name = record.split(b"\t", 1)
+        if not name.endswith(b".sh"):
+            continue
+        shell_scripts += 1
+        mode = metadata.split(b" ", 1)[0].decode("ascii", "replace")
+        if mode != "100755":
+            wrong.append(f"{name.decode('utf-8', 'replace')} ({mode})")
+    if shell_scripts == 0:
+        return fail("No tracked shell scripts were found for Git executable-bit verification")
+    if wrong:
+        return fail("Tracked shell scripts must be executable in Git (100755), "
+                    "fix with git update-index --chmod=+x <path>: "
+                    + ", ".join(wrong))
+    return 0
+
+
 def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -143,7 +180,7 @@ def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
         "windows-exe:",
         "runs-on: windows-2022",
         "macos-app-build:",
-        "runner: macos-14",
+        "runner: macos-15",
         "runner: macos-15-intel",
         "macos-app-universal:",
         "android-apk:",
@@ -210,7 +247,7 @@ def check_macos_brew_install_policy(workflow_path: Path) -> int:
         if snippet in workflow_text:
             return fail(f"Workflow contains non-conditional brew install that emits warning annotations: {snippet}")
     required_snippets = [
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do",
         "if ! brew list --versions \"$formula\" >/dev/null 2>&1; then",
         "brew install \"$formula\"",
     ]
@@ -270,7 +307,7 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
         "libfftw3-dev",
         "mingw-w64-ucrt-x86_64-fftw",
         "mingw-w64-clang-aarch64-fftw",
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
@@ -1974,7 +2011,9 @@ def check_cc_sidecar_in_overwrite_set(repo_root: Path) -> int:
     # and named in the prompt's details. The fork's two outputs ride in it.
     if "gui_record_check_output_paths(app, &existing_count, details" not in body:
         return fail("gui_record_start no longer runs gui_record_check_output_paths for the overwrite prompt")
-    if "details" not in body[body.find("existing_count && !app->settings.overwrite_files"):][:600]:
+    # 1200: upstream v1.2.7 put a headless-server refusal at the top of this
+    # block, ahead of the prompt text.
+    if "details" not in body[body.find("existing_count && !app->settings.overwrite_files"):][:1200]:
         return fail("the overwrite prompt no longer prints the per-file details it would replace")
     at = code.find("static bool gui_record_check_output_paths(")
     end = code.find("\n}", at)
@@ -2451,6 +2490,9 @@ SETTINGS_CLIENT_LOCAL_KEYS = frozenset((
     # GDH fork: the record path's overflow spill folder, a path on this
     # machine's own local disk.
     "record_spill_dir",
+    # upstream v1.2.7: this machine's Test Gen tape format and M-Client Local
+    # Save target (upstream never syncs the Local Save pair to a server).
+    "gen_tape_format", "monitor_local_save_path", "monitor_local_save_enabled",
 ))
 
 # Struct fields deliberately not persisted (the duration limits are forced to
@@ -3547,7 +3589,8 @@ def check_record_parity(repo_root: Path) -> int:
     render_pos = ui.find('CLAY(CLAY_ID("RecordButton")')
     if render_pos < 0:
         return fail("gui_ui.c: the RecordButton render was not found")
-    render_window = ui[max(0, render_pos - 2600):render_pos]
+    # 3200: the v1.2.7 sync added the M-Client finalize/pending lines here.
+    render_window = ui[max(0, render_pos - 3200):render_pos]
     if "gui_app_effective_recording(app)" not in render_window or "gui_app_control_capturing(app)" not in render_window:
         return fail("gui_ui.c: the RecordButton render does not use gui_app_effective_recording / gui_app_control_capturing")
     if "app->is_recording" in render_window:
@@ -3555,7 +3598,9 @@ def check_record_parity(repo_root: Path) -> int:
     click_pos = ui.find('Clay_PointerOver(CLAY_ID("RecordButton"))')
     if click_pos < 0:
         return fail("gui_ui.c: the RecordButton click was not found")
-    click_window = ui[click_pos:click_pos + 1400]
+    # 2400: upstream v1.2.7's M-Client branch (it forwards through the same
+    # gui_net_client_request_record) runs ahead of the effective-state branch.
+    click_window = ui[click_pos:click_pos + 2400]
     if "gui_app_effective_recording(app)" not in click_window or "gui_app_control_capturing(app)" not in click_window:
         return fail("gui_ui.c: the RecordButton click does not branch on the effective state")
     if "app->is_recording" in click_window:
@@ -4051,68 +4096,267 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
 
 
 def check_release_download_link_contract(repo_root: Path, workflow_path: Path) -> int:
-    """Assert the in-app updater's asset filename mapping matches the release
-    artifact naming, and that the live link check is wired into CI.
+    """Assert the manifest-driven update pipeline wiring + contract.
 
-    Regression (user report, release v1.2.4): gui_ui.c built asset names
-    missing the "_GUI" infix (Windows_MISRC_%s_x86.zip) while the workflow
-    publishes Windows_MISRC_GUI_<tag>_x86.zip, so every platform's
-    update-check Download button 404'd for every release.
-    check_release_artifact_naming_contract only pinned the WORKFLOW side;
-    nothing cross-checked the APP side. This guard pins both sides to the
-    identical naming and requires the live release_link_check.py CI test
-    (HEAD-checks the exact URLs the app builds, against the latest
-    published release on every run and against the just-published tag in
-    the release job).
+    History: the updater built per-platform asset URLs from filename patterns
+    compiled INTO the binary. v1.2.4 shipped patterns missing the "_GUI"
+    infix while the workflow published <Platform>_MISRC_GUI_<tag>_<arch>.<ext>,
+    so every platform's Download button 404'd; the class recurred whenever a
+    compiled-in mapping drifted, and installed binaries could never be fixed
+    retroactively (every fix needed a new release).
+
+    The 2026-10-22 rework makes the failure class impossible by construction:
+    - the manual button opens the releases PAGE (a page URL cannot 404 per
+      platform),
+    - a remote auto-patch manifest (update_manifest.json at the repo root,
+      served from a fixed raw URL on main) defines the releases page, tag
+      lookup, download base and per-platform asset patterns for EVERY
+      installed app: a fix is a commit, not a release,
+    - confirmed self-update (two-click) downloads + installs, archiving the
+      old binary by RENAME (never deleted), gated off while capturing or
+      recording.
+
+    This guard pins: the manifest file + its structural contract, the
+    app-side wiring (include, page button, confirm gate, capture gate,
+    archive-not-delete rename), the absence of ANY compiled-in asset
+    filename pattern, the updater unit test + meson wiring, and the live
+    release_link_check.py CI test + its two workflow wirings.
     """
-    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
-    if not gui_c_path.exists():
-        return fail(f"Missing gui_ui.c: {gui_c_path}")
-    gui_text = read_text(gui_c_path)
-
-    required_patterns = [
-        "Android_MISRC_GUI_%s_arm64.apk",
-        "macOS_MISRC_GUI_%s_universal.dmg",
-        "Windows_MISRC_GUI_%s_arm64.zip",
-        "Windows_MISRC_GUI_%s_x86.zip",
-        "Linux_MISRC_GUI_%s_arm64.zip",
-        "Linux_MISRC_GUI_%s_x86.zip",
-    ]
-    for pattern in required_patterns:
-        if pattern not in gui_text:
-            return fail(
-                f"gui_ui.c release asset mapping is missing the exact pattern: {pattern} "
-                "(must match the workflow's <Platform>_MISRC_GUI_<tag>_<arch>.<ext> naming)"
-            )
-    for pattern in [p.replace("MISRC_GUI_", "MISRC_") for p in required_patterns]:
-        if pattern in gui_text:
-            return fail(
-                f"gui_ui.c still contains the broken asset mapping (missing the _GUI "
-                f"infix) that 404'd the updater's Download button on every platform: {pattern}"
-            )
-
+    gui_ui_c = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
+    updater_h = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.h"
+    updater_c = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.c"
+    manifest_path = repo_root / "update_manifest.json"
     link_check = repo_root / "misrc_tools" / "test" / "release_link_check.py"
-    if not link_check.exists():
-        return fail(f"Missing release link check CI test: {link_check}")
+    updater_test = repo_root / "misrc_tools" / "test" / "gui_updater_test.c"
+    meson_path = repo_root / "misrc_tools" / "meson.build"
+
+    for path, label in [
+        (gui_ui_c, "gui_ui.c"),
+        (updater_h, "gui_updater.h"),
+        (updater_c, "gui_updater.c"),
+        (manifest_path, "update_manifest.json"),
+        (link_check, "release_link_check.py"),
+        (updater_test, "gui_updater_test.c"),
+    ]:
+        if not path.exists():
+            return fail(f"Missing {label}: {path}")
+
+    # 1. Repo manifest contract (full JSON parse; same acceptance rules as
+    #    the app's gui_updater_parse_manifest_text + the live link check).
+    try:
+        manifest = json.loads(read_text(manifest_path))
+    except json.JSONDecodeError as exc:
+        return fail(f"update_manifest.json is not valid JSON: {exc}")
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        return fail("update_manifest.json schema must be 1")
+    for key in [
+        "releases_page", "tag_lookup_url", "download_base_url",
+        "asset_android", "asset_macos", "asset_windows_x86",
+        "asset_windows_arm64", "asset_linux_x86", "asset_linux_arm64",
+    ]:
+        value = manifest.get(key)
+        if not isinstance(value, str) or not value:
+            return fail(f"update_manifest.json missing or empty key: {key}")
+        if key in ("releases_page", "tag_lookup_url", "download_base_url"):
+            if not value.startswith("https://"):
+                return fail(f"update_manifest.json {key} must be https: {value}")
+    for key in ["asset_android", "asset_macos", "asset_windows_x86",
+                "asset_windows_arm64", "asset_linux_x86", "asset_linux_arm64"]:
+        pattern = manifest[key]
+        if "{tag}" not in pattern:
+            return fail(f"update_manifest.json asset pattern must contain {{tag}}: {key}={pattern}")
+
+    # 2. App-side constants + pipeline wiring.
+    gui_text = read_text(gui_ui_c)
+    updater_h_text = read_text(updater_h)
+    updater_c_text = read_text(updater_c)
+
+    for snippet, label in [
+        ('#include "../core/gui_updater.h"', "the updater module include"),
+        ("Releases Page", "the releases page button label"),
+        ("VersionInfoInstallButton", "the install button"),
+        ("s_update_install_armed", "the two-click confirm state"),
+        ("Confirm install", "the armed confirm label"),
+        ("gui_updater_fetch_manifest", "the manifest fetch in the check thread"),
+        ("gui_updater_build_asset_url", "manifest-driven asset URL building"),
+        ("gui_updater_install_asset", "the confirmed self-update install call"),
+        ("Stop capture/recording before installing an update", "the capture/record install gate"),
+    ]:
+        if snippet not in gui_text:
+            return fail(f"gui_ui.c update pipeline missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("GUI_UPDATER_MANIFEST_URL", "the manifest URL macro"),
+        ("https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json",
+         "the fixed raw manifest URL"),
+        ("GUI_UPDATER_RELEASES_PAGE_URL", "the releases page fallback constant"),
+        ("https://github.com/harrypm/MISRC-GUI/releases/", "the releases page URL"),
+        ("GUI_UPDATER_ARCHIVE_SUFFIX", "the archive suffix constant"),
+        ("GUI_UPDATER_TAG_LOOKUP_URL", "the compiled tag-lookup fallback"),
+    ]:
+        if snippet not in updater_h_text:
+            return fail(f"gui_updater.h missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("GUI_UPDATER_MANIFEST_URL", "the manifest URL use in the fetch"),
+        ("rename(target, archive_path)", "archive the old binary by rename"),
+        ("rename(archive_path, target)", "restore the archived old binary on failure"),
+        ("gui_updater_build_archive_path", "the archive path builder"),
+    ]:
+        if snippet not in updater_c_text:
+            return fail(f"gui_updater.c missing {label}: {snippet}")
+
+    # 3. Compiled-in asset filename patterns are FORBIDDEN anywhere in the
+    #    app: asset naming lives ONLY in the remotely-patchable manifest, so
+    #    the v1.2.4-class 404 bug is impossible by construction.
+    for text, label in [(gui_text, "gui_ui.c"), (updater_c_text, "gui_updater.c"),
+                        (updater_h_text, "gui_updater.h")]:
+        for pattern in ["_MISRC_GUI_%s_", "_MISRC_%s_", "%s_arm64.apk",
+                        "%s_universal.dmg", "%s_arm64.zip", "%s_x86.zip"]:
+            if pattern in text:
+                return fail(
+                    f"{label} still contains a compiled-in release asset filename "
+                    f"pattern ({pattern}) - asset naming must live ONLY in "
+                    "update_manifest.json (the remotely-patchable manifest); "
+                    "compiled-in patterns are the v1.2.4-class 404 bug"
+                )
+
+    # 4. Updater unit test + meson wiring.
+    updater_test_text = read_text(updater_test)
+    for snippet, label in [
+        ("gui_updater_parse_manifest_text", "the manifest parse coverage"),
+        ("gui_updater_compare_versions", "the version compare coverage"),
+        ("gui_updater_build_archive_path", "the archive path coverage"),
+        ("gui_updater_install_asset", "the install pipeline failure coverage"),
+    ]:
+        if snippet not in updater_test_text:
+            return fail(f"gui_updater_test.c missing {label}: {snippet}")
+    meson_text = read_text(meson_path)
+    for snippet, label in [
+        ("'misrc_gui/core/gui_updater.c'", "the updater module in the GUI build"),
+        ("test('gui_updater'", "the updater unit test registered as a meson test"),
+    ]:
+        if snippet not in meson_text:
+            return fail(f"misrc_tools/meson.build missing {label}: {snippet}")
+
+    # 5. Live link check CI test + both workflow wirings.
     link_text = read_text(link_check)
-    for snippet in [
-        "releases/latest",
-        "releases/download",
-        "gui_ui.c",
-        "gui_ui_build_release_asset_filename_for_platform",
-        "--tag",
+    for snippet, label in [
+        ("update_manifest.json", "the manifest file name"),
+        ("raw.githubusercontent.com", "the live raw manifest fetch"),
+        ("tag_lookup_url", "the manifest tag lookup"),
+        ("releases_page", "the releases page check"),
+        ("{tag}", "the {tag} placeholder"),
+        ("--tag", "the release-job tag override"),
     ]:
         if snippet not in link_text:
-            return fail(f"release_link_check.py is missing required snippet: {snippet}")
-
+            return fail(f"release_link_check.py missing {label}: {snippet}")
     workflow_text = read_text(workflow_path)
-    for snippet in [
-        "release-link-check:",
-        "python3 misrc_tools/test/release_link_check.py",
-        'release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+    for snippet, label in [
+        ("release-link-check:", "the every-trigger link check job"),
+        ("python3 misrc_tools/test/release_link_check.py", "the job's command"),
+        ('release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+         "the release job's post-publish verification step"),
     ]:
         if snippet not in workflow_text:
-            return fail(f"Workflow is missing release download link check wiring: {snippet}")
+            return fail(f"Workflow missing release download link check wiring ({label}): {snippet}")
+    return 0
+
+
+def check_update_cli_contract(repo_root: Path) -> int:
+    """Assert the headless update CLI + its end-to-end automated test wiring.
+
+    The updater pipeline (gui_updater.c) must be reachable WITHOUT the GUI
+    (--check-update / --update-dry-run / --install-update --yes): the update
+    flow has to be automatically testable, so the update_cli meson test drives
+    the REAL built binary through every mode against a local test server
+    (manifest + releases/latest redirect + asset zip, isolated HOME) -
+    including the full confirmed install, the install refusal without --yes,
+    and the old binary archived by rename (never deleted).
+
+    Pins: the misrc_gui.c flags + runner + confirmation gate, the gui_updater
+    manifest-source load (URL/file) + the loopback-http-only test carve-out,
+    the update_cli test's assertions, the meson wiring (the captured
+    misrc_gui_exe + test('update_cli')), and the README documentation.
+    """
+    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "core" / "misrc_gui.c"
+    updater_h = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.h"
+    updater_c = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.c"
+    update_cli_test = repo_root / "misrc_tools" / "test" / "update_cli_test.py"
+    meson_path = repo_root / "misrc_tools" / "meson.build"
+    readme_path = repo_root / "README.md"
+
+    for path, label in [
+        (gui_c_path, "misrc_gui.c"),
+        (updater_h, "gui_updater.h"),
+        (updater_c, "gui_updater.c"),
+        (update_cli_test, "update_cli_test.py"),
+        (meson_path, "meson.build"),
+        (readme_path, "README.md"),
+    ]:
+        if not path.exists():
+            return fail(f"Missing {label}: {path}")
+
+    gui_text = read_text(gui_c_path)
+    for snippet, label in [
+        ("--check-update", "the check flag"),
+        ("--update-dry-run", "the dry-run flag"),
+        ("--install-update", "the install flag"),
+        ("--update-manifest", "the manifest source override flag"),
+        ("--yes", "the install confirmation flag"),
+        ("gui_run_update_cli", "the headless update runner"),
+        ("gui_updater_load_manifest_from", "the manifest source load"),
+        ("update_available: ", "the update_available output key"),
+        ("--install-update requires --yes", "the install confirmation gate"),
+    ]:
+        if snippet not in gui_text:
+            return fail(f"misrc_gui.c headless update CLI missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("gui_updater_load_manifest_from", "the manifest-source load declaration"),
+    ]:
+        if snippet not in read_text(updater_h):
+            return fail(f"gui_updater.h missing {label}: {snippet}")
+
+    updater_text = read_text(updater_c)
+    for snippet, label in [
+        ("gui_updater_load_manifest_from", "the manifest-source load implementation"),
+        ("127.0.0.1", "the loopback-http-only test carve-out"),
+    ]:
+        if snippet not in updater_text:
+            return fail(f"gui_updater.c missing {label}: {snippet}")
+
+    test_text = read_text(update_cli_test)
+    for snippet, label in [
+        ("--check-update", "the check mode"),
+        ("--update-dry-run", "the dry-run mode"),
+        ("--install-update", "the install mode"),
+        ("--yes", "the confirmation flag"),
+        ("--update-manifest", "the manifest override"),
+        ("releases/latest", "the tag redirect endpoint"),
+        ('out["install"] == "ok"', "the install success assertion"),
+        ("archived-", "the archive rename assertion"),
+        ("never deleted", "the archive-not-delete assertion"),
+    ]:
+        if snippet not in test_text:
+            return fail(f"update_cli_test.py missing {label}: {snippet}")
+
+    meson_text = read_text(meson_path)
+    for snippet, label in [
+        ("test('update_cli'", "the update_cli meson test registration"),
+        ("misrc_gui_exe = executable('misrc_gui'", "the captured misrc_gui exe the test drives"),
+    ]:
+        if snippet not in meson_text:
+            return fail(f"misrc_tools/meson.build missing {label}: {snippet}")
+
+    readme_text = read_text(readme_path)
+    for snippet, label in [
+        ("Headless update mode", "the README section"),
+        ("--check-update", "the README check flag doc"),
+        ("--install-update", "the README install flag doc"),
+    ]:
+        if snippet not in readme_text:
+            return fail(f"README.md missing {label}: {snippet}")
     return 0
 
 
@@ -4245,7 +4489,8 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         # CI must also run on direct pushes to main (regression e34dce9: a
         # guard break was pushed straight to main and ran no CI for a day;
         # the tags-only push trigger never fired).
-        "push:\n    branches:\n      - main\n    tags:\n      - 'v*'",
+        "push:\n    branches:\n      - main\n",
+        "    tags:\n      - 'v*'",
         "preflight-guard-tests:",
         "linux-appimage:",
         "windows-exe:",
@@ -4431,8 +4676,9 @@ def check_local_guard_gate_contract(repo_root: Path) -> int:
         if "CI guard tests failed" not in text:
             return fail(f"{label} must FAIL the build when the CI guard tests fail ('CI guard tests failed')")
     workflow_text = read_text(workflow_path)
-    push_main = "push:\n    branches:\n      - main\n    tags:\n      - 'v*'"
-    if push_main not in workflow_text:
+    push_main = "push:\n    branches:\n      - main\n"
+    tags = "    tags:\n      - 'v*'"
+    if push_main not in workflow_text or tags not in workflow_text:
         return fail(
             "build.yml must run CI on direct pushes to main (push: branches: [main] "
             "alongside the v* tags trigger); a tags-only push trigger let a guard "
@@ -6471,6 +6717,7 @@ def main() -> int:
 
     checks: List[Tuple[str, Callable[[], int]]] = [
         ("cross-platform workflow coverage", lambda: check_cross_platform_workflow_coverage(workflow_path)),
+        ("shell script Git executable modes", lambda: check_shell_script_git_modes(repo_root)),
         ("actions runtime policy", lambda: check_actions_runtime_policy(workflow_path)),
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
@@ -6527,6 +6774,7 @@ def main() -> int:
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
         ("release download link contract", lambda: check_release_download_link_contract(repo_root, workflow_path)),
+        ("update CLI contract", lambda: check_update_cli_contract(repo_root)),
         ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("CI-only tier contract",

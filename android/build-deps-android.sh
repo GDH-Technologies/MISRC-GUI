@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Cross-build the six MISRC GUI dependencies for Android arm64-v8a (API 30)
+# Cross-build MISRC GUI dependencies for Android arm64-v8a (API 30)
 # into .deps/install-android-arm64. Mirrors scripts/build-appimage-local.sh
 # and the main-branch CI (build.yml) dep builds, but adds the NDK toolchain.
 #
 # Deps (all built static):
 #   libFLAC 1.5.0   - hard-required by meson.build (flac.pc must report 1.5.0)
+#   Zstandard 1.5.7 - static libzstd for MISRC-M/2 monitor previews
 #   FFTW 3.3.10     - single-precision (fftw3f), required by misrc_gui
 #   libsoxr 0.1.3   - optional resampler (LIBSOXR_ENABLED)
 #   libusb 1.0.27   - Android backend (highest risk; FX3/DdD/hsdaoh depend on it)
@@ -39,6 +40,21 @@ FLAC_VERSION=1.5.0
 FLAC_TARBALL="flac-${FLAC_VERSION}.tar.xz"
 FLAC_URL="https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/${FLAC_TARBALL}"
 FLAC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
+
+OPUS_VERSION=1.5.2
+OPUS_TARBALL="opus-${OPUS_VERSION}.tar.gz"
+# GitHub release asset, byte-identical to downloads.xiph.org (sha256 verified
+# 2026-11-05, both hosts = 65c1d2f7...) but far more reliable from GH runners:
+# run 41943704989 (job 126970743360) died with `curl: (35) error:0A000126:SSL
+# routines::unexpected eof while reading` pulling opus-1.5.2.tar.gz from
+# downloads.xiph.org. Mirrors the FLAC source choice above (github.com/xiph).
+OPUS_URL="https://github.com/xiph/opus/releases/download/v${OPUS_VERSION}/${OPUS_TARBALL}"
+OPUS_SHA256="65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
+
+ZSTD_VERSION=1.5.7
+ZSTD_TARBALL="zstd-${ZSTD_VERSION}.tar.gz"
+ZSTD_URL="https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/${ZSTD_TARBALL}"
+ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
 
 FFTW_VERSION=3.3.10
 FFTW_TARBALL="fftw-${FFTW_VERSION}.tar.gz"
@@ -83,7 +99,13 @@ download() {
     log "cached $(basename "$out")"
   else
     log "downloading $(basename "$out")"
-    curl -fL --retry 3 -o "$out" "$url"
+    # --retry alone does NOT cover SSL connect errors (curl exit 35): curl's
+    # default retry policy treats only timeouts/HTTP 5xx as transient, so the
+    # old `--retry 3` was a no-op for the exit-35 SSL failure that killed run
+    # 41943704989. --retry-all-errors (curl >= 7.71; ubuntu-22.04 runners ship
+    # 7.81) makes every failure retryable; --connect-timeout avoids multi-minute
+    # TCP hangs on stalled mirrors; --retry-delay 2 spaces the 5 attempts.
+    curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 -o "$out" "$url"
   fi
   if [[ -n "$sha" ]]; then
     local actual
@@ -124,6 +146,50 @@ else
   cmake --install "$DEPS_SRC_DIR/flac-build"
 fi
 record "libFLAC" "${FLAC_VERSION} (sha256 ${FLAC_SHA256})"
+
+# ---------------- Opus 1.5.2 (static low-latency Monitor audio) ----------------
+log "=== Opus ${OPUS_VERSION} (Android static libopus) ==="
+if [[ "$(pc_version opus)" == "${OPUS_VERSION}" ]]; then
+  log "skip (opus.pc already ${OPUS_VERSION})"
+else
+  download "$OPUS_URL" "$DEPS_SRC_DIR/$OPUS_TARBALL" "$OPUS_SHA256"
+  rm -rf "$DEPS_SRC_DIR/opus-src" "$DEPS_SRC_DIR/opus-build"
+  mkdir -p "$DEPS_SRC_DIR/opus-src"
+  tar -xf "$DEPS_SRC_DIR/$OPUS_TARBALL" -C "$DEPS_SRC_DIR/opus-src" --strip-components=1
+  cmake_x -S "$DEPS_SRC_DIR/opus-src" -B "$DEPS_SRC_DIR/opus-build" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DOPUS_BUILD_SHARED_LIBRARY=OFF \
+    -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF \
+    -DOPUS_DISABLE_INTRINSICS=ON
+  cmake --build "$DEPS_SRC_DIR/opus-build" --parallel "$JOBS"
+  cmake --install "$DEPS_SRC_DIR/opus-build"
+fi
+[[ "$(pc_version opus)" == "${OPUS_VERSION}" ]] || fail "Android static Opus not found in cross pkg-config"
+record "Opus" "${OPUS_VERSION} (sha256 ${OPUS_SHA256})"
+
+# ---------------- Zstandard 1.5.7 (static libzstd) ----------------
+# Required by the MISRC-M/2 monitor preview; the Android cross pkg-config
+# wrapper intentionally excludes host libraries, so Android needs its own .pc.
+log "=== Zstandard ${ZSTD_VERSION} (Android static libzstd) ==="
+if [[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]]; then
+  log "skip (libzstd.pc already ${ZSTD_VERSION})"
+else
+  download "$ZSTD_URL" "$DEPS_SRC_DIR/$ZSTD_TARBALL" "$ZSTD_SHA256"
+  rm -rf "$DEPS_SRC_DIR/zstd-src" "$DEPS_SRC_DIR/zstd-build"
+  mkdir -p "$DEPS_SRC_DIR/zstd-src"
+  tar -xf "$DEPS_SRC_DIR/$ZSTD_TARBALL" -C "$DEPS_SRC_DIR/zstd-src" --strip-components=1
+  cmake_x -S "$DEPS_SRC_DIR/zstd-src/build/cmake" -B "$DEPS_SRC_DIR/zstd-build" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_SHARED=OFF \
+    -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF \
+    -DZSTD_MULTITHREAD_SUPPORT=OFF
+  cmake --build "$DEPS_SRC_DIR/zstd-build" --parallel "$JOBS"
+  cmake --install "$DEPS_SRC_DIR/zstd-build"
+fi
+# Verify the Android-cross prefix has the .pc file Meson needs.
+[[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]] || fail \
+  "Android-cross libzstd.pc ${ZSTD_VERSION} missing after Zstd install"
+record "Zstandard" "${ZSTD_VERSION} (sha256 ${ZSTD_SHA256})"
 
 # ---------------- FFTW 3.3.10 (single precision -> fftw3f) ----------------
 log "=== FFTW ${FFTW_VERSION} (fftw3f) ==="
@@ -451,7 +517,7 @@ fi
 
 # ---------------- summary ----------------
 log "=== installed .pc versions ==="
-for pc in flac fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
+for pc in flac opus libzstd fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
   v="$(pc_version "$pc")"
   printf '  %-14s %s\n' "$pc" "${v:-(missing)}"
 done

@@ -18,7 +18,8 @@ bool gui_audio_is_running(void);
 // This affects live monitoring only (not file writing).
 void gui_audio_set_playback_enabled(gui_app_t *app, bool enabled);
 
-// Pump audio playback (call from main thread once per frame).
+// Maintain the monitor session/device and pump ordinary playback on the main
+// thread once per frame. HiFi PCM is pulled by the audio device callback.
 void gui_audio_update_playback(gui_app_t *app);
 
 // Push demodulated audio (stereo int16 @ 48k) into the live monitor queue so

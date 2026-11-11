@@ -14,14 +14,18 @@ static atomic_bool process_entered;
 static atomic_uint process_calls;
 static atomic_uint reset_calls;
 static atomic_uint create_calls;
+static atomic_uint narrow_resample_calls,wide_resample_calls,narrow_reset_calls;
 static atomic_uint busy_ms;
 static atomic_uint active_processes;
 static atomic_uint max_active_processes;
-static atomic_uint_fast64_t latest_first_sample;
+static atomic_uint_fast64_t latest_first_sample,latest_video_count;
+static atomic_int latest_video_marker;
+static atomic_bool delay_wide_once,delay_audio_once;
 static atomic_uint_fast64_t counter_seed;
 static atomic_bool hold_audio,audio_entered,hold_resample,resample_entered;
+static atomic_bool hold_audio_flush,audio_flush_entered;
 static atomic_uint audio_calls,audio_callbacks,audio_resets;
-static atomic_uint_fast64_t audio_first,audio_end;
+static atomic_uint_fast64_t audio_first,audio_end,audio_count;
 static atomic_int audio_marker,expected_audio_marker;
 static atomic_uint wrong_audio_callbacks;
 struct gui_beta_hifi_decoder { int placeholder; };
@@ -32,13 +36,19 @@ void gui_beta_hifi_process(gui_beta_hifi_decoder_t *d,const float *samples,size_
                           gui_beta_hifi_pcm_callback_t cb,void *ctx) {
     (void)d;atomic_store(&audio_entered,true);
     while(atomic_load(&hold_audio)) thrd_sleep_ms(1);
-    atomic_store(&audio_first,first);atomic_store(&audio_marker,(int)samples[0]);
+    atomic_store(&audio_first,first);atomic_store(&audio_count,count);atomic_store(&audio_marker,(int)samples[0]);
     float pcm[2]={samples[0],-samples[0]};gui_beta_hifi_status_t status={.locked=true};
     cb(ctx,pcm,1,first+count,&status);atomic_fetch_add(&audio_calls,1);
 }
 void gui_beta_hifi_get_status(const gui_beta_hifi_decoder_t *d,gui_beta_hifi_status_t *s) {(void)d;memset(s,0,sizeof(*s));}
 static void audio_test_callback(void *ctx,const float *pcm,size_t frames,uint64_t end) {
-    (void)ctx;if(pcm && frames) {
+    (void)ctx;
+    if(!pcm || !frames) {
+        atomic_store(&audio_flush_entered,true);
+        while(atomic_load(&hold_audio_flush)) thrd_sleep_ms(1);
+        return;
+    }
+    if(pcm && frames) {
         int expected=atomic_load(&expected_audio_marker);
         if(expected && (int)pcm[0]!=expected) atomic_fetch_add(&wrong_audio_callbacks,1);
         atomic_store(&audio_end,end);atomic_fetch_add(&audio_callbacks,1);
@@ -46,11 +56,15 @@ static void audio_test_callback(void *ctx,const float *pcm,size_t frames,uint64_
 }
 static int failures;
 
-struct gui_rf_decoder { gui_rf_format_t format; gui_rf_decode_status_t status; };
+struct gui_rf_decoder { gui_rf_format_t format; gui_rf_profile_t profile; gui_rf_decode_status_t status; };
 bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
-    return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+    return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI ||
+        profile==GUI_RF_PROFILE_NTSC_ED_BETA;
 }
-struct gui_rf_resampler { uint32_t rate; };
+uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile) {
+    (void)profile;return 20000000u;
+}
+struct gui_rf_resampler { uint32_t rate,output_rate;uint64_t phase;size_t pending;float pending_marker;bool first,ed_beta; };
 
 gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
     gui_rf_decoder_t *d = calloc(1, sizeof(*d));
@@ -60,10 +74,13 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) { free(d); }
 void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full) { (void)d; (void)full; }
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
-    return gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+    gui_rf_decoder_t *d=gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+    if(d)d->profile=profile;
+    return d;
 }
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile) {
     gui_rf_decoder_reset(d, profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+    d->profile=profile;
 }
 void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
     d->format = format;
@@ -83,6 +100,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
     while (get_time_us() < busy_until) arithmetic = arithmetic * 1664525u + 1013904223u;
     (void)arithmetic;
     atomic_store(&latest_first_sample, first);
+    atomic_store(&latest_video_count,count);atomic_store(&latest_video_marker,(int)samples[0]);
     d->status.h_locked = d->status.v_locked = d->status.color_locked = true;
     uint64_t seed = atomic_exchange(&counter_seed, 0);
     if (seed) {
@@ -105,37 +123,64 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
     for (int y = 0; y < height; y++) {
         memset(rgba + y * 8 * 4, (uint8_t)((int)samples[0] + (y & 1)), 8 * 4);
     }
-    callback(context, rgba, 8, height, first + count, &d->status);
+    uint64_t public_end=first+count;
+    callback(context, rgba, 8, height, public_end, &d->status);
     atomic_fetch_add(&process_calls, 1);
     atomic_fetch_sub(&active_processes, 1);
 }
 
-gui_rf_resampler_t *gui_rf_resampler_create(uint32_t rate) {
+gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t rate,uint32_t output_rate) {
     atomic_fetch_add(&create_calls, 1);
-    /* Represents a build without soxr for a noninteger ratio. */
-    if (rate == 28636360u) return NULL;
-    gui_rf_resampler_t *r = malloc(sizeof(*r));
-    if (r) r->rate = rate;
+    if (rate == 28636360u) return NULL; /* No soxr at this unsupported fixture ratio. */
+    gui_rf_resampler_t *r=calloc(1,sizeof(*r));
+    if(r){r->rate=rate;r->output_rate=output_rate;r->first=true;}
+    return r;
+}
+gui_rf_resampler_t *gui_rf_resampler_create(uint32_t rate) {
+    return gui_rf_resampler_create_rate(rate,GUI_RF_DECODE_RATE_HZ);
+}
+gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t rate) {
+    gui_rf_resampler_t *r=gui_rf_resampler_create_rate(rate,GUI_RF_DECODE_RATE_HZ);
+    if(r)r->ed_beta=true;
     return r;
 }
 void gui_rf_resampler_destroy(gui_rf_resampler_t *r) { free(r); }
-void gui_rf_resampler_reset(gui_rf_resampler_t *r) { (void)r; }
-size_t gui_rf_resampler_output_capacity(uint32_t rate, size_t count) {
-    return ((uint64_t)count * GUI_RF_DECODE_RATE_HZ + rate - 1) / rate + 64;
+void gui_rf_resampler_reset(gui_rf_resampler_t *r) {
+    if(!r->ed_beta) atomic_fetch_add(&narrow_reset_calls,1);
+    r->phase=0;r->pending=0;r->first=true;
 }
-bool gui_rf_resampler_process(gui_rf_resampler_t *r, const int16_t *input, size_t count,
-                              float *output, size_t capacity, size_t *output_count) {
+size_t gui_rf_resampler_output_capacity_rate(uint32_t rate,uint32_t output_rate,size_t count) {
+    return ((uint64_t)count*output_rate+rate-1)/rate+64;
+}
+size_t gui_rf_resampler_output_capacity(uint32_t rate,size_t count) {
+    return gui_rf_resampler_output_capacity_rate(rate,GUI_RF_DECODE_RATE_HZ,count);
+}
+size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t rate,size_t count) {
+    return gui_rf_resampler_output_capacity_rate(rate,GUI_RF_DECODE_RATE_HZ,count);
+}
+bool gui_rf_resampler_process(gui_rf_resampler_t *r,const int16_t *input,size_t count,
+                              float *output,size_t capacity,size_t *output_count) {
     atomic_store(&resample_entered,true);
-    while(atomic_load(&hold_resample)) thrd_sleep_ms(1);
-    size_t n = (uint64_t)count * GUI_RF_DECODE_RATE_HZ / r->rate;
-    if (!n) n = 1;
-    if (n > capacity) return false;
-    for(size_t i=0;i<n;i++) output[i]=(float)input[0];
-    *output_count = n;
-    return true;
+    if(!r->ed_beta) atomic_fetch_add(&narrow_resample_calls,1);
+    else atomic_fetch_add(&wide_resample_calls,1);
+    while(atomic_load(&hold_resample))thrd_sleep_ms(1);
+    uint64_t scaled=(uint64_t)count*r->output_rate+r->phase;
+    size_t n=(size_t)(scaled/r->rate);r->phase=scaled%r->rate;
+    bool withhold=r->rate==54000000u && r->first &&
+        (r->ed_beta?atomic_load(&delay_wide_once):atomic_load(&delay_audio_once));
+    r->first=false;
+    float marker=(float)input[0]+(r->ed_beta?1000.0f:0.0f);
+    if(withhold){r->pending=n;r->pending_marker=marker;*output_count=0;return true;}
+    size_t pending=r->pending;n+=pending;r->pending=0;
+    if(n>capacity)return false;
+    for(size_t i=0;i<n;i++)output[i]=i<pending?r->pending_marker:marker;
+    *output_count=n;return true;
 }
+/* Deliberately positive ED-only fixture delay: the real soxr converter is
+ * aligned at zero, but this stub keeps worker delay accounting observable. */
+#define TEST_ED_DELAY_SAMPLES 3.25
 double gui_rf_resampler_delay_samples(const gui_rf_resampler_t *r) {
-    return r->rate == 40000000u ? 7.5 : r->rate == 80000000u ? 11.25 : 0.0;
+    return r->ed_beta?TEST_ED_DELAY_SAMPLES:r->rate==r->output_rate*2u?7.5:r->rate==r->output_rate*4u?11.25:0.0;
 }
 
 static void check(bool condition, const char *description) {
@@ -706,6 +751,209 @@ static void test_superbeta_optional_audio(void) {
     gui_rf_preview_worker_destroy(w);check(gui_rf_preview_worker_set_budget(1),"SuperBeta fixture restores default budget");
 }
 
+static void test_ed_frontends(void) {
+    check(gui_rf_preview_worker_set_budget(0),"ED dual-front-end offline budget");
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(w!=NULL,"ED worker creation");if(!w)return;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    unsigned video=atomic_load(&process_calls),audio=atomic_load(&audio_calls),created=atomic_load(&create_calls);
+    check(submit_marker(w,16000000u,0,1,false,109) && gui_rf_preview_worker_wait_idle(w,3000),"low-rate ED input drains safely");
+    gui_rf_preview_stats_t stats;gui_rf_preview_worker_get_stats(w,&stats);
+    check(strstr(stats.decode.reason,"20 MSPS") && atomic_load(&process_calls)==video &&
+        atomic_load(&audio_calls)==audio && atomic_load(&create_calls)==created,
+        "ED rejects insufficient source bandwidth without video or audio upsampling");
+    check(submit_marker(w,20000000u,0,1,true,109) && gui_rf_preview_worker_wait_idle(w,3000),"native20 MSPS ED source is accepted");
+    check(atomic_load(&latest_first_sample)==0 && atomic_load(&latest_video_count)==32 &&
+        atomic_load(&latest_video_marker)==1109 && atomic_load(&audio_marker)==109,
+        "native20 ED retains distinct video and audio front-ends on the same sample clock");
+    check(submit_marker(w,40000000u,4000,2,true,111) && gui_rf_preview_worker_wait_idle(w,3000),"ED 40 MSPS source");
+    check(atomic_load(&latest_first_sample)==2000 && atomic_load(&latest_video_count)==16 &&
+        atomic_load(&latest_video_marker)==1111,"ED video receives wide-band samples on the20 MSPS axis");
+    if(atomic_load(&audio_first)!=2000 || atomic_load(&audio_count)!=16 || atomic_load(&audio_end)!=2016 ||
+        atomic_load(&audio_marker)!=111) {
+        gui_rf_preview_worker_get_stats(w,&stats);
+        fprintf(stderr,"ED narrow observed first=%llu count=%llu end=%llu marker=%d audio_calls=%u drops=%llu\n",
+            (unsigned long long)atomic_load(&audio_first),(unsigned long long)atomic_load(&audio_count),
+            (unsigned long long)atomic_load(&audio_end),atomic_load(&audio_marker),atomic_load(&audio_calls),
+            (unsigned long long)stats.audio_blocks_dropped);
+    }
+    check(atomic_load(&audio_first)==2000 && atomic_load(&audio_count)==16 && atomic_load(&audio_end)==2016 &&
+        atomic_load(&audio_marker)==111,"ED Hi-Fi receives only the independent 20 MSPS samples and clock");
+    check(submit_marker(w,40000000u,100000,3,true,113) && gui_rf_preview_worker_wait_idle(w,3000),"ED source epoch/gap");
+    check(atomic_load(&latest_first_sample)==50000 && atomic_load(&audio_first)==50000,
+        "ED source gap resets and reanchors both front-ends independently");
+    created=atomic_load(&create_calls);audio=atomic_load(&audio_calls);
+    gui_rf_preview_worker_set_audio_enabled(w,false);
+    check(submit_marker(w,40000000u,100032,3,false,115) && gui_rf_preview_worker_wait_idle(w,3000),"ED video while audio muted");
+    check(atomic_load(&latest_first_sample)==50016 && atomic_load(&audio_calls)==audio,"mute does not halt wide video");
+    gui_rf_preview_worker_set_audio_enabled(w,true);
+    check(submit_marker(w,40000000u,100064,3,false,117) && gui_rf_preview_worker_wait_idle(w,3000),"ED audio reenabled");
+    check(atomic_load(&audio_first)==50032 && atomic_load(&latest_first_sample)==50032 &&
+        atomic_load(&create_calls)==created,"unmute reanchors narrow audio without recreating converters or changing wide video");
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_BETAMAX_HIFI);
+    check(gui_rf_preview_worker_wait_idle(w,3000) &&
+        submit_marker(w,40000000u,100096,3,false,119) && gui_rf_preview_worker_wait_idle(w,3000),"ED to ordinary Beta at unchanged source rate");
+    check(atomic_load(&latest_first_sample)==50048 && atomic_load(&latest_video_count)==16 &&
+        atomic_load(&latest_video_marker)==119 && atomic_load(&create_calls)==created+1,
+        "leaving ED rebuilds the legacy front-end even without a source-rate change");
+    created=atomic_load(&create_calls);
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(gui_rf_preview_worker_wait_idle(w,3000) &&
+        submit_marker(w,40000000u,100128,3,false,121) && gui_rf_preview_worker_wait_idle(w,3000),"ordinary Beta to ED at unchanged source rate");
+    check(atomic_load(&latest_first_sample)==50064 && atomic_load(&latest_video_count)==16 &&
+        atomic_load(&audio_first)==50064 && atomic_load(&create_calls)==created+2,
+        "entering ED rebuilds both filter paths despite equal20 MSPS output rates");
+    check(submit_marker(w,80000000u,8000,4,true,123) && gui_rf_preview_worker_wait_idle(w,3000),"ED 80 MSPS input");
+    check(atomic_load(&latest_first_sample)==2000 && atomic_load(&latest_video_count)==8 &&
+        atomic_load(&audio_first)==2000 && atomic_load(&audio_count)==8,"80 MSPS feeds distinct video/audio20 MSPS streams");
+    gui_rf_preview_worker_get_stats(w,&stats);
+    check(stats.latency_ms>=TEST_ED_DELAY_SAMPLES*1000.0/20000000.0,
+        "ED converter delay is accounted on the public20 MSPS frame axis");
+    check(submit_marker(w,16000000u,2048,5,true,125) && gui_rf_preview_worker_wait_idle(w,3000),"ED returns to insufficient source rate");
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_BETAMAX_HIFI);
+    check(gui_rf_preview_worker_wait_idle(w,3000) &&
+        submit_marker(w,16000000u,2080,5,false,127) && gui_rf_preview_worker_wait_idle(w,3000),"legacy profile recovers at the same formerly rejected source rate");
+    check(atomic_load(&latest_first_sample)==2600 && atomic_load(&audio_first)==2600,
+        "rejected ED configuration cannot leave legacy conversion unavailable");
+    gui_rf_preview_worker_destroy(w);check(gui_rf_preview_worker_set_budget(1),"ED fixture restores budget");
+}
+
+static void test_ed_buffered_frontends(bool delay_wide) {
+    atomic_store(&delay_wide_once,delay_wide);atomic_store(&delay_audio_once,!delay_wide);
+    check(gui_rf_preview_worker_set_budget(0),"ED buffered-front-end offline budget");
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(w!=NULL,"ED buffered worker creation");if(!w)goto cleanup;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    unsigned video=atomic_load(&process_calls),audio=atomic_load(&audio_calls);
+    const uint64_t origin=54002; /* Both20M converters deliberately have different buffered availability. */
+    check(submit_marker(w,54000000u,origin,8,true,129) && gui_rf_preview_worker_wait_idle(w,3000),"ED first buffered conversion");
+    check(atomic_load(&process_calls)==video+(delay_wide?0:1) &&
+        atomic_load(&audio_calls)==audio+(delay_wide?1:0),"one front-end may produce zero while the other advances");
+    check(submit_marker(w,54000000u,origin+32,8,false,129) && gui_rf_preview_worker_wait_idle(w,3000),"ED second buffered conversion");
+    const uint64_t v0=origin*20000000u/54000000u,a0=origin*20000000u/54000000u;
+    check(atomic_load(&latest_first_sample)==v0+(delay_wide?0:11) &&
+        atomic_load(&latest_video_count)==(delay_wide?23:12),"video cursor follows its actual produced count independently of audio availability");
+    check(atomic_load(&audio_first)==a0+(delay_wide?11:0) &&
+        atomic_load(&audio_count)==(delay_wide?12:23),"audio cursor follows independent buffered output at 20 MSPS");
+    check(atomic_load(&latest_video_marker)==1129 && atomic_load(&audio_marker)==129,
+        "asymmetric buffering never substitutes the narrow samples for wide video or vice versa");
+    check(submit_marker(w,54000000u,origin+64,8,false,131) && gui_rf_preview_worker_wait_idle(w,3000),"ED buffered cursors continue");
+    check(atomic_load(&latest_first_sample)==v0+23 && atomic_load(&audio_first)==a0+23,
+        "both cursors stay continuous after unequal per-call availability");
+    const uint64_t gap=108005;
+    check(submit_marker(w,54000000u,gap,9,true,133) && gui_rf_preview_worker_wait_idle(w,3000) &&
+        submit_marker(w,54000000u,gap+32,9,false,133) && gui_rf_preview_worker_wait_idle(w,3000),"ED buffered gap resets both histories");
+    check(atomic_load(&latest_first_sample)==gap*20000000u/54000000u+(delay_wide?0:11) &&
+        atomic_load(&audio_first)==gap*20000000u/54000000u+(delay_wide?11:0),
+        "gap drops old buffered tails and reanchors both noninteger output grids");
+    gui_rf_preview_worker_destroy(w);
+cleanup:
+    atomic_store(&delay_wide_once,false);atomic_store(&delay_audio_once,false);
+    check(gui_rf_preview_worker_set_budget(1),"buffered ED fixture restores budget");
+}
+
+
+/* ED has a separate wide video converter. Muting must remove all narrow
+ * converter work, then discard buffered audio and reanchor its 20M cursor
+ * when enabled again, without resetting or replaying wide video. */
+static void test_ed_muted_frontend(void) {
+    check(gui_rf_preview_worker_set_budget(0),"muted ED front-end offline budget");
+    atomic_store(&delay_audio_once,true);
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(w!=NULL,"muted ED worker creation");if(!w)goto cleanup;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    const uint64_t origin=54002;
+    unsigned audio=atomic_load(&audio_calls);
+    check(submit_marker(w,54000000u,origin,20,true,201) && gui_rf_preview_worker_wait_idle(w,3000),
+        "ED narrow converter retains a deliberately buffered old audio tail");
+    check(atomic_load(&audio_calls)==audio,"old buffered tail has not produced audio");
+    unsigned narrow=atomic_load(&narrow_resample_calls),wide=atomic_load(&wide_resample_calls);
+    unsigned video=atomic_load(&process_calls),resets=atomic_load(&reset_calls);
+    gui_rf_preview_worker_set_audio_enabled(w,false);
+    check(submit_marker(w,54000000u,origin+32,20,false,203) && gui_rf_preview_worker_wait_idle(w,3000) &&
+        submit_marker(w,54000000u,origin+64,20,false,205) && gui_rf_preview_worker_wait_idle(w,3000),
+        "muted ED consumes only wide RF across consecutive blocks");
+    gui_rf_preview_stats_t stats;gui_rf_preview_worker_get_stats(w,&stats);
+    check(atomic_load(&narrow_resample_calls)==narrow && atomic_load(&wide_resample_calls)==wide+2 &&
+        atomic_load(&process_calls)==video+2 && atomic_load(&reset_calls)==resets &&
+        atomic_load(&audio_calls)==audio && !stats.audio_enabled,
+        "muting skips narrow resampling while preserving wide decode and controls");
+    unsigned narrow_resets=atomic_load(&narrow_reset_calls);
+    gui_rf_preview_worker_set_audio_enabled(w,true);
+    check(submit_marker(w,54000000u,origin+96,20,false,207) && gui_rf_preview_worker_wait_idle(w,3000),
+        "unmute restarts ED narrow conversion at fresh source RF");
+    check(atomic_load(&narrow_reset_calls)>narrow_resets && atomic_load(&audio_calls)==audio,
+        "unmute discarded the old pending tail and permits fresh converter buffering");
+    check(submit_marker(w,54000000u,origin+128,20,false,207) && gui_rf_preview_worker_wait_idle(w,3000),
+        "fresh buffered ED audio becomes available");
+    const uint64_t resumed=(origin+96)*20000000u/54000000u;
+    check(atomic_load(&audio_calls)==audio+1 && atomic_load(&audio_marker)==207 &&
+        atomic_load(&audio_first)==resumed && atomic_load(&audio_count)==23 &&
+        atomic_load(&audio_end)==resumed+23 && atomic_load(&reset_calls)==resets,
+        "audio resumes on its source-derived 20M clock without stale payload or video reset");
+    check(atomic_load(&latest_first_sample)==origin*20000000u/54000000u+47,
+        "muting and narrow converter buffering never alter the independent wide cursor");
+    gui_rf_preview_worker_set_audio_enabled(w,false);
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_BETAMAX_HIFI);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"muted ED to legacy profile applies");
+    narrow=atomic_load(&narrow_resample_calls);wide=atomic_load(&wide_resample_calls);
+    audio=atomic_load(&audio_calls);
+    check(submit_marker(w,40000000u,400000,21,true,209) && gui_rf_preview_worker_wait_idle(w,3000),
+        "muted legacy video still converts its narrow RF");
+    check(atomic_load(&narrow_resample_calls)==narrow+1 && atomic_load(&wide_resample_calls)==wide &&
+        atomic_load(&latest_first_sample)==200000 && atomic_load(&latest_video_count)==16 &&
+        atomic_load(&latest_video_marker)==209 && atomic_load(&audio_calls)==audio,
+        "narrow work is never skipped when it supplies legacy video");
+    gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"muted legacy to ED profile applies");
+    narrow=atomic_load(&narrow_resample_calls);
+    check(submit_marker(w,40000000u,400032,21,false,211) && gui_rf_preview_worker_wait_idle(w,3000),
+        "returning to muted ED resumes only wide video");
+    check(atomic_load(&narrow_resample_calls)==narrow && atomic_load(&latest_first_sample)==200016 &&
+        atomic_load(&latest_video_marker)==1211 && atomic_load(&audio_calls)==audio,
+        "profile transition retains muted ED conversion savings");
+    gui_rf_preview_worker_set_audio_enabled(w,true);
+    check(submit_marker(w,40000000u,400064,21,false,213) && gui_rf_preview_worker_wait_idle(w,3000),
+        "reenabling audio after muted profile changes");
+    check(atomic_load(&audio_calls)==audio+1 && atomic_load(&audio_marker)==213 &&
+        atomic_load(&audio_first)==200032 && atomic_load(&latest_first_sample)==200032,
+        "profile and mute changes resume only current audio on the correct clock");
+    gui_rf_preview_worker_destroy(w);
+cleanup:
+    atomic_store(&delay_audio_once,false);
+    check(gui_rf_preview_worker_set_budget(1),"muted ED fixture restores budget");
+}
+
+
+/* A flush callback holds the audio consumer after it captured its generation.
+ * New RF then advances both producer and video generations and queues a fresh
+ * audio slot. The consumer must refresh its old local generation, not discard
+ * that newly current slot as if it were stale. */
+static void test_ed_audio_generation_handoff(void) {
+    check(gui_rf_preview_worker_set_budget(0),"ED audio generation handoff offline budget");
+    gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);
+    check(w!=NULL,"ED audio generation handoff worker");if(!w)goto cleanup;
+    gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+    atomic_store(&audio_flush_entered,false);atomic_store(&hold_audio_flush,true);
+    gui_rf_preview_worker_set_audio_enabled(w,false);
+    gui_rf_preview_worker_set_audio_enabled(w,true);
+    uint64_t until=get_time_ms()+3000;
+    while(!atomic_load(&audio_flush_entered) && get_time_ms()<until) thrd_sleep_ms(1);
+    check(atomic_load(&audio_flush_entered),"audio consumer holds a captured generation during flush");
+    unsigned video=atomic_load(&process_calls),audio=atomic_load(&audio_calls);
+    check(submit_marker(w,40000000u,8000,22,true,219) && wait_calls(video+1),
+        "new ED source advances and enqueues audio while the old generation is held");
+    atomic_store(&hold_audio_flush,false);
+    check(gui_rf_preview_worker_wait_idle(w,3000),"ED generation handoff drains");
+    check(atomic_load(&audio_calls)==audio+1 && atomic_load(&audio_marker)==219 &&
+        atomic_load(&audio_first)==4000 && atomic_load(&audio_count)==16 && atomic_load(&audio_end)==4016,
+        "newest audio slot survives consumer generation refresh with its exact 20M clock");
+    gui_rf_preview_worker_destroy(w);
+cleanup:
+    atomic_store(&hold_audio_flush,false);
+    check(gui_rf_preview_worker_set_budget(1),"ED generation handoff restores budget");
+}
+
 int main(void) {
     atomic_init(&hold_process, false);
     atomic_init(&process_entered, false);
@@ -729,6 +977,10 @@ int main(void) {
     test_fast_block_handoffs();
     test_parallel_budget();
     test_superbeta_optional_audio();
+    test_ed_frontends();
+    test_ed_buffered_frontends(true);test_ed_buffered_frontends(false);
+    test_ed_muted_frontend();
+    test_ed_audio_generation_handoff();
     test_independent_audio(GUI_RF_PROFILE_NTSC_BETAMAX_HIFI);
     test_independent_audio(GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI);
     free(frame);

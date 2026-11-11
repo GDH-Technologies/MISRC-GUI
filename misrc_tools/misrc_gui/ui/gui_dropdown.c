@@ -13,6 +13,7 @@
 #include "../signal/gui_cvbs.h"
 #include "../output/gui_record.h"
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_transport.h"
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for ADC range
 #include <string.h>
 #include <stdatomic.h>
@@ -153,9 +154,14 @@ static bool handle_device_dropdown(gui_app_t *app) {
                     // never opens local hardware. The server's resulting state
                     // is mirrored back via /stats.
                     if (gui_net_is_client(app)) {
-                        app->selected_device = i;
-                        gui_net_client_request_device(app, i);
-                        gui_net_set_status(app, "Requested device change on server");
+                        if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                           gui_monitor_client_peer_state() == 2){
+                            gui_net_set_status(app,"Stop Server recording before changing device");
+                        }else{
+                            app->selected_device = i;
+                            gui_net_client_request_device(app, i);
+                            gui_net_set_status(app, "Requested device change on server");
+                        }
                     } else {
                         // Switch to a different device - stop current and start new
                         bool was_capturing = app->is_capturing;

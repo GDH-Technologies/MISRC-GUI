@@ -204,5 +204,9 @@ void rb_close(ringbuffer_t *rb) {
 #else
 	munmap(rb->buffer, rb->buffer_size);
 	munmap(rb->buffer+rb->buffer_size, rb->buffer_size);
+#if defined(__APPLE__)
+    close(rb->fd); /* release anonymous backing object after both mappings */
+    rb->fd = -1;
+#endif
 #endif
 }

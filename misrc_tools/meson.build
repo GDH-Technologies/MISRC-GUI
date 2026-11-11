@@ -5,7 +5,29 @@ project('MISRC', 'c',
         meson_version: '>=0.57')
 
 
-version_target = vcs_tag(command: ['git-version.sh'], fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+# Version string: git-version.py is the portable twin of git-version.sh.
+# Native-Windows meson/Python cannot execute a POSIX shell script, which left
+# local Windows builds on the 'unknown_version' fallback (v1.2.7 updater
+# false-positive class). Any Python that can run meson itself can run the
+# port; git-version.sh stays the source of truth for CI shell scripts.
+# NOTE: the interpreter path must be a plain STRING (full_path()). meson 0.61.2
+# (the ubuntu-22.04 runner's system meson: Linux AppImage + Android APK jobs)
+# does shutil.which(vcs_cmd[0]) in func_vcs_tag, which raises
+# "TypeError: expected str, bytes or os.PathLike object, not ExternalProgram"
+# when handed the program object -> meson setup dies (CI runs 40448680208+).
+# The script path must ALSO be absolute: meson converts files() to a path
+# relative to the BUILD dir, but vcstagger runs the command with
+# cwd=source_dir - the relative form only resolved by accident when the
+# build dir was a sibling of misrc_tools (build-local), never on CI.
+version_prog = find_program('python3', 'python', required: false, native: true)
+if version_prog.found()
+  version_target = vcs_tag(command: [version_prog.full_path(),
+                                     meson.current_source_dir() / 'git-version.py'],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+else
+  version_target = vcs_tag(command: ['git-version.sh'],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+endif
 
 warnings = [
   '-Wall',
@@ -454,6 +476,9 @@ if raylib_dep.found()
     'misrc_gui/core/gui_session.c',
     'misrc_gui/core/gui_capture_meta.c',
     'misrc_gui/net/gui_net_query.c',
+    # Release updater (releases page button + auto-patch manifest + confirmed
+    # self-update; unit-tested by test/gui_updater_test.c)
+    'misrc_gui/core/gui_updater.c',
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
@@ -483,6 +508,8 @@ if raylib_dep.found()
     'misrc_gui/processing/gui_rf_stream_marks.c',
     'misrc_gui/signal/gui_histogram.c',
     'misrc_gui/signal/gui_demod.c',
+    # Test Gen: on-demand PAL/NTSC/SECAM test signal (hacktv values)
+    'misrc_gui/signal/gui_testgen.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',
     'misrc_gui/visualization/gui_phosphor_rt.c',
@@ -508,6 +535,23 @@ if raylib_dep.found()
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
     'misrc_gui/net/gui_net_fanout.c',
+    'misrc_gui/net/gui_monitor_transport.c',
+    'misrc_gui/net/gui_monitor_audio.c',
+    'misrc_gui/net/gui_monitor_settings.c',
+    'misrc_gui/net/gui_monitor_local_save.c',
+    'misrc_gui/net/monitor_local_save_proxy.c',
+    'misrc_gui/net/monitor_local_save_files.c',
+    'misrc_gui/net/monitor_local_save_protocol.c',
+    'misrc_gui/net/gui_remote_fs.c',
+    'misrc_gui/net/gui_remote_display.c',
+    'misrc_gui/net/gui_monitor_video_wire.c',
+    'misrc_gui/net/gui_monitor_video_i420.c',
+    'misrc_gui/net/gui_monitor_video_framebox.c',
+    'misrc_gui/net/gui_monitor_video_codec.c',
+    'misrc_gui/net/gui_monitor_video_ffmpeg.c',
+    'misrc_gui/net/gui_monitor_video_mux.c',
+    'misrc_gui/net/gui_monitor_video_server.c',
+    'misrc_gui/net/gui_monitor_video_client.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_capture_sidecar.c',
@@ -555,14 +599,88 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_rtlsdr.c'
   endif
 
+  # M-Server/M-Client use Zstd-1 for original phosphor/FFT preview.
+  zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
+  gui_deps += [ zstd_dep ]
+  # Monitor & Remote Audio Mon streams 48 kHz / 10 ms Opus mono.
+  # Do not silently ship a client with a clickable but nonworking Audio Mon.
+  if not soxr_dep.found()
+    error('Monitor Opus audio requires libsoxr resampling (install libsoxr-dev).')
+  endif
+  opus_dep = dependency('opus', required: true,
+                        static: windows_static_deps or host_system == 'android')
+  gui_deps += [opus_dep]
+  message('MISRC Monitor & Remote Opus Audio Mon enabled')
+  # OpenH264 is mandatory for the Monitor Client's video feature. Do not
+  # silently produce an apparently successful GUI without H.264 support.
+  openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
+  if openh264_dep.found()
+    gui_deps += [openh264_dep]
+    # GUI is C, while the static OpenH264 archive uses the C++ runtime.
+    # Link the runtime AFTER OpenH264 to resolve RTTI/new/delete on MinGW
+    # and libc++ on Android. Unmodified builds stay C-only.
+    if windows_static_deps
+      # MSYS2 UCRT64/GCC uses libstdc++; CLANGARM64 uses libc++.
+      if host_cpu_family == 'aarch64'
+        gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+      else
+        gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+      endif
+    elif host_system == 'android'
+      gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    elif host_system == 'linux' or host_system == 'darwin'
+      # The vendored in-repo openh264 (third_party/openh264, built by
+      # scripts/build-deps-unix.sh) is a STATIC archive, so the link needs
+      # the C++ runtime (undefined __vmi_class_type_info vtable otherwise).
+      # Detect static-ness from the .pc libdir: a static install ships
+      # libopenh264.a next to openh264.pc; shared distro builds (CI's
+      # libopenh264-dev) do not, and stay C-only. libc++ on macOS,
+      # libstdc++ on Linux.
+      fs = import('fs')
+      openh264_libdir = openh264_dep.get_variable(pkgconfig: 'libdir', default_value: '')
+      openh264_is_static = openh264_libdir != '' and fs.is_file(join_paths(openh264_libdir, 'libopenh264.a'))
+      if openh264_is_static
+        if host_system == 'darwin'
+          gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+        else
+          gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+        endif
+      endif
+    endif
+    message('MISRC monitor H.264 video codec enabled')
+    openh264_define = '-DMISRC_HAVE_OPENH264=1'
+  else
+    error('Missing required dependency: OpenH264 (pkg-config: openh264). Install the development library before building misrc_gui (Ubuntu/Debian: sudo apt install libopenh264-dev; macOS: brew install openh264). Monitor Client video cannot work without it.')
+  endif
 
-  gui_cflags = cflags + [
+  # Optional modern codecs: link FFmpeg when its headers/libs are available.
+  # Existing Android and static Windows builds retain OpenH264 fallback.
+  modern_codecs = get_option('modern_monitor_codecs')
+  avcodec_dep = dependency('libavcodec', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  avutil_dep = dependency('libavutil', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  swscale_dep = dependency('libswscale', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  # Windows and Android CI link a minimal static FFmpeg built with just the
+  # required native AV1/VP9/HEVC decoders; no full MSYS2 dependency closure.
+  if not modern_codecs.disabled() and avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
+    gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
+    message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')
+  else
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=0'
+    message('MISRC monitor modern codecs unavailable; OpenH264 fallback active')
+  endif
+  gui_cflags = cflags + [openh264_define, ffmpeg_define] + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)
     '-funroll-loops',         # Unroll loops for better performance
     '-ftree-vectorize',       # Enable auto-vectorization
     '-ffast-math',            # Fast floating-point (safe for video/audio processing)
   ]
+  # Keep rlgl.h and phosphor shader syntax consistent with the vendored raylib
+  # OpenGL 2.1 build on Linux ARM64. Other platforms retain their existing path.
+  if host_system == 'linux' and host_cpu_family == 'aarch64'
+    gui_cflags += ['-DGRAPHICS_API_OPENGL_21']
+  endif
 
   # GUI doesn't need all the ldflags_capture (e.g., onecore conflicts with raylib's CloseWindow)
   gui_ldflags = ldflags
@@ -603,6 +721,9 @@ if raylib_dep.found()
     # DefWindowProc's modal loop blocked raylib's event poll)
     sources_gui += 'misrc_gui/core/gui_win32_modal.c'
     gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']
+    # oleaut32 for the cxadc-win WMI config path in gui_cxadc.c
+    # (VariantClear/SysFreeString on the ROOT\WMI IWbemServices calls)
+    gui_ldflags += ['-loleaut32']
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_v4l2.c'
@@ -623,6 +744,7 @@ if raylib_dep.found()
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
     gui_ldflags += ['-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,Security']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_avfoundation.m'
+    sources_gui += 'misrc_gui/input/gui_cxadc_macos.c'
   endif
 
   gui_includes = include_directories('misrc_gui/ui')
@@ -672,7 +794,9 @@ if raylib_dep.found()
                 c_args: gui_cflags,
                 install: true)
   else
-    executable('misrc_gui',
+    # Captured into misrc_gui_exe so the update_cli test can depend on the
+    # real built binary (it drives the headless update CLI end to end).
+    misrc_gui_exe = executable('misrc_gui',
                 sources_gui + gui_win_resources,
                 dependencies: gui_deps,
                 include_directories: gui_includes,
@@ -725,17 +849,50 @@ if raylib_dep.found()
     else
       settings_path_ldflags += ['-lm']
     endif
+    # gui_settings.c (included by the harness) calls gui_monitor_settings_copy
+    # since the M-Server/M-Client modes landed (bdcbb7a); link the real
+    # implementation instead of a stub. It is self-contained (libc only).
     settings_paths_test = executable('gui_settings_paths_test',
       ['test/gui_settings_paths_test.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/file_utils.c',
-       'common/ddd_protocol.c'],
+       'common/ddd_protocol.c', 'misrc_gui/net/gui_monitor_settings.c'],
       dependencies: overlay_test_deps, include_directories: gui_includes,
       c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
       override_options: ['b_lto=true', 'optimization=2'])
     test('gui_settings_paths', settings_paths_test)
+
+    # Release updater: manifest parse (flat JSON), {tag} asset URL building,
+    # semver compare + dev-tag fallback, tag extraction/safety, archive
+    # naming, and the no-network failure paths of the confirmed self-update
+    # pipeline (reserved-invalid host for the download step). Includes the
+    # production gui_updater.c directly (repo test pattern).
+    gui_updater_test = executable('gui_updater_test',
+      ['test/gui_updater_test.c'],
+      dependencies: overlay_test_deps, include_directories: gui_includes,
+      c_args: cflags, link_args: settings_path_ldflags,
+      override_options: ['b_lto=true', 'optimization=2'])
+    test('gui_updater', gui_updater_test)
+
+    # Update CLI end-to-end test: drives the REAL built misrc_gui binary
+    # through the headless update flags (--check-update / --update-dry-run /
+    # --install-update --yes) against a local test server that serves the
+    # manifest, the releases/latest redirect and the asset zip, with an
+    # isolated HOME. Asserts the key: value output, the --install-update
+    # refusal without --yes, and the full install (old binary archived by
+    # rename, payload replaced). Loopback http only - gui_updater's URL
+    # scheme rule allows exactly that for this test.
+    if path_test_python.found()
+      test('update_cli', path_test_python,
+        args: [files('test/update_cli_test.py'), misrc_gui_exe.full_path()],
+        depends: [misrc_gui_exe])
+    endif
     if flac_dep.found()
+      # gui_record.c writes through the mls_proxy_* API since bdcbb7a; the
+      # CPU-only harnesses link the stdio-passthrough stub (never the networked
+      # local-save stack). Same rule as gui_playback_audio_stub.c.
       record_paths_test = executable('gui_record_paths_test',
         # GDH fork: the fork's FLAC finalize lives in common/flac_writer.c.
-        ['test/gui_record_paths_test.c', 'common/file_utils.c', 'common/flac_writer.c', version_target],
+        ['test/gui_record_paths_test.c', 'common/file_utils.c', 'common/flac_writer.c', version_target,
+         'test/monitor_local_save_stub.c'],
         dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
         c_args: cflags + ['-fwhole-program'], link_args: ldflags,
         override_options: ['b_lto=true', 'optimization=2'])
@@ -744,9 +901,13 @@ if raylib_dep.found()
 
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
+    # gui_ui.c's timeline name budget reads the selected playback file info
+    # (gui_playback_get_selected_file_info): satisfied by the info stub TU
+    # (NOT the audio stub - the playback harnesses compile the real
+    # gui_playback.c and would collide).
     stats_layout_test = executable('gui_stats_layout_test',
       ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c',
-       'common/file_utils.c', version_target],
+       'common/file_utils.c', 'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -766,7 +927,8 @@ if raylib_dep.found()
 
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
-      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -775,7 +937,8 @@ if raylib_dep.found()
     test('gui_toolbar_layout', toolbar_layout_test)
 
     viewport_layout_test = executable('gui_viewport_layout_test',
-      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -821,7 +984,8 @@ if raylib_dep.found()
       test('gui_playback_resolve', playback_resolve_test)
     endif
     rf_input_stamps_test = executable('gui_rf_input_stamps_test',
-      'test/gui_rf_input_stamps_test.c',
+      ['test/gui_rf_input_stamps_test.c', 'test/monitor_local_save_stub.c',
+       'common/file_utils.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -836,6 +1000,13 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_rf_routes', rf_routes_test)
+
+    rf_geometry_test = executable('gui_rf_preview_geometry_test',
+      'test/gui_rf_preview_geometry_test.c',
+      c_args: cflags,
+      dependencies: [meson.get_compiler('c').find_library('m', required: false)],
+    )
+    test('gui_rf_preview_geometry', rf_geometry_test)
 
     # Synthetic baseband composite contracts for the ported CVBS profile +
     # VBI sync model + burst-locked colour (gui_cvbs.c included directly,
@@ -856,6 +1027,10 @@ if raylib_dep.found()
     )
     test('gui_cvbs_baseband', cvbs_baseband_test)
 
+    # gui_audio.c (included by both harnesses) redirects stdio through the
+    # mls_proxy_* macros; the harnesses already self-define those (their own
+    # file_open_utf8 stubs get renamed by the macro). The only extra symbol
+    # is gui_monitor_server_active (stubbed inside each harness).
     audio_hifi_monitor_test = executable('gui_audio_hifi_monitor_test',
       'test/gui_audio_hifi_monitor_test.c',
       dependencies: overlay_test_deps + [dependency('threads')],
@@ -912,6 +1087,7 @@ if raylib_dep.found()
       # s16le RF and an output directory, so it is not a default CI test.
       rf_reconnect_sources = [
         'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
+        'test/monitor_local_save_stub.c',
         'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
@@ -983,6 +1159,19 @@ rf_decoder_test = executable('gui_rf_preview_test',
   ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_preview', rf_decoder_test, timeout: 120)
+rf_secam_test = executable('gui_rf_secam_test',
+  ['test/gui_rf_secam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_secam', rf_secam_test, timeout: 60)
+rf_mesecam_test = executable('gui_rf_mesecam_test',
+  ['test/gui_rf_mesecam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_mesecam', rf_mesecam_test, timeout: 180)
+rf_testgen_test = executable('gui_testgen_rf_test',
+  ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_rf_preview.c',
+   'misrc_gui/signal/gui_testgen.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_testgen_rf', rf_testgen_test, timeout: 120)
 rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
@@ -1157,3 +1346,26 @@ beta_hifi_state_test = executable('gui_beta_hifi_state_test',
   'test/gui_beta_hifi_state_test.c',
   c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
 test('gui_beta_hifi_state', beta_hifi_state_test)
+
+if host_system == 'darwin'
+  macos_ringbuffer_test = executable('macos_ringbuffer_test',
+    ['test/macos_ringbuffer_test.c', 'common/ringbuffer.c'], c_args: cflags)
+  test('macos_ringbuffer', macos_ringbuffer_test)
+endif
+
+cxadc_samples_test = executable('cxadc_samples_test', 'test/cxadc_samples_test.c', c_args: cflags)
+test('cxadc_samples', cxadc_samples_test)
+
+
+# Monitor Opus frame header: exact byte layout / length validation (no dependencies).
+monitor_audio_wire_test = executable('gui_monitor_audio_wire_test',
+  'test/gui_monitor_audio_wire_test.c', c_args: cflags)
+test('gui_monitor_audio_wire', monitor_audio_wire_test)
+
+# Monitor & Remote-only audio level metadata: exercise the production JSON
+# parser with current, legacy, incomplete and invalid status snapshots.
+if host_system != 'android'
+  monitor_audio_levels_test = executable('gui_monitor_audio_levels_test',
+    'test/gui_monitor_audio_levels_test.c', c_args: cflags)
+  test('gui_monitor_audio_levels', monitor_audio_levels_test)
+endif

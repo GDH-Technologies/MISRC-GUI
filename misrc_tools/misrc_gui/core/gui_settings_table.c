@@ -263,9 +263,12 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
     settings->video_system = 0;
 
+    // Test Gen default tape format: VHS (0=VHS..4=Hi8).
+    settings->gen_tape_format = 0;
+
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
-    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
+    settings->net_mode = 0;                     // 0=Local, 1=unified Server, 2=Client, 3=old Server ID, 4=M-Client
     settings->net_server_port = 8080;
     snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
              (unsigned)settings->net_server_port);
@@ -274,6 +277,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     snprintf(settings->net_client_port_str, sizeof(settings->net_client_port_str), "%u",
              (unsigned)settings->net_client_port);
     settings->net_client_record_local = false;  // a client's Record drives the server's
+    settings->monitor_local_save_path[0] = '\0';
+    settings->monitor_local_save_enabled = false;
 }
 
 /* ============================================================================
@@ -825,7 +830,7 @@ static bool hook_net_mode(const gui_setting_desc_t *d, gui_settings_t *s, const 
     long long ll;
     if (!parse_int_text(value, strict, &ll, err, errcap)) return false;
     int mode = (int)ll;
-    if (mode < 0 || mode > 2) mode = 0;
+    if (mode < 0 || mode > 4) mode = 0;
     s->net_mode = mode;
     (void)d;
     return true;
@@ -920,15 +925,32 @@ static bool hook_rf_preview_budget(const gui_setting_desc_t *d, gui_settings_t *
     return true;
 }
 
-/* CVBS System selector: 0=PAL, 1=NTSC, 2=SECAM (gui_cvbs_set_format's space). */
+/* CVBS System selector: 0=PAL, 1=NTSC, 2=SECAM (gui_cvbs_set_format's space).
+ * The generator Gen box may store 3 = MESECAM (RF-only; composite maps it to
+ * SECAM). */
 static bool hook_video_system(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
                               bool strict, char *err, size_t errcap) {
     long long v;
     if (!parse_int_text(value, strict, &v, err, errcap)) return false;
-    if (v >= 0 && v <= 2) {
+    if (v >= 0 && v <= 3) {
         s->video_system = (int)v;
     } else if (strict) {
-        set_err(err, errcap, "expected 0 (PAL), 1 (NTSC) or 2 (SECAM)");
+        set_err(err, errcap, "expected 0 (PAL), 1 (NTSC), 2 (SECAM) or 3 (MESECAM)");
+        return false;
+    }
+    (void)d;
+    return true;
+}
+
+/* Test Gen tape format family: 0=VHS .. 4=Hi8; an invalid saved value keeps VHS. */
+static bool hook_gen_tape_format(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                                 bool strict, char *err, size_t errcap) {
+    long long v;
+    if (!parse_int_text(value, strict, &v, err, errcap)) return false;
+    if (v >= 0 && v <= 4) {
+        s->gen_tape_format = (int)v;
+    } else if (strict) {
+        set_err(err, errcap, "expected 0 (VHS) to 4 (Hi8)");
         return false;
     }
     (void)d;
@@ -1139,6 +1161,12 @@ static const gui_setting_desc_t s_table[] = {
     /* GDH fork: where the record path spills on overflow. A path on this
      * machine's own disk, so a net client keeps its own. */
     GS_S  ("record_spill_dir",                record_spill_dir,           GS_LOCAL),
+    /* upstream v1.2.7: the Test Gen tape format and the M-Client Local Save
+     * target. All three describe this machine (its generator, its disk), and
+     * upstream never syncs the Local Save pair to a server. */
+    GS_IH ("gen_tape_format",                 gen_tape_format,            GS_LOCAL, hook_gen_tape_format),
+    GS_S  ("monitor_local_save_path",         monitor_local_save_path,    GS_LOCAL),
+    GS_B  ("monitor_local_save_enabled",      monitor_local_save_enabled, GS_LOCAL),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

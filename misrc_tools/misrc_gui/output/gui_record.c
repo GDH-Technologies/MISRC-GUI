@@ -1,3 +1,4 @@
+#include "../input/gui_cxadc_macos.h"
 /*
  * MISRC - hsdaoh-rp2350 GUI - Recording Module
  *
@@ -12,6 +13,9 @@
 #include "gui_cc_record.h"
 #include "gui_capture_sidecar.h"
 #include "../input/gui_preview_v4l2.h"
+#include "../net/monitor_local_save_proxy.h"
+#include "../net/gui_monitor_local_save.h"
+#include "../net/gui_net.h" /* GUI_NET_MODE_MONITOR_SERVER */
 #include "../core/gui_app.h"
 #include "../core/gui_capture_meta.h"
 #include "../processing/gui_extract.h"
@@ -80,6 +84,15 @@
 #include "FLAC/metadata.h"
 #endif
 
+/* All output FILE* are either genuine stdio streams or M-Client proxies;
+ * only Local Save causes the latter to be used. */
+#define fwrite mls_proxy_write
+#define fclose mls_proxy_close
+#define fflush mls_proxy_flush
+#define ferror mls_proxy_error
+#define clearerr mls_proxy_clearerr
+#define file_open_utf8 mls_proxy_open
+
 // Buffer sizes
 #define BUFFER_READ_SIZE 65536
 #define GUI_RECORD_PATH_MAX (FILE_PATH_MAX + MAX_FILENAME_LEN)
@@ -95,7 +108,7 @@
 
 static void gui_record_set_output_buffer(FILE *fp) {
     if (fp) {
-        (void)setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
+        (void)mls_proxy_setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
     }
 }
 
@@ -273,7 +286,7 @@ static void gui_record_get_os_string(char *dst, size_t dst_len) {
 static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_bytes_out);
 
 bool gui_record_get_output_free_space_bytes(const gui_app_t *app, uint64_t *free_bytes_out) {
-    if (!app || !free_bytes_out || !app->settings.output_path[0]) {
+    if (!app || !free_bytes_out || (!app->settings.output_path[0] && !gui_monitor_local_save_recording())) {
         return false;
     }
     return gui_record_get_free_space_bytes(app->settings.output_path, free_bytes_out);
@@ -1979,6 +1992,8 @@ bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,
     if (!app || !ses || ses->app != app || !app->is_recording) {
         return false;
     }
+    /* Client-owned files: the server's disk free space is irrelevant. */
+    if(gui_monitor_local_save_recording())return false;
 
     if (atomic_load(&s_disk_guard_tripped)) {
         return true;
@@ -2229,6 +2244,7 @@ static const char *raw_ext_for_bits(uint8_t bits, bool direct_native) {
 // (capture log) and gui_record_start_confirmed (writer/tap selection) so all
 // three always agree with the on-disk content.
 static bool gui_record_direct_channel_eligible(const gui_app_t *app, int channel) {
+    if(gui_monitor_local_save_recording())return false;
     if (!app || app->settings.use_flac) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     if (app->devices[app->selected_device].type != DEVICE_TYPE_CXADC) return false;
@@ -2251,6 +2267,15 @@ static bool gui_record_direct_channel_eligible(const gui_app_t *app, int channel
 // stop has handed the session to finalize (s_active == NULL by then).
 static void gui_record_direct_set_write_error_cb(void *user, int channel, bool active) {
     gui_record_session_t *ses = (gui_record_session_t *)user;
+#if defined(__APPLE__)
+    /* upstream v1.2.7: a write error on the native macOS CXADC backend stops
+     * the capture. user is the session here, never the app. */
+    if (active && gui_cxadc_macos_active() && ses && ses->app) {
+        gui_cxadc_macos_mark_failed();
+        atomic_store(&ses->app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
+        atomic_store(&ses->app->dropout_stop_requested, true);
+    }
+#endif
     if (ses && channel >= 0 && channel < GUI_RECORD_CHANNELS) {
         atomic_store(&ses->write_error[channel], active);
     }
@@ -2280,7 +2305,16 @@ static void gui_record_direct_report_drop(int card, uint32_t frame_index, size_t
     const gui_record_session_t *ses = (const gui_record_session_t *)ctx->cb.user;
     gui_app_t *app = ses ? ses->app : NULL;
     if (!app) return;
-    if (app->settings.stop_on_dropout && !atomic_load(&app->dropout_stop_requested)) {
+#if defined(__APPLE__)
+    /* upstream v1.2.7: the native macOS CXADC backend cannot recover from a
+     * lost direct block, so it always stops. */
+    if (gui_cxadc_macos_active()) gui_cxadc_macos_mark_failed();
+#endif
+    if ((app->settings.stop_on_dropout
+#if defined(__APPLE__)
+         || gui_cxadc_macos_active()
+#endif
+        ) && !atomic_load(&app->dropout_stop_requested)) {
         atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
         atomic_store(&app->dropout_stop_requested, true);
     }
@@ -3033,7 +3067,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
                              "Audio 1", "Audio 2", "Audio 3", "Audio 4",
                              "Video", "Captions" };
     bool directory = false;
-    if (!file_path_info_utf8(app->settings.output_path, NULL, &directory) || !directory) {
+    if (!gui_monitor_local_save_recording() && (!file_path_info_utf8(app->settings.output_path, NULL, &directory) || !directory)) {
         gui_app_set_status(app, "Output directory does not exist or cannot be read");
         return false;
     }
@@ -3058,7 +3092,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
             return false;
         }
         uint64_t bytes = 0;
-        if (file_path_info_utf8(path, &bytes, &directory)) {
+        if (!gui_monitor_local_save_recording() && file_path_info_utf8(path, &bytes, &directory)) {
             if (directory) {
                 gui_app_set_status(app, "Output filename refers to a directory");
                 return false;
@@ -4091,6 +4125,14 @@ int gui_record_name_test_main(void)
 }
 
 int gui_record_start(gui_app_t *app) {
+#if defined(__APPLE__)
+    if(gui_cxadc_macos_active() && (app->settings.use_flac || app->settings.enable_resample_a ||
+        app->settings.rf_bits_a!=8 || app->settings.capture_b || app->settings.enable_audio_4ch || app->settings.enable_audio_2ch_12 ||
+        app->settings.enable_audio_2ch_34 || app->settings.enable_audio_1ch[0] || app->settings.enable_audio_1ch[1] ||
+        app->settings.enable_audio_1ch[2] || app->settings.enable_audio_1ch[3])) {
+        gui_app_set_status(app,"macOS CXADC recording requires RAW8 channel A, no resampling or audio");return -1;
+    }
+#endif
 
     (void)gui_record_collect_finalize_if_done();
 
@@ -4174,6 +4216,17 @@ int gui_record_start(gui_app_t *app) {
     // popup. Required for unattended automated runs (--headless-record), where
     // the popup would stall the run forever.
     if (existing_count && !app->settings.overwrite_files) {
+        /* Headless Server never enters the GUI frame loop which consumes
+         * overwrite popup results.  Do not leave this request pending forever,
+         * and never overwrite files without explicit permission. */
+        if (app->headless_server) {
+            gui_app_set_status(app, "Recording blocked: output file exists; use a unique name or enable overwrite");
+            fprintf(stderr,
+                    "[RECORD] Headless recording refused: %u output file(s) already exist. "
+                    "Set a new output base name, enable timestamped names, or explicitly enable overwrite_files.\n",
+                    existing_count);
+            return RECORD_ERROR;
+        }
         char message[512];
         snprintf(message, sizeof(message),
                  "%u existing output file(s) will be overwritten:\n\n%s",
@@ -4186,7 +4239,11 @@ int gui_record_start(gui_app_t *app) {
     }
 
     // No files exist, start recording directly
-    return gui_record_start_confirmed(app);
+    int native_record_result=gui_record_start_confirmed(app);
+#if defined(__APPLE__)
+    if(native_record_result==0)gui_cxadc_macos_log(app);
+#endif
+    return native_record_result;
 }
 
 // Check popup result and continue recording if confirmed
@@ -4212,7 +4269,12 @@ void gui_record_check_popup(gui_app_t *app) {
 
     if (result == POPUP_RESULT_YES) {
         // User confirmed, start recording
-        gui_record_start_confirmed(app);
+        int result=gui_record_start_confirmed(app);
+#if defined(__APPLE__)
+        if(result==0)gui_cxadc_macos_log(app);
+#else
+        (void)result;
+#endif
     } else {
         // User cancelled
         gui_app_set_status(app, "Recording cancelled");

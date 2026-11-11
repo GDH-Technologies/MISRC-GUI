@@ -1,3 +1,4 @@
+#include "../net/gui_monitor_settings.h"
 /*
  * MISRC GUI - Settings Persistence
  * 16/02/25 - Remediate Win settings not saving - %appdata%
@@ -262,8 +263,16 @@ const char* gui_settings_get_desktop_path(void) {
     return desktop_path;
 }
 
+/* Preserve local capture preferences: remote M-Server fields must never be
+ * persisted over the Windows user's independent Local/Client profile. */
+static gui_settings_t s_monitor_local_profile;
+static bool s_monitor_local_profile_valid=false;
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
+void gui_settings_restore_monitor_profile(gui_settings_t *settings){
+    if(settings && s_monitor_local_profile_valid)
+        gui_monitor_settings_copy(settings,&s_monitor_local_profile);
+}
 void gui_settings_save(const gui_settings_t *settings) {
     if (!settings) return;
     if (gui_settings_save_suspended()) {
@@ -272,6 +281,16 @@ void gui_settings_save(const gui_settings_t *settings) {
         return;
     }
 
+    gui_settings_t persisted;
+    if(settings->net_mode==4 && s_monitor_local_profile_valid){
+        persisted=*settings;
+        gui_monitor_settings_copy(&persisted,&s_monitor_local_profile);
+        settings=&persisted;
+    }else if(settings->net_mode!=4){
+        gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+        s_monitor_local_profile_valid=true;
+    }
+    
     const char* path = get_settings_file_path();
     if (!gui_settings_ensure_parent_dirs(path)) {
         return;
@@ -352,10 +371,10 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
             IFileOpenDialog_GetOptions(pfd, &options);
             IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
         } else {
-            COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
+            COMDLG_FILTERSPEC filter = { L"FLAC / LDF files", L"*.flac;*.ldf;*.oga;*.ogg" };
             IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
         }
-        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC playback file");
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC / LDF playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
@@ -375,7 +394,7 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #ifdef __APPLE__
     const char *cmd = folder
         ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
-        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC / LDF playback file\")'";
 #else
     const char *cmd = folder
         ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
@@ -383,9 +402,9 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
           "elif command -v kdialog >/dev/null 2>&1; then "
           "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
         : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
-          "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
+          "zenity --file-selection --title=\"Select FLAC / LDF playback file\" --file-filter=\"*.flac *.ldf *.oga *.ogg\"; "
           "elif command -v kdialog >/dev/null 2>&1; then "
-          "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; fi'";
+          "kdialog --getopenfilename \"$HOME\" \"*.flac *.ldf *.oga *.ogg|FLAC / LDF files\"; fi'";
 #endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -420,6 +439,9 @@ void gui_settings_load(gui_settings_t *settings) {
     // Start with defaults
     gui_settings_init_defaults(settings);
 
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
+    
     const char* path = get_settings_file_path();
     FILE* f = file_open_utf8(path, "rb");
     if (!f) return; // No settings file, use defaults
@@ -452,6 +474,8 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Parse values (every key the table knows), then the post-load migrations.
     gui_settings_parse_text(settings, content);
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
 
     free(content);
 }

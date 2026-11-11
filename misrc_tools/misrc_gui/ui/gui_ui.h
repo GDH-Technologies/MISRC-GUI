@@ -135,6 +135,8 @@ typedef enum {
     UI_TEXT_FIELD_NONE = 0,
     UI_TEXT_FIELD_OUTPUT_BASE_NAME,
     UI_TEXT_FIELD_OUTPUT_PATH,
+    UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,      // upstream v1.2.7: M-Client Local Save folder
+    UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,  // upstream v1.2.7: M-Client server folder browser
     UI_TEXT_FIELD_FLAC_AFFINITY,
     UI_TEXT_FIELD_RF_TAG_A,
     UI_TEXT_FIELD_RF_TAG_B,

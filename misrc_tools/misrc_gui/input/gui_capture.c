@@ -6,6 +6,9 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <time.h>
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +28,7 @@
 #include "gui_cxadc.h"
 #include "../visualization/gui_preview_panel.h"
 #include "gui_preview_v4l2.h"
+#include "gui_cxadc_macos.h"
 #ifdef ENABLE_FX3
 #include "gui_fx3.h"
 #endif
@@ -39,6 +43,7 @@
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"
 #include "../signal/gui_demod.h"
+#include "../signal/gui_testgen.h"
 #ifdef ENABLE_RTLSDR
 #include "gui_rtlsdr.h"
 #endif
@@ -47,6 +52,9 @@
 #include "../net/gui_net.h"
 #include "../core/gui_capture_meta.h"
 #include "../ui/gui_popup.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_audio.h"
+#include "../net/gui_remote_display.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
 #if defined(_WIN32)
@@ -1038,6 +1046,15 @@ void gui_capture_callback(void *data_info_ptr) {
                            &meta, buf_out, buf_out_audio,
                            capture_handler_audio_filter, &s_capture_handler);
 
+    /* MISRC-M/2 remote Audio Mon. Upstream reaches this through
+     * gui_net_tap_audio(); the fork's legacy /rf + /baseband feed goes through
+     * the buffer-manager write tap instead, so the monitor tap is called here
+     * directly, like the other backends do. It never waits or encodes here.
+     * Read before the commit, while this writer still owns the bytes. */
+    if (buf_out_audio && result.stream1_bytes > 0 && gui_monitor_server_active()) {
+        gui_monitor_audio_server_tap(app, buf_out_audio, result.stream1_bytes);
+    }
+
     bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, result.stream0_bytes);
     if (buf_out_audio) {
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, result.stream1_bytes);
@@ -1084,19 +1101,36 @@ static inline void gui_upstream_mark_synced(gui_app_t *app)
 }
 
 
+/* glfwGetTime() requires GLFW initialization. The headless server never
+ * creates a window, so use CLOCK_MONOTONIC only for that launch mode. */
+static atomic_bool s_headless_runtime = ATOMIC_VAR_INIT(false);
+void gui_runtime_set_headless(bool enabled) { atomic_store(&s_headless_runtime, enabled); }
+double gui_runtime_time(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (atomic_load(&s_headless_runtime)) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+            return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+    }
+#endif
+    return GetTime();
+}
+
 // Initialize application
 void gui_app_init(gui_app_t *app) {
     // Initialize panel registry and register all panel types
     // This must happen before any panel state is created
-    panel_registry_init();
-    gui_waveform_panel_register();
-    gui_fft_panel_register();
-    gui_cvbs_panel_register();
-    gui_histogram_panel_register();
-    gui_waterfall_panel_register();
-    gui_spectrograph_panel_register();
-    gui_demod_panel_register();
-    gui_preview_panel_register();
+    if (!app->headless_server) {
+        panel_registry_init();
+        gui_waveform_panel_register();
+        gui_fft_panel_register();
+        gui_cvbs_panel_register();
+        gui_histogram_panel_register();
+        gui_waterfall_panel_register();
+        gui_spectrograph_panel_register();
+        gui_demod_panel_register();
+        gui_preview_panel_register();
+    }
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
@@ -1107,6 +1141,15 @@ void gui_app_init(gui_app_t *app) {
     // Initialize simulated device state
     app->sim_thread = NULL;
     atomic_store(&app->sim_running, false);
+
+    // Initialize RF transport diagnostics before UI and network worker access.
+    atomic_store(&app->net_rf_server_stream_drops, 0);
+    atomic_store(&app->net_rf_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_stream_drops, 0);
+    atomic_store(&app->net_audio_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_client_stream_live, false);
 
     // Initialize playback device state
     atomic_store(&app->playback_running, false);
@@ -1191,8 +1234,8 @@ void gui_app_init(gui_app_t *app) {
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
-    app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
-    app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
 
     // Set phosphor config (render textures are created lazily on first use)
     if (app->phosphor_a) {
@@ -1215,8 +1258,8 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.split = true;
     app->panel_config_a.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_a.right_view = PANEL_VIEW_FFT;
-    app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     app->panel_config_a.left_source = 0;
     app->panel_config_a.right_source = 0;
@@ -1224,8 +1267,8 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
-    app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
     app->panel_config_b.left_source = 1;
     app->panel_config_b.right_source = 1;
 
@@ -1247,7 +1290,7 @@ void gui_app_init(gui_app_t *app) {
     gui_extract_prepare_stream(app);
 
     // Initialize display thread (allocated, started on capture start)
-    app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
+    if (!app->headless_server) app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
         if (gui_display_thread_init(app->display_thread) != 0) {
             fprintf(stderr, "Failed to initialize display thread state\n");
@@ -1269,8 +1312,12 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->net_cmd_record_off, false);
     atomic_store(&app->net_cmd_select_device, false);
     atomic_store(&app->net_cmd_device_index, 0);
+    atomic_store(&app->net_cmd_monitor_select_device, false);
+    atomic_store(&app->net_cmd_monitor_device_index, -1);
+    atomic_store(&app->net_cmd_monitor_record, 0);
     atomic_store(&app->net_connected, false);
     atomic_store(&app->net_error, false);
+    atomic_store(&app->net_reenumerate_pending, false);
     gui_net_init_globals();
     // Stock loadup is always Local (net_mode is a per-session setting, NOT
     // resumed from saved settings) so a restart never auto-resumes a
@@ -1278,7 +1325,7 @@ void gui_app_init(gui_app_t *app) {
     // Server/Client from the info page each session.
     // EXCEPTION: when launched with --config <path> (automated testing),
     // respect the config's net_mode instead of forcing Local.
-    if (!gui_settings_override_active()) {
+    if (!gui_settings_override_active() && !app->headless_server) {
         app->settings.net_mode = GUI_NET_MODE_LOCAL;
         gui_settings_save(&app->settings);
     }
@@ -1359,7 +1406,7 @@ void gui_app_cleanup(gui_app_t *app) {
     panel_config_cleanup(&app->panel_config_b);
 
     // Cleanup oscilloscope static resources
-    gui_oscilloscope_cleanup();
+    if (!app->headless_server) gui_oscilloscope_cleanup();
 
     // Cleanup display thread
     if (app->display_thread) {
@@ -1538,6 +1585,14 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     // MISRC Clockgen entries are offered (the clockgen drives either backend).
     bool misrc_clockgen_audio_present = gui_cxadc_detect_misrc_clockgen_audio();
 
+#if defined(__APPLE__)
+    for(int i=0;i<cxadc_card_count && app->device_count<MAX_DEVICES;i++) {
+        device_info_t *dst=&app->devices[app->device_count++];
+        snprintf(dst->name,sizeof(dst->name),"[CXADC] %s",gui_cxadc_macos_name(i));
+        snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_%d",i);
+        dst->type=DEVICE_TYPE_CXADC;dst->index=1;
+    }
+#else
     if (cxadc_card_count > 1) {
         if (app->device_count < MAX_DEVICES) {
             device_info_t *dst = &app->devices[app->device_count];
@@ -1555,6 +1610,8 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         dst->index = 1;
         app->device_count++;
     }
+
+#endif
 
     // MISRC Clockgen entry: own device type, own marker serial. Offered whenever
     // the MISRC clockgen USB-audio endpoint is present (audio-only rigs have 0
@@ -1639,6 +1696,7 @@ static void gui_capture_flush_upstream_audio_pairs(gui_app_t *app)
             }
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, interleaved_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,interleaved_len);
         }
 
         gui_capture_pop_upstream_audio(&s_upstream_audio1_queue);
@@ -1840,6 +1898,7 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, padded_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,padded_len);
         }
         
         if (data_info->srate > 0) {
@@ -1909,6 +1968,15 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
     if (!app || gui_playback_is_starting(app)) {
         return -1;
     }
+    /* M-Server owns the local capture hardware and publishes extracted samples
+     * through the independent monitor preview transport. M-Client must not
+     * open hardware: queue a command for the verified M-Server instead.
+     * Keep Harry's existing Local/Server/Client paths unchanged. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        gui_net_client_request_start(app);
+        gui_net_set_status(app, "Monitor & Remote: requested capture start on Server");
+        return 0;
+    }
 
     // Client mode (network slave): forward the request to the server instead
     // of opening local hardware. The worker thread drains the flag and sends
@@ -1970,6 +2038,10 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
         int sim_rc = gui_simulated_start(app);
         if (sim_rc == 0) {
             gui_capture_hold_power_assertions();
+            // Default the waveform monitors to the generator's channel
+            // mapping (CH1 CVBS / CH2 FM RF) without overwriting any
+            // user signal-type selections.
+            gui_waveform_apply_generator_defaults(app);
         }
         return sim_rc;
     }
@@ -2006,7 +2078,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
                      prev_runtime_mode ? "MISRC" : "HSDAOH",
                      app->capture_mode_runtime_misrc ? "MISRC" : "HSDAOH",
                      app->user_capture_mode_misrc ? "MISRC" : "HSDAOH");
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2054,7 +2126,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
             // is sent (done inside gui_fx3_start), so the 5s grace period must
             // begin here, not at app init. Without this, capture_start_time stays
             // 0 and the watchdog reaps the session within 2s -> connect loop.
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2094,7 +2166,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
         }
         int rtl_rc = gui_rtlsdr_start(app);
         if (rtl_rc == 0) {
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2165,7 +2237,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
             // Same watchdog fix as FX3: capture_start_time must be set here or
             // the auto-reconnect watchdog fires within 2s (DdD streams
             // immediately on bulk submit, but the grace baseline still matters).
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2470,7 +2542,7 @@ windows_mf_open_hid:
         // immediate false timeout -> disconnect -> reconnect cycle.
         atomic_store(&app->last_callback_time_ms, get_time_ms());
         app->is_capturing = true;
-        app->capture_start_time = GetTime();
+        app->capture_start_time = gui_runtime_time();
         app->reconnect_pending = false;
         app->reconnect_attempts = 0;
 
@@ -2835,7 +2907,10 @@ void gui_app_stop_capture(gui_app_t *app) {
 // the oldest data when the link cannot keep up. A local recording that is
 // already running stays in charge until it stops, whatever the setting says.
 static bool gui_app_client_records_here(const gui_app_t *app) {
+    /* Legacy Client only: an M-Client has no /rf feed to record from, and
+     * gui_net_is_client() is true for it since upstream v1.2.7. */
     return gui_net_is_client(app) &&
+           app->settings.net_mode == GUI_NET_MODE_CLIENT &&
            (app->is_recording || app->settings.net_client_record_local);
 }
 
@@ -2898,8 +2973,18 @@ void gui_app_service_local_record_request(gui_app_t *app) {
     }
 }
 
+/* upstream v1.2.7's M-Client (Monitor & Remote): gui_net_is_client() is true
+ * there too, but its server state comes from the MISRC-M/2 status, not the
+ * legacy client's mirror. peer_state: 0 idle, 1 capturing, 2 recording. */
+static int gui_app_monitor_client_peer_state(const gui_app_t *app) {
+    if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT) return -1;
+    return gui_monitor_client_connected() ? gui_monitor_client_peer_state() : 0;
+}
+
 bool gui_app_effective_recording(const gui_app_t *app) {
     if (!app) return false;
+    int m_state = gui_app_monitor_client_peer_state(app);
+    if (m_state >= 0) return m_state == 2;
     if (gui_app_client_records_here(app)) return app->is_recording;
     if (gui_net_is_client(app)) return gui_net_client_peer_recording(app);
     return app->is_recording;
@@ -2907,6 +2992,8 @@ bool gui_app_effective_recording(const gui_app_t *app) {
 
 bool gui_app_control_capturing(const gui_app_t *app) {
     if (!app) return false;
+    int m_state = gui_app_monitor_client_peer_state(app);
+    if (m_state >= 0) return m_state >= 1;
     if (gui_net_is_client(app)) return gui_net_client_peer_capturing(app);
     return app->is_capturing;
 }
@@ -3009,6 +3096,22 @@ void gui_app_update_vu_meters(gui_app_t *app, float dt) {
     uint16_t peak_b_pos = atomic_load(&app->peak_b_pos);
     uint16_t peak_b_neg = atomic_load(&app->peak_b_neg);
 
+    /* Monitor & Remote receives no raw RF samples. The preview already
+     * carries the server's bipolar 12-bit peaks; use them instead of the
+     * local (always zero) extraction atomics. Preserve normal VU smoothing,
+     * peak hold and normalization below. If disconnected or capture is idle,
+     * the preview mailbox is invalid and the levels decay back to zero. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        uint16_t remote_peaks[2][2] = {{0}};
+        if (gui_monitor_client_connected()) {
+            (void)gui_rd_client_peaks(remote_peaks);
+        }
+        peak_a_pos = remote_peaks[0][0];
+        peak_a_neg = remote_peaks[0][1];
+        peak_b_pos = remote_peaks[1][0];
+        peak_b_neg = remote_peaks[1][1];
+    }
+
     // Convert to normalized levels (0-1), using 2048 as full scale
     float level_a_pos = (float)peak_a_pos / 2048.0f;
     float level_a_neg = (float)peak_a_neg / 2048.0f;
@@ -3080,7 +3183,7 @@ void gui_app_clear_display(gui_app_t *app) {
         strncpy(app->status_message, message,
                 sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
-        app->status_message_time = GetTime();
+        app->status_message_time = gui_runtime_time();
     }
 void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 {

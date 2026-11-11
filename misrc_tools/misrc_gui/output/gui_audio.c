@@ -1,4 +1,5 @@
 #include "gui_audio.h"
+#include "../net/monitor_local_save_proxy.h"
 
 #include "raylib.h"
 
@@ -16,6 +17,14 @@
 #if LIBSOXR_ENABLED
 #include <soxr.h>
 #endif
+
+/* Only M-Server Local Save wraps files. Genuine stdio remains unchanged. */
+#define fwrite mls_proxy_write
+#define fclose mls_proxy_close
+#define fflush mls_proxy_flush
+#define ferror mls_proxy_error
+#define clearerr mls_proxy_clearerr
+#define file_open_utf8 mls_proxy_open
 
 // External do_exit flag from ringbuffer.h
 extern atomic_int do_exit;
@@ -54,7 +63,7 @@ static atomic_bool s_monitor_session_active = false;
 static AudioStream s_play_stream;
 static bool s_play_stream_inited = false;
 static int s_play_stream_chunk_frames;
-static size_t s_play_stream_epoch;
+static atomic_size_t s_play_stream_epoch;
 static size_t s_play_stream_generation;
 static bool s_audio_device_inited = false;
 
@@ -254,10 +263,15 @@ void gui_audio_push_hifi(const void *source, const float *stereo_48k, size_t fra
     atomic_flag_clear(&s_hifi_q_guard);
 }
 
-static size_t hifi_q_pop_samples(int16_t *out, size_t max_count)
+static size_t hifi_q_pop_samples(int16_t *out, size_t max_count, size_t epoch)
 {
     if (!out || !max_count || atomic_flag_test_and_set(&s_hifi_q_guard)) return 0;
-    const size_t epoch = atomic_load(&s_monitor_epoch);
+    // A source/gap may change between the callback's precheck and this lock.
+    // Never consume fresh PCM on behalf of a stale device callback.
+    if (epoch != atomic_load(&s_monitor_epoch)) {
+        atomic_flag_clear(&s_hifi_q_guard);
+        return 0;
+    }
     if (s_hifi_q_epoch != epoch) {
         s_hifi_q_head = s_hifi_q_count = 0;
         s_hifi_q_epoch = epoch;
@@ -272,6 +286,29 @@ static size_t hifi_q_pop_samples(int16_t *out, size_t max_count)
     s_hifi_q_count -= frames;
     atomic_flag_clear(&s_hifi_q_guard);
     return epoch == atomic_load(&s_monitor_epoch) ? frames * 2 : 0;
+}
+
+// The device requests its actual frame count. A fixed UpdateAudioStream block
+// can be smaller than raylib's device-clamped half-buffer, which inserts silence;
+// refilling from the GUI also underruns when a frame takes longer than a half.
+static void hifi_stream_callback(void *buffer, unsigned int frames)
+{
+    if (!buffer || !frames) return;
+    int16_t *out = buffer;
+    const size_t wanted = (size_t)frames * 2;
+    const size_t epoch = atomic_load(&s_monitor_epoch);
+    size_t got = 0;
+    if (epoch == atomic_load(&s_play_stream_epoch) &&
+        atomic_load(&s_playback_enabled) && atomic_load(&s_monitor_session_active) &&
+        !monitor_legacy_selected()) {
+        got = hifi_q_pop_samples(out, wanted, epoch);
+    }
+    // Source/mute/stop changes invalidate a concurrent pop too. The callback
+    // never allocates, waits for PCM or calls device/stream lifecycle functions.
+    if (epoch != atomic_load(&s_monitor_epoch) || epoch != atomic_load(&s_play_stream_epoch) ||
+        !atomic_load(&s_playback_enabled) || !atomic_load(&s_monitor_session_active) ||
+        monitor_legacy_selected()) got = 0;
+    if (got < wanted) memset(out + got, 0, (wanted - got) * sizeof(*out));
 }
 
 static inline int16_t pcm24_to_i16(int32_t s24) {
@@ -1016,29 +1053,33 @@ void gui_audio_update_playback(gui_app_t *app)
         // Stream at 48kHz (resampled audio)
         s_play_stream = LoadAudioStream(48000, 16, 2);
         if (!IsAudioStreamValid(s_play_stream)) return;
+        // Publish the epoch before the device can invoke its callback. The old
+        // stream must not consume new-source PCM before the main-thread flush.
+        atomic_store(&s_play_stream_epoch, epoch);
+        if (!legacy_input) SetAudioStreamCallback(s_play_stream, hifi_stream_callback);
         PlayAudioStream(s_play_stream);
         s_play_stream_inited = true;
         s_play_stream_chunk_frames = frames_per_chunk;
-        s_play_stream_epoch = epoch;
         s_play_stream_generation = legacy_generation;
-        fprintf(stderr, "[AUDIO] Initialized playback stream at 48kHz (buffer: %d frames)\n",
-                frames_per_chunk);
+        fprintf(stderr, "[AUDIO] Initialized playback stream at 48kHz (%s, requested buffer: %d frames)\n",
+                legacy_input ? "queued" : "callback", frames_per_chunk);
     }
 
     if (!IsAudioStreamPlaying(s_play_stream)) {
         PlayAudioStream(s_play_stream);
     }
 
-    // A 1024-frame HiFi half-buffer holds 21 ms. Refill both halves if a
-    // slower GUI frame consumed both, without unbounded work on the UI thread.
+    // HiFi PCM is consumed by the audio device callback, independently of GUI
+    // frame timing and the actual device buffer size. Keep the ordinary monitor
+    // on its existing queued path.
+    if (!legacy_input) return;
+    // Refill both ordinary-monitor halves after a delayed GUI frame.
     for (unsigned int fed = 0; fed < 2 && IsAudioStreamProcessed(s_play_stream); ++fed) {
         if (s_play_stream_epoch != atomic_load(&s_monitor_epoch) ||
             (legacy_input && legacy_generation != atomic_load(&s_play_q_generation))) return;
         int16_t chunk[4096 * 2]; // Maximum ordinary-monitor stereo chunk.
         size_t samples_wanted = frames_per_chunk * 2;
-        size_t got = legacy_input
-            ? play_q_pop_samples(chunk, samples_wanted)
-            : hifi_q_pop_samples(chunk, samples_wanted);
+        size_t got = play_q_pop_samples(chunk, samples_wanted);
         if (s_play_stream_epoch != atomic_load(&s_monitor_epoch) ||
             (legacy_input && legacy_generation != atomic_load(&s_play_q_generation))) return;
         

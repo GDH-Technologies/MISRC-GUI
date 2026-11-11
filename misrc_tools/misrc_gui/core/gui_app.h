@@ -220,6 +220,20 @@ typedef struct gui_app {
 
     // Playback device state
     atomic_bool playback_running;  // Flag for playback mode
+    /* Independent mixed-rate playback mode (player only): both files loaded
+     * with DIFFERENT rates. The producer feeds BUF_CAPTURE_RF_A/B and the
+     * extraction/display pipelines consume per-channel FIFOs
+     * (BUF_DISPLAY_A/B) so each file plays at its own true rate and the RF
+     * Preview decoders run on both channels. Same-rate sets and capture
+     * devices keep the paired BUF_CAPTURE_RF/BUF_DISPLAY paths. Set once at
+     * playback commit; read by extraction/display threads. */
+    atomic_bool playback_independent_mode;
+    /* Per-channel transport (player Link: Separate mode): true pauses that
+     * channel's file while the other keeps playing. Ignored in Synced mode. */
+    atomic_bool playback_channel_paused[2];
+    /* Player link mode: false = Synced (default, one shared transport),
+     * true = Separate (per-channel transport). Session state, not persisted. */
+    atomic_bool playback_link_separate;
 
 #ifdef ENABLE_FX3
     // FX3 device state
@@ -290,6 +304,13 @@ typedef struct gui_app {
     // describe independent hardware/file clocks even when preview is gated.
     atomic_uint_fast32_t rf_source_rate_hz[2];
     atomic_bool rf_preview_input_supported;
+    // Per-channel FULL SCALE of the display-sample container (the magnitude
+    // that rails the panel). Playback decode normalizes EVERY input
+    // convention into the 12-bit container (in = out at 8/12/16-bit; user
+    // rule 2026-11-03), so playback sessions keep 2048 here; capture
+    // backends with a different container (DdD 512) publish their own scale
+    // (see gui_app_level_autostop_full_scale).
+    atomic_uint_fast32_t rf_display_full_scale[2];
     atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
 
@@ -385,6 +406,9 @@ typedef struct gui_app {
     // between UI interactions and the display thread.
     atomic_flag panel_config_lock;
 
+    // True only for headless (no-raylib-window) legacy server launch.
+    bool headless_server;
+
     // Server/Client networking state (opaque; implemented in net/gui_net.c).
     // NULL when net_mode == Local. Owned by gui_app_t; created/destroyed by
     // gui_net_apply_mode(). Accessed from the UI/main thread only for control;
@@ -402,7 +426,13 @@ typedef struct gui_app {
     atomic_bool net_cmd_record_confirm; // /record?confirm=N: an answer to the overwrite prompt
     atomic_int  net_cmd_record_confirm_value; // 1 overwrite, 0 cancel
     atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
-    atomic_int  net_cmd_device_index;   // Device index argument for select_device.
+    atomic_int  net_cmd_device_index;   // Legacy Client device argument.
+    /* The unified Server keeps monitor-specific commands separate. Otherwise
+     * a legacy /device request could restart a running capture (M behaviour),
+     * or a legacy /record could accidentally use M-Client Local Save. */
+    atomic_bool net_cmd_monitor_select_device;
+    atomic_int  net_cmd_monitor_device_index;
+    atomic_int  net_cmd_monitor_record; // 0=none, 1=server ON, 2=Local Save ON, 3=OFF
 
     // Net mirrored state snapshot (written by client mirror thread, read by UI).
     // Server mode also writes these so the local UI reflects remote-driven state.
@@ -411,7 +441,22 @@ typedef struct gui_app {
     atomic_int  net_peer_device_count;  // device count from peer /devices.
     atomic_int  net_peer_selected;      // selected_device from peer.
     atomic_bool net_connected;          // server listening / client connected.
-    atomic_bool net_error;              // last operation failed (see net_status).
+    atomic_bool net_error;               // last operation failed (see net_status).
+    /* RF transport diagnostics, published atomically by server/client threads.
+     * The two counters are deliberately separate: the client cannot know
+     * whether a stream interruption came from server queue pressure. */
+    atomic_uint_fast64_t net_rf_server_stream_drops;
+    atomic_uint_fast64_t net_rf_client_interruptions;
+    atomic_uint_fast64_t net_audio_server_stream_drops;
+    atomic_uint_fast64_t net_audio_client_interruptions;
+    atomic_size_t net_rf_server_queue_bytes;
+    atomic_size_t net_audio_server_queue_bytes;
+    atomic_bool net_rf_client_stream_live;
+    /* Set by the async net mode transition worker (gui_net_request_apply_mode)
+     * when the main loop should re-enumerate local devices once (leaving a
+     * client mode / returning to Local). Consumed on the main thread; the
+     * device array itself is main-thread-owned. */
+    atomic_bool net_reenumerate_pending;
 
     // Dedicated network status line, shown ONLY in the info window's Network
     // section. Net code writes this via gui_net_set_status() and must NEVER
@@ -448,6 +493,8 @@ static inline void gui_app_count_system_errors(gui_app_t *app, uint32_t count) {
 }
 
 // Application lifecycle
+void gui_runtime_set_headless(bool enabled);
+double gui_runtime_time(void);
 void gui_app_init(gui_app_t *app);
 void gui_app_cleanup(gui_app_t *app);
 
