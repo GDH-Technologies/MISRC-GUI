@@ -326,6 +326,13 @@ typedef struct {
     uint64_t duration_ms;       /* 0 = push target_bytes then stop */
     uint64_t target_bytes;
     uint64_t rate_bps;          /* pace to this many bytes/s; 0 = flat out */
+    /* Past duration_ms, keep pushing until the FIFO has opened this many
+     * segments, up to cap_ms in all (0 = stop at duration_ms). A segment
+     * count is what a test asserts; how many fit in a fixed window depends on
+     * the host (ThreadSanitizer on air0 moves about half of wm's bytes). */
+    uint64_t min_segments;
+    uint64_t cap_ms;
+    atomic_bool hold;           /* externally held: push nothing, keep the schedule */
     atomic_bool stop;
     /* results */
     uint64_t pushed;            /* stream bytes offered (accepted + dropped) */
@@ -334,6 +341,15 @@ typedef struct {
     uint64_t ring_pushes, spill_pushes, drop_pushes;
 } fifo_prod_t;
 
+static bool fifo_prod_keep_going(const fifo_prod_t *p, uint64_t t_end, uint64_t t_cap) {
+    uint64_t now = get_time_ms();
+    if (now < t_end) return true;
+    if (!p->min_segments || now >= t_cap) return false;
+    gui_record_fifo_stats_t st;
+    gui_record_fifo_get_stats(p->f, &st);   /* atomic loads only */
+    return st.segments < p->min_segments;
+}
+
 static int fifo_producer(void *arg) {
     fifo_prod_t *p = (fifo_prod_t *)arg;
     rng_t r = { p->seed | 1 };
@@ -341,7 +357,16 @@ static int fifo_producer(void *arg) {
     uint8_t *buf = (uint8_t *)malloc(cap);
     uint64_t t0 = get_time_ms();
     uint64_t t_end = p->duration_ms ? t0 + p->duration_ms : UINT64_MAX;
-    while (!atomic_load(&p->stop) && get_time_ms() < t_end) {
+    uint64_t t_cap = p->cap_ms ? t0 + p->cap_ms : t_end;
+    while (!atomic_load(&p->stop) && fifo_prod_keep_going(p, t_end, t_cap)) {
+        if (atomic_load(&p->hold)) {
+            /* Shift the schedule by the held time, so a resume does not
+             * burst to catch up. */
+            uint64_t h0 = get_time_ms();
+            thrd_sleep_ms(1);
+            t0 += get_time_ms() - h0;
+            continue;
+        }
         if (p->target_bytes && p->pushed >= p->target_bytes) break;
         if (p->rate_bps) {
             /* A capture is a steady source: stay on the schedule. */
@@ -475,6 +500,9 @@ static void test_random_pressure(bool no_punch) {
     memset(&p, 0, sizeof(p));
     p.f = &f; p.v = v; p.seed = g_seed ^ (no_punch ? 0x3333 : 0x4444);
     p.min_push = 8; p.max_push = 128 * 1024; p.duration_ms = 2500; p.rate_bps = 150000000;
+    /* At least 2.5 s, then until the ">= 10 segments" check below is met
+     * (air0's TSan build saw 7 in 2.5 s), at most 20 s. */
+    p.min_segments = 10; p.cap_ms = 20000;
     fifo_reader_t rd;
     memset(&rd, 0, sizeof(rd));
     rd.f = &f; rd.v = v; rd.seed = g_seed ^ 0x5555; rd.bursty = true;
@@ -589,13 +617,17 @@ static void test_recycle_stress(void) {
      * and counted on that: on wm it gave 3+ recycles, but where the
      * ThreadSanitizer build cannot move 100 MB/s (air0, every main run since
      * the FIFO landed) the producer outran the reader for the whole run -- ONE
-     * overflow episode, 0-2 recycles. So the episodes are driven, not hoped
-     * for: a 16 MB/s producer any host keeps up with, and the test holds the
-     * reader for 80 ms at a time (about 1.3 MB: the 256 KiB ring overflows and
-     * the spill passes the 512 KiB truncate threshold), then lets it drain.
-     * The bursty reader's own random pauses stay on top. At least 2 s, until 3
-     * recycles, at most 20 s. */
-    p.min_push = 8; p.max_push = 32768; p.duration_ms = 20000; p.rate_bps = 16000000;
+     * overflow episode, 0-2 recycles. Driving it with reader pauses alone was
+     * not enough either (#93): while the reader drained, the producer refilled
+     * the 256 KiB ring in ~16 ms, so the reader had to clear the spill at
+     * ~80 MB/s, which air0's TSan build cannot -- 0 recycles in 27 s. So each
+     * cycle is explicit: hold the reader until the spill has taken a set
+     * number of bytes, then hold the PRODUCER until the reader has consumed
+     * every accepted byte, then release it. The next overflow finds the spill
+     * drained -- a recycle per small cycle, at any host speed. The bursty
+     * reader's random pauses stay on top. At least 2 s, until 3 recycles, at
+     * most 30 s; the producer's own duration is only a backstop. */
+    p.min_push = 8; p.max_push = 32768; p.duration_ms = 60000; p.rate_bps = 16000000;
     fifo_reader_t rd;
     memset(&rd, 0, sizeof(rd));
     rd.f = &f; rd.v = v; rd.seed = g_seed ^ 0xAAAA; rd.bursty = true;
@@ -604,14 +636,38 @@ static void test_recycle_stress(void) {
     thrd_t tp, tr;
     expect_true(thrd_create(&tr, fifo_reader, &rd) == thrd_success, "recycle: reader thread");
     expect_true(thrd_create(&tp, fifo_producer, &p) == thrd_success, "recycle: producer thread");
-    for (;;) {
+    for (unsigned cycle = 0;; cycle++) {
+        /* Overflow: the reader holds, the producer runs until the spill has
+         * taken a set number of bytes -- sized in bytes, not milliseconds, so
+         * a slow host overflows exactly as far as a fast one. Most cycles stay
+         * well under the 512 KiB truncate threshold (a truncated spill restarts
+         * at offset 0, which is not a recycle); every third cycle passes it so
+         * the truncate path keeps being exercised. */
+        uint64_t want = (cycle % 3 == 2) ? 768u * 1024u : 64u * 1024u;
+        gui_record_fifo_get_stats(&f, &st);
+        uint64_t spill0 = st.spill_bytes;
         atomic_store(&rd.paused, true);
-        thrd_sleep_ms(80);
+        uint64_t fill_end = get_time_ms() + 10000;
+        for (;;) {
+            gui_record_fifo_get_stats(&f, &st);
+            if (st.spill_bytes >= spill0 + want || get_time_ms() >= fill_end) break;
+            thrd_sleep_ms(1);
+        }
+        /* Drain: the producer holds, the reader runs until it has every
+         * accepted byte (10 s per cycle at most). */
+        atomic_store(&p.hold, true);
         atomic_store(&rd.paused, false);
-        thrd_sleep_ms(250);
-        gui_record_fifo_get_stats(&f, &st);   /* atomic loads only */
+        uint64_t drain_end = get_time_ms() + 10000;
+        for (;;) {
+            gui_record_fifo_get_stats(&f, &st);   /* atomic loads only */
+            if (st.consumed_bytes >= st.accepted_bytes || get_time_ms() >= drain_end) break;
+            thrd_sleep_ms(2);
+        }
+        atomic_store(&p.hold, false);
+        thrd_sleep_ms(20);
+        gui_record_fifo_get_stats(&f, &st);
         uint64_t elapsed = get_time_ms() - t_run;
-        if ((st.recycles >= 3 && elapsed >= 2000) || elapsed >= 20000) break;
+        if ((st.recycles >= 3 && elapsed >= 2000) || elapsed >= 30000) break;
     }
     atomic_store(&p.stop, true);
     thrd_join(tp, NULL);
