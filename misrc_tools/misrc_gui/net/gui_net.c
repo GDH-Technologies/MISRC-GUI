@@ -489,21 +489,19 @@ int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply
         return 0;
     }
     gui_net_init_globals();
-    /* Join any PREVIOUS (already finished) worker first so its thread handle
-     * is never leaked; instant because it only runs when not busy. */
-    if (s_transition_thread_started) {
-        thrd_join(s_transition_thread, NULL);
-        s_transition_thread_started = false;
-    }
+    /* GDH fork: the transition runs here, on the calling (main) thread, not
+     * on a worker. gui_net_apply_mode() reads and writes app->settings and
+     * server_start() publishes the server's settings snapshot; both are
+     * main-thread-only on the fork (the snapshot goes out before the
+     * listener starts, b407a5c; a net client's app->settings is the server's
+     * copy during the UI pass). Every caller is on the main thread. The cost
+     * is upstream's original one: a mode change can stall a frame while
+     * client threads join. */
     s_transition_prev_mode = net_transition_normalize_mode(prev_mode);
     s_transition_force = force_reapply;
     atomic_store(&s_transition_reenumerate, false);
     atomic_store(&s_transition_running, true);
-    if (thrd_create(&s_transition_thread, net_transition_thread, app) != thrd_success) {
-        atomic_store(&s_transition_running, false);
-        return -1;  /* caller may fall back to the synchronous apply */
-    }
-    s_transition_thread_started = true;
+    (void)net_transition_thread(app);
     return 0;
 }
 
