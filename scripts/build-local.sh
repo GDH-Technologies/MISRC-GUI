@@ -80,7 +80,12 @@ export PKG_CONFIG="${MISRC_PKG_CONFIG:-pkg-config}"
 # so that path keeps the hard early gate — missing OpenH264 must never
 # yield a GUI that silently falls back to a black video preview.
 if [[ -n "${MISRC_DEPS_PREFIX:-}" ]]; then
-  bash "$SCRIPT_DIR/check-build-deps.sh" --codec
+  # Check the prefix the caller handed us, not just the system search path:
+  # PKG_CONFIG_PATH only gains it further down, so without this a prefix that
+  # does carry openh264 (a CI deps cache built by build-deps-unix.sh) failed
+  # whenever the system lacked it (macOS Homebrew has opus, not openh264).
+  PKG_CONFIG_PATH="$MISRC_DEPS_PREFIX/lib/pkgconfig:$MISRC_DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
+    bash "$SCRIPT_DIR/check-build-deps.sh" --codec
 fi
 
 # Locate a vendored deps prefix that provides hsdaoh.pc.
