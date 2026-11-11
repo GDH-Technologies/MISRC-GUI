@@ -284,8 +284,16 @@ static void test_ring_counters(void) {
     expect_true(thrd_create(&t, ring_producer, &prod) == thrd_success, "ring counters: producer thread");
     rng_t r = { g_seed ^ 0x2222 };
     uint64_t consumed = 0;
-    uint64_t t_end = get_time_ms() + 1500;
-    while (get_time_ms() < t_end) {
+    /* At least 1.5 s, then until the ring has wrapped over a thousand times:
+     * the wrap count, not the clock, is what this test needs. Under
+     * ThreadSanitizer on a loaded host 1.5 s gave as few as 948 wraps. The
+     * 15 s cap keeps a genuinely stuck ring a failure, not a hang. */
+    uint64_t t0 = get_time_ms();
+    uint64_t t_min = t0 + 1500, t_cap = t0 + 15000;
+    for (;;) {
+        uint64_t now = get_time_ms();
+        if (now >= t_cap) break;
+        if (now >= t_min && consumed / (64 * 1024) > 1000) break;
         size_t fill = bufmgr_fill_level(&g_mgr, BUF_RECORD_A);
         if (fill == 0) continue;
         size_t want = (size_t)rng_range(&r, 1, fill);
@@ -576,15 +584,44 @@ static void test_recycle_stress(void) {
     fifo_prod_t p;
     memset(&p, 0, sizeof(p));
     p.f = &f; p.v = v; p.seed = g_seed ^ 0x9999;
-    p.min_push = 8; p.max_push = 32768; p.duration_ms = 2000; p.rate_bps = 100000000;
+    /* A recycle needs an overflow that finds the previous spill fully drained.
+     * The old version ran a bursty reader against a 100 MB/s producer for 2 s
+     * and counted on that: on wm it gave 3+ recycles, but where the
+     * ThreadSanitizer build cannot move 100 MB/s (air0, every main run since
+     * the FIFO landed) the producer outran the reader for the whole run -- ONE
+     * overflow episode, 0-2 recycles. So the episodes are driven, not hoped
+     * for: a 16 MB/s producer any host keeps up with, and the test holds the
+     * reader for 80 ms at a time (about 1.3 MB: the 256 KiB ring overflows and
+     * the spill passes the 512 KiB truncate threshold), then lets it drain.
+     * The bursty reader's own random pauses stay on top. At least 2 s, until 3
+     * recycles, at most 20 s. */
+    p.min_push = 8; p.max_push = 32768; p.duration_ms = 20000; p.rate_bps = 16000000;
     fifo_reader_t rd;
     memset(&rd, 0, sizeof(rd));
     rd.f = &f; rd.v = v; rd.seed = g_seed ^ 0xAAAA; rd.bursty = true;
     gui_record_fifo_stats_t st;
-    fifo_run(&f, &p, &rd, &st);
-    printf("  recycle: %llu recycles, %llu segments, %llu episodes\n",
+    uint64_t t_run = get_time_ms();
+    thrd_t tp, tr;
+    expect_true(thrd_create(&tr, fifo_reader, &rd) == thrd_success, "recycle: reader thread");
+    expect_true(thrd_create(&tp, fifo_producer, &p) == thrd_success, "recycle: producer thread");
+    for (;;) {
+        atomic_store(&rd.paused, true);
+        thrd_sleep_ms(80);
+        atomic_store(&rd.paused, false);
+        thrd_sleep_ms(250);
+        gui_record_fifo_get_stats(&f, &st);   /* atomic loads only */
+        uint64_t elapsed = get_time_ms() - t_run;
+        if ((st.recycles >= 3 && elapsed >= 2000) || elapsed >= 20000) break;
+    }
+    atomic_store(&p.stop, true);
+    thrd_join(tp, NULL);
+    gui_record_fifo_close(&f);
+    thrd_join(tr, NULL);
+    gui_record_fifo_get_stats(&f, &st);
+    t_run = get_time_ms() - t_run;
+    printf("  recycle: %llu recycles, %llu segments, %llu episodes, %llu ms\n",
            (unsigned long long)st.recycles, (unsigned long long)st.segments,
-           (unsigned long long)st.episodes);
+           (unsigned long long)st.episodes, (unsigned long long)t_run);
     expect_true(st.recycles >= 3, "recycle: the drained spill is reused");
     expect_true(rd.received == p.accepted && v->mismatches == 0, "recycle: stream intact");
     expect_true(p.drop_pushes == 0, "recycle: nothing dropped");
