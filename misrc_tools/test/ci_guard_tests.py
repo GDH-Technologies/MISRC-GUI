@@ -6399,6 +6399,34 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
     return None
 
 
+def check_monitor_local_save_refused(repo_root: Path) -> int:
+    """GDH fork: the unified server refuses an M-Client Local Save record.
+
+    Upstream v1.2.7's Local Save redirects the record writers' stdio over a
+    socket by redefining fwrite/fclose inside gui_record.c. The fork's writers
+    live in the ordered record FIFO (gui_record_fifo.c, gui_record_sink.c),
+    which that redirect never reaches, so a Local Save would write the files
+    to the server's own disk while the client waited for them. Until the
+    proxy is ported into the sink, /monitor/record?local=1 (command 2) must
+    be answered with a refusal, and gui_monitor_local_save_begin() must not
+    run for it."""
+    net = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/net/gui_net.c"))
+    take = net.find("gui_monitor_server_take_record(app,")
+    if take < 0:
+        return fail("gui_net.c: gui_monitor_server_take_record() call not found; the Local Save guard needs updating")
+    block = net[take:take + 6000]
+    refuse = re.search(r"else\s+if\s*\(\s*monitor_record\s*==\s*2\s*\)\s*\{(.*?)\}", block, re.S)
+    if not refuse:
+        return fail("gui_net.c: the server no longer refuses an M-Client Local Save record "
+                    "(monitor_record == 2); the fork's record FIFO cannot honour it")
+    if not re.search(r"result\s*=\s*1\s*;", refuse.group(1)):
+        return fail("gui_net.c: the Local Save branch does not answer the client with a failure (result=1)")
+    begin = block.find("gui_monitor_local_save_begin(")
+    if begin >= 0 and begin < refuse.start():
+        return fail("gui_net.c: gui_monitor_local_save_begin() runs before the Local Save refusal")
+    return 0
+
+
 def check_record_fifo_contract(repo_root: Path) -> int:
     """GDH fork: the record path's ordering and capture-side contracts.
 
@@ -6804,6 +6832,7 @@ def main() -> int:
         ("capture metadata contract", lambda: check_capture_metadata_contract(repo_root)),
         ("file drop obeys the recording locks", lambda: check_drop_obeys_recording_locks(repo_root)),
         ("record FIFO contract", lambda: check_record_fifo_contract(repo_root)),
+        ("M-Client Local Save is refused", lambda: check_monitor_local_save_refused(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

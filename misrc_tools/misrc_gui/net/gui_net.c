@@ -2735,6 +2735,19 @@ void gui_net_poll_commands(gui_app_t *app) {
                     fprintf(stderr,"[M-SERVER] executing /monitor/record off\n");
                     gui_app_stop_recording(app);
                 }
+            }else if(monitor_record==2){
+                /* GDH fork: Local Save is refused. Upstream redirects the record
+                 * writers' stdio through a socket by redefining fwrite/fclose in
+                 * gui_record.c; the fork's writers live in the ordered record
+                 * FIFO (gui_record_fifo.c, gui_record_sink.c), which that
+                 * redirect does not reach, so the files would land on THIS
+                 * machine's disk while the client waited for them. Recording
+                 * to the server's disk is unaffected. */
+                result=1;
+                snprintf(reason,sizeof(reason),
+                         "Local Save is not supported by this server; record to the server's disk");
+                gui_app_set_status(app,"M-Client Local Save refused: not supported by this build");
+                fprintf(stderr,"[M-LOCAL] Record refused: Local Save is not supported by this build\n");
             }else if(!app->is_capturing){
                 result=1;
                 snprintf(reason,sizeof(reason),"Start capture first");
