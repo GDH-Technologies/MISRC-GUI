@@ -70,6 +70,12 @@ int rb_write_finished(ringbuffer_t *rb, size_t size) {
     return 0;
 }
 
+size_t rb_fill_level(const ringbuffer_t *rb) {
+    size_t head = atomic_load(&rb->head);
+    size_t tail = atomic_load(&rb->tail);
+    return tail - head;
+}
+
 void rb_close(ringbuffer_t *rb) {
     free(rb->buffer);
     rb->buffer = NULL;
