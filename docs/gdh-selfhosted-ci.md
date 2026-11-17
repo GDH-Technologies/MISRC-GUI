@@ -541,6 +541,26 @@ tag. It shares the `selfhosted-install` concurrency group with merges, so the tw
 `~/.local/bin`. The install's verify step then fails, naming the library, if any installed Linux
 binary still has an unresolved one (`ldd … not found`).
 
+## Upstream drift (weekly)
+
+`.github/workflows/upstream-drift.yml` runs on wm every Monday at 13:00 UTC (7 AM CST) and on
+demand (`gh workflow run upstream-drift.yml`). It fetches `harrypm/main` and harrypm's release
+tags by URL into private `refs/upstream-drift/*` refs (never `refs/tags`, and no remote is
+added). It then trial-merges into the fork's `main` with `git merge-tree --write-tree`, which
+writes objects only. It never merges, pushes or tags.
+
+The report is rewritten into the body of the one open issue whose title starts
+"Upstream drift". It lists:
+- the newest upstream release and whether the fork contains it;
+- for a new release and for `upstream/main`: the incoming commits and the conflicted files
+  with their conflict-block counts.
+
+A new release in the report is the cue for `/sync-upstream`. The prepared resolutions live
+in `.claude/skills/sync-upstream/SKILL.md` ("Next sync").
+
+If no such issue is open, the run fails and says so. Open the issue by hand with
+Type/Priority/Effort, since the workflow's token cannot set org issue fields.
+
 ## Reproducing a CI run by hand
 
 ```bash

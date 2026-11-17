@@ -1,0 +1,129 @@
+# Upstream drift (fork-only): a weekly read-only trial merge of harrypm/MISRC-GUI into
+# the fork's main, written into the body of the one open "Upstream drift" issue.
+#
+# Why: the v1.2.7 sync deferred c1dae40 and the next look at upstream (2026-11-17) found
+# 34 commits, 26 conflicted files and 138 conflict blocks at once. Seeing that grow week by
+# week is cheaper than meeting it on release day. The prepared resolutions live in
+# .claude/skills/sync-upstream/SKILL.md ("Next sync").
+#
+# It never merges, pushes or tags anything: `git merge-tree --write-tree` builds the trial
+# merge in the object store only, upstream is fetched by URL (no remote is added), and
+# upstream's tags land in a private ref namespace, never refs/tags, so nothing here can ever
+# push a plain upstream v* tag to the fork (selfhosted-deploy.yml would build it).
+name: Upstream drift
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"  # Mondays 13:00 UTC = 7:00 AM CST / 8:00 AM CDT
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          clean: true
+
+      - name: Fetch upstream main and release tags (private refs)
+        run: |
+          set -euo pipefail
+          url=https://github.com/harrypm/MISRC-GUI.git
+          git fetch --quiet --no-tags "$url" '+refs/heads/main:refs/upstream-drift/main'
+          git fetch --quiet --no-tags "$url" '+refs/tags/v*:refs/upstream-drift/tags/v*'
+
+      - name: Trial merges and report
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > "$RUNNER_TEMP/drift.md"
+          import re, subprocess, os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          def git(*args, check=True):
+              r = subprocess.run(["git", *args], capture_output=True, text=True)
+              if check and r.returncode not in (0, 1):
+                  raise SystemExit(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+              return r
+
+          def ver(tag):
+              return tuple(int(x) for x in tag[1:].split("."))
+
+          head = git("rev-parse", "--short", "HEAD").stdout.strip()
+          up = "refs/upstream-drift/main"
+          up_short = git("rev-parse", "--short", up).stdout.strip()
+          tags = [r.split("/")[-1] for r in git("for-each-ref", "--format=%(refname)", "refs/upstream-drift/tags").stdout.split()]
+          releases = sorted((t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)), key=ver)
+          newest = releases[-1] if releases else None
+          have = [t for t in releases if git("merge-base", "--is-ancestor", f"refs/upstream-drift/tags/{t}", "HEAD").returncode == 0]
+          fork_release = have[-1] if have else None
+
+          def trial(ref, label):
+              mb = git("merge-base", "HEAD", ref).stdout.strip()
+              count = int(git("rev-list", "--count", f"{mb}..{ref}").stdout.strip())
+              out = [f"### {label}", ""]
+              if count == 0:
+                  return out + ["Nothing new: the fork already contains it.", ""]
+              mt = git("merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", ref)
+              lines = mt.stdout.split("\n")
+              tree, files = lines[0], [f for f in lines[1:] if f]
+              stat = git("diff", "--shortstat", mb, ref).stdout.strip()
+              out.append(f"{count} upstream commit(s) past the merge-base `{mb[:7]}`; {stat}.")
+              out.append("")
+              if mt.returncode == 0:
+                  out.append("**Trial merge: clean** (no conflict markers; silent clashes are still possible, see the sync profile).")
+              else:
+                  rows = []
+                  for f in files:
+                      body = git("show", f"{tree}:{f}", check=False).stdout
+                      rows.append((body.count("\n<<<<<<< ") + body.startswith("<<<<<<< "), f))
+                  rows.sort(key=lambda r: (-r[0], r[1]))
+                  out.append(f"**Trial merge: {len(rows)} conflicted file(s), {sum(r[0] for r in rows)} conflict block(s).**")
+                  out += ["", "| blocks | file |", "| ---: | --- |"]
+                  out += [f"| {n} | `{f}` |" for n, f in rows]
+              log = git("log", "--format=%h %ad %s", "--date=short", f"{mb}..{ref}").stdout.strip().split("\n")
+              out += ["", "<details><summary>Incoming commits</summary>", "", "```"]
+              out += log[:200] + (["..."] if len(log) > 200 else [])
+              out += ["```", "</details>", ""]
+              return out
+
+          now = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %-I:%M %p %Z")
+          md = ["<!-- Written by .github/workflows/upstream-drift.yml; edits are overwritten weekly. -->",
+                f"**Checked:** {now} · fork `main` at `{head}` · `harrypm/main` at `{up_short}`", "",
+                f"**Newest upstream release:** `{newest}` · **newest release the fork contains:** `{fork_release}`", ""]
+          if newest and newest != fork_release:
+              md += [f"> **New upstream release `{newest}` is not in the fork yet: time for `/sync-upstream`.**", ""]
+              md += trial(f"refs/upstream-drift/tags/{newest}", f"Release `{newest}` (the default sync target)")
+          md += trial(up, "`upstream/main`")
+          md += ["Prepared resolutions and open decisions: `.claude/skills/sync-upstream/SKILL.md` (\"Next sync\"). "
+                 "Read-only: nothing was merged, pushed or tagged."]
+          print("\n".join(md))
+          PY
+          cat "$RUNNER_TEMP/drift.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update the Upstream drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          num="$(gh issue list --state open --search 'in:title "Upstream drift"' --json number,title \
+                 --jq '[.[] | select(.title | startswith("Upstream drift"))][0].number // empty')"
+          if [ -z "$num" ]; then
+            echo "::error::no open issue titled 'Upstream drift ...'; open it once (with Type/Priority/Effort) and re-run"
+            exit 1
+          fi
+          gh issue edit "$num" --body-file "$RUNNER_TEMP/drift.md" >/dev/null
+          echo "updated issue #$num"
