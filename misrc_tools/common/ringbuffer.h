@@ -45,6 +45,8 @@ void* rb_read_ptr(ringbuffer_t *rb, size_t size);
 int   rb_read_finished(ringbuffer_t *rb, size_t size);
 void* rb_write_ptr(ringbuffer_t *rb, size_t size);
 int   rb_write_finished(ringbuffer_t *rb, size_t size);
+/* Best-effort observer snapshot in bytes, bounded by the capacity. */
+size_t rb_fill_level(const ringbuffer_t *rb);
 void  rb_close(ringbuffer_t *rb);
 
 #endif // RINGBUFFER_H

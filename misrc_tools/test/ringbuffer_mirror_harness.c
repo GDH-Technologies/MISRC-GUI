@@ -63,7 +63,18 @@ static int create_and_verify(size_t size, const char *label) {
             if (rb.buffer[off] != (uint8_t)(i * 7)) { ok = 0; break; }
         }
         check(ok, "bytes written across the seam are readable at their wrapped offsets");
+        check(rb_fill_level(&rb) == chunk, "rb_fill_level counts a write across the seam");
+        check(rb_read_finished(&rb, chunk / 4) == 0 && rb_fill_level(&rb) == chunk - chunk / 4,
+              "rb_fill_level drops by what the reader consumed");
+        check(rb_read_finished(&rb, chunk - chunk / 4) == 0 && rb_fill_level(&rb) == 0,
+              "rb_fill_level is 0 once the reader caught up");
     }
+    /* Counters that only grow, far past the capacity: still bounded by it. */
+    atomic_store(&rb.head, 5 * size + 3);
+    atomic_store(&rb.tail, 6 * size + 3);
+    check(rb_fill_level(&rb) == size, "rb_fill_level of a full ring is the capacity");
+    atomic_store(&rb.tail, 6 * size + 1000);
+    check(rb_fill_level(&rb) == size, "rb_fill_level never exceeds the capacity");
     rb_close(&rb);
     return 0;
 }

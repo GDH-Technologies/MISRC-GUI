@@ -3458,12 +3458,20 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
                     "RF B off would open card 1 again")
     raise_active = thread.find("atomic_store(&ctx->b_active, true)")
     load_enabled = thread.find("atomic_load(&ctx->b_enabled)")
-    card1_read = thread.find("card_fds[1]")
+    # Card 1 is reached either by name (the fork's two-card body) or through a
+    # per-card loop bounded by read_b (upstream's post-v1.2.7 RF thread reads
+    # card_fds[card] for card < (read_b ? 2 : 1)). Either shape must come after
+    # the handshake and be gated on read_b.
+    card1_loop = r"card\s*<\s*\(?\s*read_b\s*\?\s*2\s*:\s*1"
+    card1_hits = [m.start() for m in (re.search(r"card_fds\[1\]", thread), re.search(card1_loop, thread)) if m]
+    card1_read = min(card1_hits) if card1_hits else -1
     if raise_active < 0 or load_enabled < 0 or not (raise_active < load_enabled < card1_read):
         return fail("gui_cxadc.c: cxadc_capture_thread() must raise b_active, then read b_enabled, "
-                    "before it reads card 1")
-    if thread.count("if (read_b)") < 2:
-        return fail("gui_cxadc.c: cxadc_capture_thread() must gate the card 1 read and the B decode on read_b")
+                    "before it reads card 1 (card_fds[1], or a card < (read_b ? 2 : 1) loop)")
+    read_b_gates = len(re.findall(r"\bif\s*\(\s*read_b\b", thread)) + len(re.findall(card1_loop, thread))
+    if read_b_gates < 2:
+        return fail("gui_cxadc.c: cxadc_capture_thread() must gate the card 1 read and the B decode on read_b "
+                    "(if (read_b ...) or a card < (read_b ? 2 : 1) loop)")
     drop_enabled = sync.find("atomic_store(&s_cxadc.b_enabled, false)")
     load_active = sync.find("atomic_load(&s_cxadc.b_active)")
     if drop_enabled < 0 or load_active < 0 or drop_enabled > load_active:
@@ -5673,6 +5681,38 @@ def check_bufmgr_write_tap_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_ring_fill_level_contract(repo_root: Path) -> int:
+    """How full a ring is goes through rb_fill_level() (upstream's API since
+    c1dae40, on the fork's grow-only counters: head loaded before tail, clamped
+    to the capacity). The status-bar and net-ingest readouts used to load head
+    and tail themselves, in whichever order, and could print over 100%."""
+    common = repo_root / "misrc_tools/common"
+    try:
+        hdr = read_text(common / "ringbuffer.h")
+        ring = strip_c_comments(read_text(common / "ringbuffer.c"))
+        mgr = strip_c_comments(read_text(common / "buffer_manager.c"))
+        ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    except OSError as exc:
+        return fail(f"ring fill guard: cannot read a source file: {exc}")
+    if "size_t rb_fill_level(const ringbuffer_t *rb);" not in hdr:
+        return fail("ringbuffer.h: rb_fill_level(const ringbuffer_t *rb) is missing (upstream's declaration)")
+    try:
+        body = extract_function_body(ring, "size_t rb_fill_level(const ringbuffer_t *rb)")
+        fill = extract_function_body(mgr, "size_t bufmgr_fill_level(buffer_manager_t *mgr, buffer_id_t id)")
+    except RuntimeError as exc:
+        return fail(f"ring fill guard: {exc}")
+    h, t = body.find("&rb->head"), body.find("&rb->tail")
+    if h < 0 or t < 0 or h > t:
+        return fail("ringbuffer.c: rb_fill_level must load head before tail (tail never trails head)")
+    if "buffer_size" not in body:
+        return fail("ringbuffer.c: rb_fill_level must clamp to the capacity")
+    if "rb_fill_level(" not in fill:
+        return fail("buffer_manager.c: bufmgr_fill_level must return rb_fill_level()")
+    if re.search(r"atomic_load\(&app->buffers\.buffers\[[A-Z_]+\]\.(head|tail)\)", ui):
+        return fail("gui_ui.c: a readout loads a ring's head/tail itself; use bufmgr_fill_percent/bufmgr_fill_level")
+    return 0
+
+
 def check_upstream_record_api_preadopted(repo_root: Path) -> int:
     """Upstream's c1dae40 (post-v1.2.7) record API, pre-adopted on the fork's
     FIFO path on 2026-11-17 so the next sync keeps our side and links. The
@@ -5845,6 +5885,70 @@ def check_preview_sdtv_geometry_runtime(repo_root: Path) -> int:
                 f"stdout:\n{exc.stdout}\n"
                 f"stderr:\n{exc.stderr}"
             )
+    return 0
+
+
+def check_text_field_caret_font(repo_root: Path) -> int:
+    """A click in an edited text field places the caret by measuring the text
+    with gui_ui_text_field_font()'s size and font id. The field is drawn by
+    gui_ui_render_active_text(field, text, size, id, ...). If the two disagree,
+    the caret lands on the wrong character: 5e55bee (2026-10-02) dropped the
+    FONT_SIZE_STATS/id 1 block together with the retired ingest_* cases, and
+    every tag field measured in the normal font while drawing in the mono
+    stats font. Every literal-field draw call must match the font map; the
+    metadata fields are mapped by gui_ui_is_meta_field() and drawn in the
+    capture-metadata panel, outside this check."""
+    ui_dir = repo_root / "misrc_tools/misrc_gui/ui"
+    try:
+        gui_ui = strip_c_comments(read_text(ui_dir / "gui_ui.c"))
+        sources = {p.name: strip_c_comments(read_text(p)) for p in sorted(ui_dir.glob("*.c"))}
+    except OSError as exc:
+        return fail(f"caret font guard: cannot read the UI sources: {exc}")
+    try:
+        body = extract_function_body(
+            gui_ui, "static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)")
+    except RuntimeError as exc:
+        return fail(f"gui_ui.c: {exc}")
+    mapping = {}
+    default = None
+    pending = []
+    size = font_id = None
+    for tok in re.finditer(r"case\s+(UI_TEXT_FIELD_\w+)\s*:|(default)\s*:|size\s*=\s*(\w+)\s*;|"
+                           r"\bid\s*=\s*(\d+)\s*;|(break)\s*;", body):
+        if tok.group(1) or tok.group(2):
+            if size is not None and font_id is not None and not pending:
+                size = font_id = None
+            pending.append(tok.group(1) or "default")
+        elif tok.group(3):
+            size = tok.group(3)
+        elif tok.group(4):
+            font_id = int(tok.group(4))
+        elif tok.group(5):
+            for label in pending:
+                if label == "default":
+                    default = (size, font_id)
+                else:
+                    mapping[label] = (size, font_id)
+            pending = []
+            size = font_id = None
+    if default is None or not mapping:
+        return fail("gui_ui.c: gui_ui_text_field_font() no longer has a parseable switch "
+                    "(case labels -> size = X; id = N; break;) with a default")
+    draws = 0
+    for name, text in sources.items():
+        for call in re.finditer(r"gui_ui_render_active_text\(\s*(UI_TEXT_FIELD_\w+)\s*,[^,]+,\s*(\w+)\s*,\s*(\d+)\s*,",
+                                text):
+            field, size, fid = call.group(1), call.group(2), int(call.group(3))
+            draws += 1
+            want = mapping.get(field, default)
+            if want != (size, fid):
+                return fail(f"{name}: {field} is drawn with ({size}, font {fid}) but "
+                            f"gui_ui_text_field_font() measures it with ({want[0]}, font {want[1]}); "
+                            "a click would put the caret on the wrong character. Add the field to the "
+                            "matching case group.")
+    if draws < 10:
+        return fail(f"caret font guard found only {draws} gui_ui_render_active_text() calls with a literal field; "
+                    "the call shape changed, update the guard")
     return 0
 
 
@@ -7209,6 +7313,8 @@ def main() -> int:
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
         ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
         ("USB reference encode options", lambda: check_usbref_encode_options(repo_root)),
+        ("text field caret font matches its draw font", lambda: check_text_field_caret_font(repo_root)),
+        ("ring fill level goes through rb_fill_level", lambda: check_ring_fill_level_contract(repo_root)),
         ("upstream record API pre-adopted", lambda: check_upstream_record_api_preadopted(repo_root)),
     ]
     if not args.static_only:

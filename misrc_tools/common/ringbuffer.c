@@ -197,6 +197,20 @@ int rb_read_finished(ringbuffer_t *rb, size_t size) {
 	return 0;
 }
 
+/*
+ * Upstream's observer API (post-v1.2.7), on the fork's grow-only counters.
+ * head is loaded before tail: tail only grows and is never behind head, so
+ * the later tail load can only be larger and the difference never underflows.
+ * Both sides may move between the loads, so the answer is a snapshot; it is
+ * clamped to the capacity like upstream's.
+ */
+size_t rb_fill_level(const ringbuffer_t *rb) {
+	size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+	size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+	size_t used = tail >= head ? tail - head : 0;
+	return used <= rb->buffer_size ? used : rb->buffer_size;
+}
+
 void rb_close(ringbuffer_t *rb) {
 #ifdef _WIN32
 	UnmapViewOfFile(rb->buffer);
