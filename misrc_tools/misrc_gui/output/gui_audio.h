@@ -3,6 +3,7 @@
 
 #include "../core/gui_app.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 
 // Start audio writer/monitor thread.
 // If no audio outputs are enabled in settings, this is a no-op and returns 0.
@@ -13,6 +14,23 @@ void gui_audio_stop(gui_app_t *app);
 
 // True if audio thread is running.
 bool gui_audio_is_running(void);
+
+/* Record paths are resolved by the caller before publishing a new session. */
+#define GUI_AUDIO_RECORD_OUTPUT_COUNT 7
+#define GUI_AUDIO_RECORD_PATH_MAX (FILE_PATH_MAX + MAX_FILENAME_LEN)
+// Upstream's record API (c1dae40), the only way WAV outputs are recorded.
+// paths[i] is "" for a disabled output, in gui_record's order: quad, 1/2, 3/4,
+// then mono 1-4. Bit i of overwrite_mask lets output i replace an existing
+// file; any other output is created exclusively. The audio thread opens the
+// files at its next loop top (discarding pre-record audio there).
+void gui_audio_begin_recording(const gui_app_t *app,
+    const char paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX],
+    unsigned overwrite_mask);
+/* Record-only stop keeps the monitor running. Wait from the finalizer. */
+void gui_audio_request_record_stop(const gui_app_t *app);
+// True when every requested WAV was opened, written and closed (headers
+// included). Waits for a pending stop; returns at once when idle.
+bool gui_audio_wait_recording_idle(void);
 
 // Enable/disable playback monitoring to system audio device.
 // This affects live monitoring only (not file writing).

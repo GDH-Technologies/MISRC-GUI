@@ -57,6 +57,21 @@ const char *gui_record_pending_message(void);
 // pending.
 void gui_record_resolve_pending(gui_app_t *app, bool confirm);
 
+/* Main-thread capture handoff invalidates a pending overwrite confirmation. */
+void gui_record_cancel_capture_confirmation(gui_app_t *app);
+
+/* Upstream's record API (c1dae40), on the fork's FIFO path. */
+/* Wait for recording finalization without resetting capture or writer state. */
+void gui_record_wait_for_finalize(void);
+/* The last completed stop lost data or failed to close/commit an output. */
+bool gui_record_last_stop_failed(void);
+// Latch input loss during the active recording so finalization fails.
+void gui_record_mark_source_loss(void);
+/* Clear the previous session's recording counters and output mode. */
+void gui_record_reset_stats(gui_app_t *app);
+/* Capture PCM failure affects recordings that requested a WAV output. */
+void gui_record_mark_audio_source_loss(void);
+
 // Stop recording
 void gui_record_stop(gui_app_t *app);
 

@@ -140,18 +140,21 @@ int main(void) {
     unsigned existing = 0;
     struct { char before[16]; char text[64]; char after[16]; } guarded;
     memset(&guarded, 'Q', sizeof(guarded));
-    CHECK(gui_record_check_output_paths(app, &existing, guarded.text, sizeof(guarded.text)));
+    unsigned existing_mask = 0;
+    CHECK(gui_record_check_output_paths(app, &existing, guarded.text, sizeof(guarded.text), &existing_mask));
     CHECK(existing == 3);  // Existing WAV must be included, not just RF.
+    // Fork: one overwrite-mask bit per existing output (upstream's bit order).
+    CHECK(__builtin_popcount(existing_mask) == (int)existing);
     CHECK(guarded.text[sizeof(guarded.text) - 1] == 0);
     for (int i = 0; i < 16; i++) CHECK(guarded.before[i] == 'Q' && guarded.after[i] == 'Q');
     app->settings.capture_a = app->settings.capture_b = false;
-    CHECK(gui_record_check_output_paths(app, &existing, NULL, 0));
+    CHECK(gui_record_check_output_paths(app, &existing, NULL, 0, NULL));
     CHECK(existing == 1);
     app->settings.capture_a = app->settings.capture_b = true;
     strcpy(app->settings.output_filename_b, app->settings.output_filename_a);
-    CHECK(!gui_record_check_output_paths(app, &existing, NULL, 0));
+    CHECK(!gui_record_check_output_paths(app, &existing, NULL, 0, NULL));
     app->settings.output_filename_b[0] = 0;
-    CHECK(!gui_record_check_output_paths(app, &existing, NULL, 0));
+    CHECK(!gui_record_check_output_paths(app, &existing, NULL, 0, NULL));
     CHECK(!gui_record_valid_filename("../same.wav"));
 #ifdef _WIN32
     CHECK(gui_record_same_filename("\xc3\x84.wav", "\xc3\xa4.wav"));

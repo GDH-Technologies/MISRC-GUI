@@ -5713,6 +5713,75 @@ def check_ring_fill_level_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_upstream_record_api_preadopted(repo_root: Path) -> int:
+    """Upstream's c1dae40 (post-v1.2.7) record API, pre-adopted on the fork's
+    FIFO path on 2026-11-17 so the next sync keeps our side and links. The
+    declarations are upstream's verbatim; the trap this guards is the WAV one:
+    upstream's gui_audio.c opens WAV files ONLY through
+    gui_audio_begin_recording, so a record path that stops calling it records
+    no WAV, silently. Also pins the close checks (a failed flac_writer_finish
+    or fclose is a failed output whose metadata is not rewritten), exclusive
+    create of unconfirmed outputs, and the verdict reaching the status."""
+    out = repo_root / "misrc_tools/misrc_gui/output"
+    try:
+        rec_h = read_text(out / "gui_record.h")
+        aud_h = read_text(out / "gui_audio.h")
+        rec = strip_c_comments(read_text(out / "gui_record.c"))
+        aud = strip_c_comments(read_text(out / "gui_audio.c"))
+    except OSError as exc:
+        return fail(f"record API guard: cannot read a source file: {exc}")
+    for header, name, decl in (
+        (rec_h, "gui_record.h", "void gui_record_wait_for_finalize(void);"),
+        (rec_h, "gui_record.h", "void gui_record_cancel_capture_confirmation(gui_app_t *app);"),
+        (rec_h, "gui_record.h", "bool gui_record_last_stop_failed(void);"),
+        (rec_h, "gui_record.h", "void gui_record_mark_source_loss(void);"),
+        (rec_h, "gui_record.h", "void gui_record_mark_audio_source_loss(void);"),
+        (rec_h, "gui_record.h", "void gui_record_reset_stats(gui_app_t *app);"),
+        (aud_h, "gui_audio.h", "#define GUI_AUDIO_RECORD_OUTPUT_COUNT 7"),
+        (aud_h, "gui_audio.h", "void gui_audio_request_record_stop(const gui_app_t *app);"),
+        (aud_h, "gui_audio.h", "bool gui_audio_wait_recording_idle(void);"),
+    ):
+        if decl not in header:
+            return fail(f"{name}: upstream's declaration is missing or changed: {decl}")
+    if not re.search(r"void gui_audio_begin_recording\(const gui_app_t \*app,\s*"
+                     r"const char paths\[GUI_AUDIO_RECORD_OUTPUT_COUNT\]\[GUI_AUDIO_RECORD_PATH_MAX\],\s*"
+                     r"unsigned overwrite_mask\);", aud_h):
+        return fail("gui_audio.h: upstream's gui_audio_begin_recording(app, paths, overwrite_mask) is missing or changed")
+    try:
+        stop = extract_function_body(rec, "void gui_record_stop(gui_app_t *app)")
+        fin = extract_function_body(rec, "static void gui_record_finalize_stop_sync(gui_record_session_t *ses)")
+        start = extract_function_body(rec, "static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask)")
+    except RuntimeError as exc:
+        return fail(f"gui_record.c: {exc}")
+    if "gui_audio_request_record_stop(app)" not in stop or "gui_audio_stop(" in stop:
+        return fail("gui_record_stop must end the WAVs with gui_audio_request_record_stop (and not stop/restart the audio thread)")
+    if "gui_audio_wait_recording_idle()" not in fin:
+        return fail("the finalizer must wait for the WAV closes: gui_audio_wait_recording_idle()")
+    if start.count("gui_record_begin_audio(app, overwrite_mask)") < 2 or \
+            "gui_audio_begin_recording(app, paths, overwrite_mask >> GUI_RECORD_OVERWRITE_WAV_SHIFT)" not in rec:
+        return fail("record start (FLAC and RAW) must publish the WAV outputs through gui_audio_begin_recording "
+                    "with the overwrite mask -- without it upstream's audio thread records no WAV")
+    if start.count('overwrite_mask & 1u ? "wb" : "wbx"') < 2 or start.count('overwrite_mask & 2u ? "wb" : "wbx"') < 2:
+        return fail("RF outputs not covered by the overwrite confirmation must be created exclusively (\"wbx\")")
+    if "existing_now & ~overwrite_mask" not in start:
+        return fail("gui_record_start_confirmed must refuse an output that appeared after the overwrite check")
+    for needle, why in (
+        ("flac_writer_finish(ses->flac_a) != FLAC_WRITER_OK", "a failed FLAC finish is a failed output"),
+        ("fclose(ses->file_a) != 0", "a failed close is a failed output"),
+        ("!ses->close_failed[0]", "no metadata rewrite into a file whose close failed"),
+        ("atomic_store(&s_record_stop_failed, incomplete)", "the verdict feeds gui_record_last_stop_failed"),
+        ('"Recording verdict: incomplete (%s)"', "the verdict reaches the capture log"),
+        ("end.complete = !incomplete", "the verdict reaches the sidecar"),
+    ):
+        if needle not in fin:
+            return fail(f"gui_record_finalize_stop_sync lost `{needle}`: {why}")
+    if '"Recording incomplete"' not in rec:
+        return fail('gui_record.c: the stop status lost upstream\'s "Recording incomplete"')
+    if "static atomic_int s_audio_record_state" not in aud or "\"wbx\"" not in aud:
+        return fail("gui_audio.c: the WAV record state, or exclusive create of unconfirmed WAVs, is gone")
+    return 0
+
+
 def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
     """Every capture, record and net-ingest path sits on common/ringbuffer.c's
     mirrored mapping, and --smoke-test returns before it is ever created, so a
@@ -6685,8 +6754,12 @@ def _check_sidecar_json(path: Path, data: object) -> Optional[str]:
         return "the sidecar and the log do not share a stem"
     result = data["result"]
     if complete:
-        if not isinstance(result, dict) or set(result) != {"drops", "waits"} or \
-                not all(isinstance(x, int) for x in result.values()):
+        # drops/waits counts, plus the recording verdict (fork, 2026-11-17:
+        # upstream's "Recording incomplete", written for the toolkit too).
+        if not isinstance(result, dict) or set(result) != {"drops", "waits", "complete", "source_loss"} or \
+                not all(isinstance(result[k], int) and not isinstance(result[k], bool)
+                        for k in ("drops", "waits", "source_loss")) or \
+                not isinstance(result["complete"], bool):
             return f"complete but result {result!r}"
     elif result is not None:
         return f"recording but result {result!r}"
@@ -6955,9 +7028,9 @@ def check_capture_metadata_post_build(gui_path: Path) -> int:
             return fail(f"misrc_gui --capture-meta-selftest failed (rc={ran.returncode}):\n"
                         f"{ran.stdout.strip()}")
         sidecars = sorted(out.rglob("*_capture_meta.json"))
-        if len(sidecars) != 2:
-            return fail(f"--capture-meta-selftest left {len(sidecars)} sidecar(s), expected 2 "
-                        "(linked + unlinked)")
+        if len(sidecars) != 3:
+            return fail(f"--capture-meta-selftest left {len(sidecars)} sidecar(s), expected 3 "
+                        "(linked + unlinked + source_loss)")
         for sidecar in sidecars:
             try:
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -6967,9 +7040,18 @@ def check_capture_metadata_post_build(gui_path: Path) -> int:
             if problem:
                 return fail(f"{sidecar.parent.name}/{sidecar.name}: {problem}")
         loaded = [json.loads(p.read_text(encoding="utf-8")) for p in sidecars]
+        # The recording verdict: the source_loss run reported input loss and
+        # must be incomplete; the others are complete unless they dropped.
+        for path, d in zip(sidecars, loaded):
+            res = d["result"]
+            lossy = path.parent.name == "source_loss"
+            if lossy and (res["complete"] is not False or res["source_loss"] != 1):
+                return fail(f"source_loss sidecar result {res!r}: expected complete false, source_loss 1")
+            if not lossy and res["drops"] == 0 and res["complete"] is not True:
+                return fail(f"{path.parent.name} sidecar result {res!r}: no drops but not complete")
         linked = [d["linked"] for d in loaded]
-        if sorted(linked) != [False, True]:
-            return fail(f"expected one linked and one unlinked sidecar, got linked={linked}")
+        if sorted(linked) != [False, False, True]:
+            return fail(f"expected one linked and two unlinked sidecars, got linked={linked}")
         # The linked run's session asked for A only and the run recorded A+B;
         # the unlinked run had no request.
         for d in loaded:
@@ -7004,7 +7086,9 @@ def check_audio_record_alignment_contract(repo_root: Path) -> int:
         (audio_c, "BUF_CAPTURE_AUDIO,\n                                    AUDIO_SYNC_CHUNK_BYTES, 0)", "sync helpers use no-wait full chunks"),
         (audio_c, "[AUDIO] Record start aligned", "start-alignment log line"),
         (audio_c, "[AUDIO] Record stop aligned", "stop-alignment log line"),
-        (audio_c, "bool was_recording = (a->f_4ch != NULL)", "pre-opened-files recording init"),
+        (audio_c, "static atomic_int s_audio_record_state", "upstream's record state (begin/stop/wait API)"),
+        (audio_c, "audio_open_record_files(a);", "WAVs opened by the thread at the START transition"),
+        (audio_c, "audio_close_record_files(a);", "WAVs closed (headers checked) at the STOP transition"),
         (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);", "2 ms read timeout keeps the transition observation at ~2-4 ms"),
         (buffer_manager_c, "if (timeout_ms == 0) return NULL;", "timeout-0 read returns only full available chunks"),
     ]
@@ -7017,7 +7101,7 @@ def check_audio_record_alignment_contract(repo_root: Path) -> int:
     # 10 ms read-timeout spin instead of only at the next full ~350 ms block.
     thread_body = func_body_from(audio_c, "static int audio_thread_main(void *ctx)")
     loop_pos = thread_body.find("while (1) {")
-    transition_pos = thread_body.find("bool rec_now = a->app && a->app->is_recording;")
+    transition_pos = thread_body.find("int record_state = atomic_load(&s_audio_record_state);")
     read_pos = thread_body.find("bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);")
     if min(loop_pos, transition_pos, read_pos) < 0:
         return fail("Audio record alignment anchors not found in audio_thread_main")
@@ -7231,6 +7315,7 @@ def main() -> int:
         ("USB reference encode options", lambda: check_usbref_encode_options(repo_root)),
         ("text field caret font matches its draw font", lambda: check_text_field_caret_font(repo_root)),
         ("ring fill level goes through rb_fill_level", lambda: check_ring_fill_level_contract(repo_root)),
+        ("upstream record API pre-adopted", lambda: check_upstream_record_api_preadopted(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

@@ -73,6 +73,8 @@ typedef struct {
     bool have_result;                       /* false = "result": null */
     uint64_t drops;
     uint64_t waits;
+    bool result_complete;                   /* the recording verdict */
+    uint64_t source_loss;                   /* input loss while it recorded */
 } gui_capture_sidecar_t;
 
 /* Format the sidecar JSON into buf (NUL-terminated, truncated if cap is

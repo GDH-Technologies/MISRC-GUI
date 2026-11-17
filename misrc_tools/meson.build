@@ -1036,6 +1036,13 @@ if raylib_dep.found()
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
     test('gui_audio_hifi_monitor', audio_hifi_monitor_test)
+    # WAV recording through upstream's record API (begin/stop/wait) on the
+    # production audio thread, real files in a scratch dir (fork, 2026-11-17).
+    audio_record_test = executable('gui_audio_record_test',
+      'test/gui_audio_record_test.c',
+      dependencies: overlay_test_deps + [dependency('threads')],
+      include_directories: gui_includes, c_args: gui_cflags, link_args: ldflags)
+    test('gui_audio_record', audio_record_test)
     if soxr_dep.found()
       audio_soxr_lifecycle_test = executable('gui_audio_soxr_lifecycle_test',
         'test/gui_audio_soxr_lifecycle_test.c',
