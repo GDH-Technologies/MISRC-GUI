@@ -204,6 +204,124 @@ upstream's tree on every machine.
 | 2026-09-06, v1.1.9 (`60f5d1d`) | `gui_ui.c` (toolbar); the stats harness `"Preview"` stub |
 | 2026-09-02, v1.1.8 (`7b92f44`); `38814fe`; `e9ddaf6` | by hand, before this skill existed |
 
+## Next sync: pre-read of upstream/main past v1.2.7 (2026-11-17)
+
+Reece chose to wait for v1.2.8 after a trial merge of `upstream/main` 24900d7 (34 commits
+past v1.2.7, 176 files, +31k/-3.7k). Start the next sync from this map, then diff only what
+upstream added after 24900d7 (`git log 24900d7..<target>`). It was a read-only review
+(`git merge-tree --write-tree`, nothing built), so treat each item as a prediction to check.
+
+**Conflicts (26 files, 138 blocks):** `gui_record.c` 51, `gui_net.c` 18, `gui_ui.c` 16,
+`gui_cxadc.c` 6, `gui_record_direct_harness.c` 6, `gui_extract.c` 5, `misrc_gui.c` 5,
+`gui_capture.c` 4, `gui_settings.c` 3, `ringbuffer.c` 3, and 1-2 each in `gui_app.h`,
+`gui_net.h`, `gui_record.h`, `gui_record_direct.{c,h}`, `gui_audio.c`, `gui_cvbs.c`,
+`gui_panel.c`, `panel_registry.c`, `meson.build`, `build-deps-unix.sh`, `ci_guard_tests.py`,
+`gui_stats_layout_harness.c`, `gui_settings_paths_test.c`, `gui_rf_playback_reconnect_test.c`,
+`gui_rf_input_stamps_test.c`.
+
+**c1dae40 ("Fix shared capture buffers and recording finalization"), most of the risk.** The
+commit message is one line with no dev note, so the intent below comes from the code:
+- Record path: keep the fork's FIFO side of `gui_record.c` (session globals, writers,
+  start, finalize, disk guard), `gui_record_direct.{c,h}` and the direct harness. The fork
+  already has the ordered spill, suffix retry (sink), SoXR EOF drain and backlog guard. Port
+  by hand:
+  - `fclose`/`flac_writer_finish` result checks, with no tag rewrite after a write error;
+  - `"wbx"` exclusive create for files not confirmed for overwrite;
+  - cancel a pending overwrite confirmation on a capture or net mode change;
+  - refuse resample without SoXR, and converted RAW when the two CX cards' rates differ;
+  - source-loss counters, `gui_record_last_stop_failed` ("Recording incomplete") and
+    `gui_record_wait_for_finalize`.
+
+  Skip upstream's numbered capture-log rename (the fork's log and sidecar share one stem).
+- **WAV opens only through `gui_audio_begin_recording(paths, mask)`** (with
+  `gui_audio_request_record_stop` / `gui_audio_wait_recording_idle`). The fork's start path
+  must call it, or WAV silently stops recording. Add a guard.
+- `gui_extract.c`:
+  - `s_recording_enabled` disappears in the merge while the fork still uses it (a compile
+    error).
+  - Upstream's `RECORD_PUBLISH_*` state machine cuts at the producer cursor
+    (sample-exact start/stop, partial tail kept). Feed it through the fork's gate plus
+    `gui_record_push(trimmed)` instead of `push_converted`.
+  - Push `sample_count` bytes, not a fixed `BUFFER_READ_SIZE*2`: RTL-SDR and tail blocks are
+    variable.
+- Symbols other merged files call, which the fork's `gui_record.c` must define:
+  `gui_record_mark_source_loss`, `_mark_audio_source_loss`, `_cancel_capture_confirmation`,
+  `_last_stop_failed`, `_wait_for_finalize`, `_reset_stats`, `_rtlsdr_active` /
+  `_rtlsdr_push` / `_get_rtlsdr_hifi_output`. `bufmgr_write_tap_harness.c` needs an
+  `rb_fill_level` stub.
+- **Ringbuffer.** Upstream independently fixed the fork's 65c8d8d race with cursors that
+  wrap at 2x capacity plus `rb_fill_level()`. Recommended (not yet decided by Reece): keep the
+  fork's grow-only counters, add `rb_fill_level`, and adapt `ringbuffer_wrap_harness.c:66-67`.
+  Under upstream's scheme `bufmgr_free_space` returns 0 after a wrap and the gui_ui fill
+  percentages break.
+- `gui_cxadc.c`: take upstream's per-card RF loop (queued bytes, 10-bit carry,
+  `native_rates_differ`) and rebuild the RF B handshake inside it:
+  - latch `read_b` each iteration;
+  - loop `card < (read_b ? 2 : 1)`;
+  - reset `queued[1]` when B drops;
+  - allocate B only when `card_count > 1`.
+
+  The "CXADC card B stays closed" guard accepts that loop shape since 2026-11-17.
+- Net (`gui_net.c`):
+  - **Capture boundaries.** `gui_net_end_capture` (called from `gui_capture.c`) plus the
+    `X-MISRC-Capture-Id` header. Keep the fork's fanout. Recommended: a no-op
+    `gui_net_end_capture`, don't advertise `capture_boundaries`, and port into
+    `gui_net_fanout.c` later.
+  - Delete upstream's subscribe/header block after the `/rf` marker: it doesn't compile and
+    would send a second 200.
+  - Drop `gui_net_tap_rf/audio` and the `s_server_capture_tap` store. Move the boundary
+    heuristic into `client_apply_stats`.
+  - Wrap only the monitor-select block in `#ifndef __ANDROID__`; `/set` and `server_publish`
+    stay unconditional.
+  - **Client feed latch.** `rf_stream_ended` is cleared only by
+    `gui_extract_discard_client_rf()`. Port that function, or the client RF pump never
+    reconnects.
+  - **Local stop.** `client_finish_recording` → `gui_app_stop_recording` only QUEUES the
+    stop of a client local recording. Call `gui_record_stop` directly, gated on
+    `GUI_NET_MODE_CLIENT`.
+  - Keep `gui_monitor_client_device_frame_rendered()` after `view_end` in `misrc_gui.c`.
+  - Local Save is still refused (the refusal merges clean); upstream's receiver hardening comes
+    along.
+- Settings to append: `rtlsdr_vga_index` (int 0-8, default 8), `rtlsdr_hifi_rf_record`
+  (bool, false), `rtlsdr_hifi_rf_tag` (string[32], ""), and `ddd_use_winusb` /
+  `ddd_libusb_raw_io` (bool, false, `#ifdef ENABLE_DDD`, probably `GS_LOCAL`). Changed
+  defaults: `rtlsdr_gain_mode` 0→1, `rtlsdr_agc` true→false. WFM and vectorscope have no keys
+  (`--wfm`, `--panel-view` only).
+- UI and panels:
+  - Add `PANEL_VIEW_VECTORSCOPE`/`WFM` next to the fork's `PREVIEW`. The order is Reece's
+    call (UX).
+  - `gui_panel.c`, the stats harness and `panel_registry` `s_prof_names` must list all three
+    in enum order.
+  - `gui_ui.h` needs `UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG` and `_RTLSDR_RATE`.
+  - Use upstream's `s_rtlsdr_*` field rows; `s_rtlsdr_freq_str` is gone.
+
+**Build and CI.**
+- **liba52.** A meson `custom_target` downloads `a52dec-0.8.0.tar.gz` (macports, MIT
+  mirror; SHA-256 pinned) on every build and patches it. It's a hard dependency: MISRC calls
+  the patched `a52_reset` and sized `a52_frame`, so Fedora's `liba52-devel` 0.7.4 can't
+  substitute. Set a persistent `MISRC_DEP_CACHE` in `selfhosted-deploy.yml` (checkout
+  `clean: true` wipes `.deps/downloads`).
+- **rtl-sdr.** `build-deps-unix.sh` / `build-deps-windows.sh` download and build osmocom
+  619ac31 via `scripts/build-rtlsdr.sh`, and the stamp now requires `librtlsdr.pc`, so every
+  deps cache rebuilds cold once. Its `cmake --build --parallel` is unbounded: set
+  `CMAKE_BUILD_PARALLEL_LEVEL=8`. Fedora's `rtl-sdr-devel` 2.0.1 would also build (the Blog V4
+  API is detected and optional).
+- **The rule contradiction.** Both downloads contradict upstream's own
+  `self_contained_deps_rules.md`, mirrored in `.claude/CLAUDE.md`. Reece decides.
+- **Host check (2026-11-17).** wm, cs0, air0 and win0 all have ninja, python3, cmake,
+  pkg-config, git and libusb 1.0.30, and reach all three download URLs (HTTP 200). With
+  libusb >= 1.0.30, win0 links WinUSB DdD (CFGMGR32.DLL, WINUSB.DLL); the fork's allowlist
+  already carries both.
+- **Worktree builds.** Upstream's `build-local.sh` always runs the deps script unless
+  `MISRC_DEPS_PREFIX` is set. In a worktree it writes through the `.deps/install` symlink into
+  the main checkout.
+
+**Open decisions for Reece:** ringbuffer side; sample-exact start/stop on the FIFO path; a
+client recording locally when the feed drops (upstream: stop and fail; fork: keep, log the
+gap); RTL-SDR on fork builds (`-Drtlsdr=disabled` with refusing stubs, or port Hi-Fi RF as a
+FIFO producer); downloads (accept with a cache, or vendor); Preview's position among the new
+panel views.
+
 ## Never
 
 - Never rebase `main`, never merge locally into `main`, never push `--force`.

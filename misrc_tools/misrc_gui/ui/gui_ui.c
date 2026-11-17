@@ -3063,6 +3063,15 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION:
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_VIDEO_TAG:
+        case UI_TEXT_FIELD_CC_TAG:
+        case UI_TEXT_FIELD_NET_SERVER_PORT:
+        case UI_TEXT_FIELD_NET_CLIENT_HOST:
+        case UI_TEXT_FIELD_NET_CLIENT_PORT:
+            size = FONT_SIZE_STATS;
+            id = 1;
+            break;
         default:
             size = FONT_SIZE_NORMAL;
             id = 0;
