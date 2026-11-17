@@ -5742,14 +5742,8 @@ static void render_version_info_window(gui_app_t *app)
             }
             static char net_ingest_line[160];
             {
-                size_t rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-                size_t rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-                size_t rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-                int rf_pct = rf_size > 0 ? (int)(((rf_tail - rf_head) * 100) / rf_size) : 0;
-                size_t au_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-                size_t au_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-                size_t au_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-                int au_pct = au_size > 0 ? (int)(((au_tail - au_head) * 100) / au_size) : 0;
+                int rf_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_RF));
+                int au_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_AUDIO));
                 snprintf(net_ingest_line, sizeof(net_ingest_line),
                          "RF buf %d%%  Audio buf %d%%  Missed %u  Errors %u", rf_pct, au_pct,
                          (unsigned)atomic_load(&app->missed_frame_count),
@@ -8767,18 +8761,10 @@ static bool render_main_panels(gui_app_t *app) {
         }
         format_status_counter(status_errors_display, sizeof(status_errors_display),
                               errors);
-        size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-        size_t status_rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-        size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-        status_rf_pct = status_rf_size > 0
-            ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        status_rf_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_RF));
         if(m_status_valid)status_rf_pct=(int)m_status.rf_fill_pct;
         snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
-        size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-        size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-        size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-        status_aud_pct = status_aud_size > 0
-            ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        status_aud_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_AUDIO));
         if(m_status_valid)status_aud_pct=(int)m_status.aud_fill_pct;
         snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
     }

@@ -5673,6 +5673,38 @@ def check_bufmgr_write_tap_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_ring_fill_level_contract(repo_root: Path) -> int:
+    """How full a ring is goes through rb_fill_level() (upstream's API since
+    c1dae40, on the fork's grow-only counters: head loaded before tail, clamped
+    to the capacity). The status-bar and net-ingest readouts used to load head
+    and tail themselves, in whichever order, and could print over 100%."""
+    common = repo_root / "misrc_tools/common"
+    try:
+        hdr = read_text(common / "ringbuffer.h")
+        ring = strip_c_comments(read_text(common / "ringbuffer.c"))
+        mgr = strip_c_comments(read_text(common / "buffer_manager.c"))
+        ui = strip_c_comments(read_text(repo_root / "misrc_tools/misrc_gui/ui/gui_ui.c"))
+    except OSError as exc:
+        return fail(f"ring fill guard: cannot read a source file: {exc}")
+    if "size_t rb_fill_level(const ringbuffer_t *rb);" not in hdr:
+        return fail("ringbuffer.h: rb_fill_level(const ringbuffer_t *rb) is missing (upstream's declaration)")
+    try:
+        body = extract_function_body(ring, "size_t rb_fill_level(const ringbuffer_t *rb)")
+        fill = extract_function_body(mgr, "size_t bufmgr_fill_level(buffer_manager_t *mgr, buffer_id_t id)")
+    except RuntimeError as exc:
+        return fail(f"ring fill guard: {exc}")
+    h, t = body.find("&rb->head"), body.find("&rb->tail")
+    if h < 0 or t < 0 or h > t:
+        return fail("ringbuffer.c: rb_fill_level must load head before tail (tail never trails head)")
+    if "buffer_size" not in body:
+        return fail("ringbuffer.c: rb_fill_level must clamp to the capacity")
+    if "rb_fill_level(" not in fill:
+        return fail("buffer_manager.c: bufmgr_fill_level must return rb_fill_level()")
+    if re.search(r"atomic_load\(&app->buffers\.buffers\[[A-Z_]+\]\.(head|tail)\)", ui):
+        return fail("gui_ui.c: a readout loads a ring's head/tail itself; use bufmgr_fill_percent/bufmgr_fill_level")
+    return 0
+
+
 def check_ringbuffer_mirror_runtime(repo_root: Path) -> int:
     """Every capture, record and net-ingest path sits on common/ringbuffer.c's
     mirrored mapping, and --smoke-test returns before it is ever created, so a
@@ -7125,6 +7157,7 @@ def main() -> int:
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
         ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
         ("USB reference encode options", lambda: check_usbref_encode_options(repo_root)),
+        ("ring fill level goes through rb_fill_level", lambda: check_ring_fill_level_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
