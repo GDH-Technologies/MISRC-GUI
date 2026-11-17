@@ -428,7 +428,7 @@ static void gui_record_build_log_timestamp(char *dst, size_t dst_len) {
 static thrd_t s_finalize_thread;
 static atomic_bool s_finalize_thread_running = ATOMIC_VAR_INIT(false);
 static char s_record_path_video[GUI_RECORD_PATH_MAX];
-static char s_video_start_msg[480];
+static char s_video_start_msg[1024];
 static char s_record_path_cc[GUI_RECORD_PATH_MAX];
 static char s_cc_start_msg[480];
 static atomic_bool s_record_stop_finalizing = ATOMIC_VAR_INIT(false);
@@ -2805,9 +2805,15 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     /* Built from settings alone. This function runs before the video spawn in
      * the FLAC path and after it in the RAW path, so it must not read live
      * video-module state or the two logs would disagree. */
-    snprintf(msg, sizeof(msg), "Reference video: enabled=%s codec=%s",
-             app->settings.video_record_enabled ? "on" : "off",
-             app->settings.usbref_codec == 1 ? "FFV1" : "H.264");
+    {
+        video_encode_opts_t enc;
+        char enc_summary[128];
+        gui_video_encode_opts_from_settings(&app->settings, &enc);
+        gui_video_encode_summary(&enc, enc_summary, sizeof(enc_summary));
+        snprintf(msg, sizeof(msg), "Reference video: enabled=%s codec=%s (%s)",
+                 app->settings.video_record_enabled ? "on" : "off",
+                 enc.codec == VIDEO_CODEC_FFV1 ? "FFV1" : "H.264", enc_summary);
+    }
     gui_record_log_write_line_locked("INFO", msg);
 
     if (app->settings.video_record_enabled && app->settings.video_filename[0]) {
@@ -3150,6 +3156,12 @@ int gui_record_video_settings_test_main(void)
     a.usbref_codec = 1;                       /* FFV1 */
     snprintf(a.video_output_tag, sizeof(a.video_output_tag), "refcam");
     snprintf(a.ffmpeg_path, sizeof(a.ffmpeg_path), "/opt/custom/ffmpeg");
+    a.usbref_h264_chroma = 422;
+    a.usbref_ffv1_chroma = 420;
+    a.usbref_h264_crf = 23;
+    snprintf(a.usbref_h264_preset, sizeof(a.usbref_h264_preset), "fast");
+    a.usbref_h264_keyint = 50;
+    a.usbref_interlace = VIDEO_INTERLACE_OFF;
     gui_settings_save(&a);
 
     gui_settings_t b;
@@ -3163,6 +3175,17 @@ int gui_record_video_settings_test_main(void)
     printf("  video_output_tag     : %s -> %s\n", a.video_output_tag, b.video_output_tag);
     printf("  ffmpeg_path          : %s -> %s\n", a.ffmpeg_path, b.ffmpeg_path);
     printf("  video_filename       : %s\n", b.video_filename);
+    printf("  encode               : h264 %d ffv1 %d crf %d %s keyint %d interlace %d -> "
+           "h264 %d ffv1 %d crf %d %s keyint %d interlace %d\n",
+           a.usbref_h264_chroma, a.usbref_ffv1_chroma, a.usbref_h264_crf, a.usbref_h264_preset,
+           a.usbref_h264_keyint, a.usbref_interlace,
+           b.usbref_h264_chroma, b.usbref_ffv1_chroma, b.usbref_h264_crf, b.usbref_h264_preset,
+           b.usbref_h264_keyint, b.usbref_interlace);
+    if (a.usbref_h264_chroma != b.usbref_h264_chroma || a.usbref_ffv1_chroma != b.usbref_ffv1_chroma ||
+        a.usbref_h264_crf != b.usbref_h264_crf || strcmp(a.usbref_h264_preset, b.usbref_h264_preset) ||
+        a.usbref_h264_keyint != b.usbref_h264_keyint || a.usbref_interlace != b.usbref_interlace) {
+        printf("FAIL: encode options did not round-trip\n"); rc = 1;
+    }
 
     if (a.video_record_enabled != b.video_record_enabled) { printf("FAIL: enabled\n"); rc = 1; }
     if (a.usbref_codec != b.usbref_codec)     { printf("FAIL: codec\n"); rc = 1; }
@@ -3177,6 +3200,13 @@ int gui_record_video_settings_test_main(void)
      * exist -- the loader clamps rather than trusting the number. */
     gui_settings_t c = b;
     c.usbref_codec = 99;
+    /* The same for every encode option: clamped or reset, never trusted. */
+    c.usbref_h264_chroma = 444;
+    c.usbref_ffv1_chroma = 0;
+    c.usbref_h264_crf = 99;
+    snprintf(c.usbref_h264_preset, sizeof(c.usbref_h264_preset), "placebo");
+    c.usbref_h264_keyint = 0;
+    c.usbref_interlace = 7;
     gui_settings_save(&c);
     gui_settings_t d;
     memset(&d, 0, sizeof(d));
@@ -3184,6 +3214,14 @@ int gui_record_video_settings_test_main(void)
     printf("  out-of-range codec 99 -> %d (must be 0 or 1)\n", d.usbref_codec);
     if (d.usbref_codec != 0 && d.usbref_codec != 1) {
         printf("FAIL: codec not clamped\n"); rc = 1;
+    }
+    printf("  out-of-range encode -> h264 %d ffv1 %d crf %d %s keyint %d interlace %d "
+           "(must be 420 422 51 veryfast 1 0)\n",
+           d.usbref_h264_chroma, d.usbref_ffv1_chroma, d.usbref_h264_crf, d.usbref_h264_preset,
+           d.usbref_h264_keyint, d.usbref_interlace);
+    if (d.usbref_h264_chroma != 420 || d.usbref_ffv1_chroma != 422 || d.usbref_h264_crf != 51 ||
+        strcmp(d.usbref_h264_preset, "veryfast") || d.usbref_h264_keyint != 1 || d.usbref_interlace != 0) {
+        printf("FAIL: encode options not clamped\n"); rc = 1;
     }
 
     printf("%s\n", rc ? "SETTINGS TEST FAILED" : "settings test passed");
@@ -3311,10 +3349,15 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
                                                       : "the dongle");
     }
 
+    /* Codec, chroma, quality, preset, keyframe and interlace, from the
+     * Recording codec window. */
+    video_encode_opts_t enc;
+    char enc_summary[128];
+    gui_video_encode_opts_from_settings(&app->settings, &enc);
+    gui_video_encode_summary(&enc, enc_summary, sizeof(enc_summary));
+
     char err[256] = {0};
-    if (gui_video_record_start(s_record_path_video,
-                               app->settings.usbref_codec == 1 ? VIDEO_CODEC_FFV1
-                                                                     : VIDEO_CODEC_H264,
+    if (gui_video_record_start(s_record_path_video, &enc,
                                pv.width, pv.height, pitch,
                                pv.fps_num, pv.fps_den, audio_dev, err, sizeof(err)) != 0) {
         gui_preview_hold_release();
@@ -3339,7 +3382,7 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
     snprintf(s_video_start_msg, sizeof(s_video_start_msg),
              "Reference video started: %s (%s, %ux%u @ %.2f fps; audio %s%s)",
              s_record_path_video,
-             app->settings.usbref_codec == 1 ? "FFV1" : "H.264",
+             enc_summary,
              pv.width, pv.height,
              pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0,
              audio_dev[0] ? audio_dev : "off: ",

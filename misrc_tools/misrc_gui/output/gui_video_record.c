@@ -117,12 +117,76 @@ int gui_video_record_timeline_selftest_main(void)
     return fails ? 1 : 0;
 }
 
+/* ---- encode options (platform-neutral) --------------------------------- */
+
+const char *const gui_video_h264_presets[] = { VIDEO_H264_PRESET_LIST };
+const int gui_video_h264_preset_count =
+    (int)(sizeof(gui_video_h264_presets) / sizeof(gui_video_h264_presets[0]));
+
+void gui_video_encode_opts_default(video_encode_opts_t *o, video_codec_t codec)
+{
+    memset(o, 0, sizeof(*o));
+    o->codec = codec == VIDEO_CODEC_FFV1 ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264;
+    o->chroma = o->codec == VIDEO_CODEC_FFV1 ? VIDEO_FFV1_CHROMA_DEFAULT
+                                             : VIDEO_H264_CHROMA_DEFAULT;
+    o->crf = VIDEO_H264_CRF_DEFAULT;
+    snprintf(o->preset, sizeof(o->preset), "%s", VIDEO_H264_PRESET_DEFAULT);
+    o->keyint = VIDEO_H264_KEYINT_DEFAULT;
+    o->interlace = VIDEO_INTERLACE_AUTO;
+}
+
+void gui_video_encode_opts_clamp(video_encode_opts_t *o)
+{
+    if (o->codec != VIDEO_CODEC_FFV1) o->codec = VIDEO_CODEC_H264;
+    if (o->chroma != 420 && o->chroma != 422)
+        o->chroma = o->codec == VIDEO_CODEC_FFV1 ? VIDEO_FFV1_CHROMA_DEFAULT
+                                                 : VIDEO_H264_CHROMA_DEFAULT;
+    if (o->crf < 0)  o->crf = 0;
+    if (o->crf > 51) o->crf = 51;
+    bool known = false;
+    for (int i = 0; i < gui_video_h264_preset_count; i++)
+        if (strcmp(o->preset, gui_video_h264_presets[i]) == 0) { known = true; break; }
+    if (!known) snprintf(o->preset, sizeof(o->preset), "%s", VIDEO_H264_PRESET_DEFAULT);
+    if (o->keyint < 1)   o->keyint = 1;
+    if (o->keyint > 300) o->keyint = 300;
+    if (o->interlace < VIDEO_INTERLACE_AUTO || o->interlace > VIDEO_INTERLACE_OFF)
+        o->interlace = VIDEO_INTERLACE_AUTO;
+}
+
+void gui_video_encode_opts_from_settings(const gui_settings_t *s, video_encode_opts_t *o)
+{
+    gui_video_encode_opts_default(o, s->usbref_codec == 1 ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264);
+    o->chroma = o->codec == VIDEO_CODEC_FFV1 ? s->usbref_ffv1_chroma : s->usbref_h264_chroma;
+    o->crf = s->usbref_h264_crf;
+    snprintf(o->preset, sizeof(o->preset), "%s", s->usbref_h264_preset);
+    o->keyint = s->usbref_h264_keyint;
+    o->interlace = s->usbref_interlace;
+    gui_video_encode_opts_clamp(o);
+}
+
+void gui_video_encode_summary(const video_encode_opts_t *o, char *buf, size_t cap)
+{
+    const char *il = o->interlace == VIDEO_INTERLACE_ON  ? "interlaced"
+                   : o->interlace == VIDEO_INTERLACE_OFF ? "progressive" : "interlace auto";
+    const char *chroma = o->chroma == 422 ? "4:2:2" : "4:2:0";
+    if (o->codec == VIDEO_CODEC_FFV1) {
+        if (o->chroma == 422) snprintf(buf, cap, "FFV1 %s lossless", chroma);
+        else                  snprintf(buf, cap, "FFV1 %s lossless, %s", chroma, il);
+    } else if (o->chroma == 422) {
+        snprintf(buf, cap, "H.264 %s CRF %d %s, keyframe %d", chroma, o->crf, o->preset, o->keyint);
+    } else {
+        snprintf(buf, cap, "H.264 %s CRF %d %s, keyframe %d, %s",
+                 chroma, o->crf, o->preset, o->keyint, il);
+    }
+}
+
 /* Android is __linux__ too, but has no V4L2 access, no posix_spawn/environ
  * ffmpeg subprocess and no writable /dev/video* -- and upstream now builds
  * this same source list into its Android target. Route Android to the
  * non-Linux stubs below instead of compiling this in. */
 #if defined(__linux__) && !defined(__ANDROID__)
 
+#include <linux/videodev2.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -192,7 +256,7 @@ static struct {
     uint32_t  slot_repeats[VR_RING_FRAMES];
 
     /* --- spawn parameters, kept for the video-only respawn --- */
-    video_codec_t codec;
+    video_encode_opts_t enc;
     char      out_path[512];
     char      audio_device[128];   /* "" once running video-only */
     double    spawned_at;
@@ -614,7 +678,27 @@ out:
  * muxed into the same file later. */
 #define VR_AUDIO_TITLE "title=Camcorder line out (USB reference)"
 
-static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
+/* Whether the source frames are two woven fields. Every SD analog raster is
+ * (uvcvideo reports V4L2_FIELD_NONE for the MS210x's 720x480 all the same);
+ * anything else only when the driver says so. */
+static bool vr_source_interlaced(void)
+{
+    if (vr.height == 480 || vr.height == 486 || vr.height == 576) return true;
+    preview_status_t ps = gui_preview_get_status();
+    return ps.field == V4L2_FIELD_INTERLACED || ps.field == V4L2_FIELD_INTERLACED_TB ||
+           ps.field == V4L2_FIELD_INTERLACED_BT;
+}
+
+/* Whether 4:2:0 chroma is halved per field: Auto follows the source. */
+static bool vr_chroma_per_field(const video_encode_opts_t *enc)
+{
+    if (enc->interlace == VIDEO_INTERLACE_ON)  return true;
+    if (enc->interlace == VIDEO_INTERLACE_OFF) return false;
+    return vr_source_interlaced();
+}
+
+static void vr_build_argv(char *argv[], int *argc_out, const video_encode_opts_t *enc,
+                          char *crf_buf, char *keyint_buf, size_t num_cap,
                           char *size_buf, size_t size_cap,
                           char *rate_buf, size_t rate_cap,
                           char *aspect_buf, size_t aspect_cap,
@@ -699,7 +783,8 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
      * frame-comparable with a tbc-video-export of the same tape. */
     argv[n++] = (char *)"-aspect";        argv[n++] = aspect_buf;
 
-    if (codec == VIDEO_CODEC_FFV1) {
+    bool c420 = enc->chroma != 422;
+    if (enc->codec == VIDEO_CODEC_FFV1) {
         argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"ffv1";
         argv[n++] = (char *)"-level";   argv[n++] = (char *)"3";
         argv[n++] = (char *)"-coder";   argv[n++] = (char *)"1";
@@ -712,10 +797,18 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
          * its own log, rather than hanging or half-writing a file. */
         argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"no_such_codec_xyz";
     } else {
+        snprintf(crf_buf, num_cap, "%d", enc->crf);
+        snprintf(keyint_buf, num_cap, "%d", enc->keyint);
         argv[n++] = (char *)"-c:v";     argv[n++] = (char *)"libx264";
-        argv[n++] = (char *)"-preset";  argv[n++] = (char *)"veryfast";
-        argv[n++] = (char *)"-crf";     argv[n++] = (char *)"18";
-        argv[n++] = (char *)"-g";       argv[n++] = (char *)"25";
+        argv[n++] = (char *)"-preset";  argv[n++] = (char *)enc->preset;
+        argv[n++] = (char *)"-crf";     argv[n++] = crf_buf;
+        argv[n++] = (char *)"-g";       argv[n++] = keyint_buf;
+        /* 4:2:0 is the default and plays everywhere: no common GPU decodes
+         * H.264 4:2:2 (an RTX 3080's NVDEC does not), and VLC 3.0 hands it to
+         * VDPAU anyway and shows no picture -- audio over an empty window
+         * (wm, 2026-11-17). 4:2:2 stays selectable for software players.
+         * -profile:v makes x264 refuse rather than silently write another. */
+        argv[n++] = (char *)"-profile:v"; argv[n++] = (char *)(c420 ? "high" : "high422");
         if (audio) {
             /* A live sound card cannot be paused, and ffmpeg's scheduler
              * pauses ("chokes") any input whose output runs >= 100 ms ahead
@@ -725,12 +818,24 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
              * half a second -- which outran the 100 ms plus dsnoop's 341 ms
              * buffer: measured on the live StarTech, ALSA xruns from ~12 s in.
              * zerolatency takes that delay out (no lookahead, no B-frames,
-             * sliced threads). FFV1 is intra-only with slice threads and has
-             * none to take out. */
+             * sliced threads) whatever the preset. FFV1 is intra-only with
+             * slice threads and has none to take out. */
             argv[n++] = (char *)"-tune"; argv[n++] = (char *)"zerolatency";
         }
     }
-    argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv422p";
+    if (c420) {
+        /* On an interlaced source the chroma is halved per FIELD: a
+         * progressive conversion averages the two fields' colour, which
+         * smears it on motion. */
+        argv[n++] = (char *)"-vf";
+        argv[n++] = (char *)(vr_chroma_per_field(enc) ? "scale=interl=1,format=yuv420p"
+                                                      : "format=yuv420p");
+        argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv420p";
+    } else {
+        /* YUYV to planar 4:2:2 is a lossless repack: the dongle's full
+         * chroma, no filter needed. */
+        argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv422p";
+    }
     /* Capped so the encoder cannot compete with FLAC level-8 RF encode. */
     argv[n++] = (char *)"-threads"; argv[n++] = (char *)"2";
     argv[n++] = (char *)"-f";       argv[n++] = (char *)"matroska";
@@ -769,9 +874,11 @@ static int vr_spawn(const char *audio_device, bool append_log, char *err, size_t
     setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
 
     char size_buf[32], rate_buf[32], aspect_buf[16], offset_buf[40];
+    char crf_buf[12], keyint_buf[12];
     char *argv[80];
     int argc = 0;
-    vr_build_argv(argv, &argc, vr.codec, size_buf, sizeof(size_buf),
+    vr_build_argv(argv, &argc, &vr.enc, crf_buf, keyint_buf, sizeof(crf_buf),
+                  size_buf, sizeof(size_buf),
                   rate_buf, sizeof(rate_buf), aspect_buf, sizeof(aspect_buf),
                   offset_buf, sizeof(offset_buf), audio_device, vr.out_path);
 
@@ -892,13 +999,18 @@ static bool vr_audio_fallback(void)
     return true;
 }
 
-int gui_video_record_start(const char *out_path, video_codec_t codec,
+int gui_video_record_start(const char *out_path, const video_encode_opts_t *enc,
                            uint32_t width, uint32_t height, uint32_t pitch,
                            uint32_t fps_num, uint32_t fps_den,
                            const char *audio_device,
                            char *err, size_t err_cap)
 {
     if (vr.thread_running) return 0;
+    video_encode_opts_t opts;
+    if (enc) opts = *enc;
+    else     gui_video_encode_opts_default(&opts, VIDEO_CODEC_H264);
+    gui_video_encode_opts_clamp(&opts);
+    video_codec_t codec = opts.codec;
     if (!out_path || !out_path[0]) {
         snprintf(err, err_cap, "no output path for the reference video");
         return -1;
@@ -932,7 +1044,7 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
     vr.tl_next_slot = 0;
     vr.tl_first_ts = 0;
     vr.tl_frames_seen = 0;
-    vr.codec = codec;
+    vr.enc = opts;
     vr.audio_retry_used = false;
     snprintf(vr.out_path, sizeof(vr.out_path), "%s", out_path);
     snprintf(vr.audio_device, sizeof(vr.audio_device), "%s", audio_device ? audio_device : "");
@@ -1113,7 +1225,7 @@ static int s_inject_at = 0;
 /* Probe the finished MKV with the ffprobe next to the ffmpeg in use (else the
  * one on PATH): stream kinds, codecs, start times and durations. Returns the
  * number of streams read, -1 if ffprobe could not run. */
-typedef struct { char type[16]; char codec[24]; double start; double duration; } vr_probe_stream_t;
+typedef struct { char type[16]; char codec[24]; char pix_fmt[24]; char profile[32]; double start; double duration; } vr_probe_stream_t;
 
 static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
 {
@@ -1126,7 +1238,7 @@ static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
     }
     char cmd[1400];
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" -v error -show_entries stream=codec_type,codec_name,start_time:stream_tags=DURATION "
+             "\"%s\" -v error -show_entries stream=codec_type,codec_name,pix_fmt,profile,start_time:stream_tags=DURATION "
              "-of compact=p=0:nk=0 \"%s\" 2>/dev/null", probe, path);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
@@ -1138,6 +1250,8 @@ static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
         st->start = st->duration = -1.0;
         for (char *tok = strtok(line, "|\n"); tok; tok = strtok(NULL, "|\n")) {
             if (!strncmp(tok, "codec_name=", 11)) snprintf(st->codec, sizeof(st->codec), "%s", tok + 11);
+            else if (!strncmp(tok, "pix_fmt=", 8)) snprintf(st->pix_fmt, sizeof(st->pix_fmt), "%s", tok + 8);
+            else if (!strncmp(tok, "profile=", 8)) snprintf(st->profile, sizeof(st->profile), "%s", tok + 8);
             else if (!strncmp(tok, "codec_type=", 11)) snprintf(st->type, sizeof(st->type), "%s", tok + 11);
             else if (!strncmp(tok, "start_time=", 11)) st->start = atof(tok + 11);
             else if (!strncmp(tok, "tag:DURATION=", 13)) {
@@ -1151,6 +1265,47 @@ static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
     return n;
 }
 
+/* "h264,chroma=422,crf=20,preset=fast,keyint=50,interlace=off" -> options.
+ * Returns 0, or 2 after listing what is accepted. Values are clamped exactly
+ * as a settings file's are, so the test records what the GUI would. */
+static int vr_parse_codec_spec(char *spec, video_encode_opts_t *o)
+{
+    char *save = NULL;
+    char *name = strtok_r(spec, ",", &save);
+    video_codec_t codec;
+    if (!name || !name[0] || !strcmp(name, "h264") || !strcmp(name, "x264")) codec = VIDEO_CODEC_H264;
+    else if (!strcmp(name, "ffv1")) codec = VIDEO_CODEC_FFV1;
+    else {
+        fprintf(stderr, "unknown codec \"%s\"; accepted: h264 (x264), ffv1\n", name);
+        return 2;
+    }
+    gui_video_encode_opts_default(o, codec);
+    for (char *kv = strtok_r(NULL, ",", &save); kv; kv = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(kv, '=');
+        const char *val = eq ? eq + 1 : "";
+        if (eq) *eq = '\0';
+        bool h264_only = !strcmp(kv, "crf") || !strcmp(kv, "preset") || !strcmp(kv, "keyint");
+        if (h264_only && codec != VIDEO_CODEC_H264) {
+            fprintf(stderr, "%s applies to h264 only\n", kv);
+            return 2;
+        }
+        if (!strcmp(kv, "chroma") && (!strcmp(val, "420") || !strcmp(val, "422"))) o->chroma = atoi(val);
+        else if (!strcmp(kv, "crf") && val[0])    o->crf = atoi(val);
+        else if (!strcmp(kv, "keyint") && val[0]) o->keyint = atoi(val);
+        else if (!strcmp(kv, "preset") && val[0]) snprintf(o->preset, sizeof(o->preset), "%s", val);
+        else if (!strcmp(kv, "interlace") && !strcmp(val, "auto")) o->interlace = VIDEO_INTERLACE_AUTO;
+        else if (!strcmp(kv, "interlace") && !strcmp(val, "on"))   o->interlace = VIDEO_INTERLACE_ON;
+        else if (!strcmp(kv, "interlace") && !strcmp(val, "off"))  o->interlace = VIDEO_INTERLACE_OFF;
+        else {
+            fprintf(stderr, "unknown codec option \"%s=%s\"; accepted: chroma=420|422, crf=N, "
+                            "preset=<x264 preset>, keyint=N, interlace=auto|on|off\n", kv, val);
+            return 2;
+        }
+    }
+    gui_video_encode_opts_clamp(o);
+    return 0;
+}
+
 int gui_video_record_test_main(const char *device, const char *out_path,
                               int seconds, const char *codec_name,
                               const char *audio_mode)
@@ -1162,10 +1317,10 @@ int gui_video_record_test_main(const char *device, const char *out_path,
         return 2;
     }
 
-    if (!out_path) { fprintf(stderr, "usage: --video-record-test <dev> <out.mkv> <secs> [x264|ffv1]\n"); return 2; }
-    char codec_buf[64] = {0};
+    if (!out_path) { fprintf(stderr, "usage: --video-record-test <dev> <out.mkv> <secs> [h264|ffv1[,opt=val...]]\n"); return 2; }
+    char codec_buf[160] = {0};
     if (codec_name) snprintf(codec_buf, sizeof(codec_buf), "%s", codec_name);
-    /* "x264", "ffv1", or "<codec>:kill@5" / ":hang@5" / ":bad-args" */
+    /* "<codec>[,opt=val...]", optionally + ":kill@5" / ":hang@5" / ":bad-args" */
     char *spec = strchr(codec_buf, ':');
     if (spec) {
         *spec++ = '\0';
@@ -1176,8 +1331,11 @@ int gui_video_record_test_main(const char *device, const char *out_path,
         else if (strcmp(spec, "bad-args") == 0) s_inject = VR_INJECT_BAD_ARGS;
         if (s_inject_at <= 0) s_inject_at = 5;
     }
-    video_codec_t codec = (codec_buf[0] && strcmp(codec_buf, "ffv1") == 0)
-                        ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264;
+    video_encode_opts_t enc;
+    if (vr_parse_codec_spec(codec_buf, &enc) != 0) return 2;
+    video_codec_t codec = enc.codec;
+    char enc_summary[128];
+    gui_video_encode_summary(&enc, enc_summary, sizeof(enc_summary));
 
     gui_preview_init(NULL);
     gui_preview_refresh_devices();
@@ -1214,7 +1372,7 @@ int gui_video_record_test_main(const char *device, const char *out_path,
             fprintf(stderr, "no ALSA card shares %s's USB port; recording video-only\n", devs[idx].path);
         }
     }
-    if (gui_video_record_start(out_path, codec, ps.width, ps.height, pitch,
+    if (gui_video_record_start(out_path, &enc, ps.width, ps.height, pitch,
                                ps.fps_num, ps.fps_den, audio_dev, err, sizeof(err)) != 0) {
         fprintf(stderr, "video record start failed: %s\n", err);
         gui_preview_disconnect();
@@ -1224,7 +1382,7 @@ int gui_video_record_test_main(const char *device, const char *out_path,
 
     printf("recording %ux%u @ %u/%u -> %s (%s), ffmpeg pid %d, audio %s\n",
            ps.width, ps.height, ps.fps_num, ps.fps_den, out_path,
-           codec == VIDEO_CODEC_FFV1 ? "ffv1" : "x264",
+           enc_summary,
            gui_video_record_get_status().child_pid,
            audio_dev[0] ? audio_dev : "off");
 
@@ -1332,6 +1490,36 @@ int gui_video_record_test_main(const char *device, const char *out_path,
     }
     if (vs.error) rc = 1;
 
+    /* The chroma layout each codec promises: H.264 4:2:0 so a GPU decodes
+     * it, FFV1 the dongle's full 4:2:2. */
+    if (s_inject == VR_INJECT_NONE && !vs.error && vs.output_bytes > 0) {
+        vr_probe_stream_t st[4];
+        int ns = vr_ffprobe_streams(out_path, st, 4);
+        const vr_probe_stream_t *v = NULL;
+        for (int k = 0; k < ns; k++) if (!strcmp(st[k].type, "video")) { v = &st[k]; break; }
+        const char *want = enc.chroma == 422 ? "yuv422p" : "yuv420p";
+        const char *want_profile = codec != VIDEO_CODEC_H264 ? NULL
+                                 : enc.chroma == 422 ? "High 4:2:2" : "High";
+        if (ns < 0) {
+            printf("note: ffprobe could not run; pixel format not checked\n");
+        } else if (!v) {
+            printf("FAIL: ffprobe found no video stream\n");
+            rc = 1;
+        } else {
+            printf("video stream: %s %s profile \"%s\" (per-field chroma: %s)\n",
+                   v->codec, v->pix_fmt, v->profile,
+                   enc.chroma == 422 ? "n/a" : vr_chroma_per_field(&enc) ? "yes" : "no");
+            if (strcmp(v->pix_fmt, want) != 0) {
+                printf("FAIL: video is %s, expected %s\n", v->pix_fmt, want);
+                rc = 1;
+            }
+            if (want_profile && strcmp(v->profile, want_profile) != 0) {
+                printf("FAIL: H.264 profile is \"%s\", expected \"%s\"\n", v->profile, want_profile);
+                rc = 1;
+            }
+        }
+    }
+
     /* With audio, what landed in the file: one FLAC track, and both tracks
      * starting and ending together -- within one frame. */
     if (want_audio && vs.audio_active) {
@@ -1370,6 +1558,93 @@ int gui_video_record_test_main(const char *device, const char *out_path,
     return rc;
 }
 
+/* The argv a set of options produces, as one space-joined string with a
+ * space at each end, so " -crf 23 " matches a whole argument pair. */
+static void vr_argv_string(const video_encode_opts_t *enc, bool audio, char *out, size_t cap)
+{
+    char crf_buf[12], keyint_buf[12], size_buf[32], rate_buf[32], aspect_buf[16], offset_buf[40];
+    char *argv[80];
+    int argc = 0;
+    vr_build_argv(argv, &argc, enc, crf_buf, keyint_buf, sizeof(crf_buf),
+                  size_buf, sizeof(size_buf), rate_buf, sizeof(rate_buf),
+                  aspect_buf, sizeof(aspect_buf), offset_buf, sizeof(offset_buf),
+                  audio ? "dsnoop:CARD=Test,DEV=0" : "", "/tmp/selftest.mkv");
+    size_t used = 0;
+    out[0] = '\0';
+    for (int i = 0; i < argc && used + 2 < cap; i++) {
+        int w = snprintf(out + used, cap - used, " %s", argv[i] ? argv[i] : "(null)");
+        if (w < 0) break;
+        used += (size_t)w;
+        if (used >= cap) { used = cap - 1; break; }
+    }
+    if (used + 2 < cap) { out[used++] = ' '; out[used] = '\0'; }
+}
+
+int gui_video_encode_selftest_main(void)
+{
+    /* A 720x480 source is SD, so Auto means per-field chroma. */
+    uint32_t save_w = vr.width, save_h = vr.height, save_n = vr.fps_num, save_d = vr.fps_den;
+    vr.width = 720; vr.height = 480; vr.fps_num = 30000; vr.fps_den = 1001;
+
+    typedef struct {
+        const char *name;
+        video_codec_t codec; int chroma; int crf; const char *preset; int keyint; int interlace;
+        bool audio;
+        const char *want[8];      /* each must appear */
+        const char *refuse[8];    /* none may appear */
+    } vr_case_t;
+    static const vr_case_t cases[] = {
+        { "h264 defaults, SD auto = per-field 4:2:0", VIDEO_CODEC_H264, 420, 18, "veryfast", 25, VIDEO_INTERLACE_AUTO, false,
+          { " -c:v libx264 ", " -preset veryfast ", " -crf 18 ", " -g 25 ", " -profile:v high ",
+            " -vf scale=interl=1,format=yuv420p ", " -pix_fmt yuv420p ", " -an " },
+          { "zerolatency", "yuv422p", "high422" } },
+        { "h264 4:2:2 = High 4:2:2, no filter", VIDEO_CODEC_H264, 422, 18, "veryfast", 25, VIDEO_INTERLACE_AUTO, false,
+          { " -profile:v high422 ", " -pix_fmt yuv422p " },
+          { " -vf ", "yuv420p", " -profile:v high " } },
+        { "h264 crf 23 fast keyint 50, progressive", VIDEO_CODEC_H264, 420, 23, "fast", 50, VIDEO_INTERLACE_OFF, false,
+          { " -preset fast ", " -crf 23 ", " -g 50 ", " -vf format=yuv420p " },
+          { "interl=", "veryfast" } },
+        { "h264 with audio forces zerolatency", VIDEO_CODEC_H264, 420, 18, "medium", 25, VIDEO_INTERLACE_AUTO, true,
+          { " -preset medium ", " -tune zerolatency ", " -c:a flac ", " -copyts " },
+          { " -an " } },
+        { "ffv1 defaults = lossless 4:2:2, no H.264 options", VIDEO_CODEC_FFV1, 422, 18, "veryfast", 25, VIDEO_INTERLACE_AUTO, false,
+          { " -c:v ffv1 ", " -g 1 ", " -pix_fmt yuv422p " },
+          { " -crf ", " -preset ", "-profile:v", " -vf ", "zerolatency" } },
+        { "ffv1 4:2:0 interlace forced on", VIDEO_CODEC_FFV1, 420, 18, "veryfast", 25, VIDEO_INTERLACE_ON, false,
+          { " -c:v ffv1 ", " -vf scale=interl=1,format=yuv420p ", " -pix_fmt yuv420p " },
+          { " -crf ", "yuv422p" } },
+        { "out of range is clamped", VIDEO_CODEC_H264, 444, 99, "placebo", 0, 7, false,
+          { " -crf 51 ", " -preset veryfast ", " -g 1 ", " -pix_fmt yuv420p ", " -vf scale=interl=1,format=yuv420p " },
+          { "placebo", "444" } },
+    };
+
+    int fails = 0;
+    char line[2048];
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const vr_case_t *k = &cases[c];
+        video_encode_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.codec = k->codec; o.chroma = k->chroma; o.crf = k->crf; o.keyint = k->keyint;
+        o.interlace = k->interlace;
+        snprintf(o.preset, sizeof(o.preset), "%s", k->preset);
+        gui_video_encode_opts_clamp(&o);
+        vr_argv_string(&o, k->audio, line, sizeof(line));
+        bool ok = true;
+        for (int i = 0; i < 8 && k->want[i]; i++)
+            if (!strstr(line, k->want[i])) { printf("  missing \"%s\"\n", k->want[i]); ok = false; }
+        for (int i = 0; i < 8 && k->refuse[i]; i++)
+            if (strstr(line, k->refuse[i])) { printf("  unexpected \"%s\"\n", k->refuse[i]); ok = false; }
+        char sum[128];
+        gui_video_encode_summary(&o, sum, sizeof(sum));
+        printf("%s: %s  [%s]\n", ok ? "PASS" : "FAIL", k->name, sum);
+        if (!ok) { printf("  argv:%s\n", line); fails++; }
+    }
+
+    vr.width = save_w; vr.height = save_h; vr.fps_num = save_n; vr.fps_den = save_d;
+    printf(fails ? "video encode selftest: FAIL (%d)\n" : "video encode selftest: PASS\n", fails);
+    return fails ? 1 : 0;
+}
+
 #else  /* !__linux__ */
 
 bool gui_video_record_probe(void) { return false; }
@@ -1377,7 +1652,7 @@ const char *gui_video_record_ffmpeg_path(void) { return ""; }
 const char *gui_video_record_cc_ffmpeg_path(void) { return ""; }
 const char *gui_video_record_ffmpeg_version(void) { return ""; }
 bool gui_video_record_codec_available(video_codec_t c) { (void)c; return false; }
-int  gui_video_record_start(const char *o, video_codec_t c, uint32_t w, uint32_t h,
+int  gui_video_record_start(const char *o, const video_encode_opts_t *c, uint32_t w, uint32_t h,
                             uint32_t p, uint32_t fn, uint32_t fd, const char *a,
                             char *err, size_t cap)
 { (void)o;(void)c;(void)w;(void)h;(void)p;(void)fn;(void)fd;(void)a;
@@ -1394,5 +1669,6 @@ int gui_video_record_test_main(const char *d, const char *o, int s, const char *
 int gui_video_record_probe_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }
 void gui_video_record_set_ffmpeg_path(const char *p) { (void)p; }
 int gui_video_record_name_test_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }
+int gui_video_encode_selftest_main(void) { printf("video encode selftest: skipped (Linux only)\n"); return 0; }
 
 #endif /* __linux__ */

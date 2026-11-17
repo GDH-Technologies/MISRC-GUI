@@ -4161,11 +4161,15 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
                     // Says which ffmpeg was found, or why the toggle is dead.
                     CLAY(CLAY_ID("VideoRefHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
-                        static char vr_hint[220];
+                        static char vr_hint[320];
                         if (ff_ok) {
-                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s%s", gui_video_record_ffmpeg_path(),
-                                     app->settings.usbref_codec == 1
-                                       ? "   FFV1 is lossless, roughly 5-16 MB/s" : "   H.264 CRF 18, under 3 MB/s");
+                            /* The encode in force; it is set in the USB
+                             * Reference Video dialog's Recording codec window. */
+                            video_encode_opts_t vr_enc;
+                            char vr_sum[128];
+                            gui_video_encode_opts_from_settings(&app->settings, &vr_enc);
+                            gui_video_encode_summary(&vr_enc, vr_sum, sizeof(vr_sum));
+                            snprintf(vr_hint, sizeof(vr_hint), "ffmpeg: %s   %s", gui_video_record_ffmpeg_path(), vr_sum);
                         } else {
                             snprintf(vr_hint, sizeof(vr_hint), "ffmpeg not found - install it or set ffmpeg_path in the settings file");
                         }

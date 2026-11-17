@@ -145,7 +145,9 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
   `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`,
   `--video-record-test <dev> <out> [secs] [h264|ffv1] audio` (the dongle's audio as a FLAC track;
   ffprobes the MKV, fails unless the tracks start and end within a frame; `MISRC_USBREF_AUDIO`
-  overrides the device), `--video-timeline-selftest`,
+  overrides the device; the codec takes `,chroma=420|422,crf=N,preset=P,keyint=N,interlace=auto|on|off`
+  and the pixel format and profile are checked against them), `--video-timeline-selftest`,
+  `--video-encode-selftest` (the encoder argv for a matrix of options; no device),
   `--config <path> --net-serve [s]` (the net server with no window; needs the config's
   `net_mode` 1 and both `net_server_port` and `net_server_port_str`) and
   `--net-client-probe <host> <port> [s]` (mirror a server, print its settings as JSON).
@@ -301,6 +303,14 @@ Fork-side:
   with audio needs `-tune zerolatency` (guarded, "USB reference audio contract"). With both
   jacks wired to the camcorder, the StarTech's composite input carried no picture (mean luma
   18 vs 118 on S-Video, 2026-11-17): select the jack that has one before measuring anything.
+  The encode is settings, set in the dialog's Recording codec window (`usbref_codec`,
+  `usbref_h264_chroma`/`usbref_ffv1_chroma`, `usbref_h264_crf`/`_preset`/`_keyint`,
+  `usbref_interlace`; `gui_video_encode_opts_from_settings`). Defaults: H.264 4:2:0 High,
+  CRF 18 veryfast, keyframe 25, FFV1 4:2:2; a 4:2:0 conversion halves chroma per field
+  (`scale=interl=1`) on an SD or interlaced source. Keep H.264 at 4:2:0 by default: as High
+  4:2:2 it played as audio over an empty window in VLC (VDPAU, no GPU decodes H.264 4:2:2, no
+  software fallback) while ffprobe and ffmpeg decoded it fine. Check playback in a
+  hardware-decoding player, not only ffprobe (guard "USB reference encode options").
 - mediamtx ports are canonical+100 (RTSP 8654) so the fork never collides with capture-node's
   `tier×10000+8554` instances on the same hosts.
 - Settings live in one descriptor table (`misrc_gui/core/gui_settings_table.c`); the struct is

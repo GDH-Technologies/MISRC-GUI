@@ -2296,6 +2296,59 @@ def check_alsa_device_resolution(repo_root: Path) -> int:
     return 0
 
 
+def check_usbref_encode_options(repo_root: Path) -> int:
+    """How the reference MKV is encoded is a set of settings (fork-only), set in
+    the USB Reference Video dialog's Recording codec window, not argv literals.
+
+    The defaults matter: H.264 is 4:2:0 High profile because as High 4:2:2 it
+    played as audio over an empty window in VLC on wm (2026-11-17) -- no common
+    GPU decodes H.264 4:2:2 and VLC 3.0 uses VDPAU anyway. FFV1 defaults to the
+    dongle's full 4:2:2. A 4:2:0 conversion halves the chroma per field on an
+    interlaced source (scale=interl=1). Each option is a settings row (its
+    automation trigger)."""
+    rec = repo_root / "misrc_tools/misrc_gui/output/gui_video_record.c"
+    hdr = repo_root / "misrc_tools/misrc_gui/output/gui_video_record.h"
+    table = repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"
+    for f in (rec, hdr, table):
+        if not f.exists():
+            return fail(f"{f.relative_to(repo_root)} is missing")
+    hdr_text = read_text(hdr)
+    for macro, want in (("VIDEO_H264_CHROMA_DEFAULT", "420"), ("VIDEO_FFV1_CHROMA_DEFAULT", "422"),
+                        ("VIDEO_H264_CRF_DEFAULT", "18"), ("VIDEO_H264_PRESET_DEFAULT", '"veryfast"'),
+                        ("VIDEO_H264_KEYINT_DEFAULT", "25")):
+        m = re.search(r"#define\s+" + macro + r"\s+(\S+)", hdr_text)
+        if not m or m.group(1) != want:
+            return fail(f"gui_video_record.h: {macro} must stay {want} "
+                        "(H.264 4:2:0 plays with hardware decoding; FFV1 keeps the full chroma)")
+    table_text = read_text(table)
+    for key, macro in (("usbref_h264_chroma", "GS_IH"), ("usbref_ffv1_chroma", "GS_IH"),
+                       ("usbref_h264_crf", "GS_IH"), ("usbref_h264_preset", "GS_SH"),
+                       ("usbref_h264_keyint", "GS_IH"), ("usbref_interlace", "GS_IH")):
+        if not re.search(macro + r'\s*\(\s*"' + key + '"', table_text):
+            return fail(f"{key} has no clamping {macro} settings row (it is the automation trigger)")
+    code = strip_c_comments(read_text(rec))
+    body = func_body_from(code, "static void vr_build_argv(")
+    if not body:
+        return fail("vr_build_argv not found in gui_video_record.c")
+    for needle, why in (
+        ('scale=interl=1,format=yuv420p', "per-field 4:2:0 chroma for an interlaced source"),
+        ('"high422"', "-profile:v high422 for H.264 4:2:2"),
+        ('"high"', "-profile:v high for H.264 4:2:0"),
+        ('"-profile:v"', "so x264 refuses rather than writes another profile"),
+        ('enc->crf', "the CRF comes from the options"),
+        ('enc->preset', "the preset comes from the options"),
+        ('enc->keyint', "the keyframe interval comes from the options"),
+        ('enc->chroma', "the chroma comes from the options"),
+        ('vr_chroma_per_field(enc)', "the interlace option decides per-field chroma"),
+    ):
+        if needle not in body:
+            return fail(f"vr_build_argv lost {needle}: {why}")
+    for literal in ('"veryfast"', '"18"', '"25"'):
+        if literal in body:
+            return fail(f"vr_build_argv hard-codes {literal} again; it must come from the encode options")
+    return 0
+
+
 def check_usbref_audio_contract(repo_root: Path) -> int:
     """The dongle's audio in the reference MKV (fork-only). Its A/V sync rests
     on a handful of ffmpeg arguments that each look optional and are not:
@@ -5746,7 +5799,7 @@ def check_usbref_ui_stays_out_of_gui_ui(repo_root: Path) -> int:
               "RtspUrl", "RtspPassword", "RtspLiveBox", "ToggleRtsp",
               "PreviewDeviceBox", "PreviewRescanBtn", "PreviewConnectBtn",
               "PreviewAspectBox", "PreviewCrop", "ToggleCcRecord", "CcTagField",
-              "VideoCodecBox")
+              "VideoCodecBox", "RecCodec", "UsbRefRec", "UsbRefAudio")
     found = [b for b in banned if b in ui]
     if found:
         return fail(
@@ -6731,6 +6784,25 @@ def check_video_timeline_post_build(gui_path: Path) -> int:
     return 0
 
 
+def check_video_encode_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --video-encode-selftest: the reference MKV's ffmpeg
+    argv for a matrix of encode options -- pixel format, profile, per-field
+    chroma, CRF/preset/keyframe, zerolatency only with audio, clamping. The
+    recorder is Linux-only; elsewhere the mode reports a skip."""
+    try:
+        ran = subprocess.run([str(gui_path), "--video-encode-selftest"],
+                             capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --video-encode-selftest timed out")
+    if not sys.platform.startswith("linux") and "skipped (Linux only)" in ran.stdout and ran.returncode == 0:
+        print("  (video encode selftest skipped: the recorder is Linux-only)")
+        return 0
+    if ran.returncode != 0 or "video encode selftest: PASS" not in ran.stdout:
+        return fail(f"misrc_gui --video-encode-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()[-3000:]}\n{ran.stderr.strip()[-1000:]}")
+    return 0
+
+
 def check_record_order_post_build(gui_path: Path) -> int:
     """Run the built GUI's --record-order-selftest: the Simulated device
     emits a self-checking counter stream, the writers stall 3 s so the
@@ -7052,6 +7124,7 @@ def main() -> int:
         ("no self-install over a GDH build", lambda: check_no_self_install(repo_root)),
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
         ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
+        ("USB reference encode options", lambda: check_usbref_encode_options(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
@@ -7094,6 +7167,7 @@ def main() -> int:
         checks.append(("record order selftest (post-build)", lambda: check_record_order_post_build(args.gui_path)))
         checks.append(("USB reference dongle matched by port (post-build)", lambda: check_usbref_device_match_post_build(args.gui_path)))
         checks.append(("video timeline selftest (post-build)", lambda: check_video_timeline_post_build(args.gui_path)))
+        checks.append(("video encode selftest (post-build)", lambda: check_video_encode_post_build(args.gui_path)))
         checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
         checks.append(("caption ffmpeg resolution (post-build)", lambda: check_cc_ffmpeg_resolution_post_build(args.gui_path)))
 
