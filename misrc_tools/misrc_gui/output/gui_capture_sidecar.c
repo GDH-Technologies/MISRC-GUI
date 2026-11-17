@@ -192,7 +192,9 @@ size_t gui_capture_sidecar_format(const gui_capture_sidecar_t *s, char *buf, siz
     sk_key(&k, 1, "result");
     if (s->have_result) {
         sk_printf(&k, "{\"drops\": %llu", (unsigned long long)s->drops);
-        sk_printf(&k, ", \"waits\": %llu}", (unsigned long long)s->waits);
+        sk_printf(&k, ", \"waits\": %llu", (unsigned long long)s->waits);
+        sk_printf(&k, ", \"complete\": %s", s->result_complete ? "true" : "false");
+        sk_printf(&k, ", \"source_loss\": %llu}", (unsigned long long)s->source_loss);
     } else {
         sk_puts(&k, "null");
     }

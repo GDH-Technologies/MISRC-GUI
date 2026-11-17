@@ -63,6 +63,11 @@ static audio_ctx_t s_audio_ctx;
  * stops and restarts it (the monitor keeps playing). */
 enum { AUDIO_RECORD_IDLE = 0, AUDIO_RECORD_ACTIVE, AUDIO_RECORD_STOPPING };
 static atomic_int s_audio_record_state = AUDIO_RECORD_IDLE;
+/* True from thread creation until audio_thread_main returns. The thread ends
+ * on its own when the capture stops; s_audio_running stays set until
+ * gui_audio_stop joins it, so "running" alone cannot say a thread will see a
+ * record state change. */
+static atomic_bool s_audio_thread_alive = false;
 static atomic_bool s_audio_record_failed = false;
 static char s_audio_record_paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX];
 static unsigned s_audio_record_mask = 0;
@@ -839,6 +844,19 @@ bool gui_audio_is_running(void)
     return s_audio_running;
 }
 
+static int audio_thread_entry(void *ctx)
+{
+    int rc = audio_thread_main(ctx);
+    /* Early returns (an allocation failure) skip the thread's own cleanup:
+     * a recording it left ACTIVE never got its files. */
+    if (atomic_load(&s_audio_record_state) == AUDIO_RECORD_ACTIVE) {
+        atomic_store(&s_audio_record_failed, true);
+    }
+    atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
+    atomic_store(&s_audio_thread_alive, false);
+    return rc;
+}
+
 void gui_audio_begin_recording(const gui_app_t *app,
     const char paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX],
     unsigned overwrite_mask)
@@ -866,7 +884,7 @@ bool gui_audio_wait_recording_idle(void)
      * the tail flush and the closes. With no audio thread there is nobody to
      * open or close anything, so the stop completes here. */
     for (int waited_ms = 0; atomic_load(&s_audio_record_state) != AUDIO_RECORD_IDLE; waited_ms += 10) {
-        if (!s_audio_running) {
+        if (!atomic_load(&s_audio_thread_alive)) {
             atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
             break;
         }
@@ -883,7 +901,12 @@ bool gui_audio_wait_recording_idle(void)
 int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
 {
     if (!app || !bufmgr) return -1;
-    if (s_audio_running) return 0;
+    if (s_audio_running) {
+        if (atomic_load(&s_audio_thread_alive)) return 0;
+        /* The thread ended with the last capture and was never joined: reap
+         * it (and its monitor resampler/stream) before starting a new one. */
+        gui_audio_stop(app);
+    }
 
     atomic_store(&s_playback_enabled, app->settings.audio_monitor_playback);
 
@@ -905,10 +928,12 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
 
     atomic_store(&s_audio_stop, false);
 
+    atomic_store(&s_audio_thread_alive, true);
     if (thrd_create_with_priority(&s_audio_thread,
-                                  audio_thread_main,
+                                  audio_thread_entry,
                                   &s_audio_ctx,
                                   THRD_PRIORITY_CRITICAL) != thrd_success) {
+        atomic_store(&s_audio_thread_alive, false);
         gui_app_set_status(app, "Failed to start audio thread");
         return -1;
     }

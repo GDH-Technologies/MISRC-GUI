@@ -346,7 +346,7 @@ static const char *const s_linked_golden =
     "    \"audio\": {\"audio_4ch\": \"Kuhn_Tape_3_4ch.wav\", \"audio_2ch_12\": null, \"audio_2ch_34\": null, "
     "\"audio_1ch_1\": null, \"audio_1ch_2\": null, \"audio_1ch_3\": null, \"audio_1ch_4\": null}\n"
     "  },\n"
-    "  \"result\": {\"drops\": 0, \"waits\": 5}\n"
+    "  \"result\": {\"drops\": 0, \"waits\": 5, \"complete\": true, \"source_loss\": 0}\n"
     "}\n";
 
 static const char *const s_unlinked_golden =
@@ -432,6 +432,8 @@ static void check_sidecar(void)
     s.have_result = true;
     s.drops = 0;
     s.waits = 5;
+    s.result_complete = true;
+    s.source_loss = 0;
 
     size_t len = 0;
     char *text = gui_capture_sidecar_format_alloc(&s, &len);

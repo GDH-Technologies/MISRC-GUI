@@ -564,6 +564,10 @@ struct gui_record_session {
      * opened, wrote and closed every one of them (set in finalize). */
     bool wav_requested;
     bool audio_ok;
+    /* Upstream's source-loss counters at record start, and the per-channel
+     * output close failures (flac_writer_finish / fclose) seen in finalize. */
+    uint64_t source_loss_start, audio_loss_start;
+    bool close_failed[GUI_RECORD_CHANNELS];
 
     /* Byte totals accumulated by this session's writer threads (survive a new
      * recording resetting the app-level display atomics). */
@@ -597,6 +601,14 @@ struct gui_record_session {
     uint32_t end_rec_b_waits, end_rec_b_drops;
 };
 
+/* Upstream's source-loss latch (c1dae40): input loss the capture side reports
+ * while a recording runs makes that recording's verdict "incomplete". Global
+ * counters; each session compares against its start snapshot. */
+static atomic_uint_fast64_t s_capture_source_loss_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t s_capture_audio_loss_count = ATOMIC_VAR_INIT(0);
+/* The verdict of the last finalized recording (gui_record_last_stop_failed). */
+static atomic_bool s_record_stop_failed = ATOMIC_VAR_INIT(false);
+
 static gui_record_session_t *s_active = NULL;      /* recording in progress */
 static gui_record_session_t *s_finalizing = NULL;  /* handed to finalize thread */
 
@@ -613,6 +625,8 @@ static void gui_record_session_init_sync(gui_record_session_t *ses) {
         atomic_store(&ses->live_bytes[i], 0);
     }
     atomic_store(&ses->capture_drops, 0);
+    ses->source_loss_start = atomic_load(&s_capture_source_loss_count);
+    ses->audio_loss_start = atomic_load(&s_capture_audio_loss_count);
     atomic_store(&ses->recording, false);
     atomic_store(&ses->drained, false);
     atomic_store(&ses->monitor_run, false);
@@ -817,6 +831,40 @@ static bool gui_record_collect_finalize_if_done(void) {
         s_finalizing = NULL;
     }
     return true;
+}
+
+void gui_record_mark_source_loss(void) {
+    atomic_fetch_add(&s_capture_source_loss_count, 1);
+}
+
+void gui_record_mark_audio_source_loss(void) {
+    atomic_fetch_add(&s_capture_audio_loss_count, 1);
+}
+
+bool gui_record_last_stop_failed(void) {
+    return atomic_load(&s_record_stop_failed);
+}
+
+/* The status a finished stop shows: upstream's two strings. */
+static const char *gui_record_stop_status(void) {
+    return atomic_load(&s_record_stop_failed) ? "Recording incomplete" : "Recording stopped";
+}
+
+void gui_record_wait_for_finalize(void) {
+    while (!gui_record_collect_finalize_if_done() &&
+           (atomic_load(&s_record_stop_finalizing) || atomic_load(&s_finalize_thread_running))) {
+        thrd_sleep_ms(10);
+    }
+}
+
+void gui_record_reset_stats(gui_app_t *app) {
+    if (!app) return;
+    atomic_store(&app->recording_bytes, 0);
+    atomic_store(&app->recording_raw_a, 0);
+    atomic_store(&app->recording_raw_b, 0);
+    atomic_store(&app->recording_compressed_a, 0);
+    atomic_store(&app->recording_compressed_b, 0);
+    app->last_recording_duration_s = 0.0;
 }
 
 #define GUI_RECORD_DISK_GUARD_CHECK_INTERVAL_MS 1000ULL
@@ -1923,9 +1971,7 @@ void gui_record_init(void) {
 
 // Cleanup recording subsystem
 void gui_record_cleanup(void) {
-    while (atomic_load(&s_record_stop_finalizing)) {
-        thrd_sleep_ms(10);
-    }
+    gui_record_wait_for_finalize();
     if (atomic_load(&s_finalize_thread_running)) {
         thrd_join(s_finalize_thread, NULL);
         atomic_store(&s_finalize_thread_running, false);
@@ -2564,6 +2610,8 @@ typedef struct {
     bool have_samples_a, have_samples_b;
     uint64_t samples_a, samples_b;
     uint64_t drops, waits;
+    bool complete;          /* the recording verdict */
+    uint64_t source_loss;   /* input loss reported while it recorded */
 } gui_record_sidecar_end_t;
 
 /* Write (or rewrite) the capture-meta sidecar. complete == false is the
@@ -2635,6 +2683,8 @@ static bool gui_record_write_sidecar(gui_record_session_t *ses, bool complete,
             s.have_result = true;
             s.drops = end->drops;
             s.waits = end->waits;
+            s.result_complete = end->complete;
+            s.source_loss = end->source_loss;
         }
     }
 
@@ -3508,6 +3558,7 @@ typedef struct {
     const char *base_name;     /* NULL = "auto" */
     uint32_t memory_budget_gb; /* 0 = the default budget */
     int finalize_wait_s;       /* 0 = 30 s */
+    bool mark_source_loss;     /* selftest: report input loss 1 s in */
 } gui_record_headless_opts_t;
 
 static int gui_record_headless_run(const gui_record_headless_opts_t *o,
@@ -3569,6 +3620,7 @@ static int gui_record_headless_run(const gui_record_headless_opts_t *o,
     for (int i = 0; i < o->seconds; i++) {
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
+        if (i == 0 && o->mark_source_loss) gui_record_mark_source_loss();
     }
 
     gui_app_stop_recording(&app);
@@ -3605,11 +3657,15 @@ static int gui_record_headless_run(const gui_record_headless_opts_t *o,
 int gui_record_auto_record_main(const char *out_dir, int seconds, bool with_video,
                                 bool use_flac, bool with_cc)
 {
-    gui_record_headless_opts_t o = { out_dir, seconds, with_video, use_flac, with_cc, NULL, 0, 0 };
+    gui_record_headless_opts_t o = { out_dir, seconds, with_video, use_flac, with_cc, NULL, 0, 0, false };
     char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
     int rc = gui_record_headless_run(&o, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     if (rc != 0) return rc;
     printf("rfA=%s rfB=%s\n", rf_a, rf_b);
+    if (gui_record_last_stop_failed()) {
+        printf("recording incomplete (see the capture log's verdict line)\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -3799,6 +3855,17 @@ static char *cm_check_run(const char *label, const char *dir, const char *rf_a, 
     CM_CHECK(*log_text_out && strstr(*log_text_out, want_log) != NULL, "%s: log does not name the sidecar", label);
     CM_CHECK(*log_text_out && strstr(*log_text_out, "Ingest metadata") == NULL,
              "%s: the retired Ingest metadata lines are in the log", label);
+    CM_CHECK(strstr(side, "\"complete\": ") != NULL && strstr(side, "\"source_loss\": ") != NULL,
+             "%s: the sidecar result has no verdict", label);
+    CM_CHECK(*log_text_out && strstr(*log_text_out, "Recording verdict: ") != NULL,
+             "%s: the log has no 'Recording verdict:' line", label);
+    /* A clean simulated run (no drops of any kind) must be complete. */
+    if (strstr(side, "\"result\": {\"drops\": 0, ") != NULL &&
+        strstr(side, "\"source_loss\": 0}") != NULL) {
+        CM_CHECK(strstr(side, "\"complete\": true, \"source_loss\": 0}") != NULL,
+                 "%s: a run with no drops is not complete", label);
+        CM_CHECK(!gui_record_last_stop_failed(), "%s: gui_record_last_stop_failed() after a clean run", label);
+    }
     return side;
 }
 
@@ -3806,7 +3873,7 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
 {
     s_cm_failures = 0;
     if (linked_seconds <= 0) linked_seconds = 2;
-    char root[700], dir_linked[760], dir_unlinked[760], cfg[760];
+    char root[700], dir_linked[760], dir_unlinked[760], dir_loss[760], cfg[760];
     if (keep_dir && keep_dir[0]) {
         snprintf(root, sizeof(root), "%s", keep_dir);
     } else {
@@ -3821,10 +3888,12 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     }
     snprintf(dir_linked, sizeof(dir_linked), "%s/linked", root);
     snprintf(dir_unlinked, sizeof(dir_unlinked), "%s/unlinked", root);
+    snprintf(dir_loss, sizeof(dir_loss), "%s/source_loss", root);
     snprintf(cfg, sizeof(cfg), "%s/settings.json", root);
     cm_mkdir(root);
     cm_mkdir(dir_linked);
     cm_mkdir(dir_unlinked);
+    cm_mkdir(dir_loss);
     /* Never the live settings file: gui_app_init() saves when no override is
      * active, and on wm that file is the running server's. */
     gui_settings_set_override_path(cfg);
@@ -3853,7 +3922,7 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     gui_capture_meta_set_rf_request(GUI_META_TRI_TRUE, GUI_META_TRI_FALSE);
 
     char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
-    gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked", 0, 0 };
+    gui_record_headless_opts_t lo = { dir_linked, linked_seconds, false, true, false, "Selftest_Linked", 0, 0, false };
     int rc = gui_record_headless_run(&lo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     CM_CHECK(rc == 0, "linked run failed (%d)", rc);
     char sidecar[1024];
@@ -3916,7 +3985,7 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     /* 2. Unlinked, RAW: what nobody typed is "" / null, operator the OS login. */
     int before = s_cm_failures;
     gui_capture_meta_init();
-    gui_record_headless_opts_t uo = { dir_unlinked, 1, false, false, false, "Selftest_Unlinked", 0, 0 };
+    gui_record_headless_opts_t uo = { dir_unlinked, 1, false, false, false, "Selftest_Unlinked", 0, 0, false };
     rc = gui_record_headless_run(&uo, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
     CM_CHECK(rc == 0, "unlinked run failed (%d)", rc);
     side = rc == 0 ? cm_check_run("unlinked", dir_unlinked, rf_a, rf_b, &log_text, sidecar, sizeof(sidecar)) : NULL;
@@ -3942,11 +4011,78 @@ int gui_record_capture_meta_selftest_main(const char *keep_dir, int linked_secon
     free(log_text);
     printf("  unlinked run: %s\n", s_cm_failures > before ? "FAILED" : "ok");
 
+    /* 3. Input loss reported while recording (upstream's
+     *    gui_record_mark_source_loss): the verdict is incomplete in the log,
+     *    the sidecar and gui_record_last_stop_failed(). */
+    before = s_cm_failures;
+    gui_capture_meta_init();
+    gui_record_headless_opts_t so = { dir_loss, 2, false, false, false, "Selftest_Loss", 0, 0, true };
+    rc = gui_record_headless_run(&so, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
+    CM_CHECK(rc == 0, "source-loss run failed (%d)", rc);
+    side = rc == 0 ? cm_check_run("source-loss", dir_loss, rf_a, rf_b, &log_text, sidecar, sizeof(sidecar)) : NULL;
+    if (side) {
+        CM_CHECK(strstr(side, "\"complete\": false, \"source_loss\": 1}") != NULL,
+                 "source-loss: the sidecar result is not complete=false source_loss=1");
+    }
+    if (log_text) {
+        CM_CHECK(strstr(log_text, "Recording verdict: incomplete (") != NULL &&
+                 strstr(log_text, "source loss 1") != NULL,
+                 "source-loss: the log has no 'Recording verdict: incomplete (... source loss 1)'");
+    }
+    CM_CHECK(gui_record_last_stop_failed(), "source-loss: gui_record_last_stop_failed() is false");
+    CM_CHECK(strcmp(gui_record_stop_status(), "Recording incomplete") == 0,
+             "source-loss: the stop status is not \"Recording incomplete\"");
+    free(side);
+    free(log_text);
+    printf("  source-loss run: %s\n", s_cm_failures > before ? "FAILED" : "ok");
+
+    /* 4. Exclusive create: an RF output that exists but is not covered by
+     *    the confirmation (it appeared after the check) refuses the start and
+     *    survives untouched. No capture needed: the check comes first. */
+    before = s_cm_failures;
+    {
+        static gui_app_t xa;
+        memset(&xa, 0, sizeof(xa));
+        gui_settings_init_defaults(&xa.settings);
+        snprintf(xa.settings.output_path, sizeof(xa.settings.output_path), "%s", dir_loss);
+        snprintf(xa.settings.output_filename_a, sizeof(xa.settings.output_filename_a), "exclusive_a.flac");
+        snprintf(xa.settings.output_filename_b, sizeof(xa.settings.output_filename_b), "exclusive_b.flac");
+        xa.settings.capture_a = true;
+        xa.settings.capture_b = true;
+        xa.settings.enable_audio_4ch = false;
+        xa.settings.enable_audio_2ch_12 = false;
+        xa.settings.enable_audio_2ch_34 = false;
+        for (int i = 0; i < 4; i++) xa.settings.enable_audio_1ch[i] = false;
+        xa.settings.video_record_enabled = false;
+        xa.settings.usbref_cc_enabled = false;
+        char sentinel[1024];
+        snprintf(sentinel, sizeof(sentinel), "%s/exclusive_a.flac", dir_loss);
+        FILE *sf = fopen(sentinel, "wb");
+        if (sf) { fputs("KEEP", sf); fclose(sf); }
+        int xr = gui_record_start_confirmed(&xa, 0u);
+        CM_CHECK(xr == RECORD_ERROR && strstr(xa.status_message, "Recording outputs changed") != NULL,
+                 "exclusive: start with an uncovered existing output was not refused (rc=%d status=\"%s\")",
+                 xr, xa.status_message);
+        char *kept = cm_read(sentinel);
+        CM_CHECK(kept && strcmp(kept, "KEEP") == 0, "exclusive: the existing output was modified");
+        free(kept);
+        /* The overwrite prompt is cancelled by a capture handoff. */
+        s_overwrite_pending = true;
+        s_pending_app = &xa;
+        s_pending_overwrite_mask = 1u;
+        gui_popup_confirm("Overwrite Files?", "selftest", "Overwrite", "Cancel", &s_overwrite_pending);
+        gui_record_cancel_capture_confirmation(&xa);
+        CM_CHECK(!gui_record_is_pending() && !gui_popup_is_open() && s_pending_app == NULL,
+                 "cancel: the overwrite prompt survived gui_record_cancel_capture_confirmation");
+    }
+    printf("  exclusive create + prompt cancel: %s\n", s_cm_failures > before ? "FAILED" : "ok");
+
     gui_settings_set_override_path(NULL);
     remove(cfg);
     if (!keep_dir) {
         cm_rmdir(dir_linked);
         cm_rmdir(dir_unlinked);
+        cm_rmdir(dir_loss);
         cm_rmdir(root);
     }
     if (s_cm_failures) {
@@ -4081,7 +4217,7 @@ int gui_record_order_selftest_main(const char *keep_dir)
         { dir_raw, false, "Order_RAW" },
     };
     for (size_t i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
-        gui_record_headless_opts_t o = { runs[i].dir, 7, false, runs[i].flac, false, runs[i].name, 1, 180 };
+        gui_record_headless_opts_t o = { runs[i].dir, 7, false, runs[i].flac, false, runs[i].name, 1, 180, false };
         char rf_a[MAX_FILENAME_LEN], rf_b[MAX_FILENAME_LEN];
         int rc = gui_record_headless_run(&o, rf_a, sizeof(rf_a), rf_b, sizeof(rf_b));
         if (rc != 0) {
@@ -4364,7 +4500,7 @@ int gui_record_start(gui_app_t *app) {
 // Check popup result and continue recording if confirmed
 void gui_record_check_popup(gui_app_t *app) {
     if (gui_record_collect_finalize_if_done()) {
-        gui_app_set_status(app, "Recording stopped");
+        gui_app_set_status(app, gui_record_stop_status());
     }
 
     if (!s_overwrite_pending) {
@@ -4660,12 +4796,7 @@ static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask) {
         }
     }
     s_active = ses;
-    atomic_store(&app->recording_bytes, 0);
-    atomic_store(&app->recording_raw_a, 0);
-    atomic_store(&app->recording_raw_b, 0);
-    atomic_store(&app->recording_compressed_a, 0);
-    atomic_store(&app->recording_compressed_b, 0);
-    app->last_recording_duration_s = 0.0;
+    gui_record_reset_stats(app);
     gui_record_session_init_sync(ses);
 
     // Reset record buffers before starting
@@ -5385,6 +5516,7 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
     }
     /* What each channel's record path did: accepted, overflowed, dropped,
      * discarded. A mismatch is a WARN with the numbers. */
+    bool fifo_mismatch = false;
     for (int ch = 0; ch < GUI_RECORD_CHANNELS; ch++) {
         if (!ses->fifo_on[ch]) continue;
         gui_record_fifo_stats_t st;
@@ -5401,6 +5533,7 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
             (unsigned long long)st.dropped_pushes, (double)discarded / 1048576.0);
         if (st.dropped_bytes || st.read_lost_bytes || discarded ||
             st.consumed_bytes != st.accepted_bytes) {
+            fifo_mismatch = true;
             gui_record_log_writef_ses(ses, "WARN",
                 "Record channel %c MISMATCH: %.2f MiB dropped before the record buffers, %.2f MiB "
                 "unreadable from the spill, %.2f MiB discarded after an output failure; "
@@ -5445,25 +5578,35 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
             ? flac_writer_get_samples_committed(ses->flac_b)
             : flac_writer_get_samples_written(ses->flac_b);
     }
-    // Finalize FLAC writers (this also cleans them up)
+    /* Finalize FLAC writers (this also cleans them up). A failed finish is a
+     * failed output, as upstream's c1dae40 has it: the file is not trusted
+     * enough to rewrite its metadata below. */
     if (ses->flac_a) {
-        flac_writer_finish(ses->flac_a);
+        if (flac_writer_finish(ses->flac_a) != FLAC_WRITER_OK) ses->close_failed[0] = true;
         ses->flac_a = NULL;
     }
     if (ses->flac_b) {
-        flac_writer_finish(ses->flac_b);
+        if (flac_writer_finish(ses->flac_b) != FLAC_WRITER_OK) ses->close_failed[1] = true;
         ses->flac_b = NULL;
     }
 #endif
 
-    // Close files
+    // Close files; a failed close (the last buffered write, or the
+    // filesystem's own flush) means the file may not hold what was written.
     if (ses->file_a) {
-        fclose(ses->file_a);
+        if (fclose(ses->file_a) != 0) ses->close_failed[0] = true;
         ses->file_a = NULL;
     }
     if (ses->file_b) {
-        fclose(ses->file_b);
+        if (fclose(ses->file_b) != 0) ses->close_failed[1] = true;
         ses->file_b = NULL;
+    }
+    for (int ch = 0; ch < GUI_RECORD_CHANNELS; ch++) {
+        if (!ses->close_failed[ch]) continue;
+        fprintf(stderr, "[REC] Channel %c output close failed\n", ch == 0 ? 'A' : 'B');
+        gui_record_log_writef_ses(ses, "ERROR",
+            "Channel %c output close failed: the file may be incomplete; its metadata was not rewritten",
+            ch == 0 ? 'A' : 'B');
     }
 
     /* Writer threads joined, video finished, files closed: the shared record
@@ -5474,13 +5617,13 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
 #if LIBFLAC_ENABLED == 1
     // Embed finalized duration metadata in RF FLAC files for easier post handling.
     if (ses->use_flac) {
-        if (ses->capture_a && ses->path_a[0]) {
+        if (ses->capture_a && ses->path_a[0] && !ses->close_failed[0]) {
             gui_record_finalize_flac_streaminfo(app, ses->path_a, "CH A",
                                                 flac_samples_a);
             gui_record_embed_flac_duration_metadata(app, ses->path_a, "CH A",
                                                     flac_samples_a, ses->sample_rate_a);
         }
-        if (ses->capture_b && ses->path_b[0]) {
+        if (ses->capture_b && ses->path_b[0] && !ses->close_failed[1]) {
             gui_record_finalize_flac_streaminfo(app, ses->path_b, "CH B",
                                                 flac_samples_b);
             gui_record_embed_flac_duration_metadata(app, ses->path_b, "CH B",
@@ -5581,9 +5724,55 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         gui_record_build_iso8601_timestamp(end_iso, sizeof(end_iso));
         gui_record_log_writef_ses(ses, "INFO", "datetime_end: %s", end_iso[0] ? end_iso : "unknown");
     }
+    /* The verdict (upstream's "Recording incomplete", fork-extended to the
+     * log and the sidecar): anything lost or not written -- record-path
+     * drops, a FIFO mismatch, capture-buffer drops, data an output failure
+     * discarded, a write or close failure, a WAV that failed, and input loss
+     * the capture side reported (gui_record_mark_source_loss). */
+    uint64_t source_loss = atomic_load(&s_capture_source_loss_count) - ses->source_loss_start;
+    if (ses->wav_requested) {
+        source_loss += atomic_load(&s_capture_audio_loss_count) - ses->audio_loss_start;
+    }
+    bool any_write_error = atomic_load(&ses->write_error[0]) || atomic_load(&ses->write_error[1]);
+    bool any_output_failed = atomic_load(&ses->output_failed[0]) || atomic_load(&ses->output_failed[1]);
+    bool any_discarded = atomic_load(&ses->discarded[0]) || atomic_load(&ses->discarded[1]);
+    uint64_t verdict_cap_drops = atomic_load(&ses->capture_drops);
+    bool wav_failed = ses->wav_requested && !ses->audio_ok;
+    bool incomplete = rec_drops || fifo_mismatch || verdict_cap_drops || any_discarded ||
+                      any_write_error || any_output_failed || ses->close_failed[0] ||
+                      ses->close_failed[1] || wav_failed || source_loss;
+    atomic_store(&s_record_stop_failed, incomplete);
+    if (incomplete) {
+        char why[512];
+        size_t w = 0;
+        why[0] = '\0';
+#define VERDICT_ADD(...) do { if (w < sizeof(why)) { \
+            int k = snprintf(why + w, sizeof(why) - w, "%s", w ? ", " : ""); \
+            if (k > 0) w += (size_t)k; \
+            if (w < sizeof(why)) { k = snprintf(why + w, sizeof(why) - w, __VA_ARGS__); \
+                                   if (k > 0) w += (size_t)k; } } } while (0)
+        if (rec_drops) VERDICT_ADD("record drops %u", rec_drops);
+        if (fifo_mismatch) VERDICT_ADD("record FIFO mismatch");
+        if (verdict_cap_drops) VERDICT_ADD("capture drops %llu", (unsigned long long)verdict_cap_drops);
+        if (any_discarded || any_output_failed) VERDICT_ADD("output failed");
+        if (any_write_error) VERDICT_ADD("write error");
+        if (ses->close_failed[0] || ses->close_failed[1]) {
+            VERDICT_ADD("output close failed %s%s", ses->close_failed[0] ? "A" : "",
+                        ses->close_failed[1] ? "B" : "");
+        }
+        if (wav_failed) VERDICT_ADD("WAV failed");
+        if (source_loss) VERDICT_ADD("source loss %llu", (unsigned long long)source_loss);
+#undef VERDICT_ADD
+        gui_record_log_writef_ses(ses, "WARN", "Recording verdict: incomplete (%s)", why);
+        fprintf(stderr, "[REC] Recording verdict: incomplete (%s)\n", why);
+    } else {
+        gui_record_log_writef_ses(ses, "INFO", "Recording verdict: complete");
+    }
     {
         gui_record_sidecar_end_t end;
         memset(&end, 0, sizeof(end));
+        end.complete = !incomplete;
+        end.source_loss = source_loss;
 #if LIBFLAC_ENABLED == 1
         if (ses->use_flac) {
             end.have_samples_a = ses->capture_a;
@@ -5720,7 +5909,7 @@ void gui_record_stop(gui_app_t *app) {
         gui_record_finalize_stop_sync(ses);
         free(ses);
         s_finalizing = NULL;
-        gui_app_set_status(app, "Recording stopped");
+        gui_app_set_status(app, gui_record_stop_status());
         return;
     }
 

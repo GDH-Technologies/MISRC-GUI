@@ -2315,12 +2315,7 @@ static int gui_app_start_capture_inner(gui_app_t *app) {
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
     app->low_signal_time = 0.0f;
     app->low_signal_armed = false;
-    atomic_store(&app->recording_bytes, 0);
-    atomic_store(&app->recording_raw_a, 0);
-    atomic_store(&app->recording_raw_b, 0);
-    atomic_store(&app->recording_compressed_a, 0);
-    atomic_store(&app->recording_compressed_b, 0);
-    app->last_recording_duration_s = 0.0;
+    gui_record_reset_stats(app);
     s_capture_last_wait_count = 0;
     s_capture_last_drop_count = 0;
     s_capture_last_logged_drop_total = 0;

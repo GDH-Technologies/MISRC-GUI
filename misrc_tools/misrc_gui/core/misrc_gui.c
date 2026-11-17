@@ -2258,6 +2258,10 @@ int main(int argc, char **argv) {
                 }
             } else if (auto_rec_phase == AUTO_REC_FINALIZING) {
                 if (!app.is_recording && !gui_record_is_finalizing()) {
+                    if (gui_record_last_stop_failed()) {
+                        fprintf(stderr, "[AUTO] ERROR: recording finalization failed\n");
+                        auto_rec_failed = true;
+                    }
                     if (app.is_capturing) {
                         gui_app_stop_capture(&app);
                         fprintf(stderr, "[AUTO] capture stopped\n");

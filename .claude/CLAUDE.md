@@ -142,7 +142,8 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
   `--session-selftest`, `--record-order-selftest [keep_dir]` (a counter stream through a forced
   3 s writer stall; FLAC and RAW must hold every sample in order; pass an NFS dir to prove the
   capture side stays off the network), `--capture-meta-selftest [keep_dir] [secs]` (both on scratch settings
-  files), `--config <path>`
+  files; it also checks the recording verdict with an injected source loss, exclusive create and the
+  overwrite-prompt cancel), `--config <path>`
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
   `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`,
@@ -249,6 +250,18 @@ Fork-side:
   stops the capture only when `stop_on_dropout` is on (default off); capture-buffer drops are
   logged the same way. A dead FLAC encoder always stops the capture (`GUI_DROPOUT_RECORD_OUTPUT`).
   `--record-order-selftest` proves it end to end; `docs/gdh-record-path.md` is the design.
+  Upstream's c1dae40 record API is pre-adopted on this path (2026-11-17, sync prep), with
+  upstream's names and signatures:
+  - WAV outputs exist only through `gui_audio_begin_recording` / `_request_record_stop` /
+    `_wait_recording_idle`. The audio thread follows an atomic record state, never
+    `is_recording`. A record stop no longer restarts the thread.
+  - Outputs not covered by the overwrite confirmation open `"wbx"`.
+  - A failed `flac_writer_finish`/`fclose` skips that file's metadata rewrite.
+  - Every finalize writes a verdict to three places: `Recording verdict:` in the log,
+    `result.complete`/`source_loss` in the sidecar, and "Recording incomplete" in the status
+    and `gui_record_last_stop_failed()`. `--auto-record` and `--headless-record` exit 1 on it.
+
+  Guard: "upstream record API pre-adopted".
   Tape-end is `level_autostop_enabled`, a separate
   switch. Since v1.2.0 it ends the recording, not the capture, and its trigger is a
   normalized 0.1-0.8 string; a legacy percent ("33") is migrated on load, so a rollback to
