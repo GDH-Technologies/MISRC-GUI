@@ -57,6 +57,9 @@ const char *gui_record_pending_message(void);
 // pending.
 void gui_record_resolve_pending(gui_app_t *app, bool confirm);
 
+/* Main-thread capture handoff invalidates a pending overwrite confirmation. */
+void gui_record_cancel_capture_confirmation(gui_app_t *app);
+
 // Stop recording
 void gui_record_stop(gui_app_t *app);
 

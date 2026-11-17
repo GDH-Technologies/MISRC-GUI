@@ -921,6 +921,7 @@ static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
         gui_app_set_status(app, "Network mode is locked while playback prepares");
         return;
     }
+    gui_record_cancel_capture_confirmation(app);
     int cur = app->settings.net_mode;
     if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
     app->settings.net_mode = next;

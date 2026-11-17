@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -788,6 +789,16 @@ static void gui_record_log_writef(const char *level, const char *format, ...) {
 static bool s_overwrite_pending = false;
 static char s_overwrite_message[512];
 static gui_app_t *s_pending_app = NULL;
+/* Which outputs the pending prompt covers: the bits of the files that existed
+ * when it was shown (gui_record_check_output_paths). A confirmation overwrites
+ * only those; every other output is created exclusively. */
+static unsigned s_pending_overwrite_mask = 0;
+
+/* Bit order of an overwrite mask, upstream's gui_record_output_targets_t
+ * order: 0 = RF A, 1 = RF B, 2..8 = the seven WAV outputs (shifted down by
+ * this many for gui_audio_begin_recording); 9 = reference video and 10 =
+ * captions are the fork's, written by ffmpeg, never opened exclusively. */
+#define GUI_RECORD_OVERWRITE_WAV_SHIFT 2u
 
 static bool gui_record_collect_finalize_if_done(void) {
     if (!atomic_exchange(&s_record_stop_finalize_done, false)) {
@@ -2124,7 +2135,7 @@ bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,
 }
 
 // Forward declaration of actual recording start (after confirmation)
-static int gui_record_start_confirmed(gui_app_t *app);
+static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask);
 
 static uint8_t clamp_rf_bits_flac(uint8_t bits) {
     if (bits == 8 || bits == 12 || bits == 16) return bits;
@@ -3051,7 +3062,8 @@ static bool gui_record_same_filename(const char *a, const char *b) {
 }
 
 static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_count,
-                                          char *message, size_t message_size) {
+                                          char *message, size_t message_size,
+                                          unsigned *existing_mask) {
     const char *names[] = {
         app->settings.output_filename_a, app->settings.output_filename_b,
         app->settings.audio_4ch_filename, app->settings.audio_2ch_12_filename,
@@ -3079,6 +3091,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
         return false;
     }
     unsigned count = 0;
+    unsigned mask = 0;
     if (message && message_size) message[0] = '\0';
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (!enabled[i]) continue;
@@ -3105,6 +3118,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
                 return false;
             }
             count++;
+            mask |= 1u << i;
             if (message && message_size) {
                 char size_buf[32];
                 format_file_size_u64(bytes, size_buf, sizeof(size_buf));
@@ -3117,6 +3131,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
         }
     }
     if (existing_count) *existing_count = count;
+    if (existing_mask) *existing_mask = mask;
     return true;
 }
 
@@ -4240,8 +4255,9 @@ int gui_record_start(gui_app_t *app) {
     }
 
     unsigned existing_count = 0;
+    unsigned existing_mask = 0;
     char details[384];
-    if (!gui_record_check_output_paths(app, &existing_count, details, sizeof(details))) {
+    if (!gui_record_check_output_paths(app, &existing_count, details, sizeof(details), &existing_mask)) {
         return RECORD_ERROR;
     }
 
@@ -4294,15 +4310,18 @@ int gui_record_start(gui_app_t *app) {
         snprintf(message, sizeof(message),
                  "%u existing output file(s) will be overwritten:\n\n%s",
                  existing_count, details);
-        gui_popup_confirm("Overwrite Files?", message, "Overwrite", "Cancel", app);
+        gui_popup_confirm("Overwrite Files?", message, "Overwrite", "Cancel", &s_overwrite_pending);
         snprintf(s_overwrite_message, sizeof(s_overwrite_message), "%s", message);
         s_overwrite_pending = true;
         s_pending_app = app;
+        s_pending_overwrite_mask = existing_mask;
         return RECORD_PENDING;
     }
 
-    // No files exist, start recording directly
-    int native_record_result=gui_record_start_confirmed(app);
+    /* No files exist (every output is created exclusively), or the
+     * "Overwrite output files" setting covers whatever does. */
+    int native_record_result=gui_record_start_confirmed(app,
+        app->settings.overwrite_files ? UINT_MAX : existing_mask);
 #if defined(__APPLE__)
     if(native_record_result==0)gui_cxadc_macos_log(app);
 #endif
@@ -4319,6 +4338,15 @@ void gui_record_check_popup(gui_app_t *app) {
         return;
     }
 
+    /* The capture stopped under the prompt (any stop path, including the
+     * background stop thread): the confirmation no longer describes a start
+     * that can happen. Cancelled here, on the main thread that owns it. */
+    if (s_pending_app == app && !app->is_capturing) {
+        gui_record_cancel_capture_confirmation(app);
+        gui_app_set_status(app, "Recording cancelled: capture stopped");
+        return;
+    }
+
     popup_result_t result = gui_popup_get_result();
 
     if (result == POPUP_RESULT_NONE) {
@@ -4332,7 +4360,7 @@ void gui_record_check_popup(gui_app_t *app) {
 
     if (result == POPUP_RESULT_YES) {
         // User confirmed, start recording
-        int result=gui_record_start_confirmed(app);
+        int result=gui_record_start_confirmed(app, s_pending_overwrite_mask);
 #if defined(__APPLE__)
         if(result==0)gui_cxadc_macos_log(app);
 #else
@@ -4344,6 +4372,19 @@ void gui_record_check_popup(gui_app_t *app) {
     }
 
     s_pending_app = NULL;
+    s_pending_overwrite_mask = 0;
+}
+
+void gui_record_cancel_capture_confirmation(gui_app_t *app) {
+    /* Upstream's semantics (c1dae40): a capture stop or a mode change on the
+     * main thread invalidates the prompt. Answering it afterwards used to
+     * reach gui_record_start_confirmed and fail there. */
+    if (!s_overwrite_pending || s_pending_app != app) return;
+    if (gui_popup_get_user_data() == &s_overwrite_pending) gui_popup_dismiss();
+    s_overwrite_pending = false;
+    s_overwrite_message[0] = '\0';
+    s_pending_app = NULL;
+    s_pending_overwrite_mask = 0;
 }
 
 const char *gui_record_pending_message(void) {
@@ -4359,8 +4400,15 @@ void gui_record_resolve_pending(gui_app_t *app, bool confirm) {
 }
 
 // Internal: Start recording after confirmation
-static int gui_record_start_confirmed(gui_app_t *app) {
-    if (!gui_record_check_output_paths(app, NULL, NULL, 0)) return RECORD_ERROR;
+static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask) {
+    unsigned existing_now = 0;
+    if (!gui_record_check_output_paths(app, NULL, NULL, 0, &existing_now)) return RECORD_ERROR;
+    /* An output that appeared after the prompt (or after the check, with no
+     * prompt) is not covered by the confirmation: never overwrite it. */
+    if (existing_now & ~overwrite_mask) {
+        gui_app_set_status(app, "Recording outputs changed. Start recording again to confirm.");
+        return RECORD_ERROR;
+    }
     gui_record_reset_disk_guard_state();
 
     // Build full output paths (output_path + filenames)
@@ -4606,12 +4654,16 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     if (app->settings.use_flac) {
         ses->use_flac = true;
         // Open FLAC files (respect per-channel enable)
-        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, "wb") : NULL;
-        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, overwrite_mask & 1u ? "wb" : "wbx") : NULL;
+        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, overwrite_mask & 2u ? "wb" : "wbx") : NULL;
         gui_record_set_output_buffer(ses->file_a);
         gui_record_set_output_buffer(ses->file_b);
 
         if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
+            /* EEXIST: an output not covered by the overwrite confirmation
+             * appeared after the check; the exclusive create left it alone. */
+            fprintf(stderr, "[REC] Cannot create %s: %s\n",
+                    (app->settings.capture_a && !ses->file_a) ? path_a : path_b, strerror(errno));
             gui_app_set_status(app, "Failed to open output files");
             if (ses->file_a) fclose(ses->file_a);
             if (ses->file_b) fclose(ses->file_b);
@@ -4921,12 +4973,16 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 #endif
     {
         // RAW recording (respect per-channel enable)
-        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, "wb") : NULL;
-        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, "wb") : NULL;
+        ses->file_a = app->settings.capture_a ? file_open_utf8(path_a, overwrite_mask & 1u ? "wb" : "wbx") : NULL;
+        ses->file_b = app->settings.capture_b ? file_open_utf8(path_b, overwrite_mask & 2u ? "wb" : "wbx") : NULL;
         gui_record_set_output_buffer(ses->file_a);
         gui_record_set_output_buffer(ses->file_b);
 
         if ((app->settings.capture_a && !ses->file_a) || (app->settings.capture_b && !ses->file_b)) {
+            /* EEXIST: an output not covered by the overwrite confirmation
+             * appeared after the check; the exclusive create left it alone. */
+            fprintf(stderr, "[REC] Cannot create %s: %s\n",
+                    (app->settings.capture_a && !ses->file_a) ? path_a : path_b, strerror(errno));
             gui_app_set_status(app, "Failed to open output files");
             if (ses->file_a) fclose(ses->file_a);
             if (ses->file_b) fclose(ses->file_b);
