@@ -3458,12 +3458,20 @@ def check_cxadc_skips_card_b_when_rf_b_off(repo_root: Path) -> int:
                     "RF B off would open card 1 again")
     raise_active = thread.find("atomic_store(&ctx->b_active, true)")
     load_enabled = thread.find("atomic_load(&ctx->b_enabled)")
-    card1_read = thread.find("card_fds[1]")
+    # Card 1 is reached either by name (the fork's two-card body) or through a
+    # per-card loop bounded by read_b (upstream's post-v1.2.7 RF thread reads
+    # card_fds[card] for card < (read_b ? 2 : 1)). Either shape must come after
+    # the handshake and be gated on read_b.
+    card1_loop = r"card\s*<\s*\(?\s*read_b\s*\?\s*2\s*:\s*1"
+    card1_hits = [m.start() for m in (re.search(r"card_fds\[1\]", thread), re.search(card1_loop, thread)) if m]
+    card1_read = min(card1_hits) if card1_hits else -1
     if raise_active < 0 or load_enabled < 0 or not (raise_active < load_enabled < card1_read):
         return fail("gui_cxadc.c: cxadc_capture_thread() must raise b_active, then read b_enabled, "
-                    "before it reads card 1")
-    if thread.count("if (read_b)") < 2:
-        return fail("gui_cxadc.c: cxadc_capture_thread() must gate the card 1 read and the B decode on read_b")
+                    "before it reads card 1 (card_fds[1], or a card < (read_b ? 2 : 1) loop)")
+    read_b_gates = len(re.findall(r"\bif\s*\(\s*read_b\b", thread)) + len(re.findall(card1_loop, thread))
+    if read_b_gates < 2:
+        return fail("gui_cxadc.c: cxadc_capture_thread() must gate the card 1 read and the B decode on read_b "
+                    "(if (read_b ...) or a card < (read_b ? 2 : 1) loop)")
     drop_enabled = sync.find("atomic_store(&s_cxadc.b_enabled, false)")
     load_active = sync.find("atomic_load(&s_cxadc.b_active)")
     if drop_enabled < 0 or load_active < 0 or drop_enabled > load_active:
