@@ -150,6 +150,13 @@ typedef struct {
     // again at launch. Stored by path rather than index: /dev/videoN survives a
     // reboot, an enumeration order does not.
     char usbref_device_path[40];
+    // The same device's USB port (V4L2 bus_info, e.g. "usb-0000:00:14.0-2").
+    // The path above is NOT stable after all: /dev/videoN follows probe order,
+    // and wm's two dongles swapped numbers across the F45 reboot (2026-11-17).
+    // When set, launch matches on this and rewrites usbref_device_path to the
+    // node the port has now; "" (a file saved before it existed) keeps the old
+    // match-by-path. See gui_preview_find_saved().
+    char usbref_device_bus[32];
     /* Analog capture settings for an SDTV dongle (em28xx and friends). Stored
      * by NAME rather than by index for the same reason the device is stored by
      * path: an index into a device-specific list means nothing once the device
