@@ -68,9 +68,32 @@ static atomic_int s_audio_record_state = AUDIO_RECORD_IDLE;
  * gui_audio_stop joins it, so "running" alone cannot say a thread will see a
  * record state change. */
 static atomic_bool s_audio_thread_alive = false;
+
 static atomic_bool s_audio_record_failed = false;
 static char s_audio_record_paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX];
 static unsigned s_audio_record_mask = 0;
+
+/* True when the current recording asked for at least one WAV output. */
+static bool audio_record_has_outputs(void)
+{
+    for (int i = 0; i < GUI_AUDIO_RECORD_OUTPUT_COUNT; i++) {
+        if (s_audio_record_paths[i][0]) return true;
+    }
+    return false;
+}
+
+/* End a record state without files: only from the state it was seen in (a
+ * compare-and-swap, so a stale end never overwrites a new recording's
+ * ACTIVE), and a requested WAV that was never opened is a failed one. */
+static void audio_record_end_unopened(int seen, const char *why)
+{
+    int expected = seen;
+    if (atomic_compare_exchange_strong(&s_audio_record_state, &expected, AUDIO_RECORD_IDLE) &&
+        audio_record_has_outputs()) {
+        atomic_store(&s_audio_record_failed, true);
+        fprintf(stderr, "[AUDIO] WAV recording ended without its files: %s\n", why);
+    }
+}
 
 // Playback monitoring (audio thread produces into queue; main thread consumes into AudioStream)
 static atomic_bool s_playback_enabled = false;
@@ -701,9 +724,8 @@ static int audio_thread_main(void *ctx)
     }
 
     size_t iter_count = 0;
-    // gui_audio_start may pre-open output files when a record is already
-    // active at thread start; begin in the recording state so the post-read
-    // open-files transition below does not double-open them.
+    // True while this thread has the recording's WAV files open (from the
+    // START transition at the loop top until the STOP transition).
     bool rec_start_aligned = false;
     while (1) {
         /*
@@ -728,6 +750,7 @@ static int audio_thread_main(void *ctx)
         int record_state = atomic_load(&s_audio_record_state);
         {
             bool rec_now = record_state == AUDIO_RECORD_ACTIVE;
+            bool closed_now = false;
             if (rec_now && !rec_start_aligned) {
                 rec_start_aligned = true;
                 uint64_t dropped = audio_discard_ring_to_now(a);
@@ -748,9 +771,16 @@ static int audio_thread_main(void *ctx)
                         "[AUDIO] Record stop aligned: flushed %llu B (~%.1f ms) of tail audio\n",
                         (unsigned long long)flushed, flushed_ms);
                 audio_close_record_files(a);
+                closed_now = true;
             }
             if (record_state == AUDIO_RECORD_STOPPING) {
-                atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
+                if (closed_now) {
+                    int expected = AUDIO_RECORD_STOPPING;
+                    atomic_compare_exchange_strong(&s_audio_record_state, &expected, AUDIO_RECORD_IDLE);
+                } else {
+                    /* The stop arrived before this loop top ever saw the start. */
+                    audio_record_end_unopened(AUDIO_RECORD_STOPPING, "stopped before the files opened");
+                }
             }
         }
         // Read from buffer manager with timeout. The 2 ms timeout keeps the
@@ -826,12 +856,20 @@ static int audio_thread_main(void *ctx)
     // Cleanup at thread exit. The exit drain above already wrote the tail.
     // A recording still ACTIVE here lost its source (capture stopped under
     // it): upstream counts that as a failed WAV. A STOPPING one ends normally.
+    bool had_files = rec_start_aligned;
     if (rec_start_aligned) audio_close_record_files(a);
-    if (atomic_load(&s_audio_record_state) == AUDIO_RECORD_ACTIVE) {
-        atomic_store(&s_audio_record_failed, true);
-        fprintf(stderr, "[AUDIO] Audio thread exited while a WAV recording was active\n");
+    {
+        int expected = AUDIO_RECORD_ACTIVE;
+        if (atomic_compare_exchange_strong(&s_audio_record_state, &expected, AUDIO_RECORD_IDLE)) {
+            atomic_store(&s_audio_record_failed, true);
+            fprintf(stderr, "[AUDIO] Audio thread exited while a WAV recording was active\n");
+        } else if (had_files) {
+            expected = AUDIO_RECORD_STOPPING;
+            atomic_compare_exchange_strong(&s_audio_record_state, &expected, AUDIO_RECORD_IDLE);
+        } else {
+            audio_record_end_unopened(AUDIO_RECORD_STOPPING, "the audio thread exited before the files opened");
+        }
     }
-    atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
 
     if (a->convert_1ch && a->buffer_1ch[0]) aligned_free(a->buffer_1ch[0]);
     if (a->convert_2ch && a->buffer_2ch[0]) aligned_free(a->buffer_2ch[0]);
@@ -848,11 +886,9 @@ static int audio_thread_entry(void *ctx)
 {
     int rc = audio_thread_main(ctx);
     /* Early returns (an allocation failure) skip the thread's own cleanup:
-     * a recording it left ACTIVE never got its files. */
-    if (atomic_load(&s_audio_record_state) == AUDIO_RECORD_ACTIVE) {
-        atomic_store(&s_audio_record_failed, true);
-    }
-    atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
+     * a recording it left behind never got its files. */
+    audio_record_end_unopened(AUDIO_RECORD_ACTIVE, "the audio thread ended early");
+    audio_record_end_unopened(AUDIO_RECORD_STOPPING, "the audio thread ended early");
     atomic_store(&s_audio_thread_alive, false);
     return rc;
 }
@@ -885,7 +921,10 @@ bool gui_audio_wait_recording_idle(void)
      * open or close anything, so the stop completes here. */
     for (int waited_ms = 0; atomic_load(&s_audio_record_state) != AUDIO_RECORD_IDLE; waited_ms += 10) {
         if (!atomic_load(&s_audio_thread_alive)) {
-            atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
+            /* No thread to open or close anything (it never started, or it
+             * ended): a requested WAV does not exist. */
+            int seen = atomic_load(&s_audio_record_state);
+            if (seen != AUDIO_RECORD_IDLE) audio_record_end_unopened(seen, "no audio thread");
             break;
         }
         if (waited_ms >= 30000) {

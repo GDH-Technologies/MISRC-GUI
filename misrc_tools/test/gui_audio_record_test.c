@@ -185,6 +185,14 @@ int main(void)
     gui_audio_request_record_stop(&app);
     expect(gui_audio_wait_recording_idle(), "with no audio thread the stop completes immediately");
 
+    /* 6. No thread, but a WAV was requested: it never existed, so the stop
+     *    must not report success (it used to, silently). */
+    only_quad("never.wav");
+    gui_audio_begin_recording(&app, (const char (*)[GUI_AUDIO_RECORD_PATH_MAX])s_paths, 0);
+    gui_audio_request_record_stop(&app);
+    expect(!gui_audio_wait_recording_idle(), "a requested WAV with no audio thread is a failed WAV");
+    expect(file_size(s_paths[0]) < 0, "and no file was created");
+
     for (const char *n = "quad.wav\0sentinel.wav\0cut.wav\0"; *n; n += strlen(n) + 1) {
         char p[600]; snprintf(p, sizeof(p), "%s/%s", s_dir, n); remove(p);
     }
