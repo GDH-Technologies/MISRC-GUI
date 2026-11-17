@@ -2714,7 +2714,7 @@ def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
     table_src = read_text(repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c")
 
     fields = sorted(set(
-        re.findall(r"\b(usbref_rtsp_[a-z0-9_]+|usbref_mediamtx_path|usbref_device_path)\b(?:\[\d+\])?\s*;",
+        re.findall(r"\b(usbref_rtsp_[a-z0-9_]+|usbref_mediamtx_path|usbref_device_path|usbref_device_bus)\b(?:\[\d+\])?\s*;",
                    struct_src)
     ))
     if not fields:
@@ -6698,6 +6698,23 @@ def check_record_fifo_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_usbref_device_match_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --preview-match-selftest: the remembered USB
+    reference dongle is found by its USB port, not by /dev/videoN, which
+    follows probe order (wm's two dongles swapped numbers across the F45
+    reboot, and a path match then opened the wrong one). A saved port that
+    matches nothing must open nothing rather than fall back to the path."""
+    try:
+        ran = subprocess.run([str(gui_path), "--preview-match-selftest"],
+                             capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --preview-match-selftest timed out")
+    if ran.returncode != 0 or "preview match selftest: PASS" not in ran.stdout:
+        return fail(f"misrc_gui --preview-match-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()[-3000:]}\n{ran.stderr.strip()[-1000:]}")
+    return 0
+
+
 def check_video_timeline_post_build(gui_path: Path) -> int:
     """Run the built GUI's --video-timeline-selftest: frames placed on the
     reference MKV's fixed-rate timeline by their own timestamps stay within one
@@ -7075,6 +7092,7 @@ def main() -> int:
         checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
         checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
         checks.append(("record order selftest (post-build)", lambda: check_record_order_post_build(args.gui_path)))
+        checks.append(("USB reference dongle matched by port (post-build)", lambda: check_usbref_device_match_post_build(args.gui_path)))
         checks.append(("video timeline selftest (post-build)", lambda: check_video_timeline_post_build(args.gui_path)))
         checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
         checks.append(("caption ffmpeg resolution (post-build)", lambda: check_cc_ffmpeg_resolution_post_build(args.gui_path)))

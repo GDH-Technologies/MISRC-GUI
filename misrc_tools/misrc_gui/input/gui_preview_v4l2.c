@@ -484,6 +484,7 @@ void gui_preview_refresh_devices(void)
         memset(dev, 0, sizeof(*dev));
         snprintf(dev->path, sizeof(dev->path), "%s", node);
         snprintf(dev->card, sizeof(dev->card), "%s", (const char *)cap.card);
+        snprintf(dev->bus_info, sizeof(dev->bus_info), "%s", (const char *)cap.bus_info);
 
         enumerate_inputs(fd, dev);
         enumerate_standards(fd, dev);
@@ -2221,3 +2222,84 @@ void gui_preview_tap_install(const preview_tap_t *t) { (void)t; }
 void gui_preview_tap_remove(void) { }
 
 #endif /* __linux__ */
+
+/* ---------------------------------------------------- saved-device matching */
+
+/* Outside the platform block on purpose: pure string matching, so the selftest
+ * proves it on any host, and the startup code calls one function everywhere. */
+int gui_preview_find_saved(const preview_device_t *devs, size_t n,
+                           const char *bus, const char *path)
+{
+    if (!devs || n == 0) return -1;
+
+    if (bus && bus[0]) {
+        int first = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(devs[i].bus_info, bus) != 0) continue;
+            if (path && path[0] && strcmp(devs[i].path, path) == 0) return (int)i;
+            if (first < 0) first = (int)i;
+        }
+        return first;   /* -1: that dongle is not plugged in */
+    }
+
+    if (path && path[0]) {
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(devs[i].path, path) == 0) return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int match_expect(const char *what, int got, int want)
+{
+    if (got == want) {
+        printf("PASS: %s -> %d\n", what, got);
+        return 0;
+    }
+    printf("FAIL: %s -> %d, expected %d\n", what, got, want);
+    return 1;
+}
+
+static void match_fixture(preview_device_t *d, const char *path, const char *card,
+                          const char *bus)
+{
+    memset(d, 0, sizeof(*d));
+    snprintf(d->path, sizeof(d->path), "%s", path);
+    snprintf(d->card, sizeof(d->card), "%s", card);
+    snprintf(d->bus_info, sizeof(d->bus_info), "%s", bus);
+}
+
+int gui_preview_match_selftest_main(void)
+{
+    /* wm after the F44 -> F45 reboot (2026-11-17): the two dongles swapped
+     * numbers. Before it, the StarTech was /dev/video0. */
+    static preview_device_t devs[3];
+    match_fixture(&devs[0], "/dev/video0", "USB Video", "usb-0000:00:14.0-13.3");
+    match_fixture(&devs[1], "/dev/video2", "StarTech SVID2USB232", "usb-0000:00:14.0-2");
+    int fails = 0;
+
+    fails += match_expect("renumbered: saved StarTech port finds /dev/video2",
+                          gui_preview_find_saved(devs, 2, "usb-0000:00:14.0-2", "/dev/video0"), 1);
+    fails += match_expect("unplugged: saved port matches nothing, path not used",
+                          gui_preview_find_saved(devs, 2, "usb-0000:00:14.0-9", "/dev/video0"), -1);
+    fails += match_expect("old settings file (no bus) falls back to the exact path",
+                          gui_preview_find_saved(devs, 2, "", "/dev/video2"), 1);
+    fails += match_expect("old settings file, path gone",
+                          gui_preview_find_saved(devs, 2, "", "/dev/video7"), -1);
+    fails += match_expect("nothing saved",
+                          gui_preview_find_saved(devs, 2, "", ""), -1);
+
+    /* Two capture nodes on one port (a combo device): the saved path picks
+     * between them, else the first node on the port. */
+    match_fixture(&devs[2], "/dev/video4", "Second Function", "usb-0000:00:14.0-13.3");
+    fails += match_expect("shared port: saved path picks the node",
+                          gui_preview_find_saved(devs, 3, "usb-0000:00:14.0-13.3", "/dev/video4"), 2);
+    fails += match_expect("shared port, path renumbered: first node on the port",
+                          gui_preview_find_saved(devs, 3, "usb-0000:00:14.0-13.3", "/dev/video9"), 0);
+    fails += match_expect("no devices",
+                          gui_preview_find_saved(devs, 0, "usb-0000:00:14.0-2", ""), -1);
+
+    printf(fails ? "preview match selftest: FAIL (%d)\n" : "preview match selftest: PASS\n",
+           fails);
+    return fails ? 1 : 0;
+}

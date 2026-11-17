@@ -88,6 +88,11 @@ typedef struct {
 typedef struct {
     char           path[32];       /* "/dev/video0" */
     char           card[40];       /* v4l2_capability.card */
+    /* v4l2_capability.bus_info, e.g. "usb-0000:00:14.0-2": the USB port the
+     * dongle is plugged into. Unlike path it survives a reboot -- /dev/videoN
+     * is handed out in probe order, and two dongles swap numbers whenever they
+     * finish probing in the other order. */
+    char           bus_info[32];
     preview_mode_t modes[PREVIEW_MAX_MODES];
     int            n_modes;        /* best first; for SDTV, derived per standard */
 
@@ -245,6 +250,22 @@ int  gui_preview_child_main(const char *device, const char *fmt_spec, int parent
  * behaviour can be verified without a GUI. */
 int gui_preview_probe_main(void);
 int gui_preview_selftest_main(void);
+
+/* Which enumerated device a saved selection names, or -1 for none.
+ *
+ * The saved USB port (bus) wins: it is the only identity that survives a
+ * reboot. If one port carries more than one capture node, the node at the
+ * saved path is preferred, then the first on the port. A saved bus that
+ * matches nothing is -1 -- the dongle is unplugged -- and never falls back to
+ * the path, because by then the path belongs to whichever device took that
+ * number, and opening it would record the wrong dongle. Only a selection saved
+ * before the bus was stored (bus "") is matched by its exact path.
+ *
+ * Pure, no device access, compiled on every platform; the selftest below drives
+ * it with fixture lists. */
+int gui_preview_find_saved(const preview_device_t *devs, size_t n,
+                           const char *bus, const char *path);
+int gui_preview_match_selftest_main(void);
 int gui_preview_tap_test_main(const char *device, int seconds);
 int gui_preview_dump_frame_main(const char *device, const char *out_png);
 int gui_preview_probe_stream_main(const char *device, int seconds);

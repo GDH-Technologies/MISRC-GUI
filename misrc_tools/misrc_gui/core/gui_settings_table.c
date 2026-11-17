@@ -180,6 +180,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->usbref_cc_vbi_device[0] = '\0';       /* auto: the dongle the preview is on */
     settings->ffmpeg_path[0] = '\0';
     settings->usbref_device_path[0] = '\0';
+    settings->usbref_device_bus[0] = '\0';
     settings->usbref_input[0] = '\0';       /* leave the device on whatever jack it has */
     settings->usbref_standard[0] = '\0';    /* auto-detect on connect */
     settings->usbref_mode_spec[0] = '\0';   /* the device's default mode */
@@ -1168,6 +1169,9 @@ static const gui_setting_desc_t s_table[] = {
     GS_IH ("gen_tape_format",                 gen_tape_format,            GS_LOCAL, hook_gen_tape_format),
     GS_S  ("monitor_local_save_path",         monitor_local_save_path,    GS_LOCAL),
     GS_B  ("monitor_local_save_enabled",      monitor_local_save_enabled, GS_LOCAL),
+    /* Appended (row order is write order): the USB port of usbref_device_path.
+     * Capture-side like the path -- the server owns the dongle. */
+    GS_S  ("usbref_device_bus",               usbref_device_bus,          0),
     /* Appended (row order is write order): the dongle's audio as a FLAC track
      * in the reference MKV. Capture-side, like video_record_enabled. */
     GS_B  ("usbref_audio_enabled",            usbref_audio_enabled,       0),
