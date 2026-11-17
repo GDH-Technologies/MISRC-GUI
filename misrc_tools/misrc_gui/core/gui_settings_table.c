@@ -199,6 +199,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->usbref_rtsp_password = false;  /* passwordless unless asked */
     settings->usbref_mediamtx_path[0] = '\0';
     settings->usbref_rtsp_audio_device[0] = '\0';
+    settings->usbref_audio_enabled = true;
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -1171,6 +1172,9 @@ static const gui_setting_desc_t s_table[] = {
     /* Appended (row order is write order): the USB port of usbref_device_path.
      * Capture-side like the path -- the server owns the dongle. */
     GS_S  ("usbref_device_bus",               usbref_device_bus,          0),
+    /* Appended (row order is write order): the dongle's audio as a FLAC track
+     * in the reference MKV. Capture-side, like video_record_enabled. */
+    GS_B  ("usbref_audio_enabled",            usbref_audio_enabled,       0),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

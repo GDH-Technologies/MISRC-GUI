@@ -37,11 +37,17 @@ void gui_preview_tap_remove(void)
     g_remove_calls++;
 }
 
-/* Stand in for the capture thread delivering one frame. */
+/* Stand in for the capture thread delivering one frame. Each frame carries a
+ * distinct start timestamp, one NTSC period apart, so a consumer can prove it
+ * got the frame's own time and not a stale or zeroed one. */
+static uint64_t g_next_ts = 1000000000ull;
+
 static void deliver_frame(const uint8_t *yuyv, uint32_t w, uint32_t h)
 {
+    uint64_t ts = g_next_ts;
+    g_next_ts += 33366667ull;
     if (g_installed && g_installed->fn) {
-        g_installed->fn(yuyv, (size_t)w * 2, w, h, g_installed->user);
+        g_installed->fn(yuyv, (size_t)w * 2, w, h, ts, g_installed->user);
     }
 }
 
@@ -59,12 +65,14 @@ typedef struct {
     uint32_t last_w, last_h;
     size_t   last_pitch;
     uint8_t  first_byte;
+    uint64_t last_ts;
 } consumer_t;
 
 static void consumer_cb(const uint8_t *yuyv, size_t pitch,
-                        uint32_t w, uint32_t h, void *user)
+                        uint32_t w, uint32_t h, uint64_t ts_ns, void *user)
 {
     consumer_t *c = (consumer_t *)user;
+    c->last_ts = ts_ns;
     c->frames++;
     c->last_w = w;
     c->last_h = h;
@@ -118,6 +126,11 @@ static int test_two_consumers_both_receive_every_frame(void)
     if (expect_eq_int((int)stream.last_h, 1, "streamer height") != 0) return 1;
     if (expect_true(stream.last_pitch == 8, "streamer pitch") != 0) return 1;
     if (expect_true(stream.first_byte == 0xAB, "streamer payload") != 0) return 1;
+    /* The frame's own start time reaches every consumer unchanged: the
+     * recorder lines the picture up with audio by it. */
+    if (expect_true(rec.last_ts != 0 && rec.last_ts == stream.last_ts &&
+                    rec.last_ts == g_next_ts - 33366667ull,
+                    "every consumer gets the frame's own timestamp") != 0) return 1;
 
     gui_preview_mux_remove(&rec_tap);
     gui_preview_mux_remove(&stream_tap);
@@ -256,9 +269,9 @@ static atomic_int q_in_callback;
 static atomic_int q_finished;
 
 static void slow_consumer_cb(const uint8_t *yuyv, size_t pitch,
-                             uint32_t w, uint32_t h, void *user)
+                             uint32_t w, uint32_t h, uint64_t ts_ns, void *user)
 {
-    (void)yuyv; (void)pitch; (void)w; (void)h; (void)user;
+    (void)yuyv; (void)pitch; (void)w; (void)h; (void)ts_ns; (void)user;
     atomic_store(&q_in_callback, 1);
     struct timespec ts = { 0, 50 * 1000 * 1000 };   /* 50ms, far longer than any race window */
     nanosleep(&ts, NULL);

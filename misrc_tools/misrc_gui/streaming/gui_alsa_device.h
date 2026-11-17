@@ -30,10 +30,18 @@
  * that actually bite: a second card on the same controller, and card indices
  * moving between boots.
  *
- * Writes e.g. "plughw:CARD=MS210x,DEV=0" -- plughw rather than hw, because hw
- * demands an exact format match and fails outright when the dongle's native
- * rate is not the one asked for, where plughw inserts the conversion ffmpeg
- * would have applied anyway.
+ * Writes e.g. "dsnoop:CARD=MS210x,DEV=0,FORMAT=S16_LE,RATE=48000".
+ *
+ * dsnoop, because the dongle's audio has two consumers -- the RTSP stream and
+ * the reference recording -- and a hw capture PCM opens once: without sharing,
+ * whichever came second failed busy. alsa-lib adds the card and device to the
+ * dsnoop IPC key, so two dongles never share a segment.
+ *
+ * FORMAT and RATE pinned, because a second dsnoop client copies the FIRST
+ * opener's hardware parameters without checking them; pinned, it does not
+ * matter which consumer opens first. Both dongles in use (em28xx's USB audio,
+ * MS210x) capture only 48 kHz S16_LE stereo, which is also what the consumers
+ * ask for, so no plug layer is needed.
  *
  * Returns 0 on success. On failure returns -1 and sets out to "" -- the caller
  * streams video-only and says why, rather than guessing at a device. */
@@ -44,5 +52,12 @@ int gui_alsa_resolve_from_cards(const char *cards_text, const char *v4l2_bus_inf
  * bus_info. Returns 0 on success, -1 if either lookup fails or no card shares
  * the address. */
 int gui_alsa_resolve_for_video_device(const char *video_device, char *out, size_t cap);
+
+/* Who holds the capture PCM of the card named in `device` (its "CARD=<id>"),
+ * read from /proc/asound/card<N>/pcm0c/sub0/status and /proc/<pid>/comm.
+ * Writes e.g. "pipewire (pid 5307)". Returns -1 and "" when the PCM is closed
+ * or anything cannot be read. For an open failure's message only: with dsnoop
+ * the owner is the first sharer, which may be a consumer that shares fine. */
+int gui_alsa_capture_holder(const char *device, char *out, size_t cap);
 
 #endif /* GUI_ALSA_DEVICE_H */

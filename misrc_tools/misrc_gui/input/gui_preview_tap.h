@@ -23,9 +23,17 @@
  * The callback runs ON THE CAPTURE THREAD, between VIDIOC_DQBUF and
  * VIDIOC_QBUF. It must not block, must not call GL, and must copy anything it
  * wants to keep -- the buffer is requeued the moment it returns.
+ *
+ * ts_ns is when the frame STARTED, on CLOCK_MONOTONIC, from the driver's own
+ * buffer timestamp: as-is where the driver stamps the start of the frame
+ * (uvcvideo, TSTAMP_SRC_SOE), one frame period earlier where it stamps the end
+ * (em28xx, TSTAMP_SRC_EOF), and CLOCK_MONOTONIC at DQBUF where the driver's
+ * clock is not monotonic. A consumer that has to line the picture up with
+ * something else -- audio -- times it by this, never by frame count: frames
+ * arrive at the SOURCE's rate (a camcorder's servo crystal), not the nominal.
  */
 typedef void (*preview_tap_fn)(const uint8_t *yuyv, size_t pitch,
-                               uint32_t w, uint32_t h, void *user);
+                               uint32_t w, uint32_t h, uint64_t ts_ns, void *user);
 
 typedef struct {
     preview_tap_fn fn;

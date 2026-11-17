@@ -127,7 +127,8 @@ static void print_usage(const char *program_name) {
             "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
             "  --cc-record-test <device> <dir> [secs] [kill|hang|bad-args|busy]\n"
             "  --cc-settings-test\n"
-            "  --video-record-test <device> <out> [seconds] [codec]\n"
+            "  --video-record-test <device> <out> [seconds] [codec] [audio|noaudio]\n"
+            "  --video-timeline-selftest\n"
             "  --mediamtx-test [seconds]\n"
             "  --rtsp-stream-test <device> [seconds]\n"
             "  --rtsp-fault-test <device> <none|kill|hang|bad-args|no-audio|busy-audio> [seconds]\n"
@@ -1106,12 +1107,16 @@ int main(int argc, char **argv) {
             int secs = (i + 1 < argc) ? atoi(argv[i + 1]) : 2;
             return gui_mediamtx_test_main(secs);
         }
+        if (strcmp(argv[i], "--video-timeline-selftest") == 0) {
+            return gui_video_record_timeline_selftest_main();
+        }
         if (strcmp(argv[i], "--video-record-test") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
             const char *out = (i + 2 < argc) ? argv[i + 2] : NULL;
             int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
             const char *codec = (i + 4 < argc) ? argv[i + 4] : NULL;
-            return gui_video_record_test_main(dev, out, secs, codec);
+            const char *audio = (i + 5 < argc) ? argv[i + 5] : NULL;
+            return gui_video_record_test_main(dev, out, secs, codec, audio);
         }
         if (strcmp(argv[i], "--video-tap-test") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
