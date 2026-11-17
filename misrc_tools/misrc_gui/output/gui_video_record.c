@@ -123,6 +123,7 @@ int gui_video_record_timeline_selftest_main(void)
  * non-Linux stubs below instead of compiling this in. */
 #if defined(__linux__) && !defined(__ANDROID__)
 
+#include <linux/videodev2.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -614,6 +615,17 @@ out:
  * muxed into the same file later. */
 #define VR_AUDIO_TITLE "title=Camcorder line out (USB reference)"
 
+/* Whether the source frames are two woven fields. Every SD analog raster is
+ * (uvcvideo reports V4L2_FIELD_NONE for the MS210x's 720x480 all the same);
+ * anything else only when the driver says so. */
+static bool vr_source_interlaced(void)
+{
+    if (vr.height == 480 || vr.height == 486 || vr.height == 576) return true;
+    preview_status_t ps = gui_preview_get_status();
+    return ps.field == V4L2_FIELD_INTERLACED || ps.field == V4L2_FIELD_INTERLACED_TB ||
+           ps.field == V4L2_FIELD_INTERLACED_BT;
+}
+
 static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
                           char *size_buf, size_t size_cap,
                           char *rate_buf, size_t rate_cap,
@@ -707,6 +719,9 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
         argv[n++] = (char *)"-g";       argv[n++] = (char *)"1";
         argv[n++] = (char *)"-slices";  argv[n++] = (char *)"4";
         argv[n++] = (char *)"-slicecrc";argv[n++] = (char *)"1";
+        /* The lossless reference keeps the dongle's full 4:2:2 chroma; no
+         * GPU decodes FFV1, so every player decodes it in software anyway. */
+        argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv422p";
     } else if (s_inject == VR_INJECT_BAD_ARGS) {
         /* A codec ffmpeg does not have: it must fail fast, with the reason in
          * its own log, rather than hanging or half-writing a file. */
@@ -716,6 +731,18 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
         argv[n++] = (char *)"-preset";  argv[n++] = (char *)"veryfast";
         argv[n++] = (char *)"-crf";     argv[n++] = (char *)"18";
         argv[n++] = (char *)"-g";       argv[n++] = (char *)"25";
+        /* 4:2:0 High profile, not 4:2:2 (High 4:2:2): no common GPU decodes
+         * H.264 4:2:2 (an RTX 3080's NVDEC does not), and VLC 3.0 hands the
+         * stream to VDPAU anyway and shows no picture -- audio over an empty
+         * window (wm, 2026-11-17). The chroma is halved per FIELD on an
+         * interlaced source: a progressive conversion averages the two
+         * fields' colour, which smears it on motion. -profile:v makes x264
+         * refuse rather than silently write another profile. */
+        argv[n++] = (char *)"-vf";
+        argv[n++] = (char *)(vr_source_interlaced() ? "scale=interl=1,format=yuv420p"
+                                                    : "format=yuv420p");
+        argv[n++] = (char *)"-pix_fmt";   argv[n++] = (char *)"yuv420p";
+        argv[n++] = (char *)"-profile:v"; argv[n++] = (char *)"high";
         if (audio) {
             /* A live sound card cannot be paused, and ffmpeg's scheduler
              * pauses ("chokes") any input whose output runs >= 100 ms ahead
@@ -730,7 +757,6 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
             argv[n++] = (char *)"-tune"; argv[n++] = (char *)"zerolatency";
         }
     }
-    argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv422p";
     /* Capped so the encoder cannot compete with FLAC level-8 RF encode. */
     argv[n++] = (char *)"-threads"; argv[n++] = (char *)"2";
     argv[n++] = (char *)"-f";       argv[n++] = (char *)"matroska";
@@ -1113,7 +1139,7 @@ static int s_inject_at = 0;
 /* Probe the finished MKV with the ffprobe next to the ffmpeg in use (else the
  * one on PATH): stream kinds, codecs, start times and durations. Returns the
  * number of streams read, -1 if ffprobe could not run. */
-typedef struct { char type[16]; char codec[24]; double start; double duration; } vr_probe_stream_t;
+typedef struct { char type[16]; char codec[24]; char pix_fmt[24]; double start; double duration; } vr_probe_stream_t;
 
 static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
 {
@@ -1126,7 +1152,7 @@ static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
     }
     char cmd[1400];
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" -v error -show_entries stream=codec_type,codec_name,start_time:stream_tags=DURATION "
+             "\"%s\" -v error -show_entries stream=codec_type,codec_name,pix_fmt,start_time:stream_tags=DURATION "
              "-of compact=p=0:nk=0 \"%s\" 2>/dev/null", probe, path);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
@@ -1138,6 +1164,7 @@ static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
         st->start = st->duration = -1.0;
         for (char *tok = strtok(line, "|\n"); tok; tok = strtok(NULL, "|\n")) {
             if (!strncmp(tok, "codec_name=", 11)) snprintf(st->codec, sizeof(st->codec), "%s", tok + 11);
+            else if (!strncmp(tok, "pix_fmt=", 8)) snprintf(st->pix_fmt, sizeof(st->pix_fmt), "%s", tok + 8);
             else if (!strncmp(tok, "codec_type=", 11)) snprintf(st->type, sizeof(st->type), "%s", tok + 11);
             else if (!strncmp(tok, "start_time=", 11)) st->start = atof(tok + 11);
             else if (!strncmp(tok, "tag:DURATION=", 13)) {
@@ -1331,6 +1358,29 @@ int gui_video_record_test_main(const char *device, const char *out_path,
         rc = 1;
     }
     if (vs.error) rc = 1;
+
+    /* The chroma layout each codec promises: H.264 4:2:0 so a GPU decodes
+     * it, FFV1 the dongle's full 4:2:2. */
+    if (s_inject == VR_INJECT_NONE && !vs.error && vs.output_bytes > 0) {
+        vr_probe_stream_t st[4];
+        int ns = vr_ffprobe_streams(out_path, st, 4);
+        const vr_probe_stream_t *v = NULL;
+        for (int k = 0; k < ns; k++) if (!strcmp(st[k].type, "video")) { v = &st[k]; break; }
+        const char *want = codec == VIDEO_CODEC_FFV1 ? "yuv422p" : "yuv420p";
+        if (ns < 0) {
+            printf("note: ffprobe could not run; pixel format not checked\n");
+        } else if (!v) {
+            printf("FAIL: ffprobe found no video stream\n");
+            rc = 1;
+        } else {
+            printf("video stream: %s %s (interlaced-aware chroma: %s)\n", v->codec, v->pix_fmt,
+                   codec == VIDEO_CODEC_H264 && vr_source_interlaced() ? "yes" : "n/a");
+            if (strcmp(v->pix_fmt, want) != 0) {
+                printf("FAIL: video is %s, expected %s\n", v->pix_fmt, want);
+                rc = 1;
+            }
+        }
+    }
 
     /* With audio, what landed in the file: one FLAC track, and both tracks
      * starting and ending together -- within one frame. */

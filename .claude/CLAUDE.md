@@ -301,6 +301,11 @@ Fork-side:
   with audio needs `-tune zerolatency` (guarded, "USB reference audio contract"). With both
   jacks wired to the camcorder, the StarTech's composite input carried no picture (mean luma
   18 vs 118 on S-Video, 2026-11-17): select the jack that has one before measuring anything.
+  The H.264 reference is 4:2:0 High profile, chroma halved per field (`scale=interl=1`) on an
+  SD or interlaced source; FFV1 stays 4:2:2. As High 4:2:2 it played as audio over an empty
+  window in VLC (VDPAU, no GPU decodes H.264 4:2:2, no software fallback) while ffprobe and
+  ffmpeg decoded it fine: check playback in a hardware-decoding player, not only ffprobe
+  (guard "USB reference H.264 is 4:2:0").
 - mediamtx ports are canonical+100 (RTSP 8654) so the fork never collides with capture-node's
   `tier×10000+8554` instances on the same hosts.
 - Settings live in one descriptor table (`misrc_gui/core/gui_settings_table.c`); the struct is

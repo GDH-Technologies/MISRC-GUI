@@ -2296,6 +2296,43 @@ def check_alsa_device_resolution(repo_root: Path) -> int:
     return 0
 
 
+def check_usbref_h264_420(repo_root: Path) -> int:
+    """The H.264 reference video is 4:2:0 High profile (fork-only). As High
+    4:2:2 it played as audio over an empty window in VLC on wm (2026-11-17):
+    no common GPU decodes H.264 4:2:2 and VLC 3.0 uses VDPAU anyway. The
+    conversion halves the chroma per field on an interlaced source. FFV1, the
+    lossless option, keeps 4:2:2."""
+    rec = repo_root / "misrc_tools/misrc_gui/output/gui_video_record.c"
+    if not rec.exists():
+        return fail(f"{rec.relative_to(repo_root)} is missing")
+    code = strip_c_comments(read_text(rec))
+    body = func_body_from(code, "static void vr_build_argv(")
+    if not body:
+        return fail("vr_build_argv not found in gui_video_record.c")
+    i_ffv1 = body.find('"ffv1"')
+    i_x264 = body.find('"libx264"')
+    if i_ffv1 < 0 or i_x264 < 0 or i_ffv1 > i_x264:
+        return fail("vr_build_argv: expected the FFV1 branch before the libx264 branch")
+    ffv1, x264 = body[i_ffv1:i_x264], body[i_x264:]
+    if '"yuv422p"' not in ffv1:
+        return fail("vr_build_argv: FFV1 must keep -pix_fmt yuv422p (the dongle's full chroma)")
+    for needle, why in (
+        ('"yuv420p"', "-pix_fmt yuv420p: H.264 4:2:2 has no GPU decoder and plays with no picture in VLC"),
+        ('format=yuv420p', "the explicit 4:2:0 conversion in -vf"),
+        ('scale=interl=1', "per-field chroma subsampling for an interlaced source"),
+        ('"-profile:v"', "-profile:v high, so x264 refuses rather than writes another profile"),
+        ('"high"', "-profile:v high"),
+    ):
+        if needle not in x264:
+            return fail(f"vr_build_argv's libx264 branch lost {needle}: {why}")
+    if '"yuv422p"' in x264:
+        return fail("vr_build_argv: yuv422p is back on the H.264 path")
+    if "vr_source_interlaced()" not in x264:
+        return fail("vr_build_argv: the libx264 branch no longer picks the interlaced conversion "
+                    "with vr_source_interlaced()")
+    return 0
+
+
 def check_usbref_audio_contract(repo_root: Path) -> int:
     """The dongle's audio in the reference MKV (fork-only). Its A/V sync rests
     on a handful of ffmpeg arguments that each look optional and are not:
@@ -7052,6 +7089,7 @@ def main() -> int:
         ("no self-install over a GDH build", lambda: check_no_self_install(repo_root)),
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
         ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
+        ("USB reference H.264 is 4:2:0", lambda: check_usbref_h264_420(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
