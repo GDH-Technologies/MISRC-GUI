@@ -104,17 +104,27 @@ bool gui_usbref_settings_handle_escape(gui_app_t *app)
 
 /* ---------------------------------------------------------------- helpers */
 
+/* Remember a device by path AND USB port. The port is what the next launch
+ * matches on (gui_preview_find_saved): /dev/videoN follows probe order and is
+ * not stable across a reboot. The path stays for the consumers that open a
+ * node (captions, RTSP) and for a rollback build, which only knows the path. */
+static void remember_device(gui_app_t *app, const preview_device_t *d)
+{
+    snprintf(app->settings.usbref_device_path, sizeof(app->settings.usbref_device_path),
+             "%s", d->path);
+    snprintf(app->settings.usbref_device_bus, sizeof(app->settings.usbref_device_bus),
+             "%s", d->bus_info);
+}
+
 /* Remember which USB preview device is selected, so the next launch can reopen
- * it. Stored by path: /dev/videoN survives a reboot, an enumeration index does
- * not. */
+ * it. Stored by port and path; an enumeration index means nothing next time. */
 static void gui_ui_remember_preview_device(gui_app_t *app)
 {
     size_t n = 0;
     const preview_device_t *devs = gui_preview_devices(&n);
     int sel = gui_preview_selected_device();
     if (sel < 0 || (size_t)sel >= n) return;
-    snprintf(app->settings.usbref_device_path, sizeof(app->settings.usbref_device_path),
-             "%s", devs[sel].path);
+    remember_device(app, &devs[sel]);
     gui_settings_save(&app->settings);
 }
 
@@ -582,8 +592,7 @@ static void pick_remember(gui_app_t *app)
 {
     const preview_device_t *d = pick_device();
     if (!d) return;
-    snprintf(app->settings.usbref_device_path, sizeof(app->settings.usbref_device_path),
-             "%s", d->path);
+    remember_device(app, d);
     int in = gui_preview_selected_input();
     if (in >= 0 && in < d->n_inputs) {
         snprintf(app->settings.usbref_input, sizeof(app->settings.usbref_input),

@@ -122,6 +122,7 @@ static void print_usage(const char *program_name) {
             "\n"
             "Diagnostics (headless, no window):\n"
             "  --preview-dump-frame <device> <out.ppm>\n"
+            "  --preview-match-selftest | --config <path> --usbref-resolve-device\n"
             "  --video-probe | --video-settings-test | --video-name-test\n"
             "  --cc-probe [--live] | --cc-argv-dump [device] [dir]\n"
             "  --cc-record-test <device> <dir> [secs] [kill|hang|bad-args|busy]\n"
@@ -838,6 +839,76 @@ static int gui_run_role_headless_server(const char *config_path,
 }
 #endif
 
+/* Find the remembered USB reference dongle among the devices present now.
+ *
+ * Matches by USB port (usbref_device_bus) when one is saved, because
+ * /dev/videoN follows probe order: wm's two dongles swapped numbers across the
+ * F45 reboot, and a path match then opened the wrong one. When the port is now
+ * a different node, usbref_device_path is rewritten to it and saved, so every
+ * consumer that opens the path (captions, RTSP, the reference recording) and a
+ * rollback build that knows only the path follow the dongle. A file saved
+ * before the port existed matches by path once and gains the port.
+ *
+ * Returns the device index, or -1 (nothing remembered, or that dongle is not
+ * plugged in). note gets one line saying what happened, or "". */
+static int usbref_resolve_saved_device(gui_settings_t *s, char *note, size_t note_cap)
+{
+    note[0] = '\0';
+    gui_preview_refresh_devices();
+    size_t n_pv = 0;
+    const preview_device_t *pv = gui_preview_devices(&n_pv);
+    int want = gui_preview_find_saved(pv, n_pv, s->usbref_device_bus, s->usbref_device_path);
+    if (want < 0) {
+        if (s->usbref_device_bus[0]) {
+            snprintf(note, note_cap, "remembered USB dongle at %s is not plugged in",
+                     s->usbref_device_bus);
+        }
+        return -1;
+    }
+
+    bool moved = strcmp(pv[want].path, s->usbref_device_path) != 0;
+    bool gained_bus = !s->usbref_device_bus[0] && pv[want].bus_info[0];
+    if (moved) {
+        snprintf(note, note_cap, "USB dongle at %s is now %s (was %s)",
+                 pv[want].bus_info, pv[want].path, s->usbref_device_path);
+    } else if (gained_bus) {
+        snprintf(note, note_cap, "USB dongle %s remembered by port %s",
+                 pv[want].path, pv[want].bus_info);
+    }
+    if (moved || gained_bus) {
+        snprintf(s->usbref_device_path, sizeof(s->usbref_device_path), "%s", pv[want].path);
+        snprintf(s->usbref_device_bus, sizeof(s->usbref_device_bus), "%s", pv[want].bus_info);
+        gui_settings_save(s);
+    }
+    return want;
+}
+
+/* Headless: run the launch-time match against a --config file and report it.
+ * Refuses without --config, because a match can rewrite the file. */
+static int usbref_resolve_device_main(const char *config_path)
+{
+    if (!config_path) {
+        fprintf(stderr, "--usbref-resolve-device needs --config <path> (it may rewrite the file)\n");
+        return 2;
+    }
+    gui_settings_set_override_path(config_path);
+    static gui_settings_t s;
+    gui_settings_load(&s);
+    char note[160];
+    int want = usbref_resolve_saved_device(&s, note, sizeof(note));
+    if (note[0]) printf("[AUTO] %s\n", note);
+    if (want < 0) {
+        printf("[AUTO] usbref device: none (bus \"%s\", path \"%s\")\n",
+               s.usbref_device_bus, s.usbref_device_path);
+        return 1;
+    }
+    size_t n_pv = 0;
+    const preview_device_t *pv = gui_preview_devices(&n_pv);
+    printf("[AUTO] usbref device: %s \"%s\" at %s\n",
+           pv[want].path, pv[want].card, pv[want].bus_info);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -939,6 +1010,15 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--preview-selftest") == 0) {
             return gui_preview_selftest_main();
+        }
+        if (strcmp(argv[i], "--preview-match-selftest") == 0) {
+            return gui_preview_match_selftest_main();
+        }
+        if (strcmp(argv[i], "--usbref-resolve-device") == 0) {
+            for (int j = 1; j + 1 < argc; j++) {
+                if (strcmp(argv[j], "--config") == 0) config_path = argv[j + 1];
+            }
+            return usbref_resolve_device_main(config_path);
         }
         /* The net server with no window: everything the GUI's main loop does
          * for it, minus the window. Needs --config (it refuses to run on the
@@ -1507,14 +1587,10 @@ int main(int argc, char **argv) {
     gui_preview_set_crop(app.settings.usbref_crop_top, app.settings.usbref_crop_bottom,
                          app.settings.usbref_crop_left, app.settings.usbref_crop_right);
 
-    if (app.settings.usbref_device_path[0]) {
-        gui_preview_refresh_devices();
-        size_t n_pv = 0;
-        const preview_device_t *pv = gui_preview_devices(&n_pv);
-        int want = -1;
-        for (size_t i = 0; i < n_pv; i++) {
-            if (strcmp(pv[i].path, app.settings.usbref_device_path) == 0) { want = (int)i; break; }
-        }
+    if (app.settings.usbref_device_path[0] || app.settings.usbref_device_bus[0]) {
+        char note[160];
+        int want = usbref_resolve_saved_device(&app.settings, note, sizeof(note));
+        if (note[0]) fprintf(stderr, "[preview] %s\n", note);
         if (want >= 0) {
             gui_preview_select(want, 0);
             /* Order matters: the standard rebuilds the mode list, so it has to
