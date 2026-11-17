@@ -122,7 +122,8 @@ visibility is `all`.
 win0 restores the Windows x64 coverage this fork lost when `build.yml` was disabled, and it
 runs on every event so a PR that breaks the Windows build fails **before** merge. The leg
 mirrors upstream `build.yml`'s `windows-exe` job rather than the fork's
-`scripts/build-local.ps1`: the same MSYS2 MINGW64 shell, `scripts/build-deps-windows.sh` for
+`scripts/build-local.ps1`: an MSYS2 shell (MINGW64 today, where upstream has moved to
+UCRT64 -- see "Planned: move win0 from MINGW64 to UCRT64"), `scripts/build-deps-windows.sh` for
 the static libuvc + hsdaoh + raylib prefix, the job's own `meson setup`/`compile` lines, and
 its release assertions — GUI subsystem, and an import table naming only system DLLs.
 `build-local.ps1` is not used because it pip-installs meson/ninja into the runner user's
@@ -164,14 +165,25 @@ session 0 with no desktop, which is fine: every step here is headless.
 #### One-time prep on win0
 
 MSYS2 at `C:\msys64` (the path `scripts/build-local.ps1` hardcodes, and the one the
-workflow's `shell:` line names), with the `windows-exe` job's MINGW64 package list plus
-`libjpeg-turbo` (CI has it, `INSTALLATION.md` omits it) and `clang-tools-extra` (clangd for
-the editor plugin). Installed by hand once, as on air0; CI never runs pacman:
+workflow's `shell:` line names), with the `windows-exe` job's package list in its MINGW64
+form plus `clang-tools-extra` (clangd for the editor plugin). Installed by hand once, as on
+air0; CI never runs pacman:
 
 ```
 pacman -Syu   # twice on a fresh install: the first pass upgrades the runtime and exits
-pacman -S --needed git mingw-w64-x86_64-{cmake,fftw,flac,gcc,libjpeg-turbo,libusb,libsoxr,meson,nasm,ninja,pkgconf,clang-tools-extra}
+pacman -S --needed git mingw-w64-x86_64-{cmake,fftw,flac,gcc,libjpeg-turbo,libusb,libsoxr,meson,nasm,ninja,pkgconf,opus,openh264,clang-tools-extra}
 ```
+
+`opus` and `openh264` arrived with upstream v1.2.7 (Monitor & Remote) as hard GUI
+dependencies; without them `meson setup` stops at `Dependency "opus" not found`. Neither is
+built by `scripts/build-deps-windows.sh` (the vendored `third_party/opus` and
+`third_party/openh264` are built only by `build-deps-unix.sh`), so on Windows they come from
+pacman, as in upstream's job. Both ship static archives (`libopus.a`, `libopenh264.a`) that
+the build links statically, so the static-link contract step still sees only system DLLs.
+`libzstd`, the third v1.2.7 dependency, needs no entry: `gcc` and `binutils` already pull in
+`mingw-w64-x86_64-zstd`, which is why upstream's list omits it too. FFmpeg
+(`modern_monitor_codecs`, auto) is optional and not installed on win0. Checked on win0
+2026-11-17: zstd 1.5.7, opus 1.6.1, openh264 2.6.0, no ffmpeg.
 
 Git for Windows must be installed: `actions/checkout` uses its `git`, and its `bash` is what
 `shell: bash` resolves to on a Windows runner. The job pins `defaults.run.shell: bash`
@@ -218,8 +230,39 @@ C:\msys64\usr\bin\env.exe MSYSTEM=MINGW64 CHERE_INVOKING=1 C:\msys64\usr\bin\bas
   build-ci/misrc_gui.exe --smoke-test
 ```
 
-Everyday development on win0 uses `pwsh -File scripts/build-local.ps1` instead (see
-`.claude/CLAUDE.md`); the two share `.deps` contents but not the prefix path.
+`pwsh -File scripts/build-local.ps1` is the Windows development entry point (see
+`.claude/CLAUDE.md`), but expect it to fail on win0 until the UCRT64 move below: it runs the
+deps step under `MSYSTEM=UCRT64`, and win0 has no UCRT64 toolchain (found by probing the
+UCRT64 shell on 2026-11-17, not by running the script).
+
+#### Planned: move win0 from MINGW64 to UCRT64
+
+win0's only job for GDH is to prove the fork still builds and passes the way upstream's
+Windows CI does: no GDH host captures on Windows, so a Windows result is worth exactly as
+much as its match to upstream's `windows-exe` job. That match has drifted. Upstream moved the
+job to **UCRT64** in v1.2.4 (MSYS2 deprecates MINGW64: `[msystem-mingw64] MINGW64 is
+deprecated. Migrate to UCRT64 or CLANG64`), and `build-deps-windows.sh` and `build-local.ps1`
+followed, preferring `/ucrt64`. win0 still builds under MINGW64 (msvcrt), so the fork is
+building a Windows binary upstream no longer builds. The intent is to move win0 to UCRT64 so
+the fork's CI mirrors upstream's again.
+
+State on 2026-11-17: `C:\msys64\ucrt64` exists but holds no packages (no `gcc`, no
+`pkg-config` under `MSYSTEM=UCRT64`); the CI leg works only because every MSYS2 step sets
+`MSYSTEM: MINGW64`, which makes `/etc/profile` export `MINGW_PREFIX=/mingw64` before
+`build-deps-windows.sh` looks for `/ucrt64`. What the move takes:
+
+1. On win0, by hand: `pacman -S --needed mingw-w64-ucrt-x86_64-{cmake,fftw,flac,gcc,libjpeg-turbo,libusb,libsoxr,meson,nasm,ninja,pkgconf,opus,openh264,clang-tools-extra}`
+   (upstream's list, plus clangd). Keep the MINGW64 packages until the first green UCRT64 run.
+2. `selfhosted-deploy.yml`: `MSYSTEM: MINGW64` -> `UCRT64` in the four MSYS2 steps, and the
+   comments that say MINGW64. This is a `.github/`-only change, so its PR runs only the static
+   guards; the first real UCRT64 build is the next PR that touches code, or a plain
+   `workflow_dispatch` (wm + win0, installs nothing) run against the branch.
+3. Sync the static-link allowlist with `build.yml`'s: upstream's also admits `BCRYPT.DLL`,
+   `BCRYPTPRIMITIVES.DLL`, `CRYPT32.DLL`, `SECUR32.DLL` and `NTDLL.DLL`, the fork's does not.
+4. Nothing to clear in the deps cache: `build-deps-windows.sh` stamps `msystem_prefix`, so
+   the first UCRT64 run rebuilds the prefix itself (upstream keys its cache on `ucrt64` for
+   the same reason: a static prefix built against msvcrt must not link into a UCRT binary).
+5. This document: the package list above, the hand-reproduction line, and the section title.
 
 ### Adding air0 immediately found two real macOS regressions
 
