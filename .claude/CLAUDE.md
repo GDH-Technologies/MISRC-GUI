@@ -143,6 +143,9 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
   (settings from a file; how the net-mode server/client tests are driven), `--device-list`,
   `--mediamtx-test`, `--preview-{probe,probe-stream,selftest,dump-frame,only,format,parent-pid}`,
   `--rtsp-{stream-test,fault-test,soak}`, `--video-{probe,tap-test,record-test,name-test,settings-test}`,
+  `--video-record-test <dev> <out> [secs] [h264|ffv1] audio` (the dongle's audio as a FLAC track;
+  ffprobes the MKV, fails unless the tracks start and end within a frame; `MISRC_USBREF_AUDIO`
+  overrides the device), `--video-timeline-selftest`,
   `--config <path> --net-serve [s]` (the net server with no window; needs the config's
   `net_mode` 1 and both `net_server_port` and `net_server_port_str`) and
   `--net-client-probe <host> <port> [s]` (mirror a server, print its settings as JSON).
@@ -288,6 +291,16 @@ Fork-side:
   scripts/build-appimage-local.sh` — stock `ubuntu:22.04` fails at `meson setup` (apt libFLAC
   1.3.3). The image is in `~/misrc-appimage-build/`, outside the repo. The container runs as
   root on a host-owned mount; a failed run can leave `.deps`, `.tmp`, `.ci-artifacts` root-owned.
+- USB reference audio (2026-11-17, `docs/superpowers/specs/2026-11-17-usbref-audio-design.md`):
+  the reference-video ffmpeg opens the dongle's ALSA card itself as
+  `dsnoop:CARD=<id>,DEV=0,FORMAT=S16_LE,RATE=48000` (shared with the RTSP stream; never
+  ALSA in the GUI process). Both tracks are timed by ARRIVAL: frames by their V4L2 kernel
+  stamps (em28xx stamps the frame's END) onto a fixed-rate timeline with repeat/skip, audio
+  by ffmpeg's ALSA stamps with `-copyts -itsoffset` + `aresample=async`. ffmpeg's scheduler
+  pauses an input >= 100 ms ahead of the slowest stream and a sound card cannot pause: H.264
+  with audio needs `-tune zerolatency` (guarded, "USB reference audio contract"). With both
+  jacks wired to the camcorder, the StarTech's composite input carried no picture (mean luma
+  18 vs 118 on S-Video, 2026-11-17): select the jack that has one before measuring anything.
 - mediamtx ports are canonical+100 (RTSP 8654) so the fork never collides with capture-node's
   `tier×10000+8554` instances on the same hosts.
 - Settings live in one descriptor table (`misrc_gui/core/gui_settings_table.c`); the struct is

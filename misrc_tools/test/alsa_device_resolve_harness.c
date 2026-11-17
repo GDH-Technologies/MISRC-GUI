@@ -78,9 +78,9 @@ static int test_resolves_the_dongle_by_bus_address(void)
 
     expect_eq_int(gui_alsa_resolve_from_cards(CARDS_REAL, "usb-0000:00:14.0-13.3",
                                               out, sizeof out), 0, "resolve");
-    /* plughw, not hw: hw demands an exact format match and fails outright when
-     * the dongle's native rate is not what we asked for. */
-    expect_str(out, "plughw:CARD=MS210x,DEV=0", "resolved device");
+    /* dsnoop, so the stream and the recording can both open it, with the
+     * format and rate pinned: a second sharer copies the first's parameters. */
+    expect_str(out, "dsnoop:CARD=MS210x,DEV=0,FORMAT=S16_LE,RATE=48000", "resolved device");
 
     if (failures == before) puts("PASS: resolves the dongle by bus address");
     return failures - before;
@@ -104,7 +104,7 @@ static int test_never_picks_the_cxadc_card_on_the_same_controller(void)
     char rf[128] = {0};
     expect_eq_int(gui_alsa_resolve_from_cards(CARDS_REAL, "usb-0000:00:14.0-13.1",
                                               rf, sizeof rf), 0, "resolve cxadc");
-    expect_str(rf, "plughw:CARD=test_cg_audio,DEV=0", "cxadc device");
+    expect_str(rf, "dsnoop:CARD=test_cg_audio,DEV=0,FORMAT=S16_LE,RATE=48000", "cxadc device");
 
     if (failures == before) puts("PASS: never picks the CXADC card on the same controller");
     return failures - before;
@@ -117,11 +117,11 @@ static int test_picks_the_right_one_of_two_identical_dongles(void)
 
     expect_eq_int(gui_alsa_resolve_from_cards(CARDS_TWO_DONGLES, "usb-0000:00:14.0-13.3",
                                               a, sizeof a), 0, "resolve first");
-    expect_str(a, "plughw:CARD=MS210x,DEV=0", "first dongle");
+    expect_str(a, "dsnoop:CARD=MS210x,DEV=0,FORMAT=S16_LE,RATE=48000", "first dongle");
 
     expect_eq_int(gui_alsa_resolve_from_cards(CARDS_TWO_DONGLES, "usb-0000:00:14.0-2.1",
                                               b, sizeof b), 0, "resolve second");
-    expect_str(b, "plughw:CARD=MS210x_1,DEV=0", "second dongle");
+    expect_str(b, "dsnoop:CARD=MS210x_1,DEV=0,FORMAT=S16_LE,RATE=48000", "second dongle");
 
     if (failures == before) puts("PASS: picks the right one of two identical dongles");
     return failures - before;
@@ -136,7 +136,7 @@ static int test_survives_card_reindexing(void)
 
     expect_eq_int(gui_alsa_resolve_from_cards(CARDS_REINDEXED, "usb-0000:00:14.0-13.3",
                                               out, sizeof out), 0, "resolve after reindex");
-    expect_str(out, "plughw:CARD=MS210x,DEV=0", "same device, different index");
+    expect_str(out, "dsnoop:CARD=MS210x,DEV=0,FORMAT=S16_LE,RATE=48000", "same device, different index");
 
     if (failures == before) puts("PASS: survives card reindexing");
     return failures - before;

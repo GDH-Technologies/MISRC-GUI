@@ -2296,14 +2296,79 @@ def check_alsa_device_resolution(repo_root: Path) -> int:
     return 0
 
 
+def check_usbref_audio_contract(repo_root: Path) -> int:
+    """The dongle's audio in the reference MKV (fork-only). Its A/V sync rests
+    on a handful of ffmpeg arguments that each look optional and are not:
+
+      -copyts            without it every input is shifted to its own zero and
+                         the audio/video offset is thrown away;
+      -itsoffset         puts the ALSA (CLOCK_REALTIME) stamps on the spawn
+                         instant, which is also video slot 0;
+      aresample=async    keeps the sample count on those stamps; without it a
+                         player clocks the audio by the dongle's crystal;
+      -fps_mode passthrough  the writer is the only frame repeat/skip;
+      -shortest          the ALSA input never ends by itself;
+      -tune zerolatency  ffmpeg pauses an input running >= 100 ms ahead of the
+                         slowest stream; x264's lookahead outran that plus the
+                         341 ms dsnoop buffer (ALSA xruns, measured);
+      -probesize         probing the raw video starved the ALSA input.
+
+    Audio must stay in the ffmpeg child: no ALSA calls in the GUI process, which
+    runs the RF capture. Frames reach the timeline by their kernel timestamps."""
+    rec = repo_root / "misrc_tools/misrc_gui/output/gui_video_record.c"
+    tap = repo_root / "misrc_tools/misrc_gui/input/gui_preview_tap.h"
+    pv = repo_root / "misrc_tools/misrc_gui/input/gui_preview_v4l2.c"
+    table = repo_root / "misrc_tools/misrc_gui/core/gui_settings_table.c"
+    for f in (rec, tap, pv, table):
+        if not f.exists():
+            return fail(f"{f.relative_to(repo_root)} is missing")
+    code = strip_c_comments(read_text(rec))
+    for banned in ("snd_pcm_open", "<alsa/asoundlib.h>"):
+        if banned in code:
+            return fail(f"gui_video_record.c uses ALSA in-process ({banned}); the dongle's "
+                        "audio must be opened by the ffmpeg child")
+    body = func_body_from(code, "static void vr_build_argv(")
+    if not body:
+        return fail("vr_build_argv not found in gui_video_record.c")
+    for needle, why in (
+        ('"-copyts"', "keeps the A/V offset"),
+        ('"-itsoffset"', "puts the ALSA stamps on the shared origin"),
+        ('aresample=async=', "keeps the audio sample count on its arrival stamps"),
+        ('first_pts=0', "pads the audio to the origin"),
+        ('"-fps_mode"', "with passthrough, the writer is the only frame repeat/skip"),
+        ('"passthrough"', "the writer is the only frame repeat/skip"),
+        ('"-shortest"', "ends the ALSA input with the video"),
+        ('"zerolatency"', "keeps x264 inside ffmpeg's 100 ms scheduling tolerance"),
+        ('"-probesize"', "stops the raw-video probe from starving the ALSA input"),
+        ('"-c:a"', "the FLAC track"),
+    ):
+        if needle not in body:
+            return fail(f"vr_build_argv lost {needle}: it {why}")
+    if "vr_timeline_place(" not in code:
+        return fail("gui_video_record.c no longer places frames with vr_timeline_place()")
+    tap_code = strip_c_comments(read_text(tap))
+    if not re.search(r"preview_tap_fn\)\([^)]*uint64_t\s+ts_ns", tap_code):
+        return fail("preview_tap_fn no longer carries the frame's start timestamp (ts_ns)")
+    pv_code = strip_c_comments(read_text(pv))
+    if "V4L2_BUF_FLAG_TSTAMP_SRC_SOE" not in pv_code or "V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC" not in pv_code:
+        return fail("gui_preview_v4l2.c no longer honours the driver's timestamp flags "
+                    "(monotonic, start vs end of frame)")
+    if not re.search(r'GS_B\s*\(\s*"usbref_audio_enabled"', read_text(table)):
+        return fail("usbref_audio_enabled has no settings table row (it is the automation trigger)")
+    return 0
+
+
 def check_alsa_never_stores_a_card_index(repo_root: Path) -> int:
     """A stored hw:N,0 breaks intermittently across reboots and replugs, pointing
     at whatever card inherited the number. Resolution is by USB bus address, and
-    the emitted device name must always be plughw:CARD=<name>."""
+    the emitted device name must always be name-based: dsnoop:CARD=<name>, with
+    the format and rate pinned (a second dsnoop client copies the first opener's
+    parameters unchecked), so the stream and the recording can share it."""
     module = read_text(repo_root / "misrc_tools/misrc_gui/streaming/gui_alsa_device.c")
     code = strip_c_comments(module)
-    if "plughw:CARD=%s,DEV=0" not in code:
-        return fail("gui_alsa_device.c no longer emits a name-based plughw:CARD= device")
+    if "dsnoop:CARD=%s,DEV=0,FORMAT=S16_LE,RATE=48000" not in code:
+        return fail("gui_alsa_device.c no longer emits a name-based, pinned "
+                    "dsnoop:CARD=<id>,DEV=0,FORMAT=S16_LE,RATE=48000 device")
     for banned in ('"hw:%d', "'hw:%d", '"hw:%u'):
         if banned in code:
             return fail(f"gui_alsa_device.c builds an index-based ALSA device name: {banned}")
@@ -6633,6 +6698,22 @@ def check_record_fifo_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_video_timeline_post_build(gui_path: Path) -> int:
+    """Run the built GUI's --video-timeline-selftest: frames placed on the
+    reference MKV's fixed-rate timeline by their own timestamps stay within one
+    slot of ideal over 2 h at +-50 ppm with USB jitter, never flip-flop between
+    a repeat and a skip, and fill lost fields."""
+    try:
+        ran = subprocess.run([str(gui_path), "--video-timeline-selftest"],
+                             capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return fail("misrc_gui --video-timeline-selftest timed out")
+    if ran.returncode != 0 or "video timeline selftest: PASS" not in ran.stdout:
+        return fail(f"misrc_gui --video-timeline-selftest failed (rc={ran.returncode}):\n"
+                    f"{ran.stdout.strip()[-3000:]}\n{ran.stderr.strip()[-1000:]}")
+    return 0
+
+
 def check_record_order_post_build(gui_path: Path) -> int:
     """Run the built GUI's --record-order-selftest: the Simulated device
     emits a self-checking counter stream, the writers stall 3 s so the
@@ -6953,6 +7034,7 @@ def main() -> int:
         ("M-Client Local Save is refused", lambda: check_monitor_local_save_refused(repo_root)),
         ("no self-install over a GDH build", lambda: check_no_self_install(repo_root)),
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
+        ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
@@ -6993,6 +7075,7 @@ def main() -> int:
         checks.append(("session launch file selftest (post-build)", lambda: check_session_launch_file_post_build(args.gui_path)))
         checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
         checks.append(("record order selftest (post-build)", lambda: check_record_order_post_build(args.gui_path)))
+        checks.append(("video timeline selftest (post-build)", lambda: check_video_timeline_post_build(args.gui_path)))
         checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
         checks.append(("caption ffmpeg resolution (post-build)", lambda: check_cc_ffmpeg_resolution_post_build(args.gui_path)))
 

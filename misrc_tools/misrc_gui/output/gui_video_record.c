@@ -4,11 +4,118 @@
 
 #include "gui_video_record.h"
 #include "../input/gui_preview_v4l2.h"
+#include "../streaming/gui_alsa_device.h"
 #include "../streaming/gui_preview_tap_mux.h"
 
+#include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ---------------------------------------------------------------- timeline
+ *
+ * Where a frame goes on the recording's fixed-rate timeline. Slot k starts at
+ * origin + k*P. A frame is placed by its own start time, so the file follows
+ * what really happened:
+ *
+ *   - a frame >= 0.75 slot late is preceded by repeats of the previous frame
+ *     (the source ran slow, or the dongle lost fields -- fed a blanked
+ *     composite input the StarTech delivered 0.6% fewer frames than nominal);
+ *   - a frame >= 0.75 slot early is skipped (the source ran fast);
+ *   - otherwise it takes the next slot.
+ *
+ * After a correction the frame sits ~0.25 slot on the other side, half a slot
+ * from either limit, so USB timestamp jitter (a few ms) cannot flip-flop it.
+ * The worst error between a frame and its slot is under one frame, which is
+ * what keeps the picture on the audio. Pure and platform-neutral so the
+ * selftest runs everywhere. Returns 1 to submit (after *repeats repeats), 0 to
+ * skip. */
+#define VR_TL_LIMIT 0.75
+
+static int vr_timeline_place(uint64_t ts_ns, uint64_t origin_ns,
+                             uint32_t fps_num, uint32_t fps_den,
+                             uint64_t *next_slot, uint32_t *repeats)
+{
+    *repeats = 0;
+    /* double is exact here: 2^53 ns is 104 days. */
+    double pos = ((double)ts_ns - (double)origin_ns) * (double)fps_num /
+                 ((double)(fps_den ? fps_den : 1) * 1e9);
+    double e = pos - (double)*next_slot;
+    if (e <= -VR_TL_LIMIT) return 0;
+    if (e >= VR_TL_LIMIT) {
+        double r = floor(e + (1.0 - VR_TL_LIMIT));
+        *repeats = (uint32_t)(r > 4.0e9 ? 4.0e9 : r);
+    }
+    *next_slot += (uint64_t)*repeats + 1;
+    return 1;
+}
+
+int gui_video_record_timeline_selftest_main(void)
+{
+    const uint32_t num = 30000, den = 1001;
+    const double P = 1e9 * den / num;
+    int fails = 0;
+
+    struct {
+        const char *name;
+        double ppm;          /* source rate error: + = frames arrive faster */
+        double jitter_ms;    /* +- uniform */
+        int    lose_every;   /* drop one frame every N (0 = never) */
+        double first_ms;     /* first frame's start after the origin */
+        int    seconds;
+    } cases[] = {
+        { "exact rate, no jitter",            0.0, 0.0,    0,  5.0, 7200 },
+        { "camcorder -50 ppm, +-3 ms jitter", -50.0, 3.0,  0, 12.0, 7200 },
+        { "camcorder +50 ppm, +-3 ms jitter", 50.0, 3.0,   0, 12.0, 7200 },
+        { "lost fields (0.6%), +-3 ms",      0.0, 3.0,  170, 40.0, 600 },
+        { "first frame 100 ms after spawn",   0.0, 1.0,    0, 100.0, 60 },
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        uint64_t origin = 1000000000000ull;
+        uint64_t next = 0, written = 0, repeats_total = 0, skips = 0, flaps = 0;
+        double worst = 0.0;
+        int last_kind = 0;            /* +1 repeat, -1 skip */
+        uint64_t last_kind_slot = 0;
+        double period = P / (1.0 + cases[c].ppm * 1e-6);
+        uint64_t frames = (uint64_t)(cases[c].seconds * 1e9 / period);
+        for (uint64_t i = 0; i < frames; i++) {
+            if (cases[c].lose_every && i % (uint64_t)cases[c].lose_every == 7) continue;
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            double j = ((double)(rng % 2001) / 1000.0 - 1.0) * cases[c].jitter_ms * 1e6;
+            double t = cases[c].first_ms * 1e6 + (double)i * period + j;
+            uint64_t ts = origin + (uint64_t)(t > 0 ? t : 0);
+            uint32_t rep = 0;
+            uint64_t before = next;
+            if (!vr_timeline_place(ts, origin, num, den, &next, &rep)) {
+                skips++;
+                if (last_kind == +1 && before - last_kind_slot < 30) flaps++;
+                last_kind = -1; last_kind_slot = before;
+                continue;
+            }
+            if (rep && i > 0) {
+                if (last_kind == -1 && before - last_kind_slot < 30) flaps++;
+                last_kind = +1; last_kind_slot = before;
+            }
+            repeats_total += rep;
+            written += rep + 1;
+            /* Error between the frame's real start and its slot, in frames. */
+            double err = ((double)(ts - origin) - (double)(next - 1) * P) / P;
+            if (fabs(err) > worst) worst = fabs(err);
+        }
+        double ideal = (cases[c].first_ms * 1e6 + (double)frames * period) / P;
+        double slot_err = (double)written - ideal;
+        bool ok = fabs(slot_err) <= 1.0 && worst < 1.0 && flaps == 0;
+        printf("%s: %s -- slots %" PRIu64 " vs ideal %.1f (%+.2f), repeats %" PRIu64
+               ", skips %" PRIu64 ", worst offset %.2f frame, flip-flops %" PRIu64 "\n",
+               ok ? "PASS" : "FAIL", cases[c].name, written, ideal, slot_err,
+               repeats_total, skips, worst, flaps);
+        if (!ok) fails++;
+    }
+    printf(fails ? "video timeline selftest: FAIL (%d)\n" : "video timeline selftest: PASS\n", fails);
+    return fails ? 1 : 0;
+}
 
 /* Android is __linux__ too, but has no V4L2 access, no posix_spawn/environ
  * ffmpeg subprocess and no writable /dev/video* -- and upstream now builds
@@ -75,6 +182,21 @@ static struct {
 
     char ffmpeg_log[600];
     preview_tap_t tap;
+
+    /* --- timeline: written by the tap (capture thread) only --- */
+    uint64_t  mono0_ns;            /* slot 0 starts here, CLOCK_MONOTONIC */
+    int64_t   real0_us;            /* the same instant on CLOCK_REALTIME (ffmpeg's ALSA clock) */
+    uint64_t  tl_next_slot;
+    uint64_t  tl_first_ts, tl_frames_seen;
+    /* Repeats of the previous frame that go before ring slot i. */
+    uint32_t  slot_repeats[VR_RING_FRAMES];
+
+    /* --- spawn parameters, kept for the video-only respawn --- */
+    video_codec_t codec;
+    char      out_path[512];
+    char      audio_device[128];   /* "" once running video-only */
+    double    spawned_at;
+    bool      audio_retry_used;
     atomic_bool drain_abandoned;   /* the child stopped reading; do not wait on it */
     double      stop_at;           /* when a stop was asked for; published before run=false */
 } vr;
@@ -286,12 +408,40 @@ bool gui_video_record_codec_available(video_codec_t codec)
  * is bounded: a memcpy, two atomics and one eventfd write. The ring being full
  * is a compare-and-return, which is what makes a hung encoder unable to stall
  * the capture thread. */
-static void vr_tap_cb(const uint8_t *yuyv, size_t pitch, uint32_t w, uint32_t h, void *user)
+static void vr_tap_cb(const uint8_t *yuyv, size_t pitch, uint32_t w, uint32_t h,
+                      uint64_t ts_ns, void *user)
 {
     (void)user;
     size_t want = pitch * (size_t)h;
     if (w != vr.width || h != vr.height || want != vr.frame_bytes) {
         return;   /* geometry changed under us; drop rather than write short */
+    }
+
+    /* A frame cannot have started after now. Clamping to the clock bounds the
+     * repeats a driver timestamp glitch could ask for by real elapsed time --
+     * a wild stamp would otherwise queue billions of them for the writer. */
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    uint64_t now_ns = (uint64_t)now_ts.tv_sec * 1000000000ull + (uint64_t)now_ts.tv_nsec;
+    if (ts_ns > now_ns) ts_ns = now_ns;
+
+    /* The source's real rate, from first and latest start times. */
+    if (vr.tl_frames_seen++ == 0) vr.tl_first_ts = ts_ns;
+    double ppm = 0.0;
+    if (vr.tl_frames_seen > 1 && ts_ns > vr.tl_first_ts) {
+        double secs = (double)(ts_ns - vr.tl_first_ts) / 1e9;
+        double nominal = (double)vr.fps_num / (double)vr.fps_den;
+        ppm = ((double)(vr.tl_frames_seen - 1) / secs / nominal - 1.0) * 1e6;
+    }
+
+    uint32_t repeats = 0;
+    if (!vr_timeline_place(ts_ns, vr.mono0_ns, vr.fps_num, vr.fps_den,
+                           &vr.tl_next_slot, &repeats)) {
+        vr_lock();
+        vr.status.frames_skipped++;
+        vr.status.source_rate_ppm = ppm;
+        vr_unlock();
+        return;
     }
 
     uint_fast32_t head = atomic_load_explicit(&vr.head, memory_order_relaxed);
@@ -300,19 +450,23 @@ static void vr_tap_cb(const uint8_t *yuyv, size_t pitch, uint32_t w, uint32_t h,
     if (head - tail >= VR_RING_FRAMES) {
         /* Count a duplicate rather than just a loss: ffmpeg assigns PTS by
          * frames read, so a silently missing frame shortens the file and
-         * slides it out of step with the RF timeline. */
-        atomic_fetch_add_explicit(&vr.pending_dupes, 1, memory_order_relaxed);
+         * slides it out of step with the RF timeline. The repeats this frame
+         * was owed go the same way. */
+        atomic_fetch_add_explicit(&vr.pending_dupes, 1 + repeats, memory_order_relaxed);
         vr_lock();
         vr.status.frames_dropped++;
+        vr.status.source_rate_ppm = ppm;
         vr_unlock();
         return;
     }
 
+    vr.slot_repeats[head % VR_RING_FRAMES] = repeats;
     memcpy(vr.slots[head % VR_RING_FRAMES], yuyv, vr.frame_bytes);
     atomic_store_explicit(&vr.head, head + 1, memory_order_release);
 
     vr_lock();
     vr.status.frames_submitted++;
+    vr.status.source_rate_ppm = ppm;
     vr_unlock();
 
     uint64_t one = 1;
@@ -353,6 +507,26 @@ static bool vr_send_all(const uint8_t *buf, size_t len)
         return false;
     }
     return true;
+}
+
+static bool vr_audio_fallback(void);
+
+/* Send one frame. If that fails because ffmpeg could not open the audio and
+ * exited, respawn it video-only once and send again: the reference video goes
+ * on without its sound rather than not at all. */
+static bool vr_send_frame(const uint8_t *buf)
+{
+    if (vr_send_all(buf, vr.frame_bytes)) return true;
+    if (!vr_audio_fallback()) return false;
+    return vr_send_all(buf, vr.frame_bytes);
+}
+
+static void vr_count_written(bool dupe)
+{
+    vr_lock();
+    if (dupe) vr.status.frames_duped++;
+    vr.status.frames_written++;
+    vr_unlock();
 }
 
 static void *vr_writer_thread(void *arg)
@@ -398,29 +572,33 @@ static void *vr_writer_thread(void *arg)
             last_stat = now;
         }
 
-        /* Duplicates first, so they occupy the timeline slots the dropped
-         * frames would have. */
+        /* Repeats first, so they occupy the timeline slots before this frame:
+         * frames the ring dropped, and slots the timeline says the source
+         * never filled. Before the first frame there is nothing to repeat, so
+         * the leading slots get the first frame itself, after it -- the same
+         * picture either way. */
         uint_fast32_t dupes = atomic_exchange_explicit(&vr.pending_dupes, 0, memory_order_relaxed);
+        dupes += vr.slot_repeats[tail % VR_RING_FRAMES];
         if (dupes && have_last) {
             for (uint_fast32_t i = 0; i < dupes; i++) {
-                if (!vr_send_all(vr.last_frame, vr.frame_bytes)) goto out;
-                vr_lock();
-                vr.status.frames_duped++;
-                vr.status.frames_written++;
-                vr_unlock();
+                if (!vr_send_frame(vr.last_frame)) goto out;
+                vr_count_written(true);
             }
+            dupes = 0;
         }
 
         const uint8_t *slot = vr.slots[tail % VR_RING_FRAMES];
-        if (!vr_send_all(slot, vr.frame_bytes)) goto out;
+        if (!vr_send_frame(slot)) goto out;
 
         memcpy(vr.last_frame, slot, vr.frame_bytes);
         have_last = true;
         atomic_store_explicit(&vr.tail, tail + 1, memory_order_release);
+        vr_count_written(false);
 
-        vr_lock();
-        vr.status.frames_written++;
-        vr_unlock();
+        for (uint_fast32_t i = 0; i < dupes; i++) {
+            if (!vr_send_frame(vr.last_frame)) goto out;
+            vr_count_written(true);
+        }
     }
 
 out:
@@ -432,12 +610,19 @@ out:
 
 /* ----------------------------------------------------------------- spawn */
 
+/* The track title, so this audio cannot be mistaken for an RF-decoded track
+ * muxed into the same file later. */
+#define VR_AUDIO_TITLE "title=Camcorder line out (USB reference)"
+
 static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
                           char *size_buf, size_t size_cap,
                           char *rate_buf, size_t rate_cap,
                           char *aspect_buf, size_t aspect_cap,
+                          char *offset_buf, size_t offset_cap,
+                          const char *audio_device,
                           const char *out_path)
 {
+    bool audio = audio_device && audio_device[0];
     snprintf(size_buf, size_cap, "%ux%u", vr.width, vr.height);
     if (vr.fps_den <= 1) snprintf(rate_buf, rate_cap, "%u", vr.fps_num);
     else                 snprintf(rate_buf, rate_cap, "%u/%u", vr.fps_num, vr.fps_den);
@@ -448,14 +633,60 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
     argv[n++] = (char *)"-hide_banner";
     argv[n++] = (char *)"-nostdin";
     argv[n++] = (char *)"-nostats";
-    argv[n++] = (char *)"-loglevel"; argv[n++] = (char *)"warning";
+    argv[n++] = (char *)"-loglevel"; argv[n++] = (char *)"+time+warning";   /* time-stamped, to place an xrun */
     argv[n++] = (char *)"-y";
+    if (audio) {
+        /* The dongle's audio, opened by ffmpeg itself, and FIRST: inputs open
+         * in order and the raw video waits for its first frame, so a busy or
+         * missing device fails at once, before any frame is lost to it.
+         *
+         * Timing (verified against FFmpeg's sources, 2026-11-16):
+         *  - alsa_dec stamps each packet with its first sample's capture
+         *    time, smoothed, on CLOCK_REALTIME (av_gettime);
+         *  - -copyts keeps those stamps -- without it every input is shifted
+         *    to its own zero and the A/V offset is thrown away;
+         *  - -itsoffset -<real0> makes them relative to the spawn instant,
+         *    which is also video slot 0 (mono0, sampled back to back). */
+        int64_t r = vr.real0_us;
+        snprintf(offset_buf, offset_cap, "-%" PRId64 ".%06" PRId64,
+                 r / 1000000, r % 1000000);
+        argv[n++] = (char *)"-copyts";
+        argv[n++] = (char *)"-f";                 argv[n++] = (char *)"alsa";
+        argv[n++] = (char *)"-sample_rate";       argv[n++] = (char *)"48000";
+        argv[n++] = (char *)"-ch_layout";         argv[n++] = (char *)"stereo";
+        argv[n++] = (char *)"-itsoffset";         argv[n++] = offset_buf;
+        argv[n++] = (char *)"-i";                 argv[n++] = (char *)audio_device;
+        /* No probing of the raw video: its format is fully given below, and
+         * while ffmpeg probes the pipe nobody reads the ALSA input, whose
+         * dsnoop buffer holds 341 ms -- measured on the live StarTech, the
+         * default probe cost 13 xruns at startup and 7 ring drops. */
+        argv[n++] = (char *)"-probesize";         argv[n++] = (char *)"32";
+        argv[n++] = (char *)"-analyzeduration";   argv[n++] = (char *)"0";
+    }
     argv[n++] = (char *)"-f";             argv[n++] = (char *)"rawvideo";
     argv[n++] = (char *)"-pixel_format";  argv[n++] = (char *)"yuyv422";
     argv[n++] = (char *)"-video_size";    argv[n++] = size_buf;
     argv[n++] = (char *)"-framerate";     argv[n++] = rate_buf;
     argv[n++] = (char *)"-i";             argv[n++] = (char *)"-";
-    argv[n++] = (char *)"-an";
+    if (audio) {
+        argv[n++] = (char *)"-map"; argv[n++] = (char *)"1:v";
+        argv[n++] = (char *)"-map"; argv[n++] = (char *)"0:a";
+        /* The writer is the only place a frame is repeated or skipped; auto
+         * would pick vfr for Matroska and start deciding too. */
+        argv[n++] = (char *)"-fps_mode"; argv[n++] = (char *)"passthrough";
+        /* Keep the sample count on the arrival stamps: async > 1 enables
+         * stretching up to async samples/s (96 = 2000 ppm, inaudible; a
+         * crystal needs < 100) and min_comp 0.001; first_pts pads the start
+         * to the origin. Without it a player clocks the audio by its sample
+         * count -- the dongle's crystal -- and the drift comes back. */
+        argv[n++] = (char *)"-af"; argv[n++] = (char *)"aresample=async=96:first_pts=0";
+        argv[n++] = (char *)"-c:a"; argv[n++] = (char *)"flac";
+        argv[n++] = (char *)"-metadata:s:a:0"; argv[n++] = (char *)VR_AUDIO_TITLE;
+        /* The ALSA input never ends by itself: stop with the video. */
+        argv[n++] = (char *)"-shortest";
+    } else {
+        argv[n++] = (char *)"-an";
+    }
     argv[n++] = (char *)"-sn";
     /* SD rasters are not square-pixel: 720x576 without this shows a 5:4
      * stretch and 720x480 a 3:2 one. The value is computed from the negotiated
@@ -485,6 +716,19 @@ static void vr_build_argv(char *argv[], int *argc_out, video_codec_t codec,
         argv[n++] = (char *)"-preset";  argv[n++] = (char *)"veryfast";
         argv[n++] = (char *)"-crf";     argv[n++] = (char *)"18";
         argv[n++] = (char *)"-g";       argv[n++] = (char *)"25";
+        if (audio) {
+            /* A live sound card cannot be paused, and ffmpeg's scheduler
+             * pauses ("chokes") any input whose output runs >= 100 ms ahead
+             * of the slowest muxed stream (SCHEDULE_TOLERANCE in
+             * ffmpeg_sched.c; no exemption for live devices). veryfast holds
+             * frames back for lookahead, B-frames and frame threads -- about
+             * half a second -- which outran the 100 ms plus dsnoop's 341 ms
+             * buffer: measured on the live StarTech, ALSA xruns from ~12 s in.
+             * zerolatency takes that delay out (no lookahead, no B-frames,
+             * sliced threads). FFV1 is intra-only with slice threads and has
+             * none to take out. */
+            argv[n++] = (char *)"-tune"; argv[n++] = (char *)"zerolatency";
+        }
     }
     argv[n++] = (char *)"-pix_fmt"; argv[n++] = (char *)"yuv422p";
     /* Capped so the encoder cannot compete with FLAC level-8 RF encode. */
@@ -504,9 +748,154 @@ static void vr_free_ring(void)
     free(vr.last_frame); vr.last_frame = NULL;
 }
 
+/* Socket, argv, posix_spawn. Sets vr.sock and vr.child_pid. append_log keeps
+ * the previous attempt's ffmpeg log (the audio failure) above the next one. */
+static int vr_spawn(const char *audio_device, bool append_log, char *err, size_t err_cap)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
+        snprintf(err, err_cap, "could not create the encoder socket: %s", strerror(errno));
+        return -1;
+    }
+    /* The default 208 KB is a quarter of one frame; without this every send
+     * round-trips to ffmpeg's read loop. */
+    int want = VR_SNDBUF_BYTES;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
+    /* Without a send timeout a stopped or wedged ffmpeg blocks the writer
+     * inside send() forever, where it can never observe the stop flag -- the
+     * drain deadline is checked at the top of the loop, which such a thread
+     * never reaches again. This is what makes the deadline reachable. */
+    struct timeval sndto = { 0, 200 * 1000 };
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
+
+    char size_buf[32], rate_buf[32], aspect_buf[16], offset_buf[40];
+    char *argv[80];
+    int argc = 0;
+    vr_build_argv(argv, &argc, vr.codec, size_buf, sizeof(size_buf),
+                  rate_buf, sizeof(rate_buf), aspect_buf, sizeof(aspect_buf),
+                  offset_buf, sizeof(offset_buf), audio_device, vr.out_path);
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    /* Keeps the terminal clean while leaving a failure diagnosable -- the
+     * difference between "video failed" and "video failed: No space left". */
+    posix_spawn_file_actions_addopen(&fa, 2, vr.ffmpeg_log,
+                                     O_WRONLY | O_CREAT | (append_log ? O_APPEND : O_TRUNC),
+                                     0644);
+
+    pid_t pid = 0;
+    /* posix_spawn for the same reason as the preview popout: this process has
+     * display, audio, capture and libusb threads plus a live GL context, and
+     * only async-signal-safe calls are legal between fork and exec. Note it
+     * returns the error directly and does NOT set errno. */
+    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    (void)syscall(SYS_ioprio_set, 1, 0, VR_CHILD_IOPRIO);
+    int rc = posix_spawn(&pid, ff.path, &fa, NULL, argv, environ);
+    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
+    posix_spawn_file_actions_destroy(&fa);
+    close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
+
+    if (rc != 0) {
+        close(sv[0]);
+        snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
+        return -1;
+    }
+    vr.sock = sv[0];
+    vr.child_pid = (int)pid;
+    vr.spawned_at = vr_now();
+    vr_lock();
+    vr.status.child_pid = (int)pid;
+    vr_unlock();
+    return 0;
+}
+
+/* Called by the writer when a send failed. If ffmpeg died within its first
+ * seconds because it could not open the audio, respawn it video-only, once,
+ * and resend what the dead one swallowed so the timeline stays whole. Any
+ * other failure is left to the normal error path. */
+static bool vr_audio_fallback(void)
+{
+    if (!vr.audio_device[0] || vr.audio_retry_used) return false;
+    if (!atomic_load_explicit(&vr.run, memory_order_acquire)) return false;
+    if (vr_now() - vr.spawned_at > 10.0) return false;
+    vr.audio_retry_used = true;
+
+    /* It has exited, or is about to: our send failed because it closed. */
+    int wstatus = 0;
+    double deadline = vr_now() + 2.0;
+    pid_t r = 0;
+    while ((r = waitpid(vr.child_pid, &wstatus, WNOHANG)) == 0 && vr_now() < deadline) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (r != vr.child_pid) return false;   /* alive: not an open failure */
+
+    char log[2048] = "";
+    FILE *f = fopen(vr.ffmpeg_log, "r");
+    if (f) { size_t n = fread(log, 1, sizeof(log) - 1, f); log[n] = '\0'; fclose(f); }
+    if (!strstr(log, vr.audio_device) && !strstr(log, "alsa") && !strstr(log, "ALSA")) {
+        /* Died of something else. Already reaped here, so say how and clear
+         * the pid, or finish() would wait out its deadline on a dead one. */
+        char msg[96];
+        if (WIFEXITED(wstatus)) snprintf(msg, sizeof(msg), "ffmpeg exited with code %d", WEXITSTATUS(wstatus));
+        else                    snprintf(msg, sizeof(msg), "ffmpeg terminated by signal %d", WTERMSIG(wstatus));
+        vr_set_error(msg, 0);
+        vr.child_pid = 0;
+        vr_lock();
+        vr.status.child_pid = 0;
+        vr_unlock();
+        return false;
+    }
+
+    /* The line that says why, and who holds the device if anyone does. */
+    /* ffmpeg's own verdict: "cannot open audio device <dev> (<errno text>)". */
+    char reason[96] = "could not be opened";
+    const char *line = strstr(log, "cannot open audio device");
+    if (line) {
+        size_t line_len = strcspn(line, "\n");
+        const char *open = memchr(line, '(', line_len);
+        const char *close = open ? memchr(open, ')', line_len - (size_t)(open - line)) : NULL;
+        if (open && close && close > open + 1 && (size_t)(close - open - 1) < sizeof(reason) - 16) {
+            snprintf(reason, sizeof(reason), "could not be opened (%.*s)",
+                     (int)(close - open - 1), open + 1);
+        }
+    }
+    char holder[96] = "";
+    gui_alsa_capture_holder(vr.audio_device, holder, sizeof(holder));
+
+    if (vr.sock >= 0) { close(vr.sock); vr.sock = -1; }
+    char err[192];
+    if (vr_spawn("", true, err, sizeof(err)) != 0) {
+        vr_set_error(err, 0);
+        return false;
+    }
+
+    vr_lock();
+    vr.status.error = false;
+    vr.status.err_text[0] = '\0';
+    vr.status.audio_active = false;
+    snprintf(vr.status.audio_note, sizeof(vr.status.audio_note),
+             "audio device %s: %s%s%s; recording video-only",
+             vr.audio_device, reason, holder[0] ? "; held by " : "", holder);
+    uint64_t lost = vr.status.frames_written;
+    vr_unlock();
+    vr.audio_device[0] = '\0';
+
+    /* The dead ffmpeg took the first frames with it. Fill their slots so the
+     * new file's frame 0 is still the origin. */
+    for (uint64_t i = 0; i < lost; i++) {
+        if (!vr_send_all(vr.last_frame, vr.frame_bytes)) return false;
+        vr_count_written(true);
+    }
+    return true;
+}
+
 int gui_video_record_start(const char *out_path, video_codec_t codec,
                            uint32_t width, uint32_t height, uint32_t pitch,
                            uint32_t fps_num, uint32_t fps_den,
+                           const char *audio_device,
                            char *err, size_t err_cap)
 {
     if (vr.thread_running) return 0;
@@ -539,8 +928,20 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
     atomic_store(&vr.drain_abandoned, false);
     vr.stop_at = 0.0;
     atomic_store(&vr.pending_dupes, 0);
+    memset(vr.slot_repeats, 0, sizeof(vr.slot_repeats));
+    vr.tl_next_slot = 0;
+    vr.tl_first_ts = 0;
+    vr.tl_frames_seen = 0;
+    vr.codec = codec;
+    vr.audio_retry_used = false;
+    snprintf(vr.out_path, sizeof(vr.out_path), "%s", out_path);
+    snprintf(vr.audio_device, sizeof(vr.audio_device), "%s", audio_device ? audio_device : "");
     snprintf(vr.status.path, sizeof(vr.status.path), "%s", out_path);
     snprintf(vr.ffmpeg_log, sizeof(vr.ffmpeg_log), "%s.ffmpeg.log", out_path);
+    if (vr.audio_device[0]) {
+        vr.status.audio_active = true;
+        snprintf(vr.status.audio_device, sizeof(vr.status.audio_device), "%s", vr.audio_device);
+    }
 
     for (int i = 0; i < VR_RING_FRAMES; i++) {
         vr.slots[i] = malloc(vr.frame_bytes);
@@ -549,67 +950,29 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
     vr.last_frame = calloc(1, vr.frame_bytes);
     if (!vr.last_frame) { vr_free_ring(); snprintf(err, err_cap, "out of memory for the video ring"); return -1; }
 
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
-        vr_free_ring();
-        snprintf(err, err_cap, "could not create the encoder socket: %s", strerror(errno));
-        return -1;
-    }
-    /* The default 208 KB is a quarter of one frame; without this every send
-     * round-trips to ffmpeg's read loop. */
-    int want = VR_SNDBUF_BYTES;
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
-    /* Without a send timeout a stopped or wedged ffmpeg blocks the writer
-     * inside send() forever, where it can never observe the stop flag -- the
-     * drain deadline is checked at the top of the loop, which such a thread
-     * never reaches again. This is what makes the deadline reachable. */
-    struct timeval sndto = { 0, 200 * 1000 };
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
-
     vr.wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (vr.wake_fd < 0) {
-        close(sv[0]); close(sv[1]); vr_free_ring();
+        vr_free_ring();
         snprintf(err, err_cap, "could not create the video wake eventfd: %s", strerror(errno));
         return -1;
     }
 
-    char size_buf[32], rate_buf[32], aspect_buf[16];
-    char *argv[64];
-    int argc = 0;
-    vr_build_argv(argv, &argc, codec, size_buf, sizeof(size_buf),
-                  rate_buf, sizeof(rate_buf), aspect_buf, sizeof(aspect_buf), out_path);
+    /* The shared origin: video slot 0 and audio pts 0. Sampled back to back;
+     * NTP slews both clocks alike, so only a step of the realtime clock
+     * mid-recording could move one against the other (it would shift the
+     * audio by the step; chrony slews by default). */
+    struct timespec m, rt;
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    clock_gettime(CLOCK_REALTIME, &rt);
+    vr.mono0_ns = (uint64_t)m.tv_sec * 1000000000ull + (uint64_t)m.tv_nsec;
+    vr.real0_us = (int64_t)rt.tv_sec * 1000000 + (int64_t)rt.tv_nsec / 1000;
 
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
-    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-    /* Keeps the terminal clean while leaving a failure diagnosable -- the
-     * difference between "video failed" and "video failed: No space left". */
-    posix_spawn_file_actions_addopen(&fa, 2, vr.ffmpeg_log,
-                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-    pid_t pid = 0;
-    /* posix_spawn for the same reason as the preview popout: this process has
-     * display, audio, capture and libusb threads plus a live GL context, and
-     * only async-signal-safe calls are legal between fork and exec. Note it
-     * returns the error directly and does NOT set errno. */
-    int saved_io = (int)syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
-    (void)syscall(SYS_ioprio_set, 1, 0, VR_CHILD_IOPRIO);
-    int rc = posix_spawn(&pid, ff.path, &fa, NULL, argv, environ);
-    (void)syscall(SYS_ioprio_set, 1, 0, saved_io);
-    posix_spawn_file_actions_destroy(&fa);
-    close(sv[1]);   /* mandatory: otherwise closing our end never delivers EOF */
-
-    if (rc != 0) {
-        close(sv[0]); close(vr.wake_fd); vr.wake_fd = -1;
+    if (vr_spawn(vr.audio_device, false, err, err_cap) != 0) {
+        close(vr.wake_fd); vr.wake_fd = -1;
         vr_free_ring();
-        snprintf(err, err_cap, "could not start ffmpeg: %s", strerror(rc));
         return -1;
     }
 
-    vr.sock = sv[0];
-    vr.child_pid = (int)pid;
-    vr.status.child_pid = (int)pid;
     vr.status.running = true;
     atomic_store(&vr.run, true);
 
@@ -618,8 +981,8 @@ int gui_video_record_start(const char *out_path, video_codec_t codec,
     if (pthread_create(&vr.thread, NULL, vr_writer_thread, NULL) != 0) {
         close(vr.sock); vr.sock = -1;
         close(vr.wake_fd); vr.wake_fd = -1;
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        kill(vr.child_pid, SIGKILL);
+        waitpid(vr.child_pid, NULL, 0);
         vr.child_pid = 0;
         vr.status.running = false;
         vr_free_ring();
@@ -747,9 +1110,58 @@ int gui_video_record_probe_main(void)
 
 static int s_inject_at = 0;
 
-int gui_video_record_test_main(const char *device, const char *out_path,
-                              int seconds, const char *codec_name)
+/* Probe the finished MKV with the ffprobe next to the ffmpeg in use (else the
+ * one on PATH): stream kinds, codecs, start times and durations. Returns the
+ * number of streams read, -1 if ffprobe could not run. */
+typedef struct { char type[16]; char codec[24]; double start; double duration; } vr_probe_stream_t;
+
+static int vr_ffprobe_streams(const char *path, vr_probe_stream_t *out, int cap)
 {
+    char probe[600] = "ffprobe";
+    const char *slash = strrchr(ff.path, '/');
+    if (slash) {
+        char cand[600];
+        snprintf(cand, sizeof(cand), "%.*s/ffprobe", (int)(slash - ff.path), ff.path);
+        if (vr_is_executable(cand)) snprintf(probe, sizeof(probe), "%s", cand);
+    }
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" -v error -show_entries stream=codec_type,codec_name,start_time:stream_tags=DURATION "
+             "-of compact=p=0:nk=0 \"%s\" 2>/dev/null", probe, path);
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    int n = 0;
+    char line[512];
+    while (n < cap && fgets(line, sizeof(line), p)) {
+        vr_probe_stream_t *st = &out[n];
+        memset(st, 0, sizeof(*st));
+        st->start = st->duration = -1.0;
+        for (char *tok = strtok(line, "|\n"); tok; tok = strtok(NULL, "|\n")) {
+            if (!strncmp(tok, "codec_name=", 11)) snprintf(st->codec, sizeof(st->codec), "%s", tok + 11);
+            else if (!strncmp(tok, "codec_type=", 11)) snprintf(st->type, sizeof(st->type), "%s", tok + 11);
+            else if (!strncmp(tok, "start_time=", 11)) st->start = atof(tok + 11);
+            else if (!strncmp(tok, "tag:DURATION=", 13)) {
+                int hh = 0, mm = 0; double ss = 0.0;
+                if (sscanf(tok + 13, "%d:%d:%lf", &hh, &mm, &ss) == 3) st->duration = hh * 3600.0 + mm * 60.0 + ss;
+            }
+        }
+        if (st->type[0]) n++;
+    }
+    pclose(p);
+    return n;
+}
+
+int gui_video_record_test_main(const char *device, const char *out_path,
+                              int seconds, const char *codec_name,
+                              const char *audio_mode)
+{
+    bool want_audio = false;
+    if (audio_mode && strcmp(audio_mode, "audio") == 0) want_audio = true;
+    else if (audio_mode && strcmp(audio_mode, "noaudio") != 0) {
+        fprintf(stderr, "unknown audio mode \"%s\"; accepted: audio, noaudio\n", audio_mode);
+        return 2;
+    }
+
     if (!out_path) { fprintf(stderr, "usage: --video-record-test <dev> <out.mkv> <secs> [x264|ffv1]\n"); return 2; }
     char codec_buf[64] = {0};
     if (codec_name) snprintf(codec_buf, sizeof(codec_buf), "%s", codec_name);
@@ -792,18 +1204,29 @@ int gui_video_record_test_main(const char *device, const char *out_path,
      * was requested. */
     uint32_t pitch = gui_preview_negotiated_pitch();
     if (pitch == 0) pitch = ps.width * 2;
+    /* The dongle's own ALSA card, found the way the recording finds it:
+     * MISRC_USBREF_AUDIO overrides (the settings override, verbatim). */
+    char audio_dev[128] = "";
+    if (want_audio) {
+        const char *ov = getenv("MISRC_USBREF_AUDIO");
+        if (ov && ov[0]) snprintf(audio_dev, sizeof(audio_dev), "%s", ov);
+        else if (gui_alsa_resolve_for_video_device(devs[idx].path, audio_dev, sizeof(audio_dev)) != 0) {
+            fprintf(stderr, "no ALSA card shares %s's USB port; recording video-only\n", devs[idx].path);
+        }
+    }
     if (gui_video_record_start(out_path, codec, ps.width, ps.height, pitch,
-                               ps.fps_num, ps.fps_den, err, sizeof(err)) != 0) {
+                               ps.fps_num, ps.fps_den, audio_dev, err, sizeof(err)) != 0) {
         fprintf(stderr, "video record start failed: %s\n", err);
         gui_preview_disconnect();
         gui_preview_shutdown();
         return 2;
     }
 
-    printf("recording %ux%u @ %u/%u -> %s (%s), ffmpeg pid %d\n",
+    printf("recording %ux%u @ %u/%u -> %s (%s), ffmpeg pid %d, audio %s\n",
            ps.width, ps.height, ps.fps_num, ps.fps_den, out_path,
            codec == VIDEO_CODEC_FFV1 ? "ffv1" : "x264",
-           gui_video_record_get_status().child_pid);
+           gui_video_record_get_status().child_pid,
+           audio_dev[0] ? audio_dev : "off");
 
     if (seconds <= 0) seconds = 10;
     int child = gui_video_record_get_status().child_pid;
@@ -826,10 +1249,11 @@ int gui_video_record_test_main(const char *device, const char *out_path,
         /* The preview counter is the point of this line under injection: with
          * ffmpeg hung it must keep climbing at 25fps while the video counters
          * stall, which is what proves the capture thread is not blocked. */
-        printf("  t=%2ds preview=%llu @%.1ffps | submitted=%llu written=%llu dropped=%llu duped=%llu bytes=%llu%s%s\n",
+        printf("  t=%2ds preview=%llu @%.1ffps | submitted=%llu written=%llu dropped=%llu duped=%llu skipped=%llu src=%+.0fppm bytes=%llu%s%s\n",
                i + 1, (unsigned long long)live.frames, live.fps_measured,
                (unsigned long long)vs.frames_submitted, (unsigned long long)vs.frames_written,
                (unsigned long long)vs.frames_dropped, (unsigned long long)vs.frames_duped,
+               (unsigned long long)vs.frames_skipped, vs.source_rate_ppm,
                (unsigned long long)vs.output_bytes,
                vs.error ? "  err=" : "", vs.error ? vs.err_text : "");
         fflush(stdout);
@@ -848,11 +1272,15 @@ int gui_video_record_test_main(const char *device, const char *out_path,
     gui_preview_disconnect();
     gui_preview_shutdown();
 
-    printf("stopped in %.2fs: submitted=%llu written=%llu dropped=%llu duped=%llu bytes=%llu\n",
+    printf("stopped in %.2fs: submitted=%llu written=%llu dropped=%llu duped=%llu skipped=%llu "
+           "source %+.0f ppm bytes=%llu\n",
            stop_s,
            (unsigned long long)vs.frames_submitted, (unsigned long long)vs.frames_written,
            (unsigned long long)vs.frames_dropped, (unsigned long long)vs.frames_duped,
+           (unsigned long long)vs.frames_skipped, vs.source_rate_ppm,
            (unsigned long long)vs.output_bytes);
+    printf("audio: %s\n", vs.audio_active ? vs.audio_device : "off");
+    if (!vs.audio_active && vs.audio_note[0]) printf("audio note: %s\n", vs.audio_note);
     if (vs.error) printf("error: %s\n", vs.err_text);
 
     if (s_inject != VR_INJECT_NONE) {
@@ -904,6 +1332,40 @@ int gui_video_record_test_main(const char *device, const char *out_path,
     }
     if (vs.error) rc = 1;
 
+    /* With audio, what landed in the file: one FLAC track, and both tracks
+     * starting and ending together -- within one frame. */
+    if (want_audio && vs.audio_active) {
+        vr_probe_stream_t st[4];
+        int ns = vr_ffprobe_streams(out_path, st, 4);
+        const vr_probe_stream_t *v = NULL, *a = NULL;
+        int n_audio = 0;
+        for (int k = 0; k < ns; k++) {
+            if (!strcmp(st[k].type, "video") && !v) v = &st[k];
+            if (!strcmp(st[k].type, "audio")) { n_audio++; if (!a) a = &st[k]; }
+        }
+        double frame = (double)ps.fps_den / (double)(ps.fps_num ? ps.fps_num : 25);
+        if (!v || !a || n_audio != 1 || strcmp(a->codec, "flac") != 0) {
+            printf("FAIL: expected one video and exactly one FLAC audio stream (ffprobe saw %d stream(s))\n", ns);
+            rc = 1;
+        } else {
+            double v_end = v->start + v->duration, a_end = a->start + a->duration;
+            printf("streams: video %s start %.3f s dur %.3f s | audio %s start %.3f s dur %.3f s "
+                   "| start diff %+.1f ms, end diff %+.1f ms (one frame = %.1f ms)\n",
+                   v->codec, v->start, v->duration, a->codec, a->start, a->duration,
+                   (a->start - v->start) * 1e3, (a_end - v_end) * 1e3, frame * 1e3);
+            if (fabs(a->start - v->start) > frame) {
+                printf("FAIL: the tracks start more than one frame apart\n");
+                rc = 1;
+            }
+            if (v->duration < 0 || a->duration < 0 || fabs(a_end - v_end) > frame) {
+                printf("FAIL: the tracks end more than one frame apart\n");
+                rc = 1;
+            }
+        }
+    } else if (want_audio) {
+        printf("note: audio was requested but the recording ran video-only\n");
+    }
+
     printf("%s\n", rc ? "VIDEO RECORD TEST FAILED" : "video record test passed");
     return rc;
 }
@@ -916,8 +1378,9 @@ const char *gui_video_record_cc_ffmpeg_path(void) { return ""; }
 const char *gui_video_record_ffmpeg_version(void) { return ""; }
 bool gui_video_record_codec_available(video_codec_t c) { (void)c; return false; }
 int  gui_video_record_start(const char *o, video_codec_t c, uint32_t w, uint32_t h,
-                            uint32_t p, uint32_t fn, uint32_t fd, char *err, size_t cap)
-{ (void)o;(void)c;(void)w;(void)h;(void)p;(void)fn;(void)fd;
+                            uint32_t p, uint32_t fn, uint32_t fd, const char *a,
+                            char *err, size_t cap)
+{ (void)o;(void)c;(void)w;(void)h;(void)p;(void)fn;(void)fd;(void)a;
   snprintf(err, cap, "reference video recording requires Linux"); return -1; }
 void gui_video_record_request_stop(void) { }
 void gui_video_record_finish(void) { }
@@ -926,8 +1389,8 @@ gui_video_record_status_t gui_video_record_get_status(void)
 { gui_video_record_status_t s; memset(&s, 0, sizeof(s)); return s; }
 uint64_t gui_video_record_output_bytes(void) { return 0; }
 bool gui_video_record_is_running(void) { return false; }
-int gui_video_record_test_main(const char *d, const char *o, int s, const char *c)
-{ (void)d;(void)o;(void)s;(void)c; fprintf(stderr, "requires Linux\n"); return 2; }
+int gui_video_record_test_main(const char *d, const char *o, int s, const char *c, const char *a)
+{ (void)d;(void)o;(void)s;(void)c;(void)a; fprintf(stderr, "requires Linux\n"); return 2; }
 int gui_video_record_probe_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }
 void gui_video_record_set_ffmpeg_path(const char *p) { (void)p; }
 int gui_video_record_name_test_main(void) { fprintf(stderr, "requires Linux\n"); return 2; }

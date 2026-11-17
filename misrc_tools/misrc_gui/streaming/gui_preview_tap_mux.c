@@ -28,7 +28,7 @@ static atomic_int g_count;
 
 /* Runs on the capture thread, between VIDIOC_DQBUF and VIDIOC_QBUF. */
 static void mux_dispatch(const uint8_t *yuyv, size_t pitch,
-                         uint32_t w, uint32_t h, void *user)
+                         uint32_t w, uint32_t h, uint64_t ts_ns, void *user)
 {
     (void)user;
     for (int i = 0; i < MUX_MAX_CONSUMERS; i++) {
@@ -41,7 +41,7 @@ static void mux_dispatch(const uint8_t *yuyv, size_t pitch,
          * the same guard gui_preview_v4l2.c applies to its single slot. */
         const preview_tap_t *t = atomic_load_explicit(&g_slots[i], memory_order_acquire);
         if (t && t->fn) {
-            t->fn(yuyv, pitch, w, h, t->user);
+            t->fn(yuyv, pitch, w, h, ts_ns, t->user);
         }
         atomic_fetch_sub_explicit(&g_inflight[i], 1, memory_order_release);
     }

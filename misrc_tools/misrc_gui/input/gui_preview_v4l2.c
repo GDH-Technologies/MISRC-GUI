@@ -776,6 +776,47 @@ static void preview_publish(const uint8_t *src)
     status_unlock();
 }
 
+/* When a dequeued frame STARTED, on CLOCK_MONOTONIC, in ns. The tap contract
+ * (gui_preview_tap.h) promises the start, because that is what an audio
+ * timestamp marks too, and drivers disagree on which end they stamp:
+ *
+ *   em28xx    MONOTONIC, no TSTAMP_SRC flag (= EOF): finish_buffer() stamps
+ *             when the NEXT frame's header arrives, i.e. this frame's end;
+ *   uvcvideo  MONOTONIC | TSTAMP_SRC_SOE: the start of the frame.
+ *
+ * Taking the em28xx stamp as-is would put its picture a constant frame
+ * (33 ms) late against its own audio. A driver stamping some other clock gets
+ * CLOCK_MONOTONIC read now -- arrival, which is still the right clock. */
+static uint64_t preview_frame_start_ns(const struct v4l2_buffer *b, uint64_t period_ns,
+                                       bool *reported)
+{
+    uint32_t clock = b->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK;
+    uint32_t src   = b->flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
+    uint64_t ts;
+    const char *how;
+    if (clock == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC &&
+        (b->timestamp.tv_sec != 0 || b->timestamp.tv_usec != 0)) {
+        ts = (uint64_t)b->timestamp.tv_sec * 1000000000ull +
+             (uint64_t)b->timestamp.tv_usec * 1000ull;
+        if (src == V4L2_BUF_FLAG_TSTAMP_SRC_SOE) {
+            how = "kernel monotonic, start of frame";
+        } else {
+            ts = (ts > period_ns) ? ts - period_ns : 0;
+            how = "kernel monotonic, end of frame (one period subtracted)";
+        }
+    } else {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ts = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+        how = "CLOCK_MONOTONIC at dequeue (driver clock not monotonic)";
+    }
+    if (!*reported) {
+        *reported = true;
+        fprintf(stderr, "[preview] frame timestamps: %s\n", how);
+    }
+    return ts;
+}
+
 static void *preview_thread(void *arg)
 {
     (void)arg;
@@ -784,6 +825,15 @@ static void *preview_thread(void *arg)
     uint32_t last_seq = 0;
     bool have_seq = false;
     bool reported_first_drop = false;
+    bool reported_ts_source = false;
+
+    /* The negotiated frame period, for turning an end-of-frame timestamp into
+     * the frame's start. Fixed for the life of this thread: a mode change
+     * reconnects, which starts a new one. */
+    status_lock();
+    uint64_t period_ns = g.status.fps_num
+        ? (uint64_t)g.status.fps_den * 1000000000ull / g.status.fps_num : 0;
+    status_unlock();
 
     for (;;) {
         fd_set rfds;
@@ -879,8 +929,10 @@ static void *preview_thread(void *arg)
                  * it, so the pointer may have been cleared just now. */
                 const preview_tap_t *t2 = atomic_load_explicit(&g_tap, memory_order_acquire);
                 if (t2 && t2->fn) {
+                    uint64_t ts_ns = preview_frame_start_ns(&buf, period_ns,
+                                                            &reported_ts_source);
                     t2->fn((const uint8_t *)g.bufs[buf.index].start, g.pitch,
-                           g.width, g.height, t2->user);
+                           g.width, g.height, ts_ns, t2->user);
                 }
                 atomic_fetch_sub_explicit(&g_tap_inflight, 1, memory_order_release);
             }
@@ -1411,8 +1463,9 @@ typedef struct {
 } tap_probe_t;
 
 static void tap_probe_cb(const uint8_t *yuyv, size_t pitch,
-                         uint32_t w, uint32_t h, void *user)
+                         uint32_t w, uint32_t h, uint64_t ts_ns, void *user)
 {
+    (void)ts_ns;
     tap_probe_t *tp = user;
     /* FNV-1a over the first line only -- cheap enough for the capture thread. */
     uint32_t d = 2166136261u;

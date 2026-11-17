@@ -10,6 +10,7 @@
 
 #include "gui_record.h"
 #include "gui_video_record.h"
+#include "../streaming/gui_alsa_device.h"
 #include "gui_cc_record.h"
 #include "gui_capture_sidecar.h"
 #include "../input/gui_preview_v4l2.h"
@@ -3293,12 +3294,29 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
      * stops the picture without stopping the file. */
     gui_preview_hold_acquire();
 
+    /* The dongle's own audio, as a FLAC track in the same MKV: the override
+     * verbatim when set, else the ALSA card on the dongle's USB port. Not
+     * finding one is never fatal -- the video records without it and the
+     * start line says why. */
+    char audio_dev[128] = "";
+    char audio_off[160] = "";
+    if (!app->settings.usbref_audio_enabled) {
+        snprintf(audio_off, sizeof(audio_off), "turned off in the USB Reference settings");
+    } else if (app->settings.usbref_rtsp_audio_device[0]) {
+        snprintf(audio_dev, sizeof(audio_dev), "%s", app->settings.usbref_rtsp_audio_device);
+    } else if (gui_alsa_resolve_for_video_device(app->settings.usbref_device_path,
+                                                 audio_dev, sizeof(audio_dev)) != 0) {
+        snprintf(audio_off, sizeof(audio_off), "no ALSA card on %s's USB port",
+                 app->settings.usbref_device_path[0] ? app->settings.usbref_device_path
+                                                      : "the dongle");
+    }
+
     char err[256] = {0};
     if (gui_video_record_start(s_record_path_video,
                                app->settings.usbref_codec == 1 ? VIDEO_CODEC_FFV1
                                                                      : VIDEO_CODEC_H264,
                                pv.width, pv.height, pitch,
-                               pv.fps_num, pv.fps_den, err, sizeof(err)) != 0) {
+                               pv.fps_num, pv.fps_den, audio_dev, err, sizeof(err)) != 0) {
         gui_preview_hold_release();
         /* Deliberately not fatal here. The RF writers are already running and
          * the producer is about to be enabled; losing the reference video is
@@ -3319,11 +3337,13 @@ static void gui_record_start_video_if_enabled(gui_app_t *app)
      * would silently drop the line in the RAW branch. */
     gui_app_set_status(app, "Reference video recording started");
     snprintf(s_video_start_msg, sizeof(s_video_start_msg),
-             "Reference video started: %s (%s, %ux%u @ %.2f fps)",
+             "Reference video started: %s (%s, %ux%u @ %.2f fps; audio %s%s)",
              s_record_path_video,
              app->settings.usbref_codec == 1 ? "FFV1" : "H.264",
              pv.width, pv.height,
-             pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0);
+             pv.fps_den ? (double)pv.fps_num / pv.fps_den : 0.0,
+             audio_dev[0] ? audio_dev : "off: ",
+             audio_dev[0] ? ", 48 kHz stereo FLAC" : audio_off);
 }
 
 /* Spawn the caption sidecar. Unlike the reference video this takes no preview
@@ -5166,12 +5186,16 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         ses->video_started = false;
 
         gui_record_log_writef_ses(ses, vs.error ? "ERROR" : "INFO",
-                 "Reference video: frames=%llu written=%llu dropped=%llu duped=%llu bytes=%llu",
+                 "Reference video: frames=%llu written=%llu dropped=%llu duped=%llu "
+                 "skipped=%llu source %+.0f ppm bytes=%llu; audio %s",
                  (unsigned long long)vs.frames_submitted,
                  (unsigned long long)vs.frames_written,
                  (unsigned long long)vs.frames_dropped,
                  (unsigned long long)vs.frames_duped,
-                 (unsigned long long)vs.output_bytes);
+                 (unsigned long long)vs.frames_skipped,
+                 vs.source_rate_ppm,
+                 (unsigned long long)vs.output_bytes,
+                 vs.audio_active ? vs.audio_device : (vs.audio_note[0] ? vs.audio_note : "off"));
         if (vs.error) {
             gui_app_count_system_errors(app, 1);
             if (vs.err_text[0]) {

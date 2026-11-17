@@ -178,8 +178,10 @@ bool gui_rtsp_stream_has_nvenc(void)
  * full", which is a compare-and-return. A wedged ffmpeg fills the socket, then
  * the ring, and frames are dropped -- VIDIOC_QBUF is never delayed, and RF
  * ingest never sees this thread block. */
-static void rs_tap_cb(const uint8_t *yuyv, size_t pitch, uint32_t w, uint32_t h, void *user)
+static void rs_tap_cb(const uint8_t *yuyv, size_t pitch, uint32_t w, uint32_t h,
+                      uint64_t ts_ns, void *user)
 {
+    (void)ts_ns;   /* a live stream: ffmpeg's own wallclock is good enough */
     (void)user;
     size_t want = pitch * (size_t)h;
     if (w != rs.width || h != rs.height || want != rs.frame_bytes) {
@@ -407,7 +409,7 @@ static void rs_resolve_audio(const gui_rtsp_stream_opts_t *opts, char *out, size
         return;
     }
     if (s_inject == RS_INJECT_BUSY_AUDIO) {
-        snprintf(out, cap, "plughw:CARD=NoSuchCard,DEV=0");
+        snprintf(out, cap, "dsnoop:CARD=NoSuchCard,DEV=0,FORMAT=S16_LE,RATE=48000");
         snprintf(rs.status.audio_device, sizeof(rs.status.audio_device), "%s", out);
         rs.status.audio_active = true;
         return;
@@ -1132,7 +1134,7 @@ int gui_rtsp_stream_fault_test_main(const char *device, const char *fault, int s
     snprintf(mkv, sizeof(mkv), "%s/misrc-fault-control.mkv",
              getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");
     if (gui_video_record_start(mkv, VIDEO_CODEC_H264, st.width, st.height, pitch,
-                               st.fps_num, st.fps_den, err, sizeof(err)) != 0) {
+                               st.fps_num, st.fps_den, "", err, sizeof(err)) != 0) {
         fprintf(stderr, "control recorder: %s\n", err);
         gui_preview_disconnect();
         gui_preview_shutdown();

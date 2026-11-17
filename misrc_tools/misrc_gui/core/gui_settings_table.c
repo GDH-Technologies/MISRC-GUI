@@ -198,6 +198,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->usbref_rtsp_password = false;  /* passwordless unless asked */
     settings->usbref_mediamtx_path[0] = '\0';
     settings->usbref_rtsp_audio_device[0] = '\0';
+    settings->usbref_audio_enabled = true;
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -1167,6 +1168,9 @@ static const gui_setting_desc_t s_table[] = {
     GS_IH ("gen_tape_format",                 gen_tape_format,            GS_LOCAL, hook_gen_tape_format),
     GS_S  ("monitor_local_save_path",         monitor_local_save_path,    GS_LOCAL),
     GS_B  ("monitor_local_save_enabled",      monitor_local_save_enabled, GS_LOCAL),
+    /* Appended (row order is write order): the dongle's audio as a FLAC track
+     * in the reference MKV. Capture-side, like video_record_enabled. */
+    GS_B  ("usbref_audio_enabled",            usbref_audio_enabled,       0),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))

@@ -79,16 +79,38 @@ The full argv ran on wm's Fedora ffmpeg 9.0.2 (exit 0, no warnings), and two con
 ## ffmpeg argv shape
 
 - **Input 0, ALSA.** Listed first so a busy device fails at once, not after the first frame:
-  `-f alsa -thread_queue_size 1024 -sample_rate 48000 -ch_layout stereo -itsoffset -<real0>
+  `-copyts -f alsa -sample_rate 48000 -ch_layout stereo -itsoffset -<real0>
   -i dsnoop:CARD=<id>,DEV=0,FORMAT=S16_LE,RATE=48000`
-- **Input 1, video:** the existing rawvideo stdin pipe.
-- **Output options:** `-copyts -map 1:v -map 0:a -fps_mode passthrough`, the existing video
-  encoder, `-af aresample=async=96:first_pts=0 -c:a flac`,
-  `-metadata:s:a:0 title=Camcorder line out (USB reference)`, `-shortest` (the ALSA input
-  never ends on its own), and the existing Matroska flags.
+- **Input 1, video:** the rawvideo stdin pipe, with `-probesize 32 -analyzeduration 0`.
+- **Output options:** `-map 1:v -map 0:a -fps_mode passthrough
+  -af aresample=async=96:first_pts=0 -c:a flac`,
+  `-metadata:s:a:0 title=Camcorder line out (USB reference)`, `-shortest`, the existing video
+  encoder plus `-tune zerolatency` for H.264, and the existing Matroska flags. The log is
+  `-loglevel +time+warning`, so an xrun can be placed in time.
 - **Audio failure:** if ffmpeg exits early and its log names the audio, the writer respawns
-  it once video-only and the status carries the note, with the device's holder when one is
-  found.
+  it once video-only, refills the frames the dead process swallowed, and the status carries
+  ffmpeg's reason plus the device's holder (from `/proc/asound/card<N>/pcm0c/sub0/status`).
+
+## What the live tests changed (wm, 2026-11-17, a Video8 tape on the StarTech)
+
+- **ffmpeg pauses a live input.** Its scheduler chokes any input whose output runs 100 ms or
+  more ahead of the slowest muxed stream (`SCHEDULE_TOLERANCE`, `fftools/ffmpeg_sched.c`), and
+  it has no exemption for live devices. x264 `veryfast` holds about half a second of frames
+  (lookahead, B-frames, frame threads), which outran the 100 ms plus dsnoop's 341 ms buffer:
+  ALSA xruns began about 12 s in. With `-tune zerolatency` there were none in 60 s or
+  120 s. FFV1 is intra-only with slice threads and needs nothing.
+- **`-thread_queue_size`** sizes only the muxer queue in this ffmpeg, so it was dropped from
+  the ALSA input.
+- **Probing the raw-video pipe** left the ALSA input unread at startup (13 xruns). With
+  `-probesize 32 -analyzeduration 0` the startup cost went away.
+- **Measured clocks.** The camcorder on S-Video: +61 ppm against the system clock. The
+  StarTech's audio: +22 ppm. Counting both would drift about 0.3 s over 2 h. The composite
+  input, which carried no picture with both jacks wired, delivered 0.6% fewer frames, because
+  the decoder lost fields. The timeline repeats frames into those gaps.
+- **Results.** In 60 s and 120 s recordings both tracks start at 0.000 s and end within
+  2-18 ms of each other, inside one ALSA period. A missing card, and a device held
+  exclusively by another program, both fall back to video-only with the reason and the
+  holder in the note.
 
 ## Not in scope (owed)
 

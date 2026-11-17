@@ -73,7 +73,8 @@ int gui_alsa_resolve_from_cards(const char *cards_text, const char *v4l2_bus_inf
         }
 
         if (current_id[0] != '\0' && line_has_bus_address(p, line_len, v4l2_bus_info)) {
-            int n = snprintf(out, cap, "plughw:CARD=%s,DEV=0", current_id);
+            int n = snprintf(out, cap, "dsnoop:CARD=%s,DEV=0,FORMAT=S16_LE,RATE=48000",
+                             current_id);
             if (n < 0 || (size_t)n >= cap) {
                 out[0] = '\0';   /* a truncated device name is not a device name */
                 return -1;
@@ -133,11 +134,71 @@ int gui_alsa_resolve_for_video_device(const char *video_device, char *out, size_
     return gui_alsa_resolve_from_cards(cards, bus_info, out, cap);
 }
 
+int gui_alsa_capture_holder(const char *device, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) return -1;
+    out[0] = '\0';
+    if (device == NULL) return -1;
+
+    /* The card id inside "...CARD=<id>,..." */
+    const char *k = strstr(device, "CARD=");
+    if (k == NULL) return -1;
+    k += 5;
+    size_t id_len = strcspn(k, ",'\"} ");
+    if (id_len == 0 || id_len >= 64) return -1;
+    char want[64];
+    memcpy(want, k, id_len);
+    want[id_len] = '\0';
+
+    /* Its index, from the header line carrying that id. */
+    char cards[8192];
+    if (read_whole_file("/proc/asound/cards", cards, sizeof(cards)) != 0) return -1;
+    int index = -1;
+    for (const char *p = cards; *p != '\0';) {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+        char id[64];
+        if (parse_card_id(p, line_len, id, sizeof(id)) && strcmp(id, want) == 0) {
+            int n = -1;
+            if (sscanf(p, " %d", &n) == 1) index = n;
+            break;
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+    }
+    if (index < 0) return -1;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/proc/asound/card%d/pcm0c/sub0/status", index);
+    char status[1024];
+    if (read_whole_file(path, status, sizeof(status)) != 0) return -1;
+    const char *op = strstr(status, "owner_pid");
+    if (op == NULL) return -1;            /* "closed": nobody holds it */
+    op = strchr(op, ':');
+    int pid = 0;
+    if (op == NULL || sscanf(op + 1, " %d", &pid) != 1 || pid <= 0) return -1;
+
+    char comm_path[64], comm[64] = "";
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    if (read_whole_file(comm_path, comm, sizeof(comm)) == 0) {
+        comm[strcspn(comm, "\n")] = '\0';
+    }
+    snprintf(out, cap, "%s (pid %d)", comm[0] ? comm : "unknown", pid);
+    return 0;
+}
+
 #else
 
 int gui_alsa_resolve_for_video_device(const char *video_device, char *out, size_t cap)
 {
     (void)video_device;
+    if (out != NULL && cap > 0) out[0] = '\0';
+    return -1;
+}
+
+int gui_alsa_capture_holder(const char *device, char *out, size_t cap)
+{
+    (void)device;
     if (out != NULL && cap > 0) out[0] = '\0';
     return -1;
 }

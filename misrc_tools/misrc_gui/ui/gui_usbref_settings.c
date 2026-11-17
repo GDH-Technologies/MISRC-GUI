@@ -16,6 +16,7 @@
 #include "../net/gui_net.h"
 #include "../output/gui_cc_record.h"
 #include "../output/gui_video_record.h"
+#include "../streaming/gui_alsa_device.h"
 #include "../streaming/gui_mediamtx.h"
 #include "../streaming/gui_rtsp_stream.h"
 
@@ -695,6 +696,61 @@ static void render_pick_sheet(gui_app_t *app)
 }
 
 
+/* ------------------------------------------------------------ audio row */
+
+/* What the reference recording would open for the dongle's audio, for the
+ * Audio row's hint. Resolving costs an open+QUERYCAP and a read of
+ * /proc/asound/cards, so it is cached and redone only when the device or the
+ * override changes, or every few seconds (a dongle plugged in later). The
+ * recording resolves again at its own start; this is only the preview of it. */
+static bool usbref_audio_resolve(const gui_app_t *app, char *dev, size_t cap)
+{
+    static char key[160];
+    static char cached[128];
+    static bool ok;
+    static double at = -1.0;
+    char want[160];
+    snprintf(want, sizeof(want), "%s|%s", app->settings.usbref_device_path,
+             app->settings.usbref_rtsp_audio_device);
+    double now = GetTime();
+    if (strcmp(want, key) != 0 || at < 0.0 || now - at > 3.0) {
+        snprintf(key, sizeof(key), "%s", want);
+        at = now;
+        if (app->settings.usbref_rtsp_audio_device[0]) {
+            snprintf(cached, sizeof(cached), "%s", app->settings.usbref_rtsp_audio_device);
+            ok = true;
+        } else {
+            ok = gui_alsa_resolve_for_video_device(app->settings.usbref_device_path,
+                                                   cached, sizeof(cached)) == 0;
+        }
+    }
+    snprintf(dev, cap, "%s", ok ? cached : "");
+    return ok;
+}
+
+/* The Audio row's state: whether the switch can be flipped, and the hint. */
+static bool usbref_audio_usable(const gui_app_t *app, char *hint, size_t cap)
+{
+    if (gui_net_is_client(app)) {
+        snprintf(hint, cap, "Recorded on the server, from its dongle's own audio");
+        return true;
+    }
+    if (!app->settings.video_record_enabled) {
+        snprintf(hint, cap, "Turn Reference video on to record the dongle's audio with it");
+        return false;
+    }
+    char dev[128];
+    if (!usbref_audio_resolve(app, dev, sizeof(dev))) {
+        snprintf(hint, cap, "No ALSA card on %s's USB port",
+                 app->settings.usbref_device_path[0] ? app->settings.usbref_device_path
+                                                      : "the dongle");
+        return false;
+    }
+    snprintf(hint, cap, "%s, 48 kHz stereo FLAC%s", dev,
+             app->settings.usbref_rtsp_audio_device[0] ? " (override)" : "");
+    return true;
+}
+
 /* ----------------------------------------------------------------- render */
 
 void gui_usbref_settings_render(gui_app_t *app)
@@ -871,6 +927,32 @@ void gui_usbref_settings_render(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("PreviewCropRight"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                     CLAY_TEXT(make_string(crop_r_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+            }
+
+            /* Audio: the dongle's own sound (a camcorder's line out) as a
+             * FLAC track in the reference MKV. The archival audio is still
+             * whatever the RF yields; this rides with the reference video
+             * and is greyed whenever that is off or no card shares the
+             * dongle's USB port. */
+            CLAY_TEXT(CLAY_STRING("Audio"),
+                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL,
+                                         .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            {
+                static char au_hint[200];
+                bool au_ok = usbref_audio_usable(app, au_hint, sizeof(au_hint));
+                bool au_on = app->settings.usbref_audio_enabled;
+                Color au_bg = au_on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                if (!au_ok) au_bg = ui_disabled_color(au_bg);
+                Color au_fg = au_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+                CLAY(CLAY_ID("UsbRefAudioRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                    CLAY(CLAY_ID("ToggleUsbRefAudio"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(au_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                        CLAY_TEXT((au_on && au_ok) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(au_fg) }));
+                    }
+                    CLAY_TEXT(CLAY_STRING("Record dongle audio in the MKV"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(au_fg) }));
+                }
+                CLAY(CLAY_ID("UsbRefAudioHintRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT } }) {
+                    CLAY_TEXT(make_string(au_hint), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
             }
 
@@ -1286,6 +1368,24 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app)
      * time: it changes how frames are presented, never the capture, so
      * a live recording keeps its geometry and simply gets the new
      * display aspect from the next spawn onwards. */
+    /* Audio: refuse rather than arm when it cannot apply, and say why --
+     * the hint already does, the status line repeats it at the click. A
+     * client flips the server's saved switch, which its next recording
+     * reads. A recording in progress keeps what it started with. */
+    if (Clay_PointerOver(CLAY_ID("ToggleUsbRefAudio"))) {
+        char hint[200];
+        if (!usbref_audio_usable(app, hint, sizeof(hint))) {
+            gui_app_set_status(app, hint);
+        } else if (gui_net_is_client(app) && gui_ui_settings_locked(app)) {
+            gui_app_set_status(app, "Not connected, or the server is recording");
+        } else {
+            app->settings.usbref_audio_enabled = !app->settings.usbref_audio_enabled;
+            gui_settings_save(&app->settings);
+            gui_app_set_status(app, app->settings.usbref_audio_enabled
+                ? "Dongle audio will be recorded in the reference MKV"
+                : "Dongle audio will not be recorded");
+        }
+    }
     if (Clay_PointerOver(CLAY_ID("PreviewAspectBox"))) {
         app->settings.usbref_aspect = (app->settings.usbref_aspect + 1) % 4;
         gui_preview_set_aspect_mode(app->settings.usbref_aspect);
