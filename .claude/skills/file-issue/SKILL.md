@@ -18,21 +18,22 @@ Honest gaps get verbally acknowledged and then lost. They belong in the tracker 
 moment of discovery, in a state where a future session can pick one up cold — which
 requires the evidence and the source pointers to live *in the issue*, not in a conversation.
 
-> [!IMPORTANT]
-> **Issues are currently disabled on `GDH-Technologies/MISRC-GUI`** (GitHub's default for a
-> fork). Check first: `gh repo view GDH-Technologies/MISRC-GUI --json hasIssuesEnabled`. If
-> they are off, draft the issue anyway, show it to Reece, and ask whether to enable issues
-> (`gh repo edit --enable-issues`) — his call, not yours. Until then the gap is written into
-> the PR body's **Owed after merge** or the active plan file, and your reply says so.
+> [!NOTE]
+> Issues have been enabled on `GDH-Technologies/MISRC-GUI` since 2026-09-04, with the
+> component label set in `.claude/rules/github.md`. If
+> `gh repo view GDH-Technologies/MISRC-GUI --json hasIssuesEnabled` ever says false again,
+> draft the issue anyway, show it to Reece, and write the gap into the PR body's **Owed after
+> merge** or the active plan file; turning issues back on is his call, not yours.
 
 ## Procedure
 
 1. **Search for duplicates first.** `search_issues` / `list_issues` before drafting, so a
    finding lands on the existing issue as a comment instead of a new duplicate.
 2. **Read the live label set** — `gh label list -R GDH-Technologies/MISRC-GUI`. An unknown
-   label fails the create call outright. Today the set is GitHub's defaults only; component
-   labels (`capture-path`, `streaming`, `networking`, `cxadc`, `ui`, `build`, `ci`,
-   `upstream`) get created when issues are enabled — propose them, do not assume them.
+   label fails the create call outright. The component labels are `capture-path`,
+   `streaming`, `cxadc`, `networking`, `ui`, `build`, `ci`, `upstream`, with the flags
+   `regression`, `upstream-bound`, `documentation`; read the set anyway, since a renamed
+   label fails the call just the same.
 3. **Draft the issue and show it to Reece.** Title, type, priority, effort, labels, body.
    File it with `issue_write` once he approves.
 4. **Read back after writing.** `issue_read` the created issue and confirm Priority and
@@ -101,5 +102,5 @@ Headings, tables, `> [!IMPORTANT]` alerts, fenced evidence.
 - **Never open an issue on `harrypm/MISRC-GUI`** without Reece; upstream defects are filed
   here first and reach harrypm as a PR with evidence.
 - **Never overwrite a human-set field value.** If your rubric disagrees, say so and leave it.
-- **Never apply `bug` or `enhancement`.** Type covers that axis; those labels are slated for
-  deletion here the moment issues are enabled.
+- **Never apply `bug` or `enhancement`.** Type covers that axis; both labels were deleted
+  here when issues were enabled, and recreating them is not yours to do.

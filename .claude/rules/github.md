@@ -15,15 +15,22 @@ tool for:
 - proving a fix landed — `git merge-base --is-ancestor <sha> origin/main`
 - proving a fix shipped — `~/.local/bin/misrc_gui --version` on the host names the built tag
 
-## Issues are disabled on the fork (for now)
+## Issues
 
-GitHub disables issues on forks by default and this one still is. Enabling them is Reece's
-call (`gh repo edit GDH-Technologies/MISRC-GUI --enable-issues`). Until then a discovered gap
-is written into the PR body's **Owed after merge** or the active plan document, and the reply
-says so explicitly — never let it vanish into conversation. Once enabled: delete the default
-`bug` and `enhancement` labels (Type covers that axis org-wide) and create component labels
-that match this codebase — `capture-path`, `streaming`, `networking`, `cxadc`, `ui`, `build`,
-`ci`, `upstream`, `documentation` — reading the live set before every use.
+Enabled on the fork on 2026-09-04 (a fork starts with them off). The same day the default
+`bug` and `enhancement` labels were deleted (Type covers that axis org-wide) and the
+component labels created: `capture-path` · `streaming` · `cxadc` · `networking` · `ui` ·
+`build` · `ci` · `upstream`, plus the workflow flags `regression` · `upstream-bound` ·
+`documentation`. GitHub's other defaults (`duplicate`, `invalid`, `question`, `wontfix`,
+`help wanted`, `good first issue`) are still there. Read the live set before every use
+anyway (`gh label list -R GDH-Technologies/MISRC-GUI`).
+
+The tracker has barely been used: #42 (the net-mode `/rf` fanout, closed 2026-09-06) is the
+only issue so far, and work owed by a PR has gone into that PR body's **Owed after merge**
+instead. Both are fine; what is not fine is a gap that lives only in conversation. A gap
+that outlives its PR becomes an issue through `/file-issue`, proposed first. If
+`hasIssuesEnabled` is ever false again, fall back to **Owed after merge** or the active plan
+document and say so; never flip the repo setting yourself.
 
 Defects in upstream code are filed **here first**, with evidence, and reach harrypm as a PR
 through `/upstream-pr`. Never open an issue on `harrypm/MISRC-GUI` without Reece.
