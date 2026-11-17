@@ -5787,6 +5787,70 @@ def check_preview_sdtv_geometry_runtime(repo_root: Path) -> int:
     return 0
 
 
+def check_text_field_caret_font(repo_root: Path) -> int:
+    """A click in an edited text field places the caret by measuring the text
+    with gui_ui_text_field_font()'s size and font id. The field is drawn by
+    gui_ui_render_active_text(field, text, size, id, ...). If the two disagree,
+    the caret lands on the wrong character: 5e55bee (2026-10-02) dropped the
+    FONT_SIZE_STATS/id 1 block together with the retired ingest_* cases, and
+    every tag field measured in the normal font while drawing in the mono
+    stats font. Every literal-field draw call must match the font map; the
+    metadata fields are mapped by gui_ui_is_meta_field() and drawn in the
+    capture-metadata panel, outside this check."""
+    ui_dir = repo_root / "misrc_tools/misrc_gui/ui"
+    try:
+        gui_ui = strip_c_comments(read_text(ui_dir / "gui_ui.c"))
+        sources = {p.name: strip_c_comments(read_text(p)) for p in sorted(ui_dir.glob("*.c"))}
+    except OSError as exc:
+        return fail(f"caret font guard: cannot read the UI sources: {exc}")
+    try:
+        body = extract_function_body(
+            gui_ui, "static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)")
+    except RuntimeError as exc:
+        return fail(f"gui_ui.c: {exc}")
+    mapping = {}
+    default = None
+    pending = []
+    size = font_id = None
+    for tok in re.finditer(r"case\s+(UI_TEXT_FIELD_\w+)\s*:|(default)\s*:|size\s*=\s*(\w+)\s*;|"
+                           r"\bid\s*=\s*(\d+)\s*;|(break)\s*;", body):
+        if tok.group(1) or tok.group(2):
+            if size is not None and font_id is not None and not pending:
+                size = font_id = None
+            pending.append(tok.group(1) or "default")
+        elif tok.group(3):
+            size = tok.group(3)
+        elif tok.group(4):
+            font_id = int(tok.group(4))
+        elif tok.group(5):
+            for label in pending:
+                if label == "default":
+                    default = (size, font_id)
+                else:
+                    mapping[label] = (size, font_id)
+            pending = []
+            size = font_id = None
+    if default is None or not mapping:
+        return fail("gui_ui.c: gui_ui_text_field_font() no longer has a parseable switch "
+                    "(case labels -> size = X; id = N; break;) with a default")
+    draws = 0
+    for name, text in sources.items():
+        for call in re.finditer(r"gui_ui_render_active_text\(\s*(UI_TEXT_FIELD_\w+)\s*,[^,]+,\s*(\w+)\s*,\s*(\d+)\s*,",
+                                text):
+            field, size, fid = call.group(1), call.group(2), int(call.group(3))
+            draws += 1
+            want = mapping.get(field, default)
+            if want != (size, fid):
+                return fail(f"{name}: {field} is drawn with ({size}, font {fid}) but "
+                            f"gui_ui_text_field_font() measures it with ({want[0]}, font {want[1]}); "
+                            "a click would put the caret on the wrong character. Add the field to the "
+                            "matching case group.")
+    if draws < 10:
+        return fail(f"caret font guard found only {draws} gui_ui_render_active_text() calls with a literal field; "
+                    "the call shape changed, update the guard")
+    return 0
+
+
 def check_usbref_ui_stays_out_of_gui_ui(repo_root: Path) -> int:
     """The USB reference video UI must stay in its own file.
 
@@ -7133,6 +7197,7 @@ def main() -> int:
         ("CLI FLAC keeps the true total_samples", lambda: check_cli_flac_true_total_samples(repo_root)),
         ("USB reference audio contract", lambda: check_usbref_audio_contract(repo_root)),
         ("USB reference encode options", lambda: check_usbref_encode_options(repo_root)),
+        ("text field caret font matches its draw font", lambda: check_text_field_caret_font(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))
