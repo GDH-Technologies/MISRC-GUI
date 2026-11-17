@@ -553,9 +553,10 @@ jobs:
         #
         # On Linux and macOS it is one cache PER OS RELEASE (fedora-45, macos-15, ...).
         # build-deps-unix.sh's stamp hashes the system libraries' versions but not the OS
-        # release or the compiler, so a cache built on the previous release could be
-        # reused after an upgrade; on wm's F44 -> F45 the stamp happened to change, which
-        # is luck, not a contract. A per-release prefix makes the first run on a new
+        # release or the compiler, so a cache built on the previous release IS reused
+        # after an upgrade: on wm's F44 -> F45 the stamp still matched, and PR #96's run
+        # (2026-11-17) linked F44-built hsdaoh/raylib/opus into an F45 binary ("deps
+        # already built (stamp matches)"). A per-release prefix makes the first run on a new
         # release a cold build by construction, and leaves the old release's cache
         # untouched for any still-installed binary whose RUNPATH points into it. Windows
         # keeps one prefix: its binary is statically linked and MSYS2 is rolling.

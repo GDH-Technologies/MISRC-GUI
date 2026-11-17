@@ -452,9 +452,10 @@ Three constraints shaped that path:
   (`ci_guard_tests.py:259`). A prefix like `~/.cache/misrc/deps` builds fine and then fails the
   guard.
 - **One per OS release**, because `build-deps-unix.sh`'s stamp hashes the system libraries'
-  versions but not the OS release or the compiler. A cache built on the previous release could
-  be reused after an upgrade (on wm's F44 → F45 the stamp happened to change: luck, not a
-  contract). With a per-release prefix the first run on a new release is a cold deps build by
+  versions but not the OS release or the compiler, so a cache built on the previous release is
+  reused after an upgrade: on wm's F44 → F45 the stamp still matched, and the first F45 CI run
+  (PR #96, 2026-11-17) linked F44-built hsdaoh, raylib and opus into its binary ("deps already
+  built (stamp matches)"). With a per-release prefix the first run on a new release is a cold deps build by
   construction. win0 keeps one prefix: its binary is statically linked and MSYS2 is rolling.
   The installed binary's `RUNPATH` names the prefix it was built against, so an old release's
   cache stays valid for whatever is still installed from it.
