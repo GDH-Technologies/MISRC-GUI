@@ -10,7 +10,9 @@
 #
 # Everything here runs on the org's own machines. `workflow-master` (label `wm`) and
 # `WIN-NODE-0` (`win0`) build every event. `capture-server-0` (`cs0`) and `air-0` (`air0`)
-# join only for the refs that install -- pushes to main and release tags. cs0 is kept out of
+# join only for the refs that install -- pushes to main and release tags. A `redeploy`
+# dispatch (below) rebuilds main and installs it on just the host(s) it names, with no
+# commit, for when the host changed under its binary (an OS upgrade). cs0 is kept out of
 # PR builds because it is a 4-core capture box and PR churn there would contend with capture
 # work; air0 is a laptop that is often asleep. win0 builds PRs because catching Windows
 # breakage before merge is the reason it is here. The POSIX machines install into
@@ -49,26 +51,43 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # A plain dispatch (redeploy: none) builds and tests on wm and win0 and installs nothing.
+  #
+  # redeploy rebuilds main and INSTALLS it on the named host(s) without a new commit. It
+  # exists for the case a merge cannot fix: the host changed under an installed binary. An
+  # OS upgrade bumps library sonames (wm's F44 -> F45 on 2026-11-17 left misrc_gui unable
+  # to load libavcodec.so.62), and before this input the only way to reinstall was to merge
+  # something that touched code. Refused on any ref but main: the installed binary is
+  # always main. See "After an OS upgrade" in docs/gdh-selfhosted-ci.md.
   workflow_dispatch:
+    inputs:
+      redeploy:
+        description: Rebuild main and install it on these host(s)
+        type: choice
+        default: none
+        options: [none, wm, cs0, air0, win0, all]
 
-# contents: write is required by the tag bump below, which pushes the release tag it
-# creates. Nothing else here writes to the repository.
+# Read-only by default. bump-tag, which pushes the release tag it mints, is the only job
+# that writes to the repository, and it asks for contents: write itself -- so the build
+# legs, which run the branch's own scripts on the runners, never hold a write token.
 permissions:
-  contents: write
+  contents: read
 
 # One run per ref. Without this, two quick merges could race the install step and leave
 # ~/.local/bin holding a binary from the older commit.
 #
-# Every ref that INSTALLS (main and release tags) shares one group, because they all write
-# the same ~/.local/bin. A tag pushed right after its merge is a different ref, so with a
-# per-ref group it would race the main run and leave the machine holding whichever finished
-# last. Sharing the group makes the later run cancel the earlier one, so the tag build
-# supersedes the main build of the same commit -- the intended outcome, since the tagged
-# version is what should end up installed.
+# Every run that INSTALLS (main, release tags, a redeploy dispatch) shares one group,
+# because they all write the same ~/.local/bin. A tag pushed right after its merge is a
+# different ref, so with a per-ref group it would race the main run and leave the machine
+# holding whichever finished last. Sharing the group makes the later run cancel the earlier
+# one, so the tag build supersedes the main build of the same commit -- the intended
+# outcome, since the tagged version is what should end up installed.
 concurrency:
   group: >-
-    ${{ (github.event_name == 'push' &&
-         (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    ${{ ((github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+         (github.event_name == 'workflow_dispatch' && inputs.redeploy != 'none' &&
+          github.ref == 'refs/heads/main'))
         && 'selfhosted-install' || format('selfhosted-{0}', github.ref) }}
   cancel-in-progress: true
 
@@ -118,7 +137,53 @@ jobs:
     outputs:
       code: ${{ steps.classify.outputs.code }}
       ci_only: ${{ steps.classify.outputs.ci_only }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      deploy: ${{ steps.plan.outputs.deploy }}
     steps:
+      # Which machines build, and whether they install, decided ONCE here rather than
+      # re-derived in the matrix and in every install step's `if:`. Two shapes install:
+      # a push to main or a release tag (all four machines), and a redeploy dispatch on
+      # main (the host(s) it names). Everything else builds on wm and win0 and installs
+      # nothing. A redeploy dispatched from another ref is refused, not quietly downgraded
+      # to a build: whoever asked for an install should learn they did not get one.
+      - name: Plan the run
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REDEPLOY: ${{ inputs.redeploy }}
+        run: |
+          set -euo pipefail
+          wm='{"name":"wm","os":"Linux","arch":"X64"}'
+          cs0='{"name":"cs0","os":"Linux","arch":"X64"}'
+          air0='{"name":"air0","os":"macOS","arch":"ARM64"}'
+          win0='{"name":"win0","os":"Windows","arch":"X64"}'
+          deploy=false
+          matrix="[$wm,$win0]"
+          if [ "$EVENT" = "push" ] && { [ "$REF" = "refs/heads/main" ] || [[ "$REF" == refs/tags/v* ]]; }; then
+            deploy=true
+            matrix="[$wm,$cs0,$air0,$win0]"
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ -n "$REDEPLOY" ] && [ "$REDEPLOY" != "none" ]; then
+            if [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::redeploy installs main and is refused on $REF; dispatch it with --ref main"
+              exit 1
+            fi
+            deploy=true
+            case "$REDEPLOY" in
+              wm)   matrix="[$wm]" ;;
+              cs0)  matrix="[$cs0]" ;;
+              air0) matrix="[$air0]" ;;
+              win0) matrix="[$win0]" ;;
+              all)  matrix="[$wm,$cs0,$air0,$win0]" ;;
+              *)    echo "::error::unknown redeploy target: $REDEPLOY"; exit 1 ;;
+            esac
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          echo "deploy=$deploy matrix=$matrix"
+
+
       - name: Classify the change
         id: classify
         shell: bash
@@ -246,11 +311,21 @@ jobs:
     # A setup-only merge mints no tag: the version string exists to identify a binary,
     # and no new binary is produced. The next real merge bumps from the same base. A
     # CI-only merge (.github/ alone) is the same case for the same reason.
+    #
+    # A redeploy dispatch runs it too: it builds main's HEAD, which after a CI-only or
+    # docs-only merge carries no tag, and an install without one would report
+    # dev-<date>-<sha>. A HEAD that is already tagged returns early below.
     if: >-
       needs.changes.outputs.code == 'true' &&
       needs.changes.outputs.ci_only != 'true' &&
-      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && needs.changes.outputs.deploy == 'true'))
     runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 10
+    # The only job that writes: it pushes the tag it mints.
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -327,6 +402,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # Nothing here pushes; leave no token in the workspace's .git/config.
+          persist-credentials: false
 
       - name: Static guard suite
         shell: bash
@@ -361,7 +439,8 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     # Strict pin: this fork builds only on the org's own machines, never on GitHub-hosted
     # runners. wm and win0 build every event; cs0 and air0 join only for the refs that
-    # install.
+    # install, and a redeploy dispatch builds only the host(s) it names. The list comes
+    # from the changes job's "Plan the run" step.
     #
     # All legs live in ONE workflow run, and `concurrency` (above) arbitrates BETWEEN
     # runs -- so the shared 'selfhosted-install' group still does the right thing: a newer
@@ -375,17 +454,16 @@ jobs:
         # Each entry carries its own OS and arch labels rather than sharing one hardcoded
         # pair, because a self-hosted runner self-reports them: wm and cs0 are Linux/X64,
         # air0 is macOS/ARM64, win0 is Windows/X64. A leg naming the wrong OS label matches
-        # no runner and sits
-        # queued forever with no error -- the same silent failure as a missing runner-group
-        # grant. Interpolating the labels as scalars keeps this to the one expression form
-        # already used below, rather than betting on an array-valued runs-on.
-        runner: >-
-          ${{ fromJSON(
-          (github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
-          && '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"cs0","os":"Linux","arch":"X64"},{"name":"air0","os":"macOS","arch":"ARM64"},{"name":"win0","os":"Windows","arch":"X64"}]'
-          || '[{"name":"wm","os":"Linux","arch":"X64"},{"name":"win0","os":"Windows","arch":"X64"}]') }}
+        # no runner and sits queued forever with no error -- the same silent failure as a
+        # missing runner-group grant. Interpolating the labels as scalars keeps this to the
+        # one expression form already used below, rather than betting on an array-valued
+        # runs-on.
+        runner: ${{ fromJSON(needs.changes.outputs.matrix) }}
     runs-on: [self-hosted, "${{ matrix.runner.os }}", "${{ matrix.runner.arch }}", "${{ matrix.runner.name }}"]
+    # Warm legs take about 2 minutes; a cold deps build (a new OS release, see "Resolve
+    # platform paths") is the long pole, win0's above all. Without this a hung leg would
+    # hold its runner for GitHub's 6-hour default.
+    timeout-minutes: 90
     # On a Windows runner the default shell for a plain `run:` step is pwsh, not bash --
     # `set -euo pipefail` there is parsed as Set-Variable and the step dies. Pinning bash
     # here makes every shared step run under Git for Windows' bash on win0, and is the
@@ -396,6 +474,9 @@ jobs:
         shell: bash
     env:
       BUILD_DIR: build-ci
+      # 'true' when this run installs (push to main or a tag, or a redeploy dispatch).
+      # Every install-side step gates on it, so the rule lives only in "Plan the run".
+      DEPLOY: ${{ needs.changes.outputs.deploy }}
 
     steps:
       - name: Checkout
@@ -405,6 +486,9 @@ jobs:
           # falling back to dev-<date>-nogit. bump-tag has already pushed the tag for this
           # commit, so this checkout sees it.
           fetch-depth: 0
+          # Nothing in this job pushes, and it runs the branch's own build scripts: leave
+          # no token in the workspace's .git/config for them to find.
+          persist-credentials: false
 
       # macOS only. air0's Homebrew lives at /opt/homebrew but is NOT on the runner's
       # non-interactive PATH, so meson, ninja, cmake and pkg-config are invisible without
@@ -467,6 +551,16 @@ jobs:
         # The path must still contain the literal ".deps/install": ci_guard_tests.py's
         # check_built_gui_links_vendored_hsdaoh asserts that substring in ldd output.
         #
+        # On Linux and macOS it is one cache PER OS RELEASE (fedora-45, macos-15, ...).
+        # build-deps-unix.sh's stamp hashes the system libraries' versions but not the OS
+        # release or the compiler, so a cache built on the previous release IS reused
+        # after an upgrade: on wm's F44 -> F45 the stamp still matched, and PR #96's run
+        # (2026-11-17) linked F44-built hsdaoh/raylib/opus into an F45 binary ("deps
+        # already built (stamp matches)"). A per-release prefix makes the first run on a new
+        # release a cold build by construction, and leaves the old release's cache
+        # untouched for any still-installed binary whose RUNPATH points into it. Windows
+        # keeps one prefix: its binary is statically linked and MSYS2 is rolling.
+        #
         # EXE and INSTALL_BIN let the shared steps below stay platform-neutral: the Windows
         # binary is misrc_gui.exe and installs under %LOCALAPPDATA%\Programs\MISRC (the
         # per-user application convention), the POSIX ones are bare names in ~/.local/bin.
@@ -476,8 +570,25 @@ jobs:
         # as /c.
         run: |
           set -euo pipefail
+          case "${{ matrix.runner.os }}" in
+            Linux)
+              # shellcheck source=/dev/null
+              # A rolling distro has no VERSION_ID; one cache serves it, as on Windows.
+              os_tag="$(. /etc/os-release && printf '%s-%s' "${ID:?}" "${VERSION_ID:-rolling}")"
+              deps_root="$HOME/.cache/misrc/$os_tag"
+              ;;
+            macOS)
+              os_tag="macos-$(sw_vers -productVersion | cut -d. -f1)"
+              deps_root="$HOME/.cache/misrc/$os_tag"
+              ;;
+            *)
+              os_tag=""
+              deps_root="$HOME/.cache/misrc"
+              ;;
+          esac
+          echo "deps prefix: $deps_root/.deps/install${os_tag:+ (per release: $os_tag)}"
           {
-            echo "MISRC_DEPS_PREFIX=$HOME/.cache/misrc/.deps/install"
+            echo "MISRC_DEPS_PREFIX=$deps_root/.deps/install"
             if [ "${{ matrix.runner.os }}" = "Windows" ]; then
               echo "EXE=.exe"
               echo "INSTALL_BIN=$(cygpath -u "$LOCALAPPDATA")/Programs/MISRC"
@@ -590,14 +701,14 @@ jobs:
         id: built
 
       # ----------------------------------------------------------------------------
-      # Install. Only on a real merge to main or a release tag -- PRs build and test but
-      # never touch the machine's installed app.
+      # Install. Only when DEPLOY is 'true' -- a merge to main, a release tag, or a
+      # redeploy dispatch on main (see "Plan the run"). PRs build and test but never
+      # touch the machine's installed app.
       # ----------------------------------------------------------------------------
       - name: Install binaries to ~/.local/bin
         if: >-
           matrix.runner.os != 'Windows' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         run: |
           set -euo pipefail
           bin_dir="$HOME/.local/bin"
@@ -625,8 +736,7 @@ jobs:
       - name: Provision host (gdh-host)
         if: >-
           (matrix.runner.name == 'wm' || matrix.runner.name == 'cs0') &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         continue-on-error: true
         env:
           RUNNER_HOST: ${{ matrix.runner.name }}
@@ -657,8 +767,7 @@ jobs:
       - name: Install binaries to %LOCALAPPDATA%\Programs\MISRC
         if: >-
           matrix.runner.os == 'Windows' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         run: |
           set -euo pipefail
           bin_dir="$INSTALL_BIN"
@@ -677,8 +786,7 @@ jobs:
       - name: Install Start Menu shortcut
         if: >-
           matrix.runner.os == 'Windows' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -718,8 +826,7 @@ jobs:
       - name: Install desktop integration
         if: >-
           matrix.runner.name == 'wm' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         run: |
           set -euo pipefail
           app_dir="$HOME/.local/share/applications"
@@ -812,8 +919,7 @@ jobs:
       - name: Install macOS app bundle
         if: >-
           matrix.runner.os == 'macOS' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         env:
           BUILT_VERSION: ${{ steps.built.outputs.version }}
         run: |
@@ -987,9 +1093,7 @@ jobs:
           echo "installed $app_dir/MISRC.app"
 
       - name: Verify install
-        if: >-
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: env.DEPLOY == 'true'
         # Passed through env rather than interpolated into the script: ${{ }} expansion
         # happens before the shell sees the line, so a value containing shell syntax
         # would execute. The version derives from a tag name, so treat it as untrusted.
@@ -998,6 +1102,23 @@ jobs:
         run: |
           set -euo pipefail
           gui="$INSTALL_BIN/misrc_gui$EXE"
+
+          # Linux: every installed binary must resolve every shared library, and a miss is
+          # reported by NAME. --version below would also fail on one, but only as the
+          # loader's one-line error for the GUI; misrc_capture and misrc_extract are never
+          # run here at all. This is the failure an OS upgrade causes (wm's F45 left
+          # misrc_gui wanting libavcodec.so.62), checked at the moment of install.
+          if [ "${{ matrix.runner.os }}" = "Linux" ]; then
+            missing=0
+            for b in misrc_gui misrc_capture misrc_extract; do
+              if unresolved="$(ldd "$INSTALL_BIN/$b" | grep 'not found')"; then
+                echo "::error::$INSTALL_BIN/$b has unresolved libraries: $(echo "$unresolved" | awk '{print $1}' | tr '\n' ' ')"
+                missing=1
+              fi
+            done
+            [ "$missing" -eq 0 ] || exit 1
+            echo "ldd: every installed binary resolves all of its libraries"
+          fi
           installed="$("$gui" --version)"
           built="$BUILT_VERSION"
           if [ "$installed" != "$built" ]; then
@@ -1036,8 +1157,7 @@ jobs:
       - name: Restart cs0 misrc-server if idle
         if: >-
           matrix.runner.name == 'cs0' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+          env.DEPLOY == 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
