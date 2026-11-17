@@ -98,9 +98,12 @@ source check; the vendored library is what links.
 `docs/gdh-selfhosted-ci.md`. `selfhosted-deploy.yml` runs on the org's own runners: `wm`
 (Linux, every event), `cs0` (Linux, `main` + tags only), `air0` (macOS ARM64, `main` + tags
 only, builds `~/Applications/MISRC.app`), `win0` (Windows x64, every event, MSYS2 MINGW64
-build after upstream's `windows-exe` job, which itself moved to UCRT64 in v1.2.4 -- win0 not
-migrated yet; installs to `%LOCALAPPDATA%\Programs\MISRC` +
-a Start Menu shortcut). PRs build and guard-test on wm and win0. `bump-tag` mints
+build after upstream's `windows-exe` job, which itself moved to UCRT64 in v1.2.4; installs to
+`%LOCALAPPDATA%\Programs\MISRC` + a Start Menu shortcut). win0 exists only to keep the fork
+aligned with upstream's code and Windows CI, so it is to move to UCRT64 too (planned, not
+done: the steps are in the CI doc's "Planned: move win0 from MINGW64 to UCRT64"; until then
+`build-local.ps1` has no UCRT64 toolchain on win0). Since v1.2.7 win0 also needs pacman's
+`opus` and `openh264`. PRs build and guard-test on wm and win0. `bump-tag` mints
 `v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 `MISRC_WINDOW_CLASS_TITLE` (guarded), and on native Wayland its file name must equal the app_id
