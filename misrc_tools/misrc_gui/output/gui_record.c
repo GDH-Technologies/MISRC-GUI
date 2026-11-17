@@ -560,6 +560,10 @@ struct gui_record_session {
     atomic_uint_fast64_t discarded[GUI_RECORD_CHANNELS];
     /* Capture-ring drops seen while this session recorded (real gaps). */
     atomic_uint_fast64_t capture_drops;
+    /* WAV outputs published to the audio thread at start, and whether it
+     * opened, wrote and closed every one of them (set in finalize). */
+    bool wav_requested;
+    bool audio_ok;
 
     /* Byte totals accumulated by this session's writer threads (survive a new
      * recording resetting the app-level display atomics). */
@@ -3135,6 +3139,35 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
     return true;
 }
 
+/* Publish this recording's WAV outputs to the audio thread (upstream's
+ * gui_audio_begin_recording): gui_record_check_output_paths' entries 2..8, ""
+ * for a disabled one, with the overwrite bits shifted to match. Main thread
+ * only (the static buffer). True when any WAV output is enabled. */
+static bool gui_record_begin_audio(gui_app_t *app, unsigned overwrite_mask) {
+    static char paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX];
+    const char *names[GUI_AUDIO_RECORD_OUTPUT_COUNT] = {
+        app->settings.audio_4ch_filename, app->settings.audio_2ch_12_filename,
+        app->settings.audio_2ch_34_filename, app->settings.audio_1ch_filenames[0],
+        app->settings.audio_1ch_filenames[1], app->settings.audio_1ch_filenames[2],
+        app->settings.audio_1ch_filenames[3]
+    };
+    const bool enabled[GUI_AUDIO_RECORD_OUTPUT_COUNT] = {
+        app->settings.enable_audio_4ch, app->settings.enable_audio_2ch_12,
+        app->settings.enable_audio_2ch_34, app->settings.enable_audio_1ch[0],
+        app->settings.enable_audio_1ch[1], app->settings.enable_audio_1ch[2],
+        app->settings.enable_audio_1ch[3]
+    };
+    bool any = false;
+    for (int i = 0; i < GUI_AUDIO_RECORD_OUTPUT_COUNT; i++) {
+        paths[i][0] = '\0';
+        if (!enabled[i]) continue;
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", app->settings.output_path, names[i]);
+        any = true;
+    }
+    gui_audio_begin_recording(app, paths, overwrite_mask >> GUI_RECORD_OVERWRITE_WAV_SHIFT);
+    return any;
+}
+
 // Start recording - checks for file existence first
 /* Prints what both auto-name functions produce from one settings blob. They
  * are separate implementations that must agree, and the only sanctioned
@@ -4965,7 +4998,9 @@ static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask) {
         gui_extract_set_recording(true, true, bits_a, bits_b, false, false);
         gui_record_gate_enable(&s_gate);
 
-        // Start audio output/monitoring (if enabled)
+        // WAV outputs first, then make sure the audio thread runs (it opens
+        // them at its next loop top; usually it is already monitoring).
+        ses->wav_requested = gui_record_begin_audio(app, overwrite_mask);
         gui_audio_start(app, &app->buffers);
 
         gui_app_set_status(app, "Recording (FLAC)...");
@@ -5223,7 +5258,9 @@ static int gui_record_start_confirmed(gui_app_t *app, unsigned overwrite_mask) {
         gui_extract_set_recording(true, false, bits_a, bits_b, direct_a, direct_b);
         gui_record_gate_enable(&s_gate);
 
-        // Start audio output/monitoring (if enabled)
+        // WAV outputs first, then make sure the audio thread runs (it opens
+        // them at its next loop top; usually it is already monitoring).
+        ses->wav_requested = gui_record_begin_audio(app, overwrite_mask);
         gui_audio_start(app, &app->buffers);
         gui_record_open_session_log(app, path_a, path_b);
         gui_record_flush_video_start_log(app);   /* RAW: log opens last */
@@ -5273,6 +5310,14 @@ static void gui_record_finalize_stop_sync(gui_record_session_t *ses) {
         if (ses->fifo_on[ch]) gui_record_fifo_maybe_end_episode(&ses->fifo[ch], get_time_ms(), 0);
     }
     gui_record_session_stop_monitor(ses);
+
+    /* The WAV outputs, upstream's wait from the finalizer: true when every
+     * requested WAV was opened, written and closed with its header. */
+    ses->audio_ok = gui_audio_wait_recording_idle();
+    if (ses->wav_requested && !ses->audio_ok) {
+        gui_record_log_writef_ses(ses, "ERROR",
+            "WAV output failed while opening, writing or closing (see [AUDIO] on stderr)");
+    }
 
     /* After the RF joins: the master reaches a consistent state first, and the
      * video finish can block for seconds flushing an FFV1 GOP. Keyed off the
@@ -5653,11 +5698,11 @@ void gui_record_stop(gui_app_t *app) {
      * Non-blocking -- the reap happens in the finalize path. */
     if (ses->cc_started) gui_cc_record_request_stop();
 
-    // Stop audio output/monitoring and restart monitor-only path if still capturing.
-    gui_audio_stop(app);
-    if (app->is_capturing) {
-        (void)gui_audio_start(app, &app->buffers);
-    }
+    /* End the WAV outputs. The audio thread flushes, closes and checks them
+     * and keeps running, so the monitor no longer drops out at a record stop
+     * (it used to be stopped and restarted here). The finalizer waits for
+     * the closes: gui_audio_wait_recording_idle. */
+    gui_audio_request_record_stop(app);
 
     // Restore normal process priority
     proc_set_priority(PROC_PRIORITY_NORMAL);

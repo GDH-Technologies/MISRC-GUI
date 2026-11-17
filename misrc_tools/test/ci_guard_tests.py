@@ -6900,7 +6900,9 @@ def check_audio_record_alignment_contract(repo_root: Path) -> int:
         (audio_c, "BUF_CAPTURE_AUDIO,\n                                    AUDIO_SYNC_CHUNK_BYTES, 0)", "sync helpers use no-wait full chunks"),
         (audio_c, "[AUDIO] Record start aligned", "start-alignment log line"),
         (audio_c, "[AUDIO] Record stop aligned", "stop-alignment log line"),
-        (audio_c, "bool was_recording = (a->f_4ch != NULL)", "pre-opened-files recording init"),
+        (audio_c, "static atomic_int s_audio_record_state", "upstream's record state (begin/stop/wait API)"),
+        (audio_c, "audio_open_record_files(a);", "WAVs opened by the thread at the START transition"),
+        (audio_c, "audio_close_record_files(a);", "WAVs closed (headers checked) at the STOP transition"),
         (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);", "2 ms read timeout keeps the transition observation at ~2-4 ms"),
         (buffer_manager_c, "if (timeout_ms == 0) return NULL;", "timeout-0 read returns only full available chunks"),
     ]
@@ -6913,7 +6915,7 @@ def check_audio_record_alignment_contract(repo_root: Path) -> int:
     # 10 ms read-timeout spin instead of only at the next full ~350 ms block.
     thread_body = func_body_from(audio_c, "static int audio_thread_main(void *ctx)")
     loop_pos = thread_body.find("while (1) {")
-    transition_pos = thread_body.find("bool rec_now = a->app && a->app->is_recording;")
+    transition_pos = thread_body.find("int record_state = atomic_load(&s_audio_record_state);")
     read_pos = thread_body.find("bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);")
     if min(loop_pos, transition_pos, read_pos) < 0:
         return fail("Audio record alignment anchors not found in audio_thread_main")
