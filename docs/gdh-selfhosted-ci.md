@@ -19,7 +19,8 @@ CI for this fork runs on four of the org's own runners, via
 | Pull request | wm + win0 | yes | no |
 | Push to `main` | wm + cs0 + air0 + win0 | yes | **yes** |
 | Release tag `v*` | wm + cs0 + air0 + win0 | yes | **yes** |
-| `workflow_dispatch` | wm + win0 | yes | no |
+| `workflow_dispatch` (`redeploy: none`) | wm + win0 | yes | no |
+| `workflow_dispatch` (`redeploy: <host>`/`all`), `main` only | the named host(s) | yes | **yes** |
 
 cs0 and air0 are kept out of PR builds deliberately, for different reasons: cs0 is a 4-core
 capture box where PR churn would contend with capture work, and air0 is a laptop that is
@@ -197,9 +198,8 @@ Binaries go to `%LOCALAPPDATA%\Programs\MISRC` (the per-user application convent
 `MISRC GUI.lnk` is written to the user's Start Menu programs folder with the icon taken from
 the `.exe` (which embeds `MISRC_Icon.ico` through `misrc_gui.rc`), and the install directory
 is appended to the **user** PATH once via the .NET environment API (`setx` truncates at
-1024 characters). The deps cache is `%USERPROFILE%\.cache\misrc\.deps\install`, the same
-`$HOME/.cache/misrc/.deps/install` the other machines use, outside the workspace for the same
-reason.
+1024 characters). The deps cache is `%USERPROFILE%\.cache\misrc\.deps\install`, outside the workspace for the
+same reason as the other machines' (which add an OS-release level, see "The deps cache").
 
 Windows refuses to overwrite or delete a running image but allows it to be renamed, so the
 install moves a live `misrc_gui.exe` aside under a unique name before the new one takes its
@@ -438,8 +438,10 @@ unused-variable warning on Windows only). Before sending work upstream, re-enabl
 
 ## The deps cache
 
-`MISRC_DEPS_PREFIX` points at **`~/.cache/misrc/.deps/install`**, deliberately outside the
-runner workspace. Two constraints shaped that path:
+`MISRC_DEPS_PREFIX` points at **`~/.cache/misrc/<os-tag>/.deps/install`** on Linux and macOS
+(`<os-tag>` is `<ID>-<VERSION_ID>` from `/etc/os-release`, e.g. `fedora-45`, or `macos-<major>`),
+and at `~/.cache/misrc/.deps/install` on win0. It sits deliberately outside the runner workspace.
+Three constraints shaped that path:
 
 - **Outside the workspace**, because `actions/checkout` defaults to `clean: true`
   (`git clean -ffdx`). A workspace-local `.deps` would be deleted every run — rebuilding
@@ -449,6 +451,13 @@ runner workspace. Two constraints shaped that path:
   `check_built_gui_links_vendored_hsdaoh` asserts that exact substring appears in `ldd` output
   (`ci_guard_tests.py:259`). A prefix like `~/.cache/misrc/deps` builds fine and then fails the
   guard.
+- **One per OS release**, because `build-deps-unix.sh`'s stamp hashes the system libraries'
+  versions but not the OS release or the compiler. A cache built on the previous release could
+  be reused after an upgrade (on wm's F44 → F45 the stamp happened to change: luck, not a
+  contract). With a per-release prefix the first run on a new release is a cold deps build by
+  construction. win0 keeps one prefix: its binary is statically linked and MSYS2 is rolling.
+  The installed binary's `RUNPATH` names the prefix it was built against, so an old release's
+  cache stays valid for whatever is still installed from it.
 
 `scripts/build-deps-unix.sh` is stamp-gated (`.build-stamp`), so a warm cache exits immediately
 with `deps already built (stamp matches)`. It is invoked as `bash scripts/build-deps-unix.sh`
@@ -458,15 +467,42 @@ same thing for the same reason.
 To rebuild the cache from scratch:
 
 ```bash
-rm -rf ~/.cache/misrc/.deps/install
-DEPS_PREFIX=~/.cache/misrc/.deps/install bash scripts/build-deps-unix.sh
+prefix=~/.cache/misrc/$(. /etc/os-release && echo "$ID-$VERSION_ID")/.deps/install
+rm -rf "$prefix"
+DEPS_PREFIX="$prefix" bash scripts/build-deps-unix.sh
 ```
+
+An older release's cache (and the pre-2026-11-17 unversioned `~/.cache/misrc/.deps`) can be removed
+once the host's installed binary no longer points into it:
+
+```bash
+readelf -d ~/.local/bin/misrc_gui | grep RUNPATH   # must name the current release's prefix
+```
+
+## After an OS upgrade
+
+An upgrade can bump the sonames an installed binary links against (wm's F44 → F45 on 2026-11-17
+left `misrc_gui` wanting `libavcodec.so.62`; F45 ships `.so.63`), and no merge is coming to
+rebuild it. Dispatch a **redeploy** for that host, which rebuilds `main` against the new release,
+in a fresh per-release deps cache, and installs it:
+
+```bash
+gh workflow run selfhosted-deploy.yml -R GDH-Technologies/MISRC-GUI --ref main -f redeploy=wm
+```
+
+`redeploy` takes `wm`, `cs0`, `air0`, `win0` or `all`, and is refused on any ref but `main`. It
+runs `bump-tag` first, so an untagged `main` HEAD (after a docs-only or CI-only merge) gets a
+`-gdh.N` tag rather than installing as `dev-<date>-<sha>`; a HEAD that is already tagged keeps its
+tag. It shares the `selfhosted-install` concurrency group with merges, so the two cannot race
+`~/.local/bin`. The install's verify step then fails, naming the library, if any installed Linux
+binary still has an unresolved one (`ldd … not found`).
 
 ## Reproducing a CI run by hand
 
 ```bash
-DEPS_PREFIX=~/.cache/misrc/.deps/install bash scripts/build-deps-unix.sh
-MISRC_DEPS_PREFIX=~/.cache/misrc/.deps/install BUILD_DIR=build-ci bash scripts/build-local.sh --all
+prefix=~/.cache/misrc/$(. /etc/os-release && echo "$ID-$VERSION_ID")/.deps/install
+DEPS_PREFIX="$prefix" bash scripts/build-deps-unix.sh
+MISRC_DEPS_PREFIX="$prefix" BUILD_DIR=build-ci bash scripts/build-local.sh --all
 python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path build-ci/misrc_gui
 build-ci/misrc_gui --smoke-test
 ```
@@ -475,7 +511,9 @@ build-ci/misrc_gui --smoke-test
 
 Installs `misrc_gui`, `misrc_capture` and `misrc_extract` into `~/.local/bin`, writing each via a
 temp name plus `mv -f` — the rename is atomic, so a merge cannot fail with `ETXTBSY` while the GUI
-is open.
+is open. The verify step then checks that the installed `--version` equals the built one, runs the
+installed `--smoke-test`, and on Linux fails if `ldd` reports any library `not found` for any of
+the three installed binaries.
 
 That step runs on both machines. A second step, **gated to wm**, then rewrites
 `~/.local/share/applications/misrc_gui.desktop`. Note the `StartupWMClass`:
@@ -544,3 +582,10 @@ grep -l MISRC ~/.local/share/applications/*.desktop ~/Desktop/*.desktop
 
 Self-hosted runners execute workflow code from pull requests on this machine. That is acceptable
 while the fork is private and contributors are trusted. Revisit before accepting outside PRs.
+
+Least privilege, as of 2026-11-17: the workflow's default token is `contents: read`; only
+`bump-tag` asks for `contents: write`, to push the tag it mints. The `guards` and
+`build-and-deploy` checkouts use `persist-credentials: false`, so no token sits in the
+workspace's `.git/config` while the branch's own build scripts run. Every job has a
+`timeout-minutes` (the build legs 90), so a hung leg does not hold its runner for GitHub's
+6-hour default.
