@@ -819,8 +819,10 @@ bool     gui_cc_record_is_running(void)   { return cc.child_pid > 0; }
 int gui_cc_record_test_main(const char *device, const char *out_dir,
                             int seconds, const char *inject_spec)
 {
-    gui_cc_record_set_ffmpeg(getenv("MISRC_FFMPEG") ? getenv("MISRC_FFMPEG")
-                                                    : "/usr/local/bin/ffmpeg");
+    /* The binary is injected by the caller (misrc_gui.c, through
+     * gui_video_record_cc_ffmpeg_path), like every other caption entry point.
+     * The old /usr/local/bin/ffmpeg default named a link GDH hosts no longer
+     * keep once the v4l2vbi build moved to ffmpeg-vbi. */
     if (device && device[0]) gui_cc_record_set_device(device);
 
     cc_probe_state_t st = gui_cc_record_probe();

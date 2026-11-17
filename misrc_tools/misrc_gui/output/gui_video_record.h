@@ -49,6 +49,20 @@ void gui_video_record_set_ffmpeg_path(const char *path);
 bool gui_video_record_probe(void);
 const char *gui_video_record_ffmpeg_path(void);     /* "" when not found */
 const char *gui_video_record_ffmpeg_version(void);
+
+/* The ffmpeg the caption recorder (gui_cc_record) is handed. It needs the
+ * v4l2vbi input device, which stock ffmpeg lacks, so the build carrying it is
+ * installed BESIDE the distro's ffmpeg under GUI_CC_FFMPEG_NAME rather than in
+ * place of it: a private build on PATH as plain `ffmpeg` breaks every caller
+ * the moment an OS upgrade bumps a soname under it (Fedora 45 did).
+ *
+ * Order: the explicit ffmpeg_path setting, then MISRC_FFMPEG -- either governs
+ * captions and video alike -- then GUI_CC_FFMPEG_NAME on PATH, then the video
+ * recorder's own binary. So with no override, captions use the v4l2vbi build
+ * and video and RTSP use the distro's ffmpeg. Cached; re-resolved after
+ * gui_video_record_set_ffmpeg_path(). "" when nothing was found. */
+#define GUI_CC_FFMPEG_NAME "ffmpeg-vbi"
+const char *gui_video_record_cc_ffmpeg_path(void);
 bool gui_video_record_codec_available(video_codec_t codec);
 
 /* Spawns ffmpeg, starts the writer thread, installs the preview tap.

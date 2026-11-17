@@ -4442,10 +4442,11 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     s_record_path_cc[0] = '\0';
     s_cc_start_msg[0] = '\0';
     if (app->settings.usbref_cc_enabled) {
-        /* Hand it the binary gui_video_record already resolved, so the two can
-         * never disagree about which ffmpeg they are using. */
+        /* Hand it the caption binary gui_video_record resolves: the
+         * ffmpeg_path override when set (shared with video), else the v4l2vbi
+         * build installed as ffmpeg-vbi, else the video ffmpeg. */
         gui_video_record_set_ffmpeg_path(app->settings.ffmpeg_path);
-        gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+        gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
         gui_cc_record_set_preview_device(app->settings.usbref_device_path);
         gui_cc_record_set_device(app->settings.usbref_cc_vbi_device);
         gui_cc_record_invalidate_probe();   /* a stale OK must not arm a recording */

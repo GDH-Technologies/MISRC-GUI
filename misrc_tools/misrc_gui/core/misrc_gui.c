@@ -982,11 +982,13 @@ int main(int argc, char **argv) {
             return gui_video_record_probe_main();
         }
         /* The caption module never resolves ffmpeg itself -- it is handed the
-         * one gui_video_record already found, so the two can never disagree
-         * about which binary they are using. */
+         * one gui_video_record resolves for it (gui_video_record_cc_ffmpeg_path:
+         * the ffmpeg_path override, else the v4l2vbi build installed as
+         * ffmpeg-vbi, else the video ffmpeg), so every caption entry point
+         * agrees on the binary. */
         if (strcmp(argv[i], "--cc-probe") == 0) {
             bool live = (i + 1 < argc) && strcmp(argv[i + 1], "--live") == 0;
-            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
             return gui_cc_record_probe_main(live);
         }
         if (strcmp(argv[i], "--cc-record-test") == 0) {
@@ -994,12 +996,13 @@ int main(int argc, char **argv) {
             const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
             int secs = (i + 3 < argc) ? atoi(argv[i + 3]) : 10;
             const char *inject = (i + 4 < argc) ? argv[i + 4] : NULL;
+            gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
             return gui_cc_record_test_main(dev, dir, secs, inject);
         }
         if (strcmp(argv[i], "--cc-argv-dump") == 0) {
             const char *dev = (i + 1 < argc) ? argv[i + 1] : NULL;
             const char *dir = (i + 2 < argc) ? argv[i + 2] : NULL;
-            gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+            gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
             return gui_cc_record_argv_dump_main(dev, dir);
         }
         if (strcmp(argv[i], "--rtsp-soak") == 0) {
@@ -1933,9 +1936,9 @@ int main(int argc, char **argv) {
         gui_rtsp_stream_poll();
         /* Same pattern: the caption spawn returns immediately and its startup
          * verdict is resolved here, so a refusal never blocks the render
-         * thread. Handed the binary gui_video_record resolved, so the two
-         * cannot disagree about which ffmpeg they are using. */
-        gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+         * thread. Handed the caption binary gui_video_record resolves (cached,
+         * so this per-frame call walks PATH only after a path change). */
+        gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
         gui_cc_record_poll();
 
         if (!session_error_shown && !gui_popup_is_open()) {
