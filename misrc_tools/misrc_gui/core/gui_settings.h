@@ -202,6 +202,16 @@ typedef struct {
     // track in the reference video MKV. Capture-side: the dongle is on the
     // machine that records.
     bool usbref_audio_enabled;
+    // How the reference MKV is encoded (USB Reference Video dialog, Recording
+    // codec window); read when ffmpeg is spawned. Capture-side, like
+    // usbref_codec. Defaults: H.264 4:2:0 CRF 18 veryfast keyframe 25, FFV1
+    // 4:2:2, interlace auto (see output/gui_video_record.h).
+    int  usbref_h264_chroma;                 // 420 or 422
+    int  usbref_ffv1_chroma;                 // 420 or 422
+    int  usbref_h264_crf;                    // 0-51
+    char usbref_h264_preset[16];             // ultrafast .. medium
+    int  usbref_h264_keyint;                 // 1-300 frames
+    int  usbref_interlace;                   // 0 auto, 1 interlaced, 2 progressive
     // (The nine ingest metadata fields were retired: capture metadata lives
     // in core/gui_capture_meta.h, outside the settings, and is never saved.)
 

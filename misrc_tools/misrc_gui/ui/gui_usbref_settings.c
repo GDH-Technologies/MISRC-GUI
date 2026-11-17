@@ -75,6 +75,17 @@ static bool s_rtsp_lan_confirm_open = false;
 /* The stream's video encoder settings, which are too many for the row they
  * belong to and are all baked in when ffmpeg is spawned. */
 static bool s_rtsp_codec_window_open = false;
+/* The reference recording's encoder settings (Recording codec window): codec,
+ * chroma, H.264 quality/preset/keyframe, interlace. All read at spawn. */
+static bool s_rec_codec_window_open = false;
+
+/* Recording codec steppers. The UI keeps CRF and the keyframe interval to a
+ * sensible band; a hand-edited value outside it still steps from where it is. */
+#define REC_CRF_UI_MIN     10
+#define REC_CRF_UI_MAX     30
+#define REC_KEYINT_STEP     5
+#define REC_KEYINT_UI_MIN   5
+#define REC_KEYINT_UI_MAX 300
 
 /* Bitrate stepper bounds. Kept inside the range gui_settings.c will accept on
  * reload (0, or 100..100000) so a value set here survives a restart, and well
@@ -93,6 +104,7 @@ bool gui_usbref_settings_handle_escape(gui_app_t *app)
     (void)app;
     /* Innermost first: a sheet over the dialog is what ESC is asking about. */
     if (s_rtsp_codec_window_open) { s_rtsp_codec_window_open = false; return true; }
+    if (s_rec_codec_window_open) { s_rec_codec_window_open = false; return true; }
     if (s_rtsp_lan_confirm_open) {
         /* Deliberately does NOT set usbref_rtsp_lan_acknowledged: declining is not an
          * answer worth remembering. */
@@ -388,6 +400,190 @@ static void render_rtsp_codec_window(gui_app_t *app)
         CLAY_TEXT(locked
                     ? CLAY_STRING("These are fixed while the stream runs. Stop it to change them.")
                     : CLAY_STRING("These take effect the next time the stream starts."),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(locked ? COLOR_SYNC_RED : COLOR_TEXT_DIM) }));
+    }
+}
+
+/* How the reference recording is encoded. Everything here is read when the
+ * recording's ffmpeg is spawned, so it is locked while one runs -- here, or on
+ * the server a client is driving. */
+static bool rec_codec_locked(gui_app_t *app)
+{
+    if (gui_net_is_client(app)) return gui_ui_settings_locked(app);
+    return gui_video_record_is_running();
+}
+
+/* Steps v by d, kept inside [lo, hi] unless it already sat outside that band
+ * (a hand-edited file), in which case it only moves back toward it. */
+static int rec_step(int v, int d, int lo, int hi, int abs_lo, int abs_hi)
+{
+    int n = v + d;
+    int l = v < lo ? abs_lo : lo;
+    int h = v > hi ? abs_hi : hi;
+    if (n < l) n = l;
+    if (n > h) n = h;
+    return n;
+}
+
+static void rec_label(int row, const char *text, Color fg)
+{
+    CLAY(CLAY_IDI("RecCodecLabel", row), { .layout = { .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+        CLAY_TEXT(make_string(text), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(fg) }));
+    }
+}
+
+static void rec_choice(Clay_ElementId id, const char *text, bool on, bool dim, int width)
+{
+    Color bg = on ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+    if (dim) bg = ui_disabled_color(bg);
+    CLAY(id, { .layout = { .sizing = { CLAY_SIZING_FIXED(width), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+        CLAY_TEXT(make_string(text), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(dim ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+    }
+}
+
+static void rec_stepper(Clay_ElementId minus, Clay_ElementId value, Clay_ElementId plus,
+                        const char *text, bool dim)
+{
+    Color step_bg = dim ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+    Color fg = dim ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+    CLAY(minus, { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+        CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(fg) }));
+    }
+    CLAY(value, { .layout = { .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+        CLAY_TEXT(make_string(text), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(fg) }));
+    }
+    CLAY(plus, { .layout = { .sizing = { CLAY_SIZING_FIXED(30), CLAY_SIZING_FIXED(30) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(step_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+        CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(fg) }));
+    }
+}
+
+static void render_rec_codec_window(gui_app_t *app)
+{
+    if (!s_rec_codec_window_open) return;
+
+    const gui_settings_t *st = &app->settings;
+    bool locked = rec_codec_locked(app);
+    bool is_client = gui_net_is_client(app);
+    bool ffv1 = st->usbref_codec == 1;
+    int chroma = ffv1 ? st->usbref_ffv1_chroma : st->usbref_h264_chroma;
+    bool h264_dim = locked || ffv1;          /* quality, preset, keyframe */
+    bool ilace_dim = locked || chroma == 422; /* per-field chroma is a 4:2:0 matter */
+    Color fg = locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+    Color h264_fg = h264_dim ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+    Color ilace_fg = ilace_dim ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+
+    CLAY(CLAY_ID("RecCodecBackdrop"), {
+        .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_TOP },
+            .zIndex = 34
+        },
+        .backgroundColor = (Clay_Color){0, 0, 0, 150}
+    }) {}
+
+    CLAY(CLAY_ID("RecCodecWindow"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(.min = 460, .max = 620), CLAY_SIZING_FIT(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .padding = { 18, 18, 16, 16 },
+            .childGap = 10
+        },
+        .floating = {
+            .attachTo = CLAY_ATTACH_TO_ROOT,
+            .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER },
+            .zIndex = 35
+        },
+        .backgroundColor = to_clay_color(COLOR_PANEL_BG),
+        .cornerRadius = CLAY_CORNER_RADIUS(8)
+    }) {
+        CLAY(CLAY_ID("RecCodecHeader"), {
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Recording codec"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
+            CLAY(CLAY_ID("RecCodecHeaderSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } } }) {}
+            CLAY(CLAY_ID("RecCodecClose"), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4)
+            }) {
+                CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+            }
+        }
+
+        /* Codec: explicit choices, so the one in force shows without clicking
+         * through. A codec this ffmpeg lacks is greyed (the server's ffmpeg
+         * decides on a client, so nothing is greyed there). */
+        CLAY(CLAY_ID("RecCodecCodecRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(0, "Codec", fg);
+            for (int c = 0; c < 2; c++) {
+                bool avail = is_client || gui_video_record_codec_available(c == 1 ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264);
+                rec_choice(CLAY_IDI("RecCodecCodec", c), c == 1 ? "FFV1" : "H.264",
+                           (st->usbref_codec == 1) == (c == 1), locked || !avail, 86);
+            }
+            CLAY_TEXT(ffv1 ? CLAY_STRING("lossless, roughly 5-16 MB/s") : CLAY_STRING("lossy, under 3 MB/s"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        /* Chroma: each codec keeps its own, so switching codec shows that
+         * codec's choice. */
+        CLAY(CLAY_ID("RecCodecChromaRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(1, "Chroma", fg);
+            rec_choice(CLAY_IDI("RecCodecChroma", 0), "4:2:0", chroma != 422, locked, 86);
+            rec_choice(CLAY_IDI("RecCodecChroma", 1), "4:2:2", chroma == 422, locked, 86);
+        }
+        if (!ffv1 && chroma == 422) {
+            CLAY_TEXT(CLAY_STRING("H.264 4:2:2 has no common GPU decoder: VLC shows no picture unless its hardware decoding is off."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_SYNC_RED) }));
+        }
+
+        CLAY(CLAY_ID("RecCodecCrfRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(2, "Quality", h264_fg);
+            static char crf_buf[24];
+            snprintf(crf_buf, sizeof(crf_buf), "CRF %d%s", st->usbref_h264_crf,
+                     st->usbref_h264_crf == VIDEO_H264_CRF_DEFAULT ? " (default)" : "");
+            rec_stepper(CLAY_ID("RecCodecCrfMinus"), CLAY_ID("RecCodecCrfValue"), CLAY_ID("RecCodecCrfPlus"),
+                        crf_buf, h264_dim);
+            CLAY_TEXT(CLAY_STRING("lower = better, bigger"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        CLAY(CLAY_ID("RecCodecPresetRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(3, "Preset", h264_fg);
+            static char preset_buf[32];
+            snprintf(preset_buf, sizeof(preset_buf), "%s", st->usbref_h264_preset);
+            rec_choice(CLAY_ID("RecCodecPreset"), preset_buf, false, h264_dim, 120);
+            CLAY_TEXT(CLAY_STRING("click to cycle; slower = smaller, more CPU"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        CLAY(CLAY_ID("RecCodecIlaceRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(4, "Interlace", ilace_fg);
+            static const char *const ilace_names[3] = { "Auto", "Interlaced", "Progressive" };
+            for (int i = 0; i < 3; i++)
+                rec_choice(CLAY_IDI("RecCodecIlace", i), ilace_names[i], st->usbref_interlace == i, ilace_dim, 100);
+        }
+        CLAY_TEXT(CLAY_STRING("Interlaced halves 4:2:0 colour per field, so it does not smear on motion. Auto = SD sources."),
+            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
+        CLAY(CLAY_ID("RecCodecKeyRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(30) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+            rec_label(5, "Keyframe", h264_fg);
+            static char key_buf[24];
+            snprintf(key_buf, sizeof(key_buf), "%d frames", st->usbref_h264_keyint);
+            rec_stepper(CLAY_ID("RecCodecKeyMinus"), CLAY_ID("RecCodecKeyValue"), CLAY_ID("RecCodecKeyPlus"),
+                        key_buf, h264_dim);
+            CLAY_TEXT(CLAY_STRING("seek granularity"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+        if (ffv1) {
+            CLAY_TEXT(CLAY_STRING("FFV1 is lossless and all-keyframe: quality, preset and keyframe do not apply."),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        }
+
+        CLAY_TEXT(locked
+                    ? (is_client ? CLAY_STRING("Locked: not connected, or the server is recording.")
+                                 : CLAY_STRING("These are fixed while the reference video records."))
+                    : CLAY_STRING("These apply to the next recording."),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_VU_CLIP, .textColor = to_clay_color(locked ? COLOR_SYNC_RED : COLOR_TEXT_DIM) }));
     }
 }
@@ -767,6 +963,7 @@ void gui_usbref_settings_render(gui_app_t *app)
     /* The two sub-windows outlive the dialog that launches them: closing this
      * window while the codec sheet is up would strand it. */
     render_rtsp_codec_window(app);
+    render_rec_codec_window(app);
     render_rtsp_lan_confirm(app);
 
     if (!s_open) { s_pick = PICK_NONE; return; }
@@ -936,6 +1133,29 @@ void gui_usbref_settings_render(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("PreviewCropRight"), { .layout = { .sizing = { CLAY_SIZING_FIXED(46), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                     CLAY_TEXT(make_string(crop_r_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+            }
+
+            /* Recording: how the reference MKV is encoded. One row naming
+             * what is in force; the Recording codec window holds the rest. */
+            CLAY_TEXT(CLAY_STRING("Recording"),
+                      CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL,
+                                         .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            {
+                bool rec_ok = gui_net_is_client(app) || gui_video_record_probe();
+                static char rec_buf[160];
+                video_encode_opts_t rec_enc;
+                gui_video_encode_opts_from_settings(&app->settings, &rec_enc);
+                char rec_sum[128];
+                gui_video_encode_summary(&rec_enc, rec_sum, sizeof(rec_sum));
+                snprintf(rec_buf, sizeof(rec_buf), "%s...", rec_sum);
+                CLAY(CLAY_ID("UsbRefRecRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 8 } }) {
+                    CLAY(CLAY_ID("UsbRefRecLabel"), { .layout = { .sizing = { CLAY_SIZING_FIXED(74), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
+                        CLAY_TEXT(CLAY_STRING("Codec"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    }
+                    CLAY(CLAY_ID("UsbRefRecCodecBox"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(rec_ok ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                        CLAY_TEXT(make_string(rec_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(rec_ok ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
+                    }
                 }
             }
 
@@ -1291,6 +1511,83 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app)
         return true;
     }
 
+    if (s_rec_codec_window_open) {
+        if (Clay_PointerOver(CLAY_ID("RecCodecClose"))) {
+            s_rec_codec_window_open = false;
+            return true;
+        }
+        gui_settings_t *st = &app->settings;
+        bool ffv1 = st->usbref_codec == 1;
+        int *chroma = ffv1 ? &st->usbref_ffv1_chroma : &st->usbref_h264_chroma;
+        bool over_control = false;
+        for (int i = 0; i < 3; i++) {
+            if ((i < 2 && (Clay_PointerOver(CLAY_IDI("RecCodecCodec", i)) ||
+                           Clay_PointerOver(CLAY_IDI("RecCodecChroma", i)))) ||
+                Clay_PointerOver(CLAY_IDI("RecCodecIlace", i)))
+                over_control = true;
+        }
+        if (Clay_PointerOver(CLAY_ID("RecCodecCrfMinus")) || Clay_PointerOver(CLAY_ID("RecCodecCrfPlus")) ||
+            Clay_PointerOver(CLAY_ID("RecCodecPreset")) ||
+            Clay_PointerOver(CLAY_ID("RecCodecKeyMinus")) || Clay_PointerOver(CLAY_ID("RecCodecKeyPlus")))
+            over_control = true;
+        if (!over_control) return true;
+        if (rec_codec_locked(app)) {
+            gui_app_set_status(app, gui_net_is_client(app)
+                ? "Not connected, or the server is recording"
+                : "The reference video is recording; these apply to the next recording");
+            return true;
+        }
+        bool changed = false;
+        for (int c = 0; c < 2; c++) {
+            if (!Clay_PointerOver(CLAY_IDI("RecCodecCodec", c))) continue;
+            video_codec_t vc = c == 1 ? VIDEO_CODEC_FFV1 : VIDEO_CODEC_H264;
+            if (!gui_net_is_client(app) && !gui_video_record_codec_available(vc)) {
+                gui_app_set_status(app, c == 1 ? "This ffmpeg cannot encode FFV1"
+                                               : "This ffmpeg cannot encode H.264 (libx264)");
+            } else if (st->usbref_codec != c) {
+                st->usbref_codec = c;
+                changed = true;
+            }
+        }
+        for (int i = 0; i < 2; i++) {
+            if (!Clay_PointerOver(CLAY_IDI("RecCodecChroma", i))) continue;
+            *chroma = i ? 422 : 420;
+            changed = true;
+        }
+        if (!ffv1) {
+            if (Clay_PointerOver(CLAY_ID("RecCodecCrfMinus")) || Clay_PointerOver(CLAY_ID("RecCodecCrfPlus"))) {
+                st->usbref_h264_crf = rec_step(st->usbref_h264_crf,
+                                               Clay_PointerOver(CLAY_ID("RecCodecCrfPlus")) ? 1 : -1,
+                                               REC_CRF_UI_MIN, REC_CRF_UI_MAX, 0, 51);
+                changed = true;
+            }
+            if (Clay_PointerOver(CLAY_ID("RecCodecPreset"))) {
+                int cur = -1;
+                for (int i = 0; i < gui_video_h264_preset_count; i++)
+                    if (strcmp(st->usbref_h264_preset, gui_video_h264_presets[i]) == 0) { cur = i; break; }
+                int next = (cur + 1) % gui_video_h264_preset_count;
+                snprintf(st->usbref_h264_preset, sizeof(st->usbref_h264_preset), "%s",
+                         gui_video_h264_presets[next]);
+                changed = true;
+            }
+            if (Clay_PointerOver(CLAY_ID("RecCodecKeyMinus")) || Clay_PointerOver(CLAY_ID("RecCodecKeyPlus"))) {
+                st->usbref_h264_keyint = rec_step(st->usbref_h264_keyint,
+                                                  Clay_PointerOver(CLAY_ID("RecCodecKeyPlus")) ? REC_KEYINT_STEP : -REC_KEYINT_STEP,
+                                                  REC_KEYINT_UI_MIN, REC_KEYINT_UI_MAX, 1, 300);
+                changed = true;
+            }
+        }
+        if (*chroma != 422) {
+            for (int i = 0; i < 3; i++) {
+                if (!Clay_PointerOver(CLAY_IDI("RecCodecIlace", i))) continue;
+                st->usbref_interlace = i;
+                changed = true;
+            }
+        }
+        if (changed) gui_settings_save(st);
+        return true;
+    }
+
     /* Answered before anything else: while this is up it is the only thing
      * on screen that may be clicked. */
     if (s_rtsp_lan_confirm_open) {
@@ -1537,11 +1834,15 @@ bool gui_usbref_settings_handle_interactions(gui_app_t *app)
             }
         }
     }
-    if (Clay_PointerOver(CLAY_ID("VideoCodecBox"))) {
-        if (gui_video_record_probe()) {
-            app->settings.usbref_codec = (app->settings.usbref_codec == 1) ? 0 : 1;
-            gui_settings_save(&app->settings);
+    if (Clay_PointerOver(CLAY_ID("UsbRefRecCodecBox"))) {
+        /* Opens even while recording: the window shows what is in force and
+         * greys it, which is more use than a box that does nothing. */
+        if (!gui_net_is_client(app) && !gui_video_record_probe()) {
+            gui_app_set_status(app, "ffmpeg was not found - install it or set ffmpeg_path in the settings file");
+        } else {
+            s_rec_codec_window_open = true;
         }
+        return true;
     }
 
     /* Dead space inside the window still belongs to the window. */

@@ -186,7 +186,7 @@ int gui_stream_soak_main(const char *device, const char *rf_device, int seconds)
     char mkv[256];
     snprintf(mkv, sizeof(mkv), "%s/misrc-soak.mkv",
              getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp");
-    if (gui_video_record_start(mkv, VIDEO_CODEC_H264, st.width, st.height, pitch,
+    if (gui_video_record_start(mkv, NULL, st.width, st.height, pitch,
                                st.fps_num, st.fps_den, "", err, sizeof(err)) != 0) {
         fprintf(stderr, "reference recorder: %s\n", err);
         gui_preview_disconnect();

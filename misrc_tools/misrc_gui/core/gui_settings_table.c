@@ -13,6 +13,7 @@
  */
 
 #include "gui_settings.h"
+#include "../output/gui_video_record.h"   /* encode defaults and the preset list */
 #include "../ui/gui_ui_scale.h"
 #ifdef ENABLE_DDD
 #include "../../common/ddd_protocol.h"
@@ -200,6 +201,13 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->usbref_mediamtx_path[0] = '\0';
     settings->usbref_rtsp_audio_device[0] = '\0';
     settings->usbref_audio_enabled = true;
+    settings->usbref_h264_chroma = VIDEO_H264_CHROMA_DEFAULT;
+    settings->usbref_ffv1_chroma = VIDEO_FFV1_CHROMA_DEFAULT;
+    settings->usbref_h264_crf = VIDEO_H264_CRF_DEFAULT;
+    snprintf(settings->usbref_h264_preset, sizeof(settings->usbref_h264_preset), "%s",
+             VIDEO_H264_PRESET_DEFAULT);
+    settings->usbref_h264_keyint = VIDEO_H264_KEYINT_DEFAULT;
+    settings->usbref_interlace = VIDEO_INTERLACE_AUTO;
     settings->enable_audio_2ch_12 = false;
     settings->enable_audio_2ch_34 = false;
     for (int i = 0; i < 4; i++) {
@@ -736,6 +744,79 @@ static bool hook_video_codec(const gui_setting_desc_t *d, gui_settings_t *s, con
     return true;
 }
 
+/* Reference-video encode options. A file is clamped (a hand edit must not
+ * stop a recording); the network setter refuses, saying what is accepted. */
+static bool encode_int(const char *value, bool strict, int lo, int hi, int fallback, bool clamp,
+                       int *out, const char *what, char *err, size_t errcap) {
+    long long v;
+    if (!parse_int_text(value, strict, &v, err, errcap)) return false;
+    if (v >= lo && v <= hi) { *out = (int)v; return true; }
+    if (strict) { set_err(err, errcap, what); return false; }
+    *out = clamp ? (v < lo ? lo : hi) : fallback;
+    return true;
+}
+
+static bool hook_encode_chroma(int *member, int fallback, const char *value, bool strict,
+                               char *err, size_t errcap) {
+    long long v;
+    if (!parse_int_text(value, strict, &v, err, errcap)) return false;
+    if (v == 420 || v == 422) { *member = (int)v; return true; }
+    if (strict) { set_err(err, errcap, "expected 420 or 422"); return false; }
+    *member = fallback;
+    return true;
+}
+
+static bool hook_h264_chroma(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                             bool strict, char *err, size_t errcap) {
+    (void)d;
+    return hook_encode_chroma(&s->usbref_h264_chroma, VIDEO_H264_CHROMA_DEFAULT, value, strict, err, errcap);
+}
+
+static bool hook_ffv1_chroma(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                             bool strict, char *err, size_t errcap) {
+    (void)d;
+    return hook_encode_chroma(&s->usbref_ffv1_chroma, VIDEO_FFV1_CHROMA_DEFAULT, value, strict, err, errcap);
+}
+
+static bool hook_h264_crf(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                          bool strict, char *err, size_t errcap) {
+    (void)d;
+    return encode_int(value, strict, 0, 51, VIDEO_H264_CRF_DEFAULT, true, &s->usbref_h264_crf,
+                      "expected a CRF from 0 to 51", err, errcap);
+}
+
+static bool hook_h264_keyint(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                             bool strict, char *err, size_t errcap) {
+    (void)d;
+    return encode_int(value, strict, 1, 300, VIDEO_H264_KEYINT_DEFAULT, true, &s->usbref_h264_keyint,
+                      "expected a keyframe interval from 1 to 300 frames", err, errcap);
+}
+
+static bool hook_interlace(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                           bool strict, char *err, size_t errcap) {
+    (void)d;
+    return encode_int(value, strict, 0, 2, VIDEO_INTERLACE_AUTO, false, &s->usbref_interlace,
+                      "expected 0 (auto), 1 (interlaced) or 2 (progressive)", err, errcap);
+}
+
+static bool hook_h264_preset(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
+                             bool strict, char *err, size_t errcap) {
+    static const char *const presets[] = { VIDEO_H264_PRESET_LIST };
+    (void)d;
+    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++) {
+        if (strcmp(value, presets[i]) == 0) {
+            snprintf(s->usbref_h264_preset, sizeof(s->usbref_h264_preset), "%s", presets[i]);
+            return true;
+        }
+    }
+    if (strict) {
+        set_err(err, errcap, "expected an x264 preset: ultrafast, superfast, veryfast, faster, fast or medium");
+        return false;
+    }
+    snprintf(s->usbref_h264_preset, sizeof(s->usbref_h264_preset), "%s", VIDEO_H264_PRESET_DEFAULT);
+    return true;
+}
+
 static bool hook_rtsp_port(const gui_setting_desc_t *d, gui_settings_t *s, const char *value,
                            bool strict, char *err, size_t errcap) {
     long long ll;
@@ -1175,6 +1256,14 @@ static const gui_setting_desc_t s_table[] = {
     /* Appended (row order is write order): the dongle's audio as a FLAC track
      * in the reference MKV. Capture-side, like video_record_enabled. */
     GS_B  ("usbref_audio_enabled",            usbref_audio_enabled,       0),
+    /* Appended (row order is write order): how the reference MKV is encoded,
+     * from the Recording codec window. Capture-side, like usbref_codec. */
+    GS_IH ("usbref_h264_chroma",              usbref_h264_chroma,         0, hook_h264_chroma),
+    GS_IH ("usbref_ffv1_chroma",              usbref_ffv1_chroma,         0, hook_ffv1_chroma),
+    GS_IH ("usbref_h264_crf",                 usbref_h264_crf,            0, hook_h264_crf),
+    GS_SH ("usbref_h264_preset",              usbref_h264_preset,         0, hook_h264_preset),
+    GS_IH ("usbref_h264_keyint",              usbref_h264_keyint,         0, hook_h264_keyint),
+    GS_IH ("usbref_interlace",                usbref_interlace,           0, hook_interlace),
 };
 
 #define GS_TABLE_COUNT (sizeof(s_table) / sizeof(s_table[0]))
