@@ -144,7 +144,7 @@ static bool vr_is_executable(const char *p)
 /* PATH is searched by hand rather than using posix_spawnp, because the
  * absolute path must be known before a recording starts: that is what lets a
  * refusal be clean and lets the log name which binary was chosen. */
-static bool vr_find_in_path(char *out, size_t cap)
+static bool vr_find_in_path(const char *name, char *out, size_t cap)
 {
     const char *path = getenv("PATH");
     if (!path || !path[0]) return false;
@@ -154,7 +154,7 @@ static bool vr_find_in_path(char *out, size_t cap)
         size_t len = sep ? (size_t)(sep - p) : strlen(p);
         if (len > 0 && len < cap - 16) {
             char cand[512];
-            snprintf(cand, sizeof(cand), "%.*s/ffmpeg", (int)len, p);
+            snprintf(cand, sizeof(cand), "%.*s/%s", (int)len, p, name);
             if (vr_is_executable(cand)) { snprintf(out, cap, "%s", cand); return true; }
         }
         if (!sep) break;
@@ -168,11 +168,18 @@ static bool vr_find_in_path(char *out, size_t cap)
  * gui_settings_t, because this module deliberately knows nothing about it. */
 static char s_ffmpeg_override[512];
 
+/* The caption recorder's binary, resolved by gui_video_record_cc_ffmpeg_path()
+ * and cached here: the main loop asks for it every frame, and a PATH walk per
+ * frame would be a stat() per PATH entry at 60 Hz. */
+static char s_cc_ffmpeg[512];
+static bool s_cc_resolved;
+
 void gui_video_record_set_ffmpeg_path(const char *path)
 {
     if (path && path[0]) snprintf(s_ffmpeg_override, sizeof(s_ffmpeg_override), "%s", path);
     else                 s_ffmpeg_override[0] = '\0';
     ff.probed = false;   /* a new path deserves a fresh probe */
+    s_cc_resolved = false;
 }
 
 static bool vr_resolve_ffmpeg(char *out, size_t cap)
@@ -183,7 +190,7 @@ static bool vr_resolve_ffmpeg(char *out, size_t cap)
     }
     const char *env = getenv("MISRC_FFMPEG");
     if (vr_is_executable(env)) { snprintf(out, cap, "%s", env); return true; }
-    if (vr_find_in_path(out, cap)) return true;
+    if (vr_find_in_path("ffmpeg", out, cap)) return true;
 
     char selfdir[512];
     ssize_t n = readlink("/proc/self/exe", selfdir, sizeof(selfdir) - 1);
@@ -247,6 +254,25 @@ bool gui_video_record_probe(void)
 
 const char *gui_video_record_ffmpeg_path(void)    { gui_video_record_probe(); return ff.path; }
 const char *gui_video_record_ffmpeg_version(void) { gui_video_record_probe(); return ff.version; }
+
+const char *gui_video_record_cc_ffmpeg_path(void)
+{
+    if (s_cc_resolved) return s_cc_ffmpeg;
+    s_cc_resolved = true;
+
+    /* An explicit choice governs captions and video alike, as before. */
+    const char *env = getenv("MISRC_FFMPEG");
+    if (vr_is_executable(s_ffmpeg_override)) {
+        snprintf(s_cc_ffmpeg, sizeof(s_cc_ffmpeg), "%s", s_ffmpeg_override);
+    } else if (vr_is_executable(env)) {
+        snprintf(s_cc_ffmpeg, sizeof(s_cc_ffmpeg), "%s", env);
+    } else if (!vr_find_in_path(GUI_CC_FFMPEG_NAME, s_cc_ffmpeg, sizeof(s_cc_ffmpeg))) {
+        /* No v4l2vbi build installed under its own name: the caption probe
+         * then asks the video ffmpeg, and says so if it lacks the device. */
+        snprintf(s_cc_ffmpeg, sizeof(s_cc_ffmpeg), "%s", gui_video_record_ffmpeg_path());
+    }
+    return s_cc_ffmpeg;
+}
 
 bool gui_video_record_codec_available(video_codec_t codec)
 {
@@ -886,6 +912,7 @@ int gui_video_record_test_main(const char *device, const char *out_path,
 
 bool gui_video_record_probe(void) { return false; }
 const char *gui_video_record_ffmpeg_path(void) { return ""; }
+const char *gui_video_record_cc_ffmpeg_path(void) { return ""; }
 const char *gui_video_record_ffmpeg_version(void) { return ""; }
 bool gui_video_record_codec_available(video_codec_t c) { (void)c; return false; }
 int  gui_video_record_start(const char *o, video_codec_t c, uint32_t w, uint32_t h,

@@ -1096,8 +1096,11 @@ void gui_usbref_settings_render_captions_row(gui_app_t *app)
     // active lines, so line 21 is never in a frame we could see.
     // Greyed out unless the whole chain probes clean, so the
     // toggle cannot be armed into a state that would refuse a
-    // recording. The probe is cached; this costs a compare.
-    gui_cc_record_set_ffmpeg(gui_video_record_ffmpeg_path());
+    // recording. The probe is cached; this costs a compare -- as long
+    // as every caller hands over the SAME binary, the caption one
+    // (gui_video_record_cc_ffmpeg_path), or alternating callers
+    // would invalidate the probe every frame.
+    gui_cc_record_set_ffmpeg(gui_video_record_cc_ffmpeg_path());
     gui_cc_record_set_preview_device(app->settings.usbref_device_path);
     gui_cc_record_set_device(app->settings.usbref_cc_vbi_device);
     bool cc_ok = (gui_cc_record_probe() == CC_PROBE_OK);

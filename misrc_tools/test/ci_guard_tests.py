@@ -6130,6 +6130,78 @@ def check_session_launch_file_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_cc_ffmpeg_resolution_post_build(gui_path: Path) -> int:
+    """Captions use the v4l2vbi build installed as ffmpeg-vbi; video uses plain
+    ffmpeg; an explicit choice (MISRC_FFMPEG, like the ffmpeg_path setting)
+    governs both.
+
+    Fedora 45 broke the old layout, where the private v4l2vbi build was on PATH
+    as plain `ffmpeg`: an OS upgrade bumped sonames under it and every ffmpeg
+    caller died. The build now lives beside the distro's ffmpeg as ffmpeg-vbi,
+    and only the caption recorder should prefer it. Drives the built binary's
+    --cc-probe and --video-probe (neither reads the settings file) with PATH set
+    to a scratch dir of stub scripts, and reads the "ffmpeg:" line each prints."""
+    if not sys.platform.startswith("linux"):
+        print("SKIP: caption ffmpeg resolution (post-build): video/caption recording is Linux-only")
+        return 0
+
+    def stub(path: Path, devices: str) -> None:
+        path.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in\n"
+            "  *-encoders*) echo ' V..... libx264              H.264 stub'; exit 0 ;;\n"
+            f"  *-devices*) echo '{devices}'; exit 0 ;;\n"
+            "  *-muxers*) echo ' E  scc             Scenarist stub'; exit 0 ;;\n"
+            "  *-version*) echo 'ffmpeg version stub'; exit 0 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def probed(mode: str, env: dict) -> Optional[str]:
+        try:
+            ran = subprocess.run([str(gui_path), mode], capture_output=True, text=True,
+                                 timeout=60, env=env)
+        except subprocess.TimeoutExpired:
+            return None
+        for line in ran.stdout.splitlines():
+            if line.startswith("ffmpeg:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    with tempfile.TemporaryDirectory(prefix="misrc_cc_ffmpeg_guard_") as temp_root:
+        both = Path(temp_root) / "both"
+        plain = Path(temp_root) / "plain"
+        both.mkdir()
+        plain.mkdir()
+        stub(both / "ffmpeg", " D  v4l2          stub")
+        stub(both / "ffmpeg-vbi", " D  v4l2vbi       stub")
+        stub(plain / "ffmpeg", " D  v4l2          stub")
+        base_env = {k: v for k, v in os.environ.items() if k != "MISRC_FFMPEG"}
+
+        cases = [
+            ("ffmpeg-vbi installed", dict(base_env, PATH=str(both)),
+             both / "ffmpeg", both / "ffmpeg-vbi"),
+            ("no ffmpeg-vbi: captions fall back to the video ffmpeg", dict(base_env, PATH=str(plain)),
+             plain / "ffmpeg", plain / "ffmpeg"),
+            ("MISRC_FFMPEG governs both", dict(base_env, PATH=str(both), MISRC_FFMPEG=str(plain / "ffmpeg")),
+             plain / "ffmpeg", plain / "ffmpeg"),
+        ]
+        for name, env, want_video, want_cc in cases:
+            video = probed("--video-probe", env)
+            cc = probed("--cc-probe", env)
+            if video is None or cc is None:
+                return fail(f"caption ffmpeg resolution ({name}): a probe timed out")
+            if video != str(want_video):
+                return fail(f"caption ffmpeg resolution ({name}): --video-probe chose {video!r}, "
+                            f"expected {str(want_video)!r}")
+            if cc != str(want_cc):
+                return fail(f"caption ffmpeg resolution ({name}): --cc-probe chose {cc!r}, "
+                            f"expected {str(want_cc)!r} (gui_video_record_cc_ffmpeg_path)")
+    return 0
+
+
 def check_record_gate_post_build(gui_path: Path) -> int:
     """Run the built GUI's --record-gate-selftest: with a finalize in flight
     gui_record_start refuses, and with none it gets past the gate."""
@@ -6922,6 +6994,7 @@ def main() -> int:
         checks.append(("capture metadata selftest (post-build)", lambda: check_capture_metadata_post_build(args.gui_path)))
         checks.append(("record order selftest (post-build)", lambda: check_record_order_post_build(args.gui_path)))
         checks.append(("record gate selftest (post-build)", lambda: check_record_gate_post_build(args.gui_path)))
+        checks.append(("caption ffmpeg resolution (post-build)", lambda: check_cc_ffmpeg_resolution_post_build(args.gui_path)))
 
     for name, check in checks:
         rc = check()
