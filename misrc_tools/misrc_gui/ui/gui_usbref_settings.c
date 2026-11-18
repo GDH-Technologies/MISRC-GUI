@@ -1310,8 +1310,8 @@ void gui_usbref_settings_render(gui_app_t *app)
                                 // Clicking copies, Ctrl+click hands the URL to whatever the
                                 // desktop registered for the scheme -- VLC for rtsp://, the
                                 // browser for http:// -- so a tape can be watched without
-                                // anyone retyping a port and landing on capture-node's
-                                // stream by accident.
+                                // anyone retyping a port and landing on another
+                                // server's stream by accident.
                                 if (rs_st.running && !rs_st.starting) {
                                     // rs_st is a copy on this frame's stack, and Clay does not
                                     // copy the text it is handed -- it keeps the pointer and

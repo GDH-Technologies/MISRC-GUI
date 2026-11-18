@@ -1,11 +1,11 @@
 /*
  * Unit harness for gui_mediamtx's config rendering.
  *
- * The generated mediamtx.yml carries the design's hard requirement: this
- * instance must not interfere with capture-node's three on the same host.
- * Two ways to break that, both silent:
+ * The generated mediamtx.yml must stay on its own ports and claim nothing it
+ * does not serve. Two ways to break that, both silent:
  *
- *   - drift onto one of capture-node's ports (8554/8000/8001, x10000 per tier);
+ *   - drift off mediamtx canonical + 100 (8654/8100/8101/...), onto a stock
+ *     mediamtx's ports;
  *   - forget to disable a listener, since mediamtx defaults rtmp/srt/moq to ON
  *     and would quietly claim 1935/8890/8892.
  *
@@ -67,37 +67,8 @@ static int test_default_ports_are_canonical_plus_100(void)
     return failures;
 }
 
-/* The hard requirement, stated as a test: nothing capture-node owns, at any
- * tier, may appear in a config we generate. */
-static int test_never_emits_a_capture_node_port(void)
-{
-    char yaml[8192];
-    gui_mediamtx_config_t cfg = gui_mediamtx_default_config();
-    int before = failures;
-
-    if (expect_eq_int(gui_mediamtx_render_config(&cfg, yaml, sizeof yaml) > 0, 1,
-                      "render loopback") == 0) {
-        /* prod / preview / dev tiers */
-        expect_absent(yaml, ":8554", "capture-node prod rtsp");
-        expect_absent(yaml, ":8000", "capture-node prod rtp");
-        expect_absent(yaml, ":8001", "capture-node prod rtcp");
-        expect_absent(yaml, ":18554", "capture-node preview rtsp");
-        expect_absent(yaml, ":28554", "capture-node dev rtsp");
-    }
-
-    cfg.lan = true;
-    if (gui_mediamtx_render_config(&cfg, yaml, sizeof yaml) > 0) {
-        expect_absent(yaml, ":8554", "capture-node prod rtsp (lan)");
-        expect_absent(yaml, ":18554", "capture-node preview rtsp (lan)");
-        expect_absent(yaml, ":28554", "capture-node dev rtsp (lan)");
-    }
-
-    if (failures == before) puts("PASS: never emits a capture-node port");
-    return failures - before;
-}
-
 /* mediamtx defaults rtmp/srt/moq to ON. Omitting them would claim
- * 1935/8890/8892 -- ports capture-node deliberately leaves free. */
+ * 1935/8890/8892 -- ports another service on the host may own. */
 static int test_disables_every_listener_we_do_not_serve(void)
 {
     char yaml[8192];
@@ -213,9 +184,6 @@ static int test_publishes_the_expected_path(void)
     expect_contains(yaml, "paths:", "paths block");
     expect_contains(yaml, "misrc-preview:", "the stream path");
     expect_contains(yaml, "source: publisher", "publisher source");
-    /* Outside capture-node's VCR0/CAM0 naming, so bookmarks never collide. */
-    expect_absent(yaml, "VCR0", "no capture-node path name");
-    expect_absent(yaml, "CAM0", "no capture-node path name");
 
     if (failures == before) puts("PASS: publishes the expected path");
     return failures - before;
@@ -367,7 +335,6 @@ int main(int argc, char **argv)
     }
 
     test_default_ports_are_canonical_plus_100();
-    test_never_emits_a_capture_node_port();
     test_disables_every_listener_we_do_not_serve();
     test_loopback_binds_localhost_on_all_six();
     test_lan_binds_all_interfaces_and_gathers_ice();

@@ -434,8 +434,8 @@ code?", which only runs on wm. `OOMPolicy=continue` keeps the runner listening t
 kill; `Restart=on-failure` covers the listener itself dying.
 
 The runner gets exactly what the priority guards lower themselves to, so they run in CI
-instead of reporting SKIP, and no more. Before this, capture-node's `capture-limits.conf`
-(`LimitRTPRIO=20`, `LimitNICE=-11`) was the ceiling and threading.h's all-or-nothing request
+instead of reporting SKIP, and no more. Before this, the now-retired capture-node's
+`capture-limits.conf` (`LimitRTPRIO=20`, `LimitNICE=-11`) was the ceiling and threading.h's all-or-nothing request
 failed under it: `[THREAD] Thread priority request 3 could not be elevated (rt_err=1,
 nice_err=13)`. The GUI's log now names the grant instead —
 `[THREAD] realtime priority 99 not permitted; using 20 (resource limit)` means the new

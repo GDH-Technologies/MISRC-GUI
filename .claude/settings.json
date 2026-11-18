@@ -44,7 +44,6 @@
     "defaultMode": "auto",
     "additionalDirectories": [
       "~/Repos/digitization-toolkit",
-      "~/Repos/capture-node",
       "~/Repos/cxadc-linux"
     ]
   },

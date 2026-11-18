@@ -41,7 +41,7 @@ extern char **environ;
 #define RS_SNDBUF_BYTES    (4 << 20)
 #define RS_DRAIN_LIMIT_S   3.0
 #define RS_REAP_LIMIT_S    8.0
-/* capture-node's posture for its ffmpeg children, for the same reason. */
+/* Encoders yield CPU to RF ingest (see the setpriority call in the spawn). */
 #define RS_CHILD_NICE      5
 /* Idle I/O class: the stream's encoder gets the disk only when nothing else
  * wants it. Set on the spawning thread around posix_spawn, so the child
@@ -354,7 +354,7 @@ static void rs_build_argv(char *argv[], int *argc_out,
         argv[n++] = (char *)"-preset";  argv[n++] = (char *)"veryfast";
         argv[n++] = (char *)"-tune";    argv[n++] = (char *)"zerolatency";
         /* Spare cores belong to the RF recorders, and this app IS the RF
-         * recorder -- more true here than in capture-node. */
+         * recorder. */
         argv[n++] = (char *)"-threads"; argv[n++] = (char *)"2";
         argv[n++] = (char *)"-b:v";     argv[n++] = br_buf;
         argv[n++] = (char *)"-maxrate"; argv[n++] = maxr_buf;
@@ -571,8 +571,7 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
 
     /* RTSP fan-out must yield to RF ingest. This app IS the RF recorder, so an
      * encoder competing for the same cores is not a fair fight to leave to
-     * chance -- capture-node nices its ffmpeg children for the same reason.
-     * Raising niceness never needs privilege, so a failure here is not worth
+     * chance. Raising niceness never needs privilege, so a failure here is not worth
      * refusing the stream over. */
     if (setpriority(PRIO_PROCESS, (id_t)pid, RS_CHILD_NICE) != 0) {
         /* Nothing to do: the stream still works, it just competes harder. */
@@ -580,9 +579,8 @@ static rs_spawn_result_t rs_spawn_attempt(const gui_rtsp_stream_opts_t *opts,
 
     /* Frames must already be flowing before the child can be judged.
      *
-     * capture-node checks its ffmpeg a second after spawning, but its ffmpeg
-     * opens -f v4l2 itself and so reaches any failure unaided. Ours takes video
-     * on stdin, and ffmpeg blocks reading input 0 before it opens input 1 or the
+     * Checking ffmpeg a second after spawning works when ffmpeg opens -f v4l2
+     * itself and so reaches any failure unaided. Ours takes video on stdin, and ffmpeg blocks reading input 0 before it opens input 1 or the
      * output. Measured: with stdin held open and empty, both a deliberately
      * unknown encoder and a nonexistent ALSA card leave ffmpeg alive
      * indefinitely -- it never gets far enough to fail. So the writer and the
@@ -845,8 +843,8 @@ void gui_rtsp_stream_poll(void)
 
     /* One retry, video-only, per the failure-mode table: a sound card that
      * cannot be opened must not cost the picture. Exactly one -- retrying a
-     * genuinely broken device in a loop burns CPU and fills logs, which is why
-     * capture-node leaves restarts to the operator. */
+     * genuinely broken device in a loop burns CPU and fills logs, so further
+     * restarts are left to the operator. */
     if (why == RS_SPAWN_FAIL_AUDIO && !rs.retried_video_only && rs.audio_device[0]) {
         rs.retried_video_only = true;
         rs.audio_device[0] = '\0';
