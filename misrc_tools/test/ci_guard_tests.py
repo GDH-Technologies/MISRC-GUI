@@ -2113,9 +2113,9 @@ def check_cc_settings_have_defaults_and_rows(repo_root: Path) -> int:
 
 
 def check_mediamtx_config_runtime(repo_root: Path) -> int:
-    """The generated mediamtx.yml carries the design's hard requirement: this
-    instance must not disturb capture-node's three on the same host. Two ways to
-    break it, both silent -- drift onto one of its ports, or forget to disable a
+    """The generated mediamtx.yml stays on its own ports and claims nothing it
+    does not serve. Two ways to break it, both silent -- drift off mediamtx
+    canonical + 100 onto a stock mediamtx's ports, or forget to disable a
     listener, since mediamtx defaults rtmp/srt/moq to ON and would quietly claim
     1935/8890/8892. Renders the config for both bind modes and asserts neither."""
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
@@ -2791,9 +2791,9 @@ def check_rtsp_settings_roundtrip(repo_root: Path) -> int:
 def check_streaming_children_yield_to_rf(repo_root: Path) -> int:
     """RTSP fan-out must yield to RF ingest. This app IS the RF recorder, so an
     encoder and a media server competing for the same cores is not a fair fight
-    to leave to chance -- the design calls for the nice(+5) posture capture-node
-    uses on its ffmpeg children, and it was missing until the concurrency proof
-    went looking for it."""
+    to leave to chance -- the design calls for a nice(+5) posture on the
+    streaming children, and it was missing until the concurrency proof went
+    looking for it."""
     for rel, define in (
         ("misrc_tools/misrc_gui/streaming/gui_rtsp_stream.c", "RS_CHILD_NICE"),
         ("misrc_tools/misrc_gui/streaming/gui_mediamtx.c", "MTX_CHILD_NICE"),
@@ -2829,7 +2829,16 @@ def check_gdh_host_installer(repo_root: Path) -> int:
     the invoking user with the GUI's limits, top CPU and I/O weight, and room
     for a FLAC finalize on stop. It must refuse to install without root and
     never restart a service: user@ and the runner would take the deploy down
-    with them."""
+    with them.
+
+    Since capture-node's retirement it also installs the capture-host files at
+    the paths capture-node used: the 70-/71- udev rules (the clockgen's ALSA
+    card id <host>_cg_audio, which gui_cxadc.c resolves the card by, and the
+    /dev/cx aliases), /etc/asound.conf (the clockgen-dsnoop fan-out the GUI opens
+    first) and the WirePlumber clockgen policy in the capture user's home, which
+    root must never write itself -- a symlink planted there would redirect the
+    write -- so it goes through runuser. The 72- nvidia-uvm rule is the
+    toolkit's, not a capture file."""
     if not sys.platform.startswith("linux"):
         print("SKIP: GDH host installer guard (Linux only)")
         return 0
@@ -2923,6 +2932,45 @@ def check_gdh_host_installer(repo_root: Path) -> int:
                         "takes minutes, give it at least 600")
     if problems:
         return fail("install.sh cs0: misrc-server.service " + "; ".join(problems))
+
+    home = os.path.expanduser(f"~{who}")
+    for host, sections in (("cs0", cs0), ("wm", wm)):
+        usb = f"/etc/udev/rules.d/70-gdhvc-{host}-usb-capture.rules"
+        cx = f"/etc/udev/rules.d/71-gdhvc-{host}-cxadc-alias.rules"
+        wp = f"{home}/.config/wireplumber/wireplumber.conf.d/99-gdhvc-clockgen.conf"
+        for path in (usb, cx, "/etc/asound.conf", wp):
+            if path not in sections:
+                return fail(f"install.sh {host} does not install {path}; capture-node "
+                            "installed it and nothing else does since its retirement")
+        rules = [l for l in sections[usb] if l and not l.startswith("#")]
+        if not any(f'ATTR{{id}}:="{host}_cg_audio"' in l and 'ATTRS{idVendor}=="1209"' in l
+                   for l in rules):
+            return fail(f"install.sh {host}: {usb} must name the clockgen's ALSA card "
+                        f"{host}_cg_audio (gui_cxadc.c resolves the card by it)")
+        aliases = " ".join(l for l in sections[cx] if not l.startswith("#"))
+        for alias in (f"cx/{host}-video", f"cx/{host}-hifi"):
+            if f'SYMLINK+="{alias}"' not in aliases:
+                return fail(f"install.sh {host}: {cx} lost the /dev/{alias} alias")
+        asound = "\n".join(l for l in sections["/etc/asound.conf"] if not l.startswith("#"))
+        dsnoop = re.search(r"pcm\.clockgen-dsnoop\s*\{(.*?)\n\}", asound, re.S)
+        if (not dsnoop or "type dsnoop" not in dsnoop.group(1)
+                or f'pcm "hw:CARD={host}_cg_audio,0"' not in dsnoop.group(1)):
+            return fail(f"install.sh {host}: /etc/asound.conf must define clockgen-dsnoop as "
+                        f"a dsnoop on hw:CARD={host}_cg_audio,0; gui_cxadc.c opens it first")
+        if not any("device.disabled = true" in l for l in sections[wp]):
+            return fail(f"install.sh {host}: the WirePlumber clockgen policy no longer "
+                        "disables the card")
+        uvm = [k for k in sections if "nvidia-uvm" in k]
+        if uvm:
+            return fail(f"install.sh {host} installs {uvm}; the decode-GPU rule is the "
+                        "toolkit's, not a capture file")
+    code = strip_shell_comments(read_text(script))
+    put_user = re.search(r"^put_user\(\)\s*\{(.*?)^\}", code, re.S | re.M)
+    if not put_user or len(re.findall(r'runuser -u "\$capture_user"', put_user.group(1))) < 2:
+        return fail("install.sh: put_user must compare and write the home-directory file "
+                    "through runuser -u \"$capture_user\", never as root")
+    if not re.search(r'put_user\s+"\$wireplumber"', code):
+        return fail("install.sh writes the WirePlumber policy without put_user")
 
     bad = subprocess.run(["bash", str(script), "--print", "nosuchhost"],
                          capture_output=True, text=True)

@@ -239,8 +239,8 @@ jobs:
             run_everything "::warning::Empty file listing for ${EVENT}; assuming code changed."
           fi
           # The setup-only set. .claude/** is ignored WHOLESALE here, unlike in the
-          # toolkit and capture-node where the hooks are a ruff target and settings.json
-          # is asserted by a test: nothing in this repo's CI reads .claude/ at all (the
+          # toolkit, where the hooks are a ruff target and settings.json is asserted by
+          # a test: nothing in this repo's CI reads .claude/ at all (the
           # guard suite is misrc_tools/test/ci_guard_tests.py). .clangd is LSP config that
           # no build step consults. NOT here, deliberately: misrc_tools/**, third_party/**
           # and CMakeLists.txt, all of which change what gets built.
@@ -260,7 +260,7 @@ jobs:
           # purpose is substring-matching this file, instead of the build matrix.
           #
           # .claude/ needs no arm here: it is already inside the setup-only set above,
-          # unlike the toolkit and capture-node where hooks are linted and tested.
+          # unlike the toolkit, where hooks are linted and tested.
           #
           # The tradeoff, stated plainly: the static guards cannot prove the workflow
           # still EXECUTES, only that its load-bearing strings survived. A workflow edit

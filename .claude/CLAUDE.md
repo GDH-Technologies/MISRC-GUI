@@ -8,14 +8,14 @@ disagree, the scripts and `.github/workflows/selfhosted-deploy.yml` are ground t
 
 ## Direction
 
-GDH is consolidating on MISRC-GUI as its capture engine and operator seat and retiring the
-Python `capture-node` service. The order was reset on 2026-09-04: `digitization-toolkit`
-was decoupled from capture-node first (`digitization-toolkit/docs/plans/
-capture-node-retirement/{design,plan}.md`, all landed 2026-09-06), capture-node is in
-maintenance mode, and what remains is adapting the toolkit to MISRC-GUI. That plan's
-`design.md` supersedes `../capture-node/docs/misrc-gui-comparison.md` as the analysis of
-record. Keep GDH specifics (hostnames, fleet, archival policy) out of any code that could
-go upstream.
+MISRC-GUI is GDH's only capture tool and operator seat. The Python `capture-node`
+service was retired in 2026-11 (`digitization-toolkit/docs/plans/
+capture-node-retirement/{design,plan}.md`, Phase 4); the toolkit still reads its old
+captures. The capture-host files capture-node used to install (the 70-/71- udev rules
+with the clockgen's ALSA id `<host>_cg_audio`, `/etc/asound.conf`, the WirePlumber
+clockgen policy) are now `scripts/gdh-host/install.sh`'s, at the same paths, and the rig
+wiring is `scripts/gdh-host/rigs.md`. Keep GDH specifics (hostnames, fleet, archival
+policy) out of any code that could go upstream.
 
 Fork-only surfaces: `misrc_tools/misrc_gui/streaming/`, `misrc_tools/misrc_gui/input/
 gui_preview_v4l2.c`, `misrc_tools/misrc_gui/input/gui_preview_sdtv.{c,h}`,
@@ -327,8 +327,9 @@ Fork-side:
   4:2:2 it played as audio over an empty window in VLC (VDPAU, no GPU decodes H.264 4:2:2, no
   software fallback) while ffprobe and ffmpeg decoded it fine. Check playback in a
   hardware-decoding player, not only ffprobe (guard "USB reference encode options").
-- mediamtx ports are canonical+100 (RTSP 8654) so the fork never collides with capture-node's
-  `tier×10000+8554` instances on the same hosts.
+- mediamtx ports are canonical+100 (RTSP 8654, path `misrc-preview`). They were chosen to stay
+  clear of capture-node's instances; capture-node is retired and the ports stay, so nothing
+  that bookmarked them moves.
 - Settings live in one descriptor table (`misrc_gui/core/gui_settings_table.c`); the struct is
   in `gui_settings.h` so the table compiles without raylib. A new field needs a default and a
   `GS_*` row, with `GS_CLIENT_LOCAL` if it describes the machine rather than the capture; the

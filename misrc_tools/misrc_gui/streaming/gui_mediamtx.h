@@ -2,23 +2,19 @@
  * MISRC GUI - mediamtx supervisor
  *
  * Runs a private mediamtx as a child of misrc_gui, so the RTSP publisher has
- * somewhere to publish and viewers have somewhere to read. Modelled on
- * capture-node's ManagedRtspServer, with one deliberate improvement: that one
- * has no health check, so a mediamtx that dies mid-run is simply gone until the
- * daemon restarts. This polls the child and surfaces the state.
+ * somewhere to publish and viewers have somewhere to read. It polls the child
+ * and surfaces its state, so a mediamtx that dies mid-run is reported rather
+ * than silently gone.
  *
- * The hard requirement this module carries: capture-node runs three mediamtx
- * instances on this same host, and its port scheme is `tier x 10000 +
- * 8554/8000/8001`. We must stay out of that namespace entirely, which is why
- * every port is mediamtx canonical + 100 and every listener we do not serve is
- * explicitly disabled -- mediamtx defaults rtmp/srt/moq to ON.
+ * Every port is mediamtx canonical + 100, so this instance stays off the ports
+ * of any stock mediamtx on the same host, and every listener we do not serve
+ * is explicitly disabled -- mediamtx defaults rtmp/srt/moq to ON.
  *
  * The config is GENERATED at runtime rather than shipped, so the ports in the
  * file are always the ports the app actually chose; the two cannot drift.
  *
  * If the binary is absent the feature is simply unavailable and the UI says so.
- * This is a desktop app: it must still run without mediamtx installed, unlike
- * capture-node which hard-fails its startup preflight.
+ * This is a desktop app: it must still run without mediamtx installed.
  */
 
 #ifndef GUI_MEDIAMTX_H
@@ -81,7 +77,7 @@ const char *gui_mediamtx_version(void);
  * message. */
 int  gui_mediamtx_start(const gui_mediamtx_config_t *cfg, char *err, size_t err_cap);
 
-/* SIGTERM -> 3s -> SIGKILL -> 2s, capture-node's ladder. Blocks. */
+/* SIGTERM -> 3s -> SIGKILL -> 2s. Blocks. */
 void gui_mediamtx_stop(void);
 
 /* Last-resort teardown for app exit. */
@@ -108,8 +104,8 @@ const char *gui_mediamtx_read_password(void);
 gui_mediamtx_status_t gui_mediamtx_get_status(void);
 bool gui_mediamtx_is_running(void);
 
-/* Headless harness: starts the server, asserts our ports are bound and
- * capture-node's are untouched, stops it, asserts they are released. */
+/* Headless harness: starts the server, asserts our ports are bound, stops it,
+ * asserts they are released. */
 int gui_mediamtx_test_main(int seconds);
 
 #endif /* GUI_MEDIAMTX_H */

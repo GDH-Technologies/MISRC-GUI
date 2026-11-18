@@ -63,8 +63,8 @@ or a real host:
 
 ### 4. Are all sub-issues closed?
 
-A parent closes last. Sub-issues can be cross-repo (`digitization-toolkit`, `capture-node`
-during the transition); read each with `issue_read` and check its state.
+A parent closes last. Sub-issues can be cross-repo (`digitization-toolkit`; older ones in the
+archived `capture-node`); read each with `issue_read` and check its state.
 
 ## Things that are not closure
 
