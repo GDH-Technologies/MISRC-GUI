@@ -6470,14 +6470,15 @@ def check_session_launch_file_contract(repo_root: Path) -> int:
 
 
 def check_cc_ffmpeg_resolution_post_build(gui_path: Path) -> int:
-    """Captions use the v4l2vbi build installed as ffmpeg-vbi; video uses plain
+    """Captions use the v4l2vbi build installed as ffmpeg-gdh; video uses plain
     ffmpeg; an explicit choice (MISRC_FFMPEG, like the ffmpeg_path setting)
     governs both.
 
     Fedora 45 broke the old layout, where the private v4l2vbi build was on PATH
     as plain `ffmpeg`: an OS upgrade bumped sonames under it and every ffmpeg
-    caller died. The build now lives beside the distro's ffmpeg as ffmpeg-vbi,
-    and only the caption recorder should prefer it. Drives the built binary's
+    caller died. The build now lives beside the distro's ffmpeg as ffmpeg-gdh
+    (named ffmpeg-vbi until 2026-11-24), and only the caption recorder should
+    prefer it. Drives the built binary's
     --cc-probe and --video-probe (neither reads the settings file) with PATH set
     to a scratch dir of stub scripts, and reads the "ffmpeg:" line each prints."""
     if not sys.platform.startswith("linux"):
@@ -6515,14 +6516,14 @@ def check_cc_ffmpeg_resolution_post_build(gui_path: Path) -> int:
         both.mkdir()
         plain.mkdir()
         stub(both / "ffmpeg", " D  v4l2          stub")
-        stub(both / "ffmpeg-vbi", " D  v4l2vbi       stub")
+        stub(both / "ffmpeg-gdh", " D  v4l2vbi       stub")
         stub(plain / "ffmpeg", " D  v4l2          stub")
         base_env = {k: v for k, v in os.environ.items() if k != "MISRC_FFMPEG"}
 
         cases = [
-            ("ffmpeg-vbi installed", dict(base_env, PATH=str(both)),
-             both / "ffmpeg", both / "ffmpeg-vbi"),
-            ("no ffmpeg-vbi: captions fall back to the video ffmpeg", dict(base_env, PATH=str(plain)),
+            ("ffmpeg-gdh installed", dict(base_env, PATH=str(both)),
+             both / "ffmpeg", both / "ffmpeg-gdh"),
+            ("no ffmpeg-gdh: captions fall back to the video ffmpeg", dict(base_env, PATH=str(plain)),
              plain / "ffmpeg", plain / "ffmpeg"),
             ("MISRC_FFMPEG governs both", dict(base_env, PATH=str(both), MISRC_FFMPEG=str(plain / "ffmpeg")),
              plain / "ffmpeg", plain / "ffmpeg"),

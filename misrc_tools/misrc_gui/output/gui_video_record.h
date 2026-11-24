@@ -112,9 +112,10 @@ const char *gui_video_record_ffmpeg_version(void);
  * Order: the explicit ffmpeg_path setting, then MISRC_FFMPEG -- either governs
  * captions and video alike -- then GUI_CC_FFMPEG_NAME on PATH, then the video
  * recorder's own binary. So with no override, captions use the v4l2vbi build
+ * (GDH's own ffmpeg, ffmpeg-gdh; it was named ffmpeg-vbi until 2026-11-24)
  * and video and RTSP use the distro's ffmpeg. Cached; re-resolved after
  * gui_video_record_set_ffmpeg_path(). "" when nothing was found. */
-#define GUI_CC_FFMPEG_NAME "ffmpeg-vbi"
+#define GUI_CC_FFMPEG_NAME "ffmpeg-gdh"
 const char *gui_video_record_cc_ffmpeg_path(void);
 bool gui_video_record_codec_available(video_codec_t codec);
 
