@@ -316,18 +316,45 @@ exists before either leg checks out, so both resolve the same version.
 'skipped')` — without the `skipped` arm, every event other than a push to `main` would skip
 the build too.
 
+The logic is `scripts/gdh-ci/bump-gdh-tag.sh`; the job only checks out and calls it.
+
 **Which base the tag gets.** The bump takes the *highest* of harrypm's plain `vX.Y.Z` tags
-that `HEAD` contains and mints `${base}-gdh.N` with `N` one past the highest already minted
-on that base. It fetches those tags from `harrypm/MISRC-GUI` for the step (`--no-tags`,
-`refs/tags/v*` only): the fork's remote deliberately carries none of them, because pushing
-a plain `v*` tag to the fork would fire this workflow's tag trigger and install upstream's
-tree on every machine. It does **not** use `git describe --abbrev=0`, which picks the
+that `HEAD` contains and mints `${base}-gdh.N` with `N` one past the highest `${base}-gdh.*`
+tag **on origin** (`git ls-remote`, not the checkout's tag list). It fetches harrypm's tags
+from `harrypm/MISRC-GUI` by URL into the private `refs/gdh-bump/upstream-tags/` namespace,
+never into `refs/tags` (the same pattern as upstream-drift's `refs/upstream-drift/`): the
+fork's remote deliberately carries none of them, because pushing a plain `v*` tag to the
+fork would fire this workflow's tag trigger and install upstream's tree on every machine. It does **not** use `git describe --abbrev=0`, which picks the
 *nearest* tag by commit distance: a sync merge brings a handful of upstream commits, so it
 sits closer to the previous `-gdh` tag than to the new upstream tag, and the base never
 advanced — the v1.1.9 merge (#56) was minted `v1.1.8-gdh.22`. The first push to `main`
 after that fix minted `v1.1.9-gdh.1`; the stray `v1.1.8-gdh.22` on the merge commit is
 harmless to the bump (it counts only tags on the current base) but reads wrong in
 `git log`, so it may be deleted.
+
+**It reads no global git config.** wm's runners run as `rdodge`, and `actions/checkout`
+swaps in a temporary `HOME` only for its own step, so every later step reads the desktop
+user's `~/.gitconfig`. The script sets `GIT_CONFIG_GLOBAL=/dev/null` and
+`GIT_CONFIG_NOSYSTEM=1`; push credentials live in the checkout's local config and still work.
+The tag is made with `-c user.*` and `--no-sign`, so nothing is written into the runner
+workspace and no personal key signs it. Before tagging, it checks that the checkout holds
+every one of origin's tags on the base, and refuses otherwise. A rejected push is re-checked:
+if origin already has that tag on `HEAD` it succeeds, and otherwise it recounts from origin,
+at most three times.
+
+This is why. On 2026-11-26 `~/workflow-master/git-github/gitconfig` gained
+`fetch.prune = true`. The old inline step fetched harrypm's tags as
+`refs/tags/v*:refs/tags/v*`, and git prunes an explicit refspec's destination, so every
+`-gdh` tag was deleted from the checkout. The step counted from zero, minted
+`v1.2.7-gdh.1` on top of gdh.1-15, and the #117 merge failed on the rejected push. The
+same file's `tag.gpgSign` signed the bot's tag with the personal SSH key. Other repositories'
+CI on wm still reads that file.
+
+**The PR preview.** Job `tag-preview` runs the script `--dry-run` on every same-repo PR,
+on wm, against the PR's merge commit and the real origin and harrypm tags. It prints the
+tag the merge would get (`would tag v1.2.7-gdh.16 at …`, also in the job summary) and fails
+if the checkout's tags disagree with origin's. It never tags or pushes, and nothing depends
+on it.
 
 ## Runner group access — invisible in the tree
 
@@ -648,8 +675,8 @@ Self-hosted runners execute workflow code from pull requests on this machine. Th
 while the fork is private and contributors are trusted. Revisit before accepting outside PRs.
 
 Least privilege, as of 2026-11-17: the workflow's default token is `contents: read`; only
-`bump-tag` asks for `contents: write`, to push the tag it mints. The `guards` and
-`build-and-deploy` checkouts use `persist-credentials: false`, so no token sits in the
+`bump-tag` asks for `contents: write`, to push the tag it mints. The `guards`,
+`tag-preview` and `build-and-deploy` checkouts use `persist-credentials: false`, so no token sits in the
 workspace's `.git/config` while the branch's own build scripts run. Every job has a
 `timeout-minutes` (the build legs 90), so a hung leg does not hold its runner for GitHub's
 6-hour default.
