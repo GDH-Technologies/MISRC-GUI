@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """PreToolUse hook for the GitHub MCP tools.
 
-Repo-agnostic: nothing here names a repository, so this file is byte-identical in
-digitization-toolkit and capture-node. The conventions it enforces are org-wide.
+Repo-agnostic: nothing here names a repository, so this one file is byte-identical in
+every GDH-Technologies repo that registers it (tracked in some, local-only under an
+ignored `.claude/` in others). Change every copy together; from the folder holding the
+checkouts, `md5sum */.claude/hooks/github-conventions.py` lists them. The conventions it
+enforces are org-wide.
 
 Two jobs, both on `PreToolUse`:
 
