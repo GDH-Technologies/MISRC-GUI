@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DEPS_PREFIX="${DEPS_PREFIX:-$REPO_ROOT/.deps/install}"
 HSDAOH_SOURCE_DIR="${HSDAOH_SOURCE_DIR:-$REPO_ROOT/third_party/hsdaoh}"
-RAYLIB_TAG="${RAYLIB_TAG:-5.5}"
+RAYLIB_TAG="${RAYLIB_TAG:-6.0}"
 OPUS_TAG="${OPUS_TAG:-v1.5.2}"
 OPENH264_TAG="${OPENH264_TAG:-v2.6.0}"  # same pin as android/build-openh264-android.sh
 

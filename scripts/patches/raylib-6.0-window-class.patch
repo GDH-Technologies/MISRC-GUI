@@ -1,12 +1,12 @@
 diff --git a/src/platforms/rcore_desktop_glfw.c b/src/platforms/rcore_desktop_glfw.c
-index baf2967..1219814 100644
+index 9b6881d..4b22661 100644
 --- a/src/platforms/rcore_desktop_glfw.c
 +++ b/src/platforms/rcore_desktop_glfw.c
-@@ -100,6 +100,24 @@ extern CoreData CORE;                   // Global CORE state context
+@@ -120,6 +120,24 @@ extern CoreData CORE;                   // Global CORE state context
  
  static PlatformData platform = { 0 };   // Platform specific data
  
-+// GDH-Technologies/MISRC-GUI patch (scripts/patches/raylib-5.5-window-class.patch):
++// GDH-Technologies/MISRC-GUI patch (scripts/patches/raylib-6.0-window-class.patch):
 +// window hints the application must set before InitWindow(), which InitPlatform()
 +// would otherwise wipe with glfwDefaultWindowHints() before creating the window.
 +static char gdhWaylandAppId[128] = { 0 };
@@ -27,7 +27,7 @@ index baf2967..1219814 100644
  //----------------------------------------------------------------------------------
  // Module Internal Functions Declaration
  //----------------------------------------------------------------------------------
-@@ -684,6 +702,11 @@ void SetWindowSize(int width, int height)
+@@ -739,6 +757,11 @@ void SetWindowSize(int width, int height)
      CORE.Window.screen.height = height;
  
      glfwSetWindowSize(platform.handle, width, height);
@@ -39,7 +39,7 @@ index baf2967..1219814 100644
  }
  
  // Set window opacity, value opacity is between 0.0 and 1.0
-@@ -1306,6 +1329,9 @@ int InitPlatform(void)
+@@ -1459,6 +1482,9 @@ int InitPlatform(void)
      // Initialize graphic device: display/window and graphic context
      //----------------------------------------------------------------------------
      glfwDefaultWindowHints();                       // Set default windows hints

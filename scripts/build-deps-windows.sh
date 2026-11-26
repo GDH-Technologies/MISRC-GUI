@@ -17,7 +17,7 @@ HSDAOH_SOURCE_DIR="${HSDAOH_SOURCE_DIR:-$REPO_ROOT/third_party/hsdaoh}"
 # reproducible. CI's windows-exe job clones `main` (drifting); step 4 of the
 # plan updates CI to this same tag so local == CI. Bump here + in CI together.
 LIBUVC_REF="${LIBUVC_REF:-v0.0.7}"
-RAYLIB_TAG="${RAYLIB_TAG:-5.5}"
+RAYLIB_TAG="${RAYLIB_TAG:-6.0}"
 
 # MSYS2 UCRT64 must be on PATH (caller ensures this, but enforce for safety).
 # MINGW64 is deprecated by MSYS2; UCRT64 is the CI toolchain since run

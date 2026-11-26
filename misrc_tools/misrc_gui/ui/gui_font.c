@@ -183,8 +183,17 @@ static bool font_empty_advance(const font_source_t *source, int codepoint, int *
 static Font font_source_glyph(font_source_t *source, int codepoint) {
     Font font = {0};
     if (!source) return font;
+#if RAYLIB_VERSION_MAJOR >= 6
+    /* raylib 6.0 added the glyphCount out-parameter and skips a codepoint the
+     * font lacks (5.5 returned an empty glyph for it). */
+    int loaded_glyphs = 0;
+    GlyphInfo *glyph = LoadFontData(source->data, (int)source->size, FALLBACK_SIZE,
+                                   &codepoint, 1, FONT_DEFAULT, &loaded_glyphs);
+    if (glyph && loaded_glyphs < 1) { UnloadFontData(glyph, loaded_glyphs); glyph = NULL; }
+#else
     GlyphInfo *glyph = LoadFontData(source->data, (int)source->size, FALLBACK_SIZE,
                                    &codepoint, 1, FONT_DEFAULT);
+#endif
     if (!glyph) return font;
     if (!glyph[0].image.data || glyph[0].image.width <= 0) {
         int advance;
