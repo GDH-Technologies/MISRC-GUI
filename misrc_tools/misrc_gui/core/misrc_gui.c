@@ -1066,7 +1066,7 @@ int main(int argc, char **argv) {
         /* The caption module never resolves ffmpeg itself -- it is handed the
          * one gui_video_record resolves for it (gui_video_record_cc_ffmpeg_path:
          * the ffmpeg_path override, else the v4l2vbi build installed as
-         * ffmpeg-vbi, else the video ffmpeg), so every caption entry point
+         * ffmpeg-gdh, else the video ffmpeg), so every caption entry point
          * agrees on the binary. */
         if (strcmp(argv[i], "--cc-probe") == 0) {
             bool live = (i + 1 < argc) && strcmp(argv[i + 1], "--live") == 0;
