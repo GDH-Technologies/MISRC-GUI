@@ -173,7 +173,9 @@ framebuffer); every `InitWindow` goes after `gui_ui_prepare_window_platform()` (
   `scripts/build-*`, `git-version.sh`, the suite and its harnesses); `build-on-stop.sh` refuses
   to end a turn while C sources differ from `origin/main` until an incremental build and
   `--smoke-test` pass. `MISRC_GUARDS_ON_EDIT=0` / `MISRC_BUILD_ON_STOP=0` disable them for a
-  session.
+  session. They fire only when MISRC-GUI is the session's main folder. As an extra folder
+  in a multi-repo session (for example a Claude Desktop environment), neither runs, so run
+  `/build` and the guards yourself (`.claude/rules/worktrees.md`).
 - Agents: `capture-path-verifier` (runtime checks), `dev-notes-auditor` (static check of the
   five constraints below), `upstream-diff-curator` (the gate before `/upstream-pr`). Skills:
   `/build`, `/guard`.
