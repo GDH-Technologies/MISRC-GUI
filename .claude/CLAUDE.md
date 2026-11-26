@@ -28,7 +28,7 @@ gui_preview_v4l2.c`, `misrc_tools/misrc_gui/input/gui_preview_sdtv.{c,h}`,
 `misrc_tools/test/gui_record_fifo_harness.c` (the ordered record path, kept fork-only by Reece's
 call on 2026-10-21),
 `.github/workflows/selfhosted-deploy.yml`, `docs/gdh-*`, `docs/superpowers/`,
-`scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `.claude/`, `.clangd`.
+`scripts/fetch-mediamtx.sh`, `scripts/gdh-host/`, `scripts/gdh-ci/`, `.claude/`, `.clangd`.
 
 ## Commands
 
@@ -104,7 +104,10 @@ aligned with upstream's code and Windows CI, so it is to move to UCRT64 too (pla
 done: the steps are in the CI doc's "Planned: move win0 from MINGW64 to UCRT64"; until then
 `build-local.ps1` has no UCRT64 toolchain on win0). Since v1.2.7 win0 also needs pacman's
 `opus` and `openh264`. PRs build and guard-test on wm and win0. `bump-tag` mints
-`v<upstream>-gdh.N` before the build legs so all resolve the same version. POSIX installs
+`v<upstream>-gdh.N` before the build legs so all resolve the same version; its logic is
+`scripts/gdh-ci/bump-gdh-tag.sh`, which reads no global git config (wm's runners run as
+`rdodge`, so steps after checkout see Reece's `~/.gitconfig`) and keeps harrypm's tags out of
+`refs/tags`. Every same-repo PR runs it `--dry-run` on wm (job `tag-preview`). POSIX installs
 are atomic into `~/.local/bin`; the GNOME launcher's `StartupWMClass` must equal
 `MISRC_WINDOW_CLASS_TITLE` (guarded), and on native Wayland its file name must equal the app_id
 `GUI_WAYLAND_APP_ID` (`misrc_gui.desktop`). Linux raylib is built with GLFW's Wayland AND X11

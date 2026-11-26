@@ -95,9 +95,10 @@ concurrency:
 # carries the same-repo guard
 #   github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 # so a PR from someone else's fork is skipped, while the maintainers' own branches still
-# build on wm and win0. (bump-tag runs only on a push to main, so it needs none.) The
-# runners sit next to production env roots and credentials, and an approved fork PR would
-# otherwise run its own build scripts and guards on them. The org's approval requirement
+# build on wm and win0. (bump-tag runs only on a push to main, so it needs none; its PR
+# twin tag-preview carries it.) The runners sit next to production env roots and
+# credentials, and an approved fork PR would otherwise run its own build scripts and
+# guards on them. The org's approval requirement
 # for outside contributors' fork PRs is the primary control: a fork PR runs its own copy
 # of this file and could delete the guard, so a PR that edits a workflow still needs
 # reading before it is approved. This stops the approved-innocent case. A fork PR whose
@@ -334,52 +335,37 @@ jobs:
           # falling back to dev-<date>-nogit.
           fetch-depth: 0
 
+      # All of the logic, and why each rule exists, is in the script's header.
       - name: Bump GDH release tag
-        run: |
-          set -euo pipefail
+        run: scripts/gdh-ci/bump-gdh-tag.sh
 
-          # Already tagged (a re-run of the same commit, or a merge that a human tagged
-          # first): leave it alone rather than minting a second tag for one commit.
-          existing="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)"
-          if [ -n "$existing" ]; then
-            echo "HEAD is already $existing; not bumping"
-            exit 0
-          fi
+  # The tag bump's canary, on every same-repo PR. It runs bump-gdh-tag.sh --dry-run on wm,
+  # the machine bump-tag runs on, against the PR's merge commit and the real origin and
+  # harrypm tags. It prints the tag the merge would get and fails if the checkout's tags
+  # disagree with origin's. On 2026-11-26 a change to the runner user's git config made
+  # bump-tag prune every -gdh tag, and the #117 merge was the first to find out; this job
+  # would have failed that PR instead. Read-only: it never tags or pushes.
+  tag-preview:
+    name: Preview GDH release tag
+    # Same-repo guard (see above jobs:): no fork PR runs on a self-hosted runner.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # No token in the workspace while the PR's own script runs; it only reads, and the
+      # repository is public.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-          # The base is the highest of upstream's release tags that HEAD contains, never
-          # the nearest tag. Two things go wrong with "nearest": the fork's remote carries
-          # none of harrypm's plain vX.Y.Z tags (pushing one here would fire this
-          # workflow's tag trigger and install upstream's tree), so they are fetched from
-          # harrypm's repository for this step only; and a sync merge that brings a
-          # handful of upstream commits sits closer to the previous -gdh tag than to the
-          # new upstream tag, so `git describe` kept the old base -- the v1.1.9 merge
-          # (#56) was minted v1.1.8-gdh.22 that way.
-          if ! git fetch --quiet --no-tags https://github.com/harrypm/MISRC-GUI.git \
-               'refs/tags/v*:refs/tags/v*'; then
-            echo "::error::could not fetch harrypm/MISRC-GUI release tags to base the GDH tag on"
-            exit 1
-          fi
-          # Both pipelines below end in grep, which exits 1 on no match; under pipefail
-          # that would abort the step silently (it did, on the first run after #57, when
-          # no v1.1.9-gdh.* tag existed yet). An empty result is handled explicitly.
-          base="$(git tag --merged HEAD --list 'v[0-9]*' \
-                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
-          if [ -z "$base" ]; then
-            echo "::error::no upstream vX.Y.Z tag reachable from HEAD to base a GDH release tag on"
-            exit 1
-          fi
-
-          # One past the highest -gdh.N already minted on that base, wherever it sits.
-          n="$(git tag --list "${base}-gdh.*" | sed "s/^${base}-gdh\.//" \
-               | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)"
-          n=$(( ${n:-0} + 1 ))
-          next="${base}-gdh.${n}"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$next" -m "auto: ${GITHUB_SHA}"
-          git push origin "$next"
-          echo "tagged $next"
+      - name: Preview GDH release tag
+        run: scripts/gdh-ci/bump-gdh-tag.sh --dry-run
 
   # The CI-only tier's whole check. ci_guard_tests.py --static-only is a raw substring
   # matcher over selfhosted-deploy.yml, meson.build, the build scripts and git-version.sh
