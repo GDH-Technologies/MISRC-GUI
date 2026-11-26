@@ -1582,7 +1582,10 @@ def check_native_wayland_contract(repo_root: Path) -> int:
     if re.search(r"--parallel\s*$", deps, re.MULTILINE):
         return fail("build-deps-unix.sh: an unnumbered `cmake --build --parallel` is an unbounded make -j")
 
-    patch_path = repo_root / "scripts/patches/raylib-5.5-window-class.patch"
+    tag = re.search(r'^RAYLIB_TAG="\$\{RAYLIB_TAG:-([^}]+)\}"', deps, re.MULTILINE)
+    if not tag:
+        return fail("build-deps-unix.sh: no default RAYLIB_TAG")
+    patch_path = repo_root / f"scripts/patches/raylib-{tag.group(1)}-window-class.patch"
     if not patch_path.exists():
         return fail(f"missing {patch_path.relative_to(repo_root)}")
     patch = read_text(patch_path)

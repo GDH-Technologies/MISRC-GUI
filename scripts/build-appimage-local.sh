@@ -12,7 +12,7 @@ TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/.deps/tools-appimage-local}"
 WORK_TMP_DIR="${WORK_TMP_DIR:-$REPO_ROOT/.tmp/appimage-local}"
 APPIMAGE_BUILD_IMAGE="${APPIMAGE_BUILD_IMAGE:-ubuntu:22.04}"
 HSDAOH_SOURCE_DIR="${HSDAOH_SOURCE_DIR:-$REPO_ROOT/third_party/hsdaoh}"
-RAYLIB_TAG="5.5"
+RAYLIB_TAG="6.0"
 TARGET_MAX_GLIBC="2.35"
 
 log() {

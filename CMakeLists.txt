@@ -156,14 +156,14 @@ endif()
 # Raylib
 # ========================================
 if(USE_SYSTEM_RAYLIB)
-    find_package(raylib 5.0 REQUIRED)
+    find_package(raylib 6.0 REQUIRED)
 else()
     include(FetchContent)
     set(FETCHCONTENT_QUIET FALSE)
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY https://github.com/raysan5/raylib.git
-        GIT_TAG 5.0
+        GIT_TAG 6.0
         GIT_PROGRESS TRUE
     )
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
